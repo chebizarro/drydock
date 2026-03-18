@@ -1,0 +1,11 @@
+.git
+.gitignore
+.beads
+*.db
+*.sqlite
+tmp
+repos
+dist
+bin
+node_modules
+

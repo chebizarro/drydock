@@ -1,0 +1,20 @@
+{
+  "id": "heldout-sample-v1",
+  "cases": [
+    {
+      "case_id": "sample-1",
+      "patch_diff": "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -1,3 +1,6 @@\n+func validateToken(t string) bool { return t != \"\" }\n",
+      "changed_files": ["auth.go"],
+      "context_bundle": "Auth validation change",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "auth.go",
+          "line": 1,
+          "severity": "high"
+        }
+      ]
+    }
+  ]
+}
+

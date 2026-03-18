@@ -1,0 +1,32 @@
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /src
+RUN apk add --no-cache git ca-certificates
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/drydock ./cmd/drydock && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/drydock-eval ./cmd/drydock-eval
+
+FROM alpine:3.22
+
+RUN apk add --no-cache ca-certificates tzdata git bash
+WORKDIR /app
+
+COPY --from=builder /out/drydock /usr/local/bin/drydock
+COPY --from=builder /out/drydock-eval /usr/local/bin/drydock-eval
+COPY eval /app/eval
+COPY scripts/entrypoint.sh /entrypoint.sh
+
+RUN chmod +x /entrypoint.sh && \
+    mkdir -p /data/repos
+
+ENV DRYDOCK_DATABASE_URL=file:/data/drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)
+ENV DRYDOCK_REPO_CACHE_DIR=/data/repos
+ENV DRYDOCK_EVAL_DATASET_PATH=/app/eval/heldout-sample.json
+ENV DRYDOCK_MODE=listener
+
+ENTRYPOINT ["/entrypoint.sh"]
+

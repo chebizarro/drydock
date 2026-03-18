@@ -1,0 +1,34 @@
+services:
+  drydock:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: drydock:latest
+    restart: unless-stopped
+    environment:
+      DRYDOCK_MODE: ${DRYDOCK_MODE:-listener}
+      DRYDOCK_DATABASE_URL: ${DRYDOCK_DATABASE_URL:-file:/data/drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)}
+      DRYDOCK_REPO_CACHE_DIR: ${DRYDOCK_REPO_CACHE_DIR:-/data/repos}
+      DRYDOCK_EVAL_DATASET_PATH: ${DRYDOCK_EVAL_DATASET_PATH:-/app/eval/heldout-sample.json}
+      DRYDOCK_RELAYS: ${DRYDOCK_RELAYS:-wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net}
+      DRYDOCK_LOG_LEVEL: ${DRYDOCK_LOG_LEVEL:-info}
+      DRYDOCK_SIGNER_BUNKER_URL: ${DRYDOCK_SIGNER_BUNKER_URL:-}
+      DRYDOCK_LLM_API_KEY: ${DRYDOCK_LLM_API_KEY:-}
+      DRYDOCK_PLANNER_BASE_URL: ${DRYDOCK_PLANNER_BASE_URL:-http://host.docker.internal:11434/v1}
+      DRYDOCK_PLANNER_MODEL: ${DRYDOCK_PLANNER_MODEL:-qwen2.5-coder-14b-instruct-q4_k_m}
+      DRYDOCK_CODER32B_BASE_URL: ${DRYDOCK_CODER32B_BASE_URL:-http://host.docker.internal:11434/v1}
+      DRYDOCK_CODER32B_MODEL: ${DRYDOCK_CODER32B_MODEL:-qwen2.5-coder-32b-instruct-q4_k_m}
+      DRYDOCK_LLM70B_BASE_URL: ${DRYDOCK_LLM70B_BASE_URL:-http://host.docker.internal:11435/v1}
+      DRYDOCK_LLM70B_MODEL: ${DRYDOCK_LLM70B_MODEL:-llama-3.3-70b-instruct-q4_k_m}
+      DRYDOCK_CODER14B_BASE_URL: ${DRYDOCK_CODER14B_BASE_URL:-http://host.docker.internal:11434/v1}
+      DRYDOCK_CODER14B_MODEL: ${DRYDOCK_CODER14B_MODEL:-qwen2.5-coder-14b-instruct-q4_k_m}
+      DRYDOCK_META_BASE_URL: ${DRYDOCK_META_BASE_URL:-http://host.docker.internal:11436/v1}
+      DRYDOCK_META_MODEL: ${DRYDOCK_META_MODEL:-gpt-5-codex}
+    volumes:
+      - drydock_data:/data
+      - ./eval:/app/eval:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  drydock_data:
