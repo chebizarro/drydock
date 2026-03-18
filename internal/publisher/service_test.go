@@ -18,7 +18,9 @@ type fakeSigner struct {
 	sk nostr.SecretKey
 }
 
-func (f fakeSigner) GetPublicKey(context.Context) (nostr.PubKey, error) { return nostr.GetPublicKey(f.sk), nil }
+func (f fakeSigner) GetPublicKey(context.Context) (nostr.PubKey, error) {
+	return nostr.GetPublicKey(f.sk), nil
+}
 func (f fakeSigner) SignEvent(_ context.Context, evt *nostr.Event) error {
 	return evt.Sign(f.sk)
 }
@@ -76,11 +78,20 @@ func TestPublishReviewSummaryAndHighDetail(t *testing.T) {
 		t.Fatalf("expected 2 publish calls (summary + high detail), got %d", len(fakePub.calls))
 	}
 	for _, c := range fakePub.calls {
-		if c.event.Kind != 1622 {
-			t.Fatalf("expected kind 1622, got %d", c.event.Kind)
+		if c.event.Kind != nostr.KindComment {
+			t.Fatalf("expected kind %d, got %d", nostr.KindComment, c.event.Kind)
 		}
 		if !strings.Contains(c.event.Content, "context-layers-dropped:") {
 			t.Fatalf("missing mandatory context-layers-dropped footer field")
+		}
+		assertHasTag(t, c.event.Tags, "E")
+		assertHasTag(t, c.event.Tags, "K")
+		assertHasTag(t, c.event.Tags, "P")
+		assertHasTag(t, c.event.Tags, "e")
+		assertHasTag(t, c.event.Tags, "k")
+		assertHasTag(t, c.event.Tags, "p")
+		if strings.Contains(c.event.Content, "##") || strings.Contains(c.event.Content, "**") {
+			t.Fatalf("expected plaintext comment content, got markdown-like formatting: %q", c.event.Content)
 		}
 	}
 	if !contains(fakePub.calls[0].relays, "wss://relay.patch.example") || !contains(fakePub.calls[0].relays, "wss://relay.repo.example") {
@@ -126,6 +137,62 @@ func seedRepoAndPatch(t *testing.T, ctx context.Context, store *db.Store) (patch
 	return patchEvt.ID.Hex(), db.RepoIDFromPatch(patchEvt)
 }
 
+func TestPublishReviewPRUpdateUsesRootAndParentScopes(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	repoOwner := nostr.MustPubKeyFromHex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+	rootPRID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	repoEvt := nostr.Event{ID: nostr.MustIDFromHex("1212121212121212121212121212121212121212121212121212121212121212"), PubKey: repoOwner, Kind: 30617, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"d", "repo-2"}, {"relays", "wss://relay.repo.example"}}}
+	if err := store.UpsertRepositoryAnnouncement(ctx, repoEvt); err != nil {
+		t.Fatalf("seed repo announcement: %v", err)
+	}
+
+	updateEvt := nostr.Event{
+		ID:        nostr.MustIDFromHex("3434343434343434343434343434343434343434343434343434343434343434"),
+		PubKey:    nostr.MustPubKeyFromHex("abababababababababababababababababababababababababababababababab"),
+		Kind:      1619,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"a", "30617:" + repoOwner.Hex() + ":repo-2"},
+			{"E", rootPRID},
+			{"P", repoOwner.Hex()},
+			{"c", "1111111111111111111111111111111111111111"},
+		},
+	}
+	if err := store.InsertPatchEvent(ctx, updateEvt); err != nil {
+		t.Fatalf("seed pr update: %v", err)
+	}
+	if err := store.RecordPatchEventRelay(ctx, updateEvt.ID.Hex(), "wss://relay.patch.example"); err != nil {
+		t.Fatalf("seed patch relay: %v", err)
+	}
+	if _, err := store.BeginReview(ctx, updateEvt.ID.Hex(), db.RepoIDFromPatch(updateEvt)); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	fakePub := &fakeRelayPublisher{}
+	svc := New(Config{DefaultRelays: []string{"wss://fallback.example"}}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	if _, err := svc.PublishReview(ctx, PublishInput{PatchEventID: updateEvt.ID.Hex(), RepoID: db.RepoIDFromPatch(updateEvt), Summary: "ok", Model: "m", ContextHash: "h", Confidence: 0.7}); err != nil {
+		t.Fatalf("publish review: %v", err)
+	}
+	if len(fakePub.calls) == 0 {
+		t.Fatalf("expected at least one publish call")
+	}
+	tags := fakePub.calls[0].event.Tags
+	if got := findTagValue(tags, "E"); got != rootPRID {
+		t.Fatalf("expected E=%s got %s", rootPRID, got)
+	}
+	if got := findTagValue(tags, "K"); got != "1618" {
+		t.Fatalf("expected K=1618 got %s", got)
+	}
+	if got := findTagValue(tags, "e"); got != updateEvt.ID.Hex() {
+		t.Fatalf("expected e=%s got %s", updateEvt.ID.Hex(), got)
+	}
+	if got := findTagValue(tags, "k"); got != "1619" {
+		t.Fatalf("expected k=1619 got %s", got)
+	}
+}
+
 func mustStore(t *testing.T, ctx context.Context) *db.Store {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "publisher-test.db")
@@ -140,6 +207,25 @@ func mustStore(t *testing.T, ctx context.Context) *db.Store {
 	return store
 }
 
+func assertHasTag(t *testing.T, tags nostr.Tags, name string) {
+	t.Helper()
+	for _, tag := range tags {
+		if len(tag) > 0 && tag[0] == name {
+			return
+		}
+	}
+	t.Fatalf("missing required tag %s in %v", name, tags)
+}
+
+func findTagValue(tags nostr.Tags, name string) string {
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == name {
+			return tag[1]
+		}
+	}
+	return ""
+}
+
 func contains(items []string, target string) bool {
 	for _, item := range items {
 		if item == target {
@@ -148,4 +234,3 @@ func contains(items []string, target string) bool {
 	}
 	return false
 }
-

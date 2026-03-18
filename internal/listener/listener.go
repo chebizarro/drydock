@@ -15,7 +15,7 @@ type EventProcessor interface {
 var subscribedKinds = []nostr.Kind{
 	30617, 30618,
 	1617, 1618, 1619,
-	1621, 1622,
+	1621, nostr.KindComment,
 	1630, 1631, 1632, 1633,
 	1985,
 }

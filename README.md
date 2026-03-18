@@ -1,6 +1,6 @@
 # Drydock
 
-Drydock is an automated NIP-34 code review agent that ingests patch and PR events from Nostr, builds repository context, runs local model reviews, and publishes structured kind `1622` review events.
+Drydock is an automated NIP-34 code review agent that ingests patch and PR events from Nostr, builds repository context, runs local model reviews, and publishes structured kind `1111` review comments.
 
 ## Current bootstrap scope
 
@@ -18,7 +18,7 @@ Drydock is an automated NIP-34 code review agent that ingests patch and PR event
 - Nostr listener wired to kinds:
   - `30617`, `30618`
   - `1617`, `1618`, `1619`
-  - `1621`, `1622`
+  - `1621`, `1111`
   - `1630-1633`
   - `1985`
 - Ingestion path reuses `fiatjaf.com/nostr/nip34` for repository and patch parsing.
@@ -35,7 +35,7 @@ Drydock is an automated NIP-34 code review agent that ingests patch and PR event
   - file-type checklist injection and security-sensitive prompt augmentation
   - strict reviewer findings schema validation
 - Review publisher (`internal/publisher`):
-  - builds and publishes kind `1622` summary events (+ high/critical detail events)
+  - builds and publishes kind `1111` summary comments (+ high/critical detail comments)
   - includes required metadata footer fields (`context-layers-dropped` always present)
   - relay fanout = patch-seen relays + repository announcement relays
   - explicit guard to never emit status kinds `1631` / `1632`

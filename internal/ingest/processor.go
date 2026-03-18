@@ -34,6 +34,8 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 		return p.store.UpsertRepositoryAnnouncement(ctx, event)
 	case nostr.KindRepositoryState:
 		return p.store.UpsertRepositorySnapshot(ctx, event)
+	case 1630, 1631, 1632, 1633:
+		return p.store.UpsertRootStatus(ctx, event)
 	case 1617, 1618, 1619:
 		if err := p.store.InsertPatchEvent(ctx, event); err != nil {
 			return err
@@ -54,6 +56,15 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			p.logger.Info("skipping stale patch from snapshot", "event_id", event.ID.Hex(), "repo_id", repoID, "reason", reason)
 			return nil
 		}
+		closed, closedReason, err := p.store.IsRootClosedByStatus(ctx, db.RootEventID(event), repoID)
+		if err != nil {
+			return err
+		}
+		if closed {
+			p.logger.Info("skipping review for closed/applied root", "event_id", event.ID.Hex(), "repo_id", repoID, "reason", closedReason)
+			return nil
+		}
+
 		acquired, err := p.store.BeginReview(ctx, event.ID.Hex(), repoID)
 		if err != nil {
 			if errors.Is(err, db.ErrReviewAlreadyPublished) {

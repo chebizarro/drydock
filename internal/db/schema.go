@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS thread_cache (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS root_statuses (
+  root_event_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL DEFAULT '',
+  status_kind INTEGER NOT NULL,
+  status_event_id TEXT NOT NULL,
+  author_pubkey TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (root_event_id, repo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_root_statuses_kind ON root_statuses(status_kind);
+
 CREATE TABLE IF NOT EXISTS review_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   patch_event_id TEXT NOT NULL,

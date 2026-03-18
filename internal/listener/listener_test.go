@@ -12,7 +12,7 @@ func TestSubscribedKindsSet(t *testing.T) {
 		1618:  true,
 		1619:  true,
 		1621:  true,
-		1622:  true,
+		1111:  true,
 		1630:  true,
 		1631:  true,
 		1632:  true,

@@ -81,6 +81,67 @@ func (m *Manager) ApplyPatchSeries(ctx context.Context, repoPath, patchEventID s
 	return branch, nil
 }
 
+func (m *Manager) EnsureCommitAvailable(ctx context.Context, repoPath, eventID, commit string, cloneURLs []string) error {
+	if strings.TrimSpace(commit) == "" {
+		return fmt.Errorf("commit is required")
+	}
+
+	if _, err := m.runGit(ctx, repoPath, "cat-file", "-e", commit+"^{commit}"); err == nil {
+		return nil
+	}
+
+	for _, cloneURL := range cloneURLs {
+		cloneURL = strings.TrimSpace(cloneURL)
+		if cloneURL == "" {
+			continue
+		}
+		if eventID != "" {
+			if _, err := m.runGit(ctx, repoPath, "fetch", "--no-tags", cloneURL, "refs/nostr/"+eventID+":refs/drydock/nostr/"+eventID); err == nil {
+				if _, err := m.runGit(ctx, repoPath, "cat-file", "-e", commit+"^{commit}"); err == nil {
+					return nil
+				}
+			}
+		}
+		if _, err := m.runGit(ctx, repoPath, "fetch", "--no-tags", cloneURL, commit); err == nil {
+			if _, err := m.runGit(ctx, repoPath, "cat-file", "-e", commit+"^{commit}"); err == nil {
+				return nil
+			}
+		}
+	}
+
+	if _, err := m.runGit(ctx, repoPath, "cat-file", "-e", commit+"^{commit}"); err != nil {
+		return fmt.Errorf("commit %s not available after fetch attempts", commit)
+	}
+	return nil
+}
+
+func (m *Manager) CheckoutCommitOnBranch(ctx context.Context, repoPath, branch, commit string) error {
+	if strings.TrimSpace(branch) == "" {
+		return fmt.Errorf("branch is required")
+	}
+	if strings.TrimSpace(commit) == "" {
+		return fmt.Errorf("commit is required")
+	}
+
+	mu := m.getRepoLock(repoPath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if _, err := m.runGit(ctx, repoPath, "reset", "--hard", "HEAD"); err != nil {
+		return fmt.Errorf("git reset before checkout: %w", err)
+	}
+	if _, err := m.runGit(ctx, repoPath, "clean", "-fd"); err != nil {
+		return fmt.Errorf("git clean before checkout: %w", err)
+	}
+	if _, err := m.runGit(ctx, repoPath, "fetch", "--all", "--prune"); err != nil {
+		return fmt.Errorf("git fetch before checkout: %w", err)
+	}
+	if _, err := m.runGit(ctx, repoPath, "checkout", "-B", branch, commit); err != nil {
+		return fmt.Errorf("checkout branch %s at %s: %w", branch, commit, err)
+	}
+	return nil
+}
+
 func (m *Manager) CleanupReviewBranch(ctx context.Context, repoPath, branch string) error {
 	if branch == "" {
 		return nil
@@ -100,7 +161,7 @@ func (m *Manager) applySinglePatch(ctx context.Context, repoPath, patchContent s
 	if err != nil {
 		return fmt.Errorf("open stdin: %w", err)
 	}
-	
+
 	errCh := make(chan error, 1)
 	go func() {
 		defer stdin.Close()
@@ -113,12 +174,12 @@ func (m *Manager) applySinglePatch(ctx context.Context, repoPath, patchContent s
 		_, writeErr := io.WriteString(stdin, patchContent)
 		errCh <- writeErr
 	}()
-	
+
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
-	
+
 	if writeErr := <-errCh; writeErr != nil && writeErr != io.ErrClosedPipe {
 		return fmt.Errorf("write patch content: %w", writeErr)
 	}
@@ -150,4 +211,3 @@ func shortID(v string) string {
 	}
 	return v[:12]
 }
-

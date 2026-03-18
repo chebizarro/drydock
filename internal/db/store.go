@@ -200,7 +200,7 @@ func (s *Store) InsertPatchEvent(ctx context.Context, event nostr.Event) error {
 		      ELSE ',' || excluded.event_ids
 		    END,
 		    updated_at=excluded.updated_at`,
-		rootID, event.ID.String(), now,
+		rootID, event.ID.Hex(), now,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert thread cache: %w", err)
@@ -340,6 +340,135 @@ func (s *Store) ListPatchThreadEvents(ctx context.Context, rootID, repoID string
 	return events, nil
 }
 
+func (s *Store) UpsertRootStatus(ctx context.Context, event nostr.Event) error {
+	rootID := statusRootEventID(event)
+	if rootID == "" {
+		return nil
+	}
+
+	repoID := repoIDFromAddressTags(event.Tags)
+	if repoID == "" {
+		var inferred string
+		if err := s.db.QueryRowContext(ctx, `SELECT repo_id FROM patch_events WHERE event_id=? LIMIT 1`, rootID).Scan(&inferred); err == nil {
+			repoID = inferred
+		}
+	}
+
+	allowed, err := s.isStatusAuthorAllowed(ctx, rootID, repoID, event.PubKey)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return nil
+	}
+
+	now := time.Now().Unix()
+	_, err = s.db.ExecContext(
+		ctx,
+		`INSERT INTO root_statuses(root_event_id, repo_id, status_kind, status_event_id, author_pubkey, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(root_event_id, repo_id) DO UPDATE SET
+		   status_kind=excluded.status_kind,
+		   status_event_id=excluded.status_event_id,
+		   author_pubkey=excluded.author_pubkey,
+		   created_at=excluded.created_at,
+		   updated_at=excluded.updated_at
+		 WHERE excluded.created_at >= root_statuses.created_at`,
+		rootID,
+		repoID,
+		int(event.Kind),
+		event.ID.Hex(),
+		event.PubKey.Hex(),
+		int64(event.CreatedAt),
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert root status: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) isStatusAuthorAllowed(ctx context.Context, rootID, repoID string, author nostr.PubKey) (bool, error) {
+	if strings.TrimSpace(rootID) == "" {
+		return false, nil
+	}
+
+	var rootAuthorHex string
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT author_pubkey FROM patch_events WHERE event_id=? LIMIT 1`,
+		rootID,
+	).Scan(&rootAuthorHex); err == nil {
+		if strings.EqualFold(rootAuthorHex, author.Hex()) {
+			return true, nil
+		}
+	}
+
+	if strings.TrimSpace(repoID) == "" {
+		return false, nil
+	}
+
+	var rawRepo string
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT raw_event_json FROM repositories WHERE repo_id=? LIMIT 1`,
+		repoID,
+	).Scan(&rawRepo)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lookup repository announcement for status auth: %w", err)
+	}
+
+	var repoEvt nostr.Event
+	if err := json.Unmarshal([]byte(rawRepo), &repoEvt); err != nil {
+		return false, fmt.Errorf("decode repository announcement for status auth: %w", err)
+	}
+	repo := nip34.ParseRepository(repoEvt)
+	if repoEvt.PubKey == author {
+		return true, nil
+	}
+	for _, maintainer := range repo.Maintainers {
+		if maintainer == author {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Store) IsRootClosedByStatus(ctx context.Context, rootID, repoID string) (bool, string, error) {
+	if strings.TrimSpace(rootID) == "" {
+		return false, "", nil
+	}
+
+	var statusKind int
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT status_kind
+		   FROM root_statuses
+		  WHERE root_event_id=? AND (repo_id=? OR repo_id='')
+		  ORDER BY CASE WHEN repo_id=? THEN 0 ELSE 1 END
+		  LIMIT 1`,
+		rootID, repoID, repoID,
+	).Scan(&statusKind)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("query root status: %w", err)
+	}
+
+	switch statusKind {
+	case 1631:
+		return true, "root status is applied/merged (1631)", nil
+	case 1632:
+		return true, "root status is closed (1632)", nil
+	default:
+		return false, "", nil
+	}
+}
+
 func (s *Store) InsertReviewEvent(ctx context.Context, event nostr.Event, patchEventID, repoID string) error {
 	_, err := s.db.ExecContext(
 		ctx,
@@ -412,7 +541,7 @@ func (s *Store) BeginReview(ctx context.Context, patchEventID, repoID string) (b
 	if err != nil {
 		return false, fmt.Errorf("rows affected: %w", err)
 	}
-	
+
 	if affected == 1 {
 		if err := tx.Commit(); err != nil {
 			return false, fmt.Errorf("commit transaction: %w", err)
@@ -714,11 +843,20 @@ func RepoIDFromPatch(event nostr.Event) string {
 
 func RootEventID(event nostr.Event) string {
 	for _, tag := range event.Tags {
-		if len(tag) < 2 || tag[0] != "e" {
+		if len(tag) < 2 {
 			continue
 		}
-		// root marker in NIP-10 style e tags
+		if tag[0] != "e" && tag[0] != "E" {
+			continue
+		}
 		if len(tag) >= 4 && tag[3] == "root" {
+			return tag[1]
+		}
+	}
+
+	// NIP-34 PR updates carry root with NIP-22 `E`.
+	for _, tag := range event.Tags {
+		if len(tag) >= 2 && tag[0] == "E" {
 			return tag[1]
 		}
 	}
@@ -728,6 +866,46 @@ func RootEventID(event nostr.Event) string {
 		}
 	}
 	return event.ID.Hex()
+}
+
+func statusRootEventID(event nostr.Event) string {
+	for _, tag := range event.Tags {
+		if len(tag) < 2 {
+			continue
+		}
+		if tag[0] != "e" && tag[0] != "E" {
+			continue
+		}
+		if len(tag) >= 4 && tag[3] == "root" {
+			return tag[1]
+		}
+	}
+	for _, tag := range event.Tags {
+		if len(tag) >= 2 && (tag[0] == "e" || tag[0] == "E") {
+			return tag[1]
+		}
+	}
+	return ""
+}
+
+func repoIDFromAddressTags(tags nostr.Tags) string {
+	for _, tag := range tags {
+		if len(tag) < 2 {
+			continue
+		}
+		if tag[0] != "a" && tag[0] != "A" {
+			continue
+		}
+		spl := strings.SplitN(tag[1], ":", 3)
+		if len(spl) != 3 || spl[0] != "30617" {
+			continue
+		}
+		if !isHex(spl[1], 64) {
+			continue
+		}
+		return strings.ToLower(spl[1]) + ":" + spl[2]
+	}
+	return ""
 }
 
 func patchTipCandidates(event nostr.Event) []string {

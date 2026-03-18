@@ -2,6 +2,7 @@ package publisher
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -46,11 +47,11 @@ type PublishInput struct {
 }
 
 type Service struct {
-	cfg      Config
-	store    *db.Store
-	signer   Signer
-	publish  RelayPublisher
-	logger   *slog.Logger
+	cfg     Config
+	store   *db.Store
+	signer  Signer
+	publish RelayPublisher
+	logger  *slog.Logger
 }
 
 func New(cfg Config, store *db.Store, signer Signer, relayPublisher RelayPublisher, logger *slog.Logger) *Service {
@@ -73,9 +74,22 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	if strings.TrimSpace(in.RepoID) == "" {
 		return "", errors.New("repo id is required")
 	}
-	patchAuthor, err := s.store.GetPatchAuthorPubKey(ctx, in.PatchEventID)
+	patchRec, err := s.store.GetPatchEvent(ctx, in.PatchEventID)
 	if err != nil {
 		return "", err
+	}
+	var patchEvent nostr.Event
+	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
+		return "", fmt.Errorf("decode patch event: %w", err)
+	}
+	scope, err := deriveCommentScope(patchEvent)
+	if err != nil {
+		return "", err
+	}
+	if scope.RootID != patchEvent.ID.Hex() {
+		if rootAuthor, err := s.store.GetPatchAuthorPubKey(ctx, scope.RootID); err == nil && strings.TrimSpace(rootAuthor) != "" {
+			scope.RootPubKey = rootAuthor
+		}
 	}
 	relays, err := s.resolveRelays(ctx, in.PatchEventID, in.RepoID)
 	if err != nil {
@@ -89,15 +103,10 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	expiresAt := strconv.FormatInt(time.Now().Add(ttl).Unix(), 10)
 
 	summaryEvent := nostr.Event{
-		Kind:      1622,
+		Kind:      nostr.KindComment,
 		CreatedAt: nostr.Now(),
-		Tags: buildCommonTags(
-			in.PatchEventID,
-			in.RepoID,
-			patchAuthor,
-			expiresAt,
-		),
-		Content: buildSummaryContent(in),
+		Tags:      buildCommonTags(scope, in.RepoID, expiresAt),
+		Content:   buildSummaryContent(in),
 	}
 	if err := s.signer.SignEvent(ctx, &summaryEvent); err != nil {
 		return "", fmt.Errorf("sign summary review event: %w", err)
@@ -117,15 +126,10 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 			continue
 		}
 		detail := nostr.Event{
-			Kind:      1622,
+			Kind:      nostr.KindComment,
 			CreatedAt: nostr.Now(),
-			Tags: buildCommonTags(
-				in.PatchEventID,
-				in.RepoID,
-				patchAuthor,
-				expiresAt,
-			),
-			Content: buildFindingContent(finding, in),
+			Tags:      buildCommonTags(scope, in.RepoID, expiresAt),
+			Content:   buildFindingContent(finding, in),
 		}
 		if err := s.signer.SignEvent(ctx, &detail); err != nil {
 			s.logger.Error("failed to sign detail finding event", "patch_event_id", in.PatchEventID, "error", err)
@@ -159,14 +163,69 @@ func (s *Service) resolveRelays(ctx context.Context, patchEventID, repoID string
 	return relays, nil
 }
 
-func buildCommonTags(patchEventID, repoID, patchAuthorPubkey, expiration string) nostr.Tags {
-	return nostr.Tags{
-		{"e", patchEventID, "", "root"},
-		{"e", patchEventID, "", "reply"},
-		{"a", "30617:" + repoID},
-		{"p", patchAuthorPubkey},
+type commentScope struct {
+	RootID       string
+	RootKind     nostr.Kind
+	RootPubKey   string
+	ParentID     string
+	ParentKind   nostr.Kind
+	ParentPubKey string
+}
+
+func buildCommonTags(scope commentScope, repoID, expiration string) nostr.Tags {
+	tags := nostr.Tags{
+		{"E", scope.RootID, "", scope.RootPubKey},
+		{"K", strconv.Itoa(int(scope.RootKind))},
+		{"e", scope.ParentID, "", scope.ParentPubKey},
+		{"k", strconv.Itoa(int(scope.ParentKind))},
+		{"A", "30617:" + repoID},
 		{"expiration", expiration},
 	}
+	if scope.RootPubKey != "" {
+		tags = append(tags, nostr.Tag{"P", scope.RootPubKey})
+	}
+	if scope.ParentPubKey != "" {
+		tags = append(tags, nostr.Tag{"p", scope.ParentPubKey})
+	}
+	return tags
+}
+
+func deriveCommentScope(target nostr.Event) (commentScope, error) {
+	scope := commentScope{
+		RootID:       target.ID.Hex(),
+		RootKind:     target.Kind,
+		RootPubKey:   target.PubKey.Hex(),
+		ParentID:     target.ID.Hex(),
+		ParentKind:   target.Kind,
+		ParentPubKey: target.PubKey.Hex(),
+	}
+
+	if target.Kind == 1619 {
+		rootIDTag := target.Tags.Find("E")
+		if rootIDTag == nil || len(rootIDTag) < 2 || strings.TrimSpace(rootIDTag[1]) == "" {
+			return commentScope{}, errors.New("PR update event missing required E tag")
+		}
+		scope.RootID = rootIDTag[1]
+		scope.RootKind = 1618
+
+		if rootPKTag := target.Tags.Find("P"); rootPKTag != nil && len(rootPKTag) >= 2 {
+			scope.RootPubKey = rootPKTag[1]
+		}
+		return scope, nil
+	}
+
+	for _, tag := range target.Tags {
+		if len(tag) < 2 || tag[0] != "e" {
+			continue
+		}
+		if len(tag) >= 4 && tag[3] == "root" {
+			scope.RootID = tag[1]
+			scope.RootKind = target.Kind
+			break
+		}
+	}
+
+	return scope, nil
 }
 
 func dedupeNonEmpty(items []string) []string {
@@ -204,12 +263,12 @@ func footer(in PublishInput) string {
 
 func buildSummaryContent(in PublishInput) string {
 	var b strings.Builder
-	b.WriteString("## Automated Review Summary\n\n")
-	b.WriteString(strings.TrimSpace(in.Summary))
+	b.WriteString("Automated review summary\n")
+	b.WriteString(plainText(strings.TrimSpace(in.Summary)))
 	if len(in.Findings) > 0 {
-		b.WriteString("\n\n### Findings\n")
+		b.WriteString("\n\nFindings\n")
 		for _, f := range in.Findings {
-			b.WriteString(fmt.Sprintf("- **%s/%s** `%s:%d` — %s\n", f.Severity, f.Category, f.File, f.Line, strings.TrimSpace(f.Explanation)))
+			b.WriteString(fmt.Sprintf("%s | %s | %s:%d | %s\n", f.Severity, f.Category, f.File, f.Line, plainText(strings.TrimSpace(f.Explanation))))
 		}
 	}
 	b.WriteString(footer(in))
@@ -218,9 +277,33 @@ func buildSummaryContent(in PublishInput) string {
 
 func buildFindingContent(f reviewengine.Finding, in PublishInput) string {
 	content := fmt.Sprintf(
-		"## Automated Review Finding\n\n**Severity:** %s\n**Category:** %s\n**Location:** `%s:%d`\n\n**Evidence:** %s\n\n**Explanation:** %s\n\n**Suggestion:** %s",
-		f.Severity, f.Category, f.File, f.Line, f.Evidence, f.Explanation, f.Suggestion,
+		"Automated review finding\nSeverity: %s\nCategory: %s\nLocation: %s:%d\nEvidence: %s\nExplanation: %s\nSuggestion: %s",
+		f.Severity, f.Category, f.File, f.Line, plainText(f.Evidence), plainText(f.Explanation), plainText(f.Suggestion),
 	)
 	return content + footer(in)
 }
 
+func plainText(v string) string {
+	v = strings.ReplaceAll(v, "\r\n", "\n")
+	v = strings.ReplaceAll(v, "\t", " ")
+	replacer := strings.NewReplacer(
+		"```", "",
+		"**", "",
+		"__", "",
+		"`", "",
+		"#", "",
+	)
+	v = replacer.Replace(v)
+	lines := strings.Split(v, "\n")
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "- ")
+		line = strings.TrimPrefix(line, "* ")
+		lines[i] = line
+	}
+	out := strings.TrimSpace(strings.Join(lines, "\n"))
+	for strings.Contains(out, "\n\n\n") {
+		out = strings.ReplaceAll(out, "\n\n\n", "\n\n")
+	}
+	return out
+}
