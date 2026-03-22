@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - ENV_FILE=${ENV_FILE:-.env}
     image: drydock:latest
     restart: unless-stopped
     environment:
@@ -29,6 +31,7 @@ services:
       - ./eval:/app/eval:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    network_mode: host  # use host networking on Lemmy so container reaches 192.168.30.10:8080 directly
 
 volumes:
   drydock_data:

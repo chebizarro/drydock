@@ -11,12 +11,17 @@ import (
 )
 
 type Processor struct {
-	store  *db.Store
-	logger *slog.Logger
+	store       *db.Store
+	logger      *slog.Logger
+	ReviewQueue chan db.ReviewTask
 }
 
 func NewProcessor(store *db.Store, logger *slog.Logger) *Processor {
-	return &Processor{store: store, logger: logger}
+	return &Processor{
+		store:       store,
+		logger:      logger,
+		ReviewQueue: make(chan db.ReviewTask, 256),
+	}
 }
 
 func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayURL string) error {
@@ -75,6 +80,12 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 		}
 		if acquired {
 			p.logger.Info("queued patch review", "event_id", event.ID.Hex(), "repo_id", repoID, "kind", int(event.Kind))
+			task := db.ReviewTask{PatchEventID: event.ID.Hex(), RepoID: repoID}
+			select {
+			case p.ReviewQueue <- task:
+			default:
+				p.logger.Warn("review queue full, dropping task", "event_id", event.ID.Hex(), "repo_id", repoID)
+			}
 		}
 		return nil
 	default:

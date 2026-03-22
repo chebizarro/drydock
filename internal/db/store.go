@@ -1002,3 +1002,22 @@ func jaccard(a, b []string) float64 {
 	}
 	return float64(intersection) / float64(len(union))
 }
+
+// ReviewTask is a queued patch/repo pair ready for pipeline execution.
+type ReviewTask struct {
+	PatchEventID string
+	RepoID       string
+}
+
+// ResetStuckReviews transitions entries stuck in "reviewing" (e.g. from a crash)
+// back to "pending" so they can be retried.
+func (s *Store) ResetStuckReviews(ctx context.Context) (int64, error) {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE review_log SET status='pending', updated_at=?
+		  WHERE status='reviewing'`, now)
+	if err != nil {
+		return 0, fmt.Errorf("reset stuck reviews: %w", err)
+	}
+	return res.RowsAffected()
+}
