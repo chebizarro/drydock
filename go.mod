@@ -42,4 +42,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace fiatjaf.com/nostr => /Users/bizarro/Documents/Dev/nostrlib
+replace fiatjaf.com/nostr => git.sharegap.net/bizarro/nostrlib.git v0.0.0-20260320232724-e675f04bd29a
