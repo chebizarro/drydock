@@ -71,8 +71,16 @@ func main() {
 		}
 		signer = s
 		logger.Info("NIP-46 bunker signer ready")
+	} else if cfg.SignerNsec != "" {
+		s, err := signing.NewLocalSigner(cfg.SignerNsec)
+		if err != nil {
+			logger.Error("failed to create local signer", "error", err)
+			os.Exit(1)
+		}
+		signer = s
+		logger.Info("local nsec signer ready")
 	} else {
-		logger.Warn("DRYDOCK_SIGNER_BUNKER_URL not set — review publishing disabled")
+		logger.Warn("no signer configured (set DRYDOCK_SIGNER_BUNKER_URL or DRYDOCK_SIGNER_NSEC) — review publishing disabled")
 	}
 
 	// --- Repo service ---

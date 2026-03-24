@@ -24,6 +24,7 @@ type Config struct {
 	Coder14BModel   string
 	LLMAPIKey       string
 	SignerBunkerURL string
+	SignerNsec      string
 	MetaBaseURL     string
 	MetaModel       string
 	EvalDatasetPath string
@@ -51,6 +52,7 @@ func FromEnv() Config {
 		Coder14BModel:       envOrDefault("DRYDOCK_CODER14B_MODEL", "qwen2.5-coder-14b-instruct-q4_k_m"),
 		LLMAPIKey:           envOrDefault("DRYDOCK_LLM_API_KEY", ""),
 		SignerBunkerURL:     envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
+		SignerNsec:          envOrDefault("DRYDOCK_SIGNER_NSEC", ""),
 		MetaBaseURL:         envOrDefault("DRYDOCK_META_BASE_URL", "http://127.0.0.1:11436/v1"),
 		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", "gpt-5-codex"),
 		EvalDatasetPath:     envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
