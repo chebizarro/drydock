@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Drydock AI favicon">
+  <rect width="64" height="64" rx="14" fill="#071B3A"/>
+  <g transform="translate(8 12) scale(0.2)">
+    <polygon points="18,110 70,110 106,138 54,138" fill="#178FE6"/>
+    <polygon points="78,78 116,106 116,150 78,122" fill="#E8EEF7"/>
+    <polygon points="110,46 142,70 142,146 110,124" fill="#1EC8F3"/>
+    <polygon points="146,46 178,22 178,100 146,124" fill="#E8EEF7"/>
+    <polygon points="142,106 180,78 180,122 142,150" fill="#AFC5DB"/>
+    <polygon points="150,110 238,110 202,138 150,138" fill="#63C9F5"/>
+  </g>
+</svg>

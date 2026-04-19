@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Drydock AI app icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0A2551"/>
+      <stop offset="100%" stop-color="#071B3A"/>
+    </linearGradient>
+    <linearGradient id="gCyan" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1EC8F3"/>
+      <stop offset="100%" stop-color="#178FE6"/>
+    </linearGradient>
+    <linearGradient id="gLight" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#E8EEF7"/>
+      <stop offset="100%" stop-color="#AFC5DB"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#021129" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect x="20" y="20" width="472" height="472" rx="108" fill="url(#bg)"/>
+  <g transform="translate(56 110)" filter="url(#shadow)">
+    <polygon points="18,110 70,110 106,138 54,138" fill="url(#gCyan)"/>
+    <polygon points="78,78 116,106 116,150 78,122" fill="url(#gLight)"/>
+    <polygon points="110,46 142,70 142,146 110,124" fill="url(#gCyan)"/>
+    <polygon points="146,46 178,22 178,100 146,124" fill="url(#gLight)"/>
+    <polygon points="142,106 180,78 180,122 142,150" fill="url(#gLight)"/>
+    <polygon points="150,110 202,110 238,110 202,138 150,138" fill="url(#gCyan)" opacity="0.75"/>
+  </g>
+</svg>
