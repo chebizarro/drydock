@@ -69,7 +69,7 @@ func TestHello(t *testing.T) {
 
 	ctx := context.Background()
 
-	result, err := s.SearchSymbol(ctx, dir, "Hello")
+	result, err := s.SearchSymbol(ctx, dir, "Hello", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestHello(t *testing.T) {
 		t.Errorf("expected to find Hello in grep output, got: %s", result)
 	}
 
-	testResult, err := s.SearchSymbolTests(ctx, dir, "Hello")
+	testResult, err := s.SearchSymbolTests(ctx, dir, "Hello", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestCalculate(t *testing.T) {
 
 	ctx := context.Background()
 
-	result, err := s.SearchSymbol(ctx, dir, "Calculate")
+	result, err := s.SearchSymbol(ctx, dir, "Calculate", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestCalculate(t *testing.T) {
 		t.Errorf("expected to find Calculate in rg output, got: %s", result)
 	}
 
-	testResult, err := s.SearchSymbolTests(ctx, dir, "Calculate")
+	testResult, err := s.SearchSymbolTests(ctx, dir, "Calculate", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,6 +164,63 @@ func TestCalculate(t *testing.T) {
 	}
 	if !strings.Contains(testResult, "_test.go") {
 		t.Errorf("expected results from test files, got: %s", testResult)
+	}
+}
+
+func TestSearcherWorkspaceScoped(t *testing.T) {
+	dir := t.TempDir()
+
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %s: %s", args, err, out)
+		}
+	}
+
+	run("init")
+	run("config", "user.email", "test@test.com")
+	run("config", "user.name", "test")
+
+	// Create a monorepo with two packages
+	os.MkdirAll(filepath.Join(dir, "packages", "auth"), 0o755)
+	os.MkdirAll(filepath.Join(dir, "packages", "core"), 0o755)
+
+	os.WriteFile(filepath.Join(dir, "packages", "auth", "login.go"), []byte(`package auth
+func Login() string { return "logged in" }
+`), 0o644)
+	os.WriteFile(filepath.Join(dir, "packages", "core", "core.go"), []byte(`package core
+func Login() string { return "core login" }
+`), 0o644)
+
+	run("add", ".")
+	run("commit", "-m", "init")
+
+	s := &searcher{hasRg: false}
+	ctx := context.Background()
+
+	// Search scoped to auth workspace only
+	result, err := s.SearchSymbol(ctx, dir, "Login", []string{"packages/auth"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "auth") {
+		t.Errorf("expected auth in scoped results, got: %s", result)
+	}
+	if strings.Contains(result, "core") {
+		t.Errorf("core should not appear in auth-scoped search, got: %s", result)
+	}
+
+	// Unscoped search finds both
+	all, err := s.SearchSymbol(ctx, dir, "Login", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(all, "auth") || !strings.Contains(all, "core") {
+		t.Errorf("unscoped search should find both, got: %s", all)
 	}
 }
 
@@ -193,7 +250,7 @@ func TestSearcherNoMatch(t *testing.T) {
 	ctx := context.Background()
 
 	// git grep returns exit code 1 for no match, which runGit wraps as error
-	result, err := s.SearchSymbol(ctx, dir, "NonExistentSymbol")
+	result, err := s.SearchSymbol(ctx, dir, "NonExistentSymbol", nil)
 	if result != "" && err == nil {
 		t.Errorf("expected empty result for non-existent symbol, got: %s", result)
 	}

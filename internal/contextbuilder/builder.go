@@ -23,6 +23,10 @@ const (
 type BuildInput struct {
 	PatchEventContent string
 	RepoPath          string
+	// WorkspaceRoots are relative paths of detected monorepo workspaces that
+	// contain changed files. Empty means "whole repo" (no workspace isolation).
+	// Set automatically by Builder.Build when a workspace config is detected.
+	WorkspaceRoots []string
 }
 
 type ContextBundle struct {
@@ -94,6 +98,21 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 	}
 	if b.TokenBudget <= 0 {
 		b.TokenBudget = DefaultTokenBudget
+	}
+
+	// Auto-detect workspace boundaries for monorepo context isolation.
+	if in.RepoPath != "" && len(in.WorkspaceRoots) == 0 {
+		workspaces := DetectWorkspaces(in.RepoPath)
+		if len(workspaces) > 0 {
+			files, _ := parsePatch(in.PatchEventContent)
+			var changedPaths []string
+			for _, f := range files {
+				if p := pickPath(f); p != "" {
+					changedPaths = append(changedPaths, p)
+				}
+			}
+			in.WorkspaceRoots = RelevantWorkspaces(workspaces, changedPaths)
+		}
 	}
 
 	type layer struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -33,35 +34,41 @@ func (s *searcher) init() {
 }
 
 // SearchSymbol finds callsites of a symbol in the repo, returning file:line:content lines.
-func (s *searcher) SearchSymbol(ctx context.Context, repoPath, symbol string) (string, error) {
+// When workspaceRoots are provided, only those directories are searched.
+func (s *searcher) SearchSymbol(ctx context.Context, repoPath, symbol string, workspaceRoots []string) (string, error) {
 	s.init()
 
 	if s.hasRg {
 		pattern := `\b` + regexp.QuoteMeta(symbol) + `\b`
-		return s.rgSearch(ctx, repoPath, pattern, nil)
+		return s.rgSearch(ctx, repoPath, pattern, nil, workspaceRoots)
 	}
-	return s.gitGrepSymbol(ctx, repoPath, symbol, nil)
+	return s.gitGrepSymbol(ctx, repoPath, symbol, nil, workspaceRoots)
 }
 
 // SearchSymbolTests finds test-related callsites of a symbol.
-func (s *searcher) SearchSymbolTests(ctx context.Context, repoPath, symbol string) (string, error) {
+// When workspaceRoots are provided, only those directories are searched.
+func (s *searcher) SearchSymbolTests(ctx context.Context, repoPath, symbol string, workspaceRoots []string) (string, error) {
 	s.init()
 
 	if s.hasRg {
 		pattern := `\b` + regexp.QuoteMeta(symbol) + `\b`
-		return s.rgSearch(ctx, repoPath, pattern, testGlobs)
+		return s.rgSearch(ctx, repoPath, pattern, testGlobs, workspaceRoots)
 	}
-	return s.gitGrepSymbol(ctx, repoPath, symbol, []string{"*test*", "*_test.go", "*.spec.*", "*.test.*"})
+	return s.gitGrepSymbol(ctx, repoPath, symbol, []string{"*test*", "*_test.go", "*.spec.*", "*.test.*"}, workspaceRoots)
 }
 
 // gitGrepSymbol searches for a symbol using git grep.
 // Uses -P (Perl regex with \b) when available, falls back to plain -F (fixed string).
-func (s *searcher) gitGrepSymbol(ctx context.Context, repoPath, symbol string, pathspecs []string) (string, error) {
+// When workspaceRoots are provided, pathspecs are scoped to those directories.
+func (s *searcher) gitGrepSymbol(ctx context.Context, repoPath, symbol string, pathspecs []string, workspaceRoots []string) (string, error) {
+	// Merge workspace roots into pathspecs for directory scoping
+	effectiveSpecs := buildGitPathspecs(pathspecs, workspaceRoots)
+
 	// Try -P (Perl regex) for word boundaries first
 	args := []string{"grep", "-n", "-P", `\b` + regexp.QuoteMeta(symbol) + `\b`}
-	if len(pathspecs) > 0 {
+	if len(effectiveSpecs) > 0 {
 		args = append(args, "--")
-		args = append(args, pathspecs...)
+		args = append(args, effectiveSpecs...)
 	}
 	result, err := runGit(ctx, repoPath, args...)
 	if err == nil {
@@ -70,11 +77,37 @@ func (s *searcher) gitGrepSymbol(ctx context.Context, repoPath, symbol string, p
 
 	// Fall back to fixed-string search if -P not supported
 	args = []string{"grep", "-n", "-F", symbol}
-	if len(pathspecs) > 0 {
+	if len(effectiveSpecs) > 0 {
 		args = append(args, "--")
-		args = append(args, pathspecs...)
+		args = append(args, effectiveSpecs...)
 	}
 	return runGit(ctx, repoPath, args...)
+}
+
+// buildGitPathspecs combines file-type globs with workspace directory scoping.
+// If workspaceRoots is empty, returns pathspecs unchanged.
+// If pathspecs is empty but workspaceRoots is set, returns workspace dirs.
+// If both are set, returns workspace-scoped pathspecs.
+func buildGitPathspecs(pathspecs, workspaceRoots []string) []string {
+	if len(workspaceRoots) == 0 {
+		return pathspecs
+	}
+	if len(pathspecs) == 0 {
+		// Just scope to workspace directories
+		specs := make([]string, len(workspaceRoots))
+		for i, r := range workspaceRoots {
+			specs[i] = r + "/"
+		}
+		return specs
+	}
+	// Combine: for each workspace root, apply each pathspec pattern
+	var specs []string
+	for _, root := range workspaceRoots {
+		for _, ps := range pathspecs {
+			specs = append(specs, filepath.Join(root, ps))
+		}
+	}
+	return specs
 }
 
 var testGlobs = []string{
@@ -89,7 +122,8 @@ var testGlobs = []string{
 }
 
 // rgSearch runs ripgrep with the given pattern, optionally filtering to glob patterns.
-func (s *searcher) rgSearch(ctx context.Context, repoPath, pattern string, globs []string) (string, error) {
+// When workspaceRoots are provided, search is scoped to those directories.
+func (s *searcher) rgSearch(ctx context.Context, repoPath, pattern string, globs []string, workspaceRoots []string) (string, error) {
 	args := []string{
 		"--no-heading",   // file:line:content format
 		"--line-number",  // include line numbers
@@ -103,7 +137,14 @@ func (s *searcher) rgSearch(ctx context.Context, repoPath, pattern string, globs
 		args = append(args, "--glob", g)
 	}
 
-	args = append(args, repoPath)
+	// Scope to workspace directories if provided
+	if len(workspaceRoots) > 0 {
+		for _, root := range workspaceRoots {
+			args = append(args, filepath.Join(repoPath, root))
+		}
+	} else {
+		args = append(args, repoPath)
+	}
 
 	cmd := exec.CommandContext(ctx, s.rgPath, args...)
 	out, err := cmd.CombinedOutput()

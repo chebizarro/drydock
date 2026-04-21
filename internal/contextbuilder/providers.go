@@ -149,7 +149,7 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 	}
 
 	for _, sym := range syms {
-		lines, err := srch.SearchSymbol(ctx, in.RepoPath, sym)
+		lines, err := srch.SearchSymbol(ctx, in.RepoPath, sym, in.WorkspaceRoots)
 		if err != nil || lines == "" {
 			continue
 		}
@@ -259,7 +259,7 @@ func (p testsProvider) Build(ctx context.Context, in BuildInput) (string, error)
 	}
 
 	for _, sym := range symbols {
-		lines, _ := srch.SearchSymbolTests(ctx, in.RepoPath, sym)
+		lines, _ := srch.SearchSymbolTests(ctx, in.RepoPath, sym, in.WorkspaceRoots)
 		if strings.TrimSpace(lines) == "" {
 			continue
 		}
@@ -336,6 +336,19 @@ func (projectDocsProvider) Build(_ context.Context, in BuildInput) (string, erro
 		"docs/CONTRIBUTING.md",
 		"docs/style-guide.md",
 		"docs/STYLEGUIDE.md",
+	}
+
+	// Also check workspace-local docs when in a monorepo
+	if len(in.WorkspaceRoots) > 0 {
+		var wsCandidates []string
+		for _, root := range in.WorkspaceRoots {
+			wsCandidates = append(wsCandidates,
+				filepath.Join(root, "README.md"),
+				filepath.Join(root, "CONTRIBUTING.md"),
+			)
+		}
+		// Workspace docs first, then repo-level docs
+		candidates = append(wsCandidates, candidates...)
 	}
 
 	var out bytes.Buffer
