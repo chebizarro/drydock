@@ -56,17 +56,35 @@ type Provider interface {
 	Build(ctx context.Context, in BuildInput) (string, error)
 }
 
+// BuilderOptions configures optional service clients for enhanced analysis.
+// All fields are optional — nil means the feature is disabled.
+type BuilderOptions struct {
+	QdrantClient  interface{ /* *vectorstore.Client */ } // nil = no Qdrant retrieval
+	EmbedClient   interface{ /* *embedding.Client */ }   // nil = no embedding
+	LSPClient     interface{ /* *lspbridge.Client */ }    // nil = git grep fallback
+
+	// Typed accessors set internally. Use the With* helpers.
+	qdrantProvider Provider
+	lspClient      interface{}
+}
+
 type Builder struct {
 	TokenBudget int
 	Counter     TokenCounter
 	Providers   []Provider
 }
 
+// NewDefault creates a builder with no optional services.
 func NewDefault() *Builder {
+	return NewWithOptions(BuilderOptions{})
+}
+
+// NewWithOptions creates a builder with optional service clients.
+func NewWithOptions(opts BuilderOptions) *Builder {
 	return &Builder{
 		TokenBudget: DefaultTokenBudget,
 		Counter:     DefaultTiktokenCounter(),
-		Providers:   DefaultProviders(),
+		Providers:   DefaultProviders(opts),
 	}
 }
 

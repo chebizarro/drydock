@@ -14,16 +14,30 @@ import (
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
 )
 
-func DefaultProviders() []Provider {
-	return []Provider{
+// DefaultProviders returns the standard provider set, optionally enhanced
+// with Qdrant retrieval and LSP-based analysis when services are configured.
+func DefaultProviders(opts ...BuilderOptions) []Provider {
+	var opt BuilderOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	providers := []Provider{
 		patchDiffProvider{},
 		fileContextProvider{},
-		symbolsCallsitesProvider{},
+		symbolsCallsitesProvider{lspClient: opt.lspClient},
 		testsProvider{},
 		importsExportsProvider{},
 		commitHistoryProvider{},
 		projectDocsProvider{},
 	}
+
+	// Add Qdrant retrieval provider if configured.
+	if opt.qdrantProvider != nil {
+		providers = append(providers, opt.qdrantProvider)
+	}
+
+	return providers
 }
 
 func parsePatch(content string) ([]*gitdiff.File, error) {
@@ -92,11 +106,13 @@ func (fileContextProvider) Build(_ context.Context, in BuildInput) (string, erro
 	return strings.TrimSpace(out.String()), nil
 }
 
-type symbolsCallsitesProvider struct{}
+type symbolsCallsitesProvider struct {
+	lspClient interface{} // optional *lspbridge.Client for enhanced analysis
+}
 
-func (symbolsCallsitesProvider) LayerName() string { return LayerSymbolsCallsites }
-func (symbolsCallsitesProvider) Priority() int     { return 3 }
-func (symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (string, error) {
+func (p symbolsCallsitesProvider) LayerName() string { return LayerSymbolsCallsites }
+func (p symbolsCallsitesProvider) Priority() int     { return 3 }
+func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (string, error) {
 	if in.RepoPath == "" {
 		return "", nil
 	}
@@ -108,6 +124,10 @@ func (symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (strin
 	out.WriteString("symbols: ")
 	out.WriteString(strings.Join(symbols, ", "))
 	out.WriteString("\n")
+
+	// TODO: When lspClient is set and reachable, query LSP bridge for
+	// type-aware symbol definitions and references. For now, always
+	// use git grep as the fallback.
 
 	for _, sym := range symbols {
 		lines, err := gitGrep(ctx, in.RepoPath, sym)
