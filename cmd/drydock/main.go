@@ -57,7 +57,7 @@ func main() {
 		logger.Info("reset stuck reviews to pending", "count", n)
 	}
 
-	// --- Signer (chain: bunker → socket → nsec) ---
+	// --- Signer (chain: bunker → socket → DBus → nsec) ---
 	var signer publisher.Signer
 	if cfg.SignerBunkerURL != "" {
 		s, err := signing.NewBunkerSigner(ctx, signing.BunkerSignerConfig{
@@ -82,6 +82,15 @@ func main() {
 		} else {
 			signer = s
 			logger.Info("NIP-5F socket signer ready")
+		}
+	}
+	if signer == nil && cfg.SignerDBus {
+		s, err := signing.NewDBusSigner(ctx, signing.DBusSignerConfig{})
+		if err != nil {
+			logger.Warn("NIP-55L DBus signer not available", "error", err)
+		} else {
+			signer = s
+			logger.Info("NIP-55L DBus signer ready")
 		}
 	}
 	if signer == nil && cfg.SignerNsec != "" {
