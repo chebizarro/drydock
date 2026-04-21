@@ -1,6 +1,8 @@
 module drydock
 
-go 1.25
+go 1.26
+
+toolchain go1.26.0
 
 require (
 	fiatjaf.com/nostr v0.0.0
