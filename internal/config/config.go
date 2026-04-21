@@ -27,8 +27,10 @@ type Config struct {
 	Coder14BBaseURL string
 	Coder14BModel   string
 	LLMAPIKey       string
-	SignerBunkerURL string
-	SignerNsec      string
+	SignerBunkerURL    string
+	SignerNsec         string
+	SignerSocketPath   string
+	SignerDBus         bool
 	QdrantURL       string
 	QdrantAPIKey    string
 	EmbedBaseURL    string
@@ -68,6 +70,8 @@ func FromEnv() Config {
 		LLMAPIKey:           envOrDefault("DRYDOCK_LLM_API_KEY", ""),
 		SignerBunkerURL:     envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
 		SignerNsec:          envOrDefault("DRYDOCK_SIGNER_NSEC", ""),
+		SignerSocketPath:    envOrDefault("DRYDOCK_SIGNER_SOCKET_PATH", ""),
+		SignerDBus:          envOrDefault("DRYDOCK_SIGNER_DBUS", "") == "true",
 		QdrantURL:           envOrDefault("DRYDOCK_QDRANT_URL", ""),
 		QdrantAPIKey:        envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
 		EmbedBaseURL:        envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
