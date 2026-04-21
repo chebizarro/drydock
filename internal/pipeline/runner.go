@@ -28,16 +28,17 @@ type PromptRefiner interface {
 }
 
 type Runner struct {
-	store         *db.Store
-	repoSvc       *repo.Service
-	ctxBuilder    *contextbuilder.Builder
-	engine        *reviewengine.Engine
-	pubSvc        *publisher.Service
-	metaSvc       *metareview.Service
-	promptRefiner PromptRefiner
-	queue         <-chan db.ReviewTask
-	workers       int
-	logger        *slog.Logger
+	store            *db.Store
+	repoSvc          *repo.Service
+	ctxBuilder       *contextbuilder.Builder
+	engine           *reviewengine.Engine
+	pubSvc           *publisher.Service
+	metaSvc          *metareview.Service
+	promptRefiner    PromptRefiner
+	fewShotRetriever FewShotRetriever
+	queue            <-chan db.ReviewTask
+	workers          int
+	logger           *slog.Logger
 }
 
 type Config struct {
@@ -49,6 +50,14 @@ type Config struct {
 func WithPromptRefiner(pr *promptrefine.Service) func(*Runner) {
 	return func(r *Runner) {
 		r.promptRefiner = pr
+	}
+}
+
+// WithFewShotRetriever sets a custom few-shot retriever. When not set, the
+// runner falls back to recency-based retrieval from the database.
+func WithFewShotRetriever(fsr FewShotRetriever) func(*Runner) {
+	return func(r *Runner) {
+		r.fewShotRetriever = fsr
 	}
 }
 
@@ -160,7 +169,12 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	// 5. Retrieve few-shot examples for reviewer prompt injection
-	fewShot, err := r.store.GetRecentFewShots(ctx, 3)
+	var fewShot []string
+	if r.fewShotRetriever != nil {
+		fewShot, err = r.fewShotRetriever.RetrieveFewShots(ctx, patchDiffContent, 2)
+	} else {
+		fewShot, err = r.store.GetRecentFewShots(ctx, 3)
+	}
 	if err != nil {
 		r.logger.Warn("failed to retrieve few-shot examples, continuing without", "error", err)
 		fewShot = nil

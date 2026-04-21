@@ -10,7 +10,9 @@ import (
 	"strings"
 
 	"drydock/internal/db"
+	"drydock/internal/embedding"
 	"drydock/internal/reviewengine"
+	"drydock/internal/vectorstore"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -54,14 +56,26 @@ type Result struct {
 }
 
 type Service struct {
-	cfg    Config
-	store  *db.Store
-	client LLMClient
-	logger *slog.Logger
-	sem    *semaphore.Weighted
+	cfg      Config
+	store    *db.Store
+	client   LLMClient
+	logger   *slog.Logger
+	sem      *semaphore.Weighted
+	qdrant   *vectorstore.Client
+	embedder *embedding.Client
 }
 
-func New(cfg Config, store *db.Store, client LLMClient, logger *slog.Logger) *Service {
+// WithQdrant configures Qdrant + embedding clients for similarity-based
+// few-shot upsert. When set, positive few-shot examples are embedded and
+// upserted into the few_shot_reviews Qdrant collection.
+func WithQdrant(qdrant *vectorstore.Client, embed *embedding.Client) func(*Service) {
+	return func(s *Service) {
+		s.qdrant = qdrant
+		s.embedder = embed
+	}
+}
+
+func New(cfg Config, store *db.Store, client LLMClient, logger *slog.Logger, opts ...func(*Service)) *Service {
 	if cfg.RandomSampleRate <= 0 {
 		cfg.RandomSampleRate = 0.15
 	}
@@ -74,13 +88,17 @@ func New(cfg Config, store *db.Store, client LLMClient, logger *slog.Logger) *Se
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = 10
 	}
-	return &Service{
+	s := &Service{
 		cfg:    cfg,
 		store:  store,
 		client: client,
 		logger: logger,
 		sem:    semaphore.NewWeighted(cfg.MaxConcurrent),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *Service) RunAsync(ctx context.Context, in Input) {
@@ -226,8 +244,30 @@ func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOut
 			"local_review": in.LocalReview,
 		}
 		buf, _ := json.Marshal(payload)
-		if err := s.store.InsertFewShot(ctx, in.PatchEventID, in.RepoID, "positive", string(buf), out.ReasoningQuality); err != nil {
+		content := string(buf)
+		if err := s.store.InsertFewShot(ctx, in.PatchEventID, in.RepoID, "positive", content, out.ReasoningQuality); err != nil {
 			return err
+		}
+
+		// Embed and upsert into Qdrant for similarity-based retrieval.
+		if s.qdrant != nil && s.embedder != nil && in.PatchDiff != "" {
+			vec, err := s.embedder.Embed(ctx, in.PatchDiff)
+			if err != nil {
+				s.logger.Warn("failed to embed few-shot for Qdrant", "patch_event_id", in.PatchEventID, "error", err)
+			} else {
+				point := vectorstore.Point{
+					ID:     in.PatchEventID,
+					Vector: vec,
+					Payload: map[string]any{
+						"content":  content,
+						"repo_id":  in.RepoID,
+						"quality":  out.ReasoningQuality,
+					},
+				}
+				if err := s.qdrant.Upsert(ctx, vectorstore.CollectionFewShot, []vectorstore.Point{point}); err != nil {
+					s.logger.Warn("failed to upsert few-shot to Qdrant", "patch_event_id", in.PatchEventID, "error", err)
+				}
+			}
 		}
 	}
 	if len(out.FalsePositives) > 0 {

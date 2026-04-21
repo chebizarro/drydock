@@ -248,13 +248,17 @@ func main() {
 		reviewengine.RetryConfig{MaxAttempts: 3},
 		logger,
 	)
+	var metaOpts []func(*metareview.Service)
+	if qdrantClient != nil && embedClient != nil {
+		metaOpts = append(metaOpts, metareview.WithQdrant(qdrantClient, embedClient))
+	}
 	metaSvc := metareview.New(metareview.Config{
 		Endpoint:         reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.MetaModel},
 		RandomSampleRate: 0.15,
 		MinReuseJaccard:  0.85,
 		FewShotCap:       500,
 		MaxConcurrent:    2,
-	}, store, metaClient, logger)
+	}, store, metaClient, logger, metaOpts...)
 
 	// --- Prompt refinement (reuses the meta-review LLM endpoint) ---
 	prSvc := promptrefine.New(promptrefine.Config{
@@ -266,6 +270,13 @@ func main() {
 	// --- Pipeline runner ---
 	var pipelineRunner *pipeline.Runner
 	if pubSvc != nil {
+		var pipelineOpts []func(*pipeline.Runner)
+		pipelineOpts = append(pipelineOpts, pipeline.WithPromptRefiner(prSvc))
+		if qdrantClient != nil && embedClient != nil {
+			pipelineOpts = append(pipelineOpts,
+				pipeline.WithFewShotRetriever(
+					pipeline.NewQdrantRetriever(qdrantClient, embedClient, store, logger)))
+		}
 		pipelineRunner = pipeline.New(
 			pipeline.Config{Workers: cfg.PipelineWorkers},
 			store,
@@ -276,7 +287,7 @@ func main() {
 			metaSvc,
 			processor.ReviewQueue,
 			logger,
-			pipeline.WithPromptRefiner(prSvc),
+			pipelineOpts...,
 		)
 	} else {
 		logger.Warn("pipeline runner disabled (no signer configured)")
