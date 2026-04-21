@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"drydock/internal/db"
+	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
 
 	"fiatjaf.com/nostr"
@@ -144,7 +145,9 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 			"patch_event_id", in.PatchEventID, "error", err)
 	}
 
+	metrics.PublishAttempts.Inc()
 	if err := s.publish.Publish(ctx, relays, summaryEvent); err != nil {
+		metrics.PublishFailures.Inc()
 		return "", fmt.Errorf("publish summary review event: %w", err)
 	}
 	if err := s.store.InsertReviewEvent(ctx, summaryEvent, in.PatchEventID, in.RepoID); err != nil {
@@ -193,6 +196,7 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	if err := s.store.MarkReviewPublished(ctx, in.PatchEventID, in.RepoID, summaryEvent.ID.Hex()); err != nil {
 		return "", err
 	}
+	metrics.PublishSuccesses.Inc()
 	return summaryEvent.ID.Hex(), nil
 }
 

@@ -3,9 +3,11 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
 	"drydock/internal/db"
+	"drydock/internal/metrics"
 
 	"fiatjaf.com/nostr"
 )
@@ -27,6 +29,7 @@ func NewProcessor(store *db.Store, logger *slog.Logger) *Processor {
 func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayURL string) error {
 	// Verify event signature before processing. Reject forged or unsigned events.
 	if !event.VerifySignature() {
+		metrics.EventsRejected.Inc()
 		p.logger.Warn("rejected event with invalid signature",
 			"event_id", event.ID.Hex(),
 			"kind", int(event.Kind),
@@ -43,6 +46,8 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 		p.logger.Debug("skipping duplicate event", "event_id", event.ID.Hex(), "kind", int(event.Kind))
 		return nil
 	}
+
+	metrics.EventsIngested.With(fmt.Sprintf("%d", int(event.Kind))).Inc()
 
 	switch event.Kind {
 	case nostr.KindRepositoryAnnouncement:
@@ -92,10 +97,13 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			task := db.ReviewTask{PatchEventID: event.ID.Hex(), RepoID: repoID}
 			select {
 			case p.ReviewQueue <- task:
+				metrics.ReviewQueuePushed.Inc()
+				metrics.ReviewQueueDepth.Inc()
 				p.logger.Info("queued patch review", "event_id", event.ID.Hex(), "repo_id", repoID, "kind", int(event.Kind))
 			default:
 				// Queue is full — mark task back to failed so it can be retried
 				// by the next startup's ResetStuckReviews or a future re-enqueue sweep.
+				metrics.ReviewQueueFull.Inc()
 				p.logger.Warn("review queue full, marking task for retry", "event_id", event.ID.Hex(), "repo_id", repoID)
 				_ = p.store.MarkReviewFailed(ctx, event.ID.Hex(), repoID, "review queue full")
 			}

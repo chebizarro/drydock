@@ -20,6 +20,7 @@ import (
 	"drydock/internal/listener"
 	"drydock/internal/lspbridge"
 	"drydock/internal/metareview"
+	"drydock/internal/metrics"
 	"drydock/internal/nipingest"
 	"drydock/internal/pipeline"
 	"drydock/internal/promptrefine"
@@ -377,6 +378,7 @@ func main() {
 					if err != nil {
 						logger.Warn("failed review requeue sweep error", "error", err)
 					} else if len(tasks) > 0 {
+						metrics.ReviewsRequeued.Add(int64(len(tasks)))
 						logger.Info("requeued failed reviews", "count", len(tasks))
 						for _, task := range tasks {
 							select {

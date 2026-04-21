@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"drydock/internal/metrics"
+
 	"fiatjaf.com/nostr"
 )
 
@@ -64,6 +66,8 @@ func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []str
 	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
 		fetchCtx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
 		defer cancel()
+		doneTimer := metrics.TimerVec(metrics.GitOpDuration, "fetch")
+		defer doneTimer()
 		if _, err := m.runGit(fetchCtx, repoPath, "fetch", "--all", "--prune"); err != nil {
 			return "", fmt.Errorf("git fetch: %w", err)
 		}
@@ -93,6 +97,8 @@ func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []str
 
 	cloneCtx, cloneCancel := context.WithTimeout(ctx, gitCloneTimeout)
 	defer cloneCancel()
+	doneClone := metrics.TimerVec(metrics.GitOpDuration, "clone")
+	defer doneClone()
 	if out, err := exec.CommandContext(cloneCtx, "git", "clone", cloneURL, repoPath).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git clone %s: %w: %s", cloneURL, err, strings.TrimSpace(string(out)))
 	}
@@ -207,6 +213,8 @@ func (m *Manager) CleanupReviewBranch(ctx context.Context, repoPath, branch stri
 func (m *Manager) applySinglePatch(ctx context.Context, repoPath, patchContent string) error {
 	applyCtx, cancel := context.WithTimeout(ctx, gitApplyTimeout)
 	defer cancel()
+	doneApply := metrics.TimerVec(metrics.GitOpDuration, "apply")
+	defer doneApply()
 	cmd := exec.CommandContext(applyCtx, "git", "-C", repoPath, "apply", "--3way", "--index", "-")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

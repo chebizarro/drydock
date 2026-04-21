@@ -12,6 +12,7 @@ import (
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/metareview"
+	"drydock/internal/metrics"
 	"drydock/internal/promptrefine"
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
@@ -138,13 +139,22 @@ func (r *Runner) work(ctx context.Context, id int) {
 			if !ok {
 				return
 			}
+			metrics.ReviewQueueDepth.Dec()
+			metrics.ReviewsStarted.Inc()
+			metrics.WorkersActive.Inc()
+			done := metrics.Timer(metrics.ReviewDuration)
 			log.Info("processing review task", "patch_event_id", task.PatchEventID, "repo_id", task.RepoID)
 			if err := r.process(ctx, task); err != nil {
+				metrics.ReviewsFinished.With("failed").Inc()
 				log.Error("review pipeline failed", "patch_event_id", task.PatchEventID, "repo_id", task.RepoID, "error", err)
 				if markErr := r.store.MarkReviewFailed(ctx, task.PatchEventID, task.RepoID, err.Error()); markErr != nil {
 					log.Error("failed to mark review as failed", "error", markErr)
 				}
+			} else {
+				metrics.ReviewsFinished.With("published").Inc()
 			}
+			done()
+			metrics.WorkersActive.Dec()
 		}
 	}
 }

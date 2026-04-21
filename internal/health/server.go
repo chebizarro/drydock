@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"drydock/internal/metrics"
 )
 
 // Checker can verify a dependency is healthy.
@@ -32,6 +34,7 @@ func New(db Checker, logger *slog.Logger) *Server {
 	}
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.mux.HandleFunc("/readyz", s.handleReadyz)
+	s.mux.Handle("/metrics", metrics.Handler())
 	return s
 }
 

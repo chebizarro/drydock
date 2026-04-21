@@ -10,6 +10,8 @@ import (
 	"math"
 	"net/http"
 	"time"
+
+	"drydock/internal/metrics"
 )
 
 type LLMClient interface {
@@ -66,6 +68,10 @@ func NewOpenAICompatClient() *OpenAICompatClient {
 }
 
 func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest) (string, error) {
+	metrics.LLMRequests.With(req.Model).Inc()
+	done := metrics.TimerVec(metrics.LLMDuration, req.Model)
+	defer done()
+
 	payload := map[string]any{
 		"model": req.Model,
 		"messages": []map[string]string{
@@ -91,6 +97,7 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 	defer res.Body.Close()
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		metrics.LLMErrors.With(req.Model).Inc()
 		respBody, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
 		return "", &LLMHTTPError{
 			StatusCode: res.StatusCode,
