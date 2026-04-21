@@ -190,10 +190,10 @@ With this setup, increase `DRYDOCK_PIPELINE_WORKERS` to match your inference par
 The evaluation harness measures review quality against a labeled dataset:
 
 ```bash
-# Native
-DRYDOCK_MODE=eval go run ./cmd/drydock-eval
+# Native (separate binary, no DRYDOCK_MODE needed)
+go run ./cmd/drydock-eval
 
-# Docker
+# Docker (DRYDOCK_MODE selects binary via entrypoint.sh)
 make eval
 ```
 

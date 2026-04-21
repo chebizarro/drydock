@@ -10,7 +10,7 @@ cp .env.example .env
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DRYDOCK_MODE` | `listener` \| `eval` | `listener` | Operating mode. The eval binary (`cmd/drydock-eval`) is separate; this variable is unused by `cmd/drydock`. |
+| `DRYDOCK_MODE` | `listener` \\| `eval` | `listener` | Docker entrypoint routing: `listener` runs `cmd/drydock`, `eval` runs `cmd/drydock-eval`. Not parsed by the Go binaries themselves — only used by `scripts/entrypoint.sh`. |
 | `DRYDOCK_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` | Structured JSON log level. `debug` is verbose and includes raw LLM responses. |
 
 ## Database & Storage
