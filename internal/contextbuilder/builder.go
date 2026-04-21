@@ -35,6 +35,11 @@ type ContextBundle struct {
 	TokenCount    int
 	LayersUsed    []string
 	LayersDropped []string
+	// ExcludedFiles lists paths of changed files that were excluded from
+	// review (e.g. lock files, generated code, .proto files). The reviewer
+	// LLM sees a notification about these so it can flag dependency or
+	// schema changes that deserve human attention.
+	ExcludedFiles []string
 }
 
 type TokenCounter interface {
@@ -115,6 +120,18 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		}
 	}
 
+	// Pre-scan: identify excluded files so we can notify the reviewer.
+	var excludedFiles []string
+	if in.PatchEventContent != "" {
+		patchFiles, _ := parsePatch(in.PatchEventContent)
+		for _, f := range patchFiles {
+			path := pickPath(f)
+			if path != "" && isExcludedPath(path) {
+				excludedFiles = append(excludedFiles, path)
+			}
+		}
+	}
+
 	type layer struct {
 		name     string
 		priority int
@@ -179,12 +196,28 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		usedNames = append(usedNames, lr.name)
 	}
 
+	// Append a notification about excluded non-source files so the reviewer
+	// can flag dependency / schema changes that deserve human attention.
+	if len(excludedFiles) > 0 {
+		note := "## excluded-files\n" +
+			"The following non-source files were modified but not reviewed: " +
+			strings.Join(excludedFiles, ", ") + ".\n" +
+			"If these are dependency lock files, generated code, or schema definitions, " +
+			"note that changes may have security or compatibility implications."
+		noteTokens := b.Counter.Count(note)
+		if usedTokens+noteTokens <= b.TokenBudget {
+			parts = append(parts, note)
+			usedTokens += noteTokens
+		}
+	}
+
 	return ContextBundle{
 		Content:       strings.Join(parts, "\n\n"),
 		TokenBudget:   b.TokenBudget,
 		TokenCount:    usedTokens,
 		LayersUsed:    usedNames,
 		LayersDropped: dropped,
+		ExcludedFiles: excludedFiles,
 	}, nil
 }
 

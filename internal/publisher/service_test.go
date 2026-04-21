@@ -276,6 +276,43 @@ func TestPublishReviewFailsGracefullyWhenAllRelaysReject(t *testing.T) {
 	}
 }
 
+func TestPublishReviewExcludedFilesInFooter(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	fakePub := &fakeRelayPublisher{}
+	svc := New(Config{
+		DefaultRelays:       []string{"wss://fallback.example"},
+		DetailSeverityFloor: "high",
+	}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	_, err := svc.PublishReview(ctx, PublishInput{
+		PatchEventID:      patchID,
+		RepoID:            repoID,
+		Summary:           "Review with excluded files.",
+		Model:             "test-model",
+		ContextHash:       "hash789",
+		Confidence:        0.85,
+		ContextLayersUsed: []string{"patch"},
+		ExcludedFiles:     []string{"package-lock.json", "schema.proto"},
+	})
+	if err != nil {
+		t.Fatalf("publish should succeed: %v", err)
+	}
+	if len(fakePub.calls) == 0 {
+		t.Fatal("expected at least one publish call")
+	}
+	for _, c := range fakePub.calls {
+		if !strings.Contains(c.event.Content, "excluded-files: package-lock.json, schema.proto") {
+			t.Fatalf("expected excluded-files in footer, got: %s", c.event.Content)
+		}
+	}
+}
+
 func TestPublishReviewPartialRelayFailureStillSucceeds(t *testing.T) {
 	// This test verifies that when the publisher succeeds (returns nil),
 	// the service treats it as success. The real NostrRelayPublisher handles

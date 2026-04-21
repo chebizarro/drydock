@@ -211,6 +211,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		Confidence:           confidence,
 		ContextLayersUsed:    bundle.LayersUsed,
 		ContextLayersDropped: bundle.LayersDropped,
+		ExcludedFiles:        bundle.ExcludedFiles,
 		Superseded:           superseded,
 	})
 	if err != nil {

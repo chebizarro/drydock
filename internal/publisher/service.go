@@ -43,6 +43,7 @@ type PublishInput struct {
 	Confidence           float64
 	ContextLayersUsed    []string
 	ContextLayersDropped []string
+	ExcludedFiles        []string
 	Superseded           bool
 }
 
@@ -254,10 +255,11 @@ func isAtOrAboveSeverity(severity, threshold string) bool {
 func footer(in PublishInput) string {
 	used := strings.Join(in.ContextLayersUsed, ", ")
 	dropped := strings.Join(in.ContextLayersDropped, ", ")
+	excluded := strings.Join(in.ExcludedFiles, ", ")
 	// mandatory: keep field present even when empty
 	return fmt.Sprintf(
-		"\n\n---\nmodel: %s\ncontext-hash: %s\npatch-event-id: %s\nrepo-id: %s\nreview-mode: automated\nconfidence: %.2f\ncontext-layers-used: %s\ncontext-layers-dropped: %s\n",
-		in.Model, in.ContextHash, in.PatchEventID, in.RepoID, in.Confidence, used, dropped,
+		"\n\n---\nmodel: %s\ncontext-hash: %s\npatch-event-id: %s\nrepo-id: %s\nreview-mode: automated\nconfidence: %.2f\ncontext-layers-used: %s\ncontext-layers-dropped: %s\nexcluded-files: %s\n",
+		in.Model, in.ContextHash, in.PatchEventID, in.RepoID, in.Confidence, used, dropped, excluded,
 	)
 }
 

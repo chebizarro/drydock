@@ -2,6 +2,7 @@ package contextbuilder
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -46,6 +47,120 @@ func TestBuilderHardStopsAndDropsLowerPriorityLayers(t *testing.T) {
 		t.Fatalf("unexpected dropped order: %#v", out.LayersDropped)
 	}
 }
+
+func TestBuilderExcludedFilesNotification(t *testing.T) {
+	// Minimal unified diff touching a lock file and a normal Go file.
+	patch := "diff --git a/go.sum b/go.sum\n" +
+		"--- a/go.sum\n" +
+		"+++ b/go.sum\n" +
+		"@@ -1,1 +1,2 @@\n" +
+		" existing\n" +
+		"+added\n" +
+		"diff --git a/package-lock.json b/package-lock.json\n" +
+		"--- a/package-lock.json\n" +
+		"+++ b/package-lock.json\n" +
+		"@@ -1,1 +1,2 @@\n" +
+		" {}\n" +
+		"+{\"a\": 1}\n" +
+		"diff --git a/main.go b/main.go\n" +
+		"--- a/main.go\n" +
+		"+++ b/main.go\n" +
+		"@@ -1,1 +1,2 @@\n" +
+		" package main\n" +
+		"+// comment\n"
+
+	b := &Builder{
+		TokenBudget: 100_000,
+		Counter:     byteCounter{},
+		Providers: []Provider{
+			// Minimal provider that returns something so we have content.
+			fakeProvider{name: "test", priority: 1, content: "ok"},
+		},
+	}
+
+	out, err := b.Build(context.Background(), BuildInput{PatchEventContent: patch})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+
+	// Should detect package-lock.json as excluded.
+	if len(out.ExcludedFiles) != 1 {
+		t.Fatalf("expected 1 excluded file, got %d: %v", len(out.ExcludedFiles), out.ExcludedFiles)
+	}
+	if out.ExcludedFiles[0] != "package-lock.json" {
+		t.Fatalf("expected package-lock.json excluded, got %q", out.ExcludedFiles[0])
+	}
+
+	// Content should contain the notification.
+	if !strings.Contains(out.Content, "excluded-files") {
+		t.Fatal("expected excluded-files notification in content")
+	}
+	if !strings.Contains(out.Content, "package-lock.json") {
+		t.Fatal("expected package-lock.json mentioned in notification")
+	}
+}
+
+func TestBuilderExcludedFilesOmittedWhenBudgetExhausted(t *testing.T) {
+	patch := "diff --git a/package-lock.json b/package-lock.json\n" +
+		"--- a/package-lock.json\n" +
+		"+++ b/package-lock.json\n" +
+		"@@ -1,1 +1,2 @@\n" +
+		" {}\n" +
+		"+{\"a\": 1}\n"
+
+	b := &Builder{
+		// Budget barely fits the provider content (2 bytes) but not the note.
+		TokenBudget: 4,
+		Counter:     byteCounter{},
+		Providers: []Provider{
+			fakeProvider{name: "test", priority: 1, content: "ok"},
+		},
+	}
+
+	out, err := b.Build(context.Background(), BuildInput{PatchEventContent: patch})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+
+	// ExcludedFiles should still be populated (metadata).
+	if len(out.ExcludedFiles) != 1 {
+		t.Fatalf("expected 1 excluded file, got %d", len(out.ExcludedFiles))
+	}
+	// But notification should NOT be in content because of budget.
+	if strings.Contains(out.Content, "excluded-files") {
+		t.Fatal("notification should be omitted when budget is exhausted")
+	}
+}
+
+func TestBuilderNoExcludedFilesWhenAllSourceCode(t *testing.T) {
+	patch := "diff --git a/main.go b/main.go\n" +
+		"--- a/main.go\n" +
+		"+++ b/main.go\n" +
+		"@@ -1,1 +1,2 @@\n" +
+		" package main\n" +
+		"+// comment\n"
+
+	b := &Builder{
+		TokenBudget: 100_000,
+		Counter:     byteCounter{},
+		Providers: []Provider{
+			fakeProvider{name: "test", priority: 1, content: "ok"},
+		},
+	}
+
+	out, err := b.Build(context.Background(), BuildInput{PatchEventContent: patch})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+
+	if len(out.ExcludedFiles) != 0 {
+		t.Fatalf("expected no excluded files, got %v", out.ExcludedFiles)
+	}
+	if strings.Contains(out.Content, "excluded-files") {
+		t.Fatal("should not include excluded-files notification")
+	}
+}
+
 
 func TestBuilderDeterministicOrderByPriorityThenName(t *testing.T) {
 	b := &Builder{
