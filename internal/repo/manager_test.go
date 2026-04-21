@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testLogger() *slog.Logger {
@@ -211,5 +212,79 @@ func TestIsSafeCloneURLComprehensive(t *testing.T) {
 		if got != tc.safe {
 			t.Errorf("isSafeCloneURL(%q) = %v, want %v", tc.url, got, tc.safe)
 		}
+	}
+}
+
+func TestEvictionByCount(t *testing.T) {
+	cacheDir := t.TempDir()
+	mgr := NewManager(cacheDir, testLogger(), WithMaxRepoCount(2))
+
+	// Create 3 repos with staggered access times
+	for i, name := range []string{"old", "mid", "new"} {
+		repoPath := filepath.Join(cacheDir, name)
+		initWorkRepo(t, repoPath)
+		// Stagger access times
+		marker := filepath.Join(repoPath, accessMarkerFile)
+		accessTime := time.Now().Add(time.Duration(i-3) * time.Hour)
+		os.WriteFile(marker, []byte(accessTime.Format(time.RFC3339)), 0o644)
+		os.Chtimes(marker, accessTime, accessTime)
+	}
+
+	// Verify we have 3 repos
+	repos, _ := mgr.listCachedRepos()
+	if len(repos) != 3 {
+		t.Fatalf("expected 3 repos, got %d", len(repos))
+	}
+
+	// Evict — should remove the oldest (old) to get down to 2
+	mgr.evictIfNeeded()
+
+	repos, _ = mgr.listCachedRepos()
+	if len(repos) != 2 {
+		t.Fatalf("expected 2 repos after eviction, got %d", len(repos))
+	}
+
+	// The "old" repo should be gone
+	if _, err := os.Stat(filepath.Join(cacheDir, "old")); !os.IsNotExist(err) {
+		t.Fatal("expected 'old' repo to be evicted")
+	}
+	// "mid" and "new" should remain
+	for _, name := range []string{"mid", "new"} {
+		if _, err := os.Stat(filepath.Join(cacheDir, name)); err != nil {
+			t.Fatalf("expected %q repo to remain: %v", name, err)
+		}
+	}
+}
+
+func TestEvictionNoLimits(t *testing.T) {
+	cacheDir := t.TempDir()
+	mgr := NewManager(cacheDir, testLogger()) // no limits
+
+	// Create a repo
+	repoPath := filepath.Join(cacheDir, "keep")
+	initWorkRepo(t, repoPath)
+
+	// Should be a no-op
+	mgr.evictIfNeeded()
+
+	if _, err := os.Stat(repoPath); err != nil {
+		t.Fatal("repo should not be evicted when no limits set")
+	}
+}
+
+func TestTouchAccessAndRepoAccessTime(t *testing.T) {
+	cacheDir := t.TempDir()
+	mgr := NewManager(cacheDir, testLogger())
+
+	repoPath := filepath.Join(cacheDir, "testrepo")
+	initWorkRepo(t, repoPath)
+
+	before := time.Now().Add(-time.Second)
+	mgr.touchAccess(repoPath)
+	after := time.Now().Add(time.Second)
+
+	at := repoAccessTime(repoPath)
+	if at.Before(before) || at.After(after) {
+		t.Fatalf("access time %v not in expected range [%v, %v]", at, before, after)
 	}
 }

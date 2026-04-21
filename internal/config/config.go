@@ -10,6 +10,8 @@ import (
 type Config struct {
 	DatabaseURL         string
 	RepoCacheDir        string
+	RepoCacheMaxCount   int
+	RepoCacheMaxSizeMB  int
 	Relays              []string
 	ReadRelays          []string
 	WriteRelays         []string
@@ -36,6 +38,8 @@ func FromEnv() Config {
 	return Config{
 		DatabaseURL:         envOrDefault("DRYDOCK_DATABASE_URL", "file:drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)"),
 		RepoCacheDir:        envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
+		RepoCacheMaxCount:   parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_COUNT", "50"), 50),
+		RepoCacheMaxSizeMB:  parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_SIZE_MB", "10240"), 10240),
 		Relays: splitCSV(
 			envOrDefault(
 				"DRYDOCK_RELAYS",

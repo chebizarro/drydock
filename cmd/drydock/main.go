@@ -142,7 +142,10 @@ func main() {
 	}, processor, logger, listener.WithPool(pool), listener.WithStore(store))
 
 	// --- Repo service ---
-	repoManager := repo.NewManager(cfg.RepoCacheDir, logger)
+	repoManager := repo.NewManager(cfg.RepoCacheDir, logger,
+		repo.WithMaxRepoCount(cfg.RepoCacheMaxCount),
+		repo.WithMaxCacheSizeMB(cfg.RepoCacheMaxSizeMB),
+	)
 	repoSvc := repo.NewService(store, repoManager, logger)
 
 	// --- Context builder ---

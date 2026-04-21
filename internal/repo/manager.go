@@ -8,23 +8,44 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"fiatjaf.com/nostr"
 )
 
 type Manager struct {
-	baseDir   string
-	logger    *slog.Logger
-	repoLocks sync.Map
+	baseDir      string
+	logger       *slog.Logger
+	repoLocks    sync.Map
+	maxCount     int // 0 = unlimited
+	maxSizeBytes int64 // 0 = unlimited
 }
 
-func NewManager(baseDir string, logger *slog.Logger) *Manager {
-	return &Manager{
+// ManagerOption configures a Manager.
+type ManagerOption func(*Manager)
+
+// WithMaxRepoCount sets the maximum number of cached repos before LRU eviction.
+func WithMaxRepoCount(n int) ManagerOption {
+	return func(m *Manager) { m.maxCount = n }
+}
+
+// WithMaxCacheSizeMB sets the maximum total cache size in megabytes.
+func WithMaxCacheSizeMB(mb int) ManagerOption {
+	return func(m *Manager) { m.maxSizeBytes = int64(mb) * 1024 * 1024 }
+}
+
+func NewManager(baseDir string, logger *slog.Logger, opts ...ManagerOption) *Manager {
+	m := &Manager{
 		baseDir: baseDir,
 		logger:  logger,
 	}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
 }
 
 func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []string) (string, error) {
@@ -37,8 +58,12 @@ func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []str
 		if _, err := m.runGit(ctx, repoPath, "fetch", "--all", "--prune"); err != nil {
 			return "", fmt.Errorf("git fetch: %w", err)
 		}
+		m.touchAccess(repoPath)
 		return repoPath, nil
 	}
+
+	// Evict before cloning to make room
+	m.evictIfNeeded()
 
 	if err := os.MkdirAll(filepath.Dir(repoPath), 0o755); err != nil {
 		return "", fmt.Errorf("create repo cache dir: %w", err)
@@ -60,6 +85,7 @@ func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []str
 	if out, err := exec.CommandContext(ctx, "git", "clone", cloneURL, repoPath).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git clone %s: %w: %s", cloneURL, err, strings.TrimSpace(string(out)))
 	}
+	m.touchAccess(repoPath)
 	return repoPath, nil
 }
 
@@ -222,6 +248,141 @@ func shortID(v string) string {
 		return v
 	}
 	return v[:12]
+}
+
+const accessMarkerFile = ".drydock-accessed"
+
+// touchAccess updates the access marker for LRU tracking.
+func (m *Manager) touchAccess(repoPath string) {
+	marker := filepath.Join(repoPath, accessMarkerFile)
+	now := time.Now()
+	if err := os.WriteFile(marker, []byte(now.Format(time.RFC3339)), 0o644); err != nil {
+		m.logger.Debug("failed to touch access marker", "path", marker, "error", err)
+	}
+}
+
+// repoAccessTime returns the last access time for a cached repo.
+func repoAccessTime(repoPath string) time.Time {
+	marker := filepath.Join(repoPath, accessMarkerFile)
+	info, err := os.Stat(marker)
+	if err != nil {
+		// Fall back to .git directory mod time
+		info, err = os.Stat(filepath.Join(repoPath, ".git"))
+		if err != nil {
+			return time.Time{} // epoch — oldest possible
+		}
+	}
+	return info.ModTime()
+}
+
+type cachedRepo struct {
+	path       string
+	accessTime time.Time
+	sizeBytes  int64
+}
+
+// listCachedRepos enumerates repos in the cache directory.
+func (m *Manager) listCachedRepos() ([]cachedRepo, error) {
+	entries, err := os.ReadDir(m.baseDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var repos []cachedRepo
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		repoPath := filepath.Join(m.baseDir, e.Name())
+		// Only count directories that look like git repos
+		if _, err := os.Stat(filepath.Join(repoPath, ".git")); err != nil {
+			continue
+		}
+		size := dirSize(repoPath)
+		repos = append(repos, cachedRepo{
+			path:       repoPath,
+			accessTime: repoAccessTime(repoPath),
+			sizeBytes:  size,
+		})
+	}
+	return repos, nil
+}
+
+// dirSize walks a directory to compute total size in bytes.
+func dirSize(path string) int64 {
+	var total int64
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip errors
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// evictIfNeeded removes least-recently-used repos until under configured limits.
+func (m *Manager) evictIfNeeded() {
+	if m.maxCount <= 0 && m.maxSizeBytes <= 0 {
+		return // no limits configured
+	}
+
+	repos, err := m.listCachedRepos()
+	if err != nil {
+		m.logger.Warn("cache eviction: failed to list repos", "error", err)
+		return
+	}
+
+	// Sort by access time ascending (oldest first = evict first)
+	sort.Slice(repos, func(i, j int) bool {
+		return repos[i].accessTime.Before(repos[j].accessTime)
+	})
+
+	var totalSize int64
+	for _, r := range repos {
+		totalSize += r.sizeBytes
+	}
+
+	count := len(repos)
+	evicted := 0
+
+	for i := 0; i < len(repos); i++ {
+		overCount := m.maxCount > 0 && count > m.maxCount
+		overSize := m.maxSizeBytes > 0 && totalSize > m.maxSizeBytes
+		if !overCount && !overSize {
+			break
+		}
+
+		r := repos[i]
+		m.logger.Info("evicting cached repo",
+			"path", r.path,
+			"last_access", r.accessTime.Format(time.RFC3339),
+			"size_mb", r.sizeBytes/(1024*1024),
+			"reason_count", overCount,
+			"reason_size", overSize,
+		)
+		if err := os.RemoveAll(r.path); err != nil {
+			m.logger.Warn("failed to evict repo", "path", r.path, "error", err)
+			continue
+		}
+		m.repoLocks.Delete(r.path)
+		totalSize -= r.sizeBytes
+		count--
+		evicted++
+	}
+
+	if evicted > 0 {
+		m.logger.Info("cache eviction complete",
+			"evicted", evicted,
+			"remaining", count,
+			"total_size_mb", totalSize/(1024*1024),
+		)
+	}
 }
 
 // isSafeCloneURL validates that a clone URL uses a safe protocol.
