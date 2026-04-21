@@ -27,6 +27,12 @@ ENV DRYDOCK_DATABASE_URL=file:/data/drydock.db?_pragma=foreign_keys(1)&_pragma=b
 ENV DRYDOCK_REPO_CACHE_DIR=/data/repos
 ENV DRYDOCK_EVAL_DATASET_PATH=/app/eval/heldout-sample.json
 ENV DRYDOCK_MODE=listener
+ENV DRYDOCK_HEALTH_ADDR=:8081
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- http://localhost:8081/readyz || exit 1
+
+EXPOSE 8081
 
 ENTRYPOINT ["/entrypoint.sh"]
 

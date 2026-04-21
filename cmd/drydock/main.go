@@ -10,6 +10,7 @@ import (
 
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
+	"drydock/internal/health"
 	"drydock/internal/db"
 	"drydock/internal/ingest"
 	"drydock/internal/listener"
@@ -210,6 +211,18 @@ func main() {
 		logger.Warn("pipeline runner disabled (no signer configured)")
 	}
 
+	// --- Health check server ---
+	healthAddr := os.Getenv("DRYDOCK_HEALTH_ADDR")
+	if healthAddr == "" {
+		healthAddr = ":8081"
+	}
+	healthSrv := health.New(store, logger)
+	go func() {
+		if err := healthSrv.ListenAndServe(healthAddr); err != nil {
+			logger.Error("health server error", "error", err)
+		}
+	}()
+
 	// --- Run ---
 	errCh := make(chan error, 2)
 
@@ -222,6 +235,8 @@ func main() {
 	if pipelineRunner != nil {
 		go pipelineRunner.Run(ctx)
 	}
+
+	healthSrv.SetReady(true)
 
 	select {
 	case err := <-errCh:
