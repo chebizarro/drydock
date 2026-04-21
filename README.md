@@ -49,7 +49,7 @@ Drydock is an automated NIP-34 code review agent that ingests patch and PR event
 - Held-out eval harness (`internal/eval` + `cmd/drydock-eval`):
   - dataset-driven monthly run flow with persisted `eval_runs`
   - metrics: recall, false-positive rate, confidence calibration (MAE), high-confidence precision
-  - sample dataset scaffold at `eval/heldout-sample.json`
+  - sample dataset at `eval/heldout-sample.json` (5 cases covering security, correctness, concurrency, and clean-pass scenarios)
 
 ## Run
 
