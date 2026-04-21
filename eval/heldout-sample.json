@@ -1,5 +1,5 @@
 {
-  "id": "heldout-sample-v1",
+  "id": "heldout-sample-v2",
   "cases": [
     {
       "case_id": "sample-auth-empty-token",
@@ -63,6 +63,314 @@
       "changed_files": ["utils/format.go"],
       "context_bundle": "Utility package for string formatting. No concurrent access.",
       "expected_findings": []
+    },
+    {
+      "case_id": "sample-path-traversal",
+      "patch_diff": "diff --git a/api/files.go b/api/files.go\n--- a/api/files.go\n+++ b/api/files.go\n@@ -12,7 +12,9 @@\n func (s *Server) ServeFile(w http.ResponseWriter, r *http.Request) {\n-\tname := filepath.Base(r.URL.Query().Get(\"name\"))\n-\tpath := filepath.Join(s.uploadDir, name)\n+\tname := r.URL.Query().Get(\"name\")\n+\tpath := filepath.Join(s.uploadDir, name)\n \thttp.ServeFile(w, r, path)\n }\n",
+      "changed_files": ["api/files.go"],
+      "context_bundle": "File serving endpoint for user-uploaded assets. uploadDir is /var/data/uploads.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "api/files.go",
+          "line": 14,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-ssrf",
+      "patch_diff": "diff --git a/proxy/fetch.go b/proxy/fetch.go\n--- a/proxy/fetch.go\n+++ b/proxy/fetch.go\n@@ -8,10 +8,12 @@\n func FetchURL(w http.ResponseWriter, r *http.Request) {\n+\ttargetURL := r.URL.Query().Get(\"url\")\n+\tresp, err := http.Get(targetURL)\n+\tif err != nil {\n+\t\thttp.Error(w, \"fetch failed\", http.StatusBadGateway)\n+\t\treturn\n+\t}\n+\tdefer resp.Body.Close()\n+\tio.Copy(w, resp.Body)\n }\n",
+      "changed_files": ["proxy/fetch.go"],
+      "context_bundle": "HTTP proxy handler that fetches remote resources on behalf of the client. Deployed in internal network with access to metadata services.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "proxy/fetch.go",
+          "line": 10,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-xss-reflected",
+      "patch_diff": "diff --git a/web/search.go b/web/search.go\n--- a/web/search.go\n+++ b/web/search.go\n@@ -15,8 +15,10 @@\n func (s *Server) SearchHandler(w http.ResponseWriter, r *http.Request) {\n \tquery := r.URL.Query().Get(\"q\")\n \tresults := s.search(query)\n-\ts.renderTemplate(w, \"search.html\", map[string]any{\"query\": query, \"results\": results})\n+\tw.Header().Set(\"Content-Type\", \"text/html\")\n+\tfmt.Fprintf(w, \"<h1>Results for: %s</h1>\", query)\n+\tfor _, r := range results {\n+\t\tfmt.Fprintf(w, \"<p>%s</p>\", r.Title)\n+\t}\n }\n",
+      "changed_files": ["web/search.go"],
+      "context_bundle": "Web search page handler. Query parameter is user-supplied from the search form.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "web/search.go",
+          "line": 18,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-nil-pointer-deref",
+      "patch_diff": "diff --git a/service/user.go b/service/user.go\n--- a/service/user.go\n+++ b/service/user.go\n@@ -18,10 +18,8 @@\n func (s *UserService) GetProfile(ctx context.Context, id string) (*Profile, error) {\n \tuser, err := s.store.FindUser(ctx, id)\n-\tif err != nil {\n-\t\treturn nil, fmt.Errorf(\"find user: %w\", err)\n-\t}\n-\tif user == nil {\n-\t\treturn nil, ErrNotFound\n-\t}\n+\tif err != nil { return nil, err }\n \treturn &Profile{\n \t\tName:  user.Name,\n \t\tEmail: user.Email,\n",
+      "changed_files": ["service/user.go"],
+      "context_bundle": "User service. store.FindUser returns (nil, nil) when no user matches the given ID.",
+      "expected_findings": [
+        {
+          "category": "correctness",
+          "file": "service/user.go",
+          "line": 23,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-integer-overflow",
+      "patch_diff": "diff --git a/billing/calc.go b/billing/calc.go\n--- a/billing/calc.go\n+++ b/billing/calc.go\n@@ -5,8 +5,7 @@\n-func TotalCents(items []LineItem) int64 {\n-\tvar total int64\n+func TotalCents(items []LineItem) int32 {\n+\tvar total int32\n \tfor _, item := range items {\n-\t\ttotal += int64(item.Quantity) * int64(item.PriceCents)\n+\t\ttotal += int32(item.Quantity) * int32(item.PriceCents)\n \t}\n \treturn total\n }\n",
+      "changed_files": ["billing/calc.go"],
+      "context_bundle": "Billing calculation. LineItem.Quantity is uint32 (up to 1M), PriceCents is uint32 (up to $100K in cents). Total can exceed 2^31-1.",
+      "expected_findings": [
+        {
+          "category": "correctness",
+          "file": "billing/calc.go",
+          "line": 7,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-resource-leak-file",
+      "patch_diff": "diff --git a/export/csv.go b/export/csv.go\n--- a/export/csv.go\n+++ b/export/csv.go\n@@ -10,12 +10,10 @@\n func ExportToCSV(path string, rows [][]string) error {\n-\tf, err := os.Create(path)\n-\tif err != nil {\n-\t\treturn err\n-\t}\n-\tdefer f.Close()\n-\tw := csv.NewWriter(f)\n+\tf, err := os.Create(path)\n+\tif err != nil { return err }\n+\tw := csv.NewWriter(f)\n \tfor _, row := range rows {\n \t\tw.Write(row)\n \t}\n \tw.Flush()\n-\treturn w.Error()\n+\treturn nil\n }\n",
+      "changed_files": ["export/csv.go"],
+      "context_bundle": "CSV export utility. Called for batch data exports, writing potentially large files.",
+      "expected_findings": [
+        {
+          "category": "correctness",
+          "file": "export/csv.go",
+          "line": 13,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-deadlock",
+      "patch_diff": "diff --git a/ledger/transfer.go b/ledger/transfer.go\n--- a/ledger/transfer.go\n+++ b/ledger/transfer.go\n@@ -15,14 +15,12 @@\n func (l *Ledger) Transfer(from, to string, amount int64) error {\n-\ta, b := l.sortedAccounts(from, to)\n-\ta.mu.Lock()\n-\tdefer a.mu.Unlock()\n-\tb.mu.Lock()\n-\tdefer b.mu.Unlock()\n+\tsrc := l.accounts[from]\n+\tsrc.mu.Lock()\n+\tdefer src.mu.Unlock()\n+\tdst := l.accounts[to]\n+\tdst.mu.Lock()\n+\tdefer dst.mu.Unlock()\n \n-\tif a.balance < amount {\n+\tif src.balance < amount {\n \t\treturn ErrInsufficientFunds\n \t}\n-\ta.balance -= amount\n-\tb.balance += amount\n+\tsrc.balance -= amount\n+\tdst.balance += amount\n \treturn nil\n }\n",
+      "changed_files": ["ledger/transfer.go"],
+      "context_bundle": "Account ledger with per-account mutex. Transfer is called concurrently for different account pairs including bidirectional transfers (A\u2192B and B\u2192A simultaneously).",
+      "expected_findings": [
+        {
+          "category": "concurrency",
+          "file": "ledger/transfer.go",
+          "line": 18,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-missing-input-validation",
+      "patch_diff": "diff --git a/api/users.go b/api/users.go\n--- a/api/users.go\n+++ b/api/users.go\n@@ -20,12 +20,8 @@\n func (s *Server) CreateUser(w http.ResponseWriter, r *http.Request) {\n \tvar req CreateUserRequest\n \tjson.NewDecoder(r.Body).Decode(&req)\n-\tif req.Email == \"\" || !strings.Contains(req.Email, \"@\") {\n-\t\thttp.Error(w, \"invalid email\", http.StatusBadRequest)\n-\t\treturn\n-\t}\n-\tif len(req.Name) < 1 || len(req.Name) > 200 {\n-\t\thttp.Error(w, \"invalid name\", http.StatusBadRequest)\n-\t\treturn\n-\t}\n \tuser, err := s.store.InsertUser(ctx, req.Name, req.Email)\n",
+      "changed_files": ["api/users.go"],
+      "context_bundle": "REST API user creation endpoint. Input comes from untrusted HTTP clients.",
+      "expected_findings": [
+        {
+          "category": "correctness",
+          "file": "api/users.go",
+          "line": 23,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-hardcoded-credentials",
+      "patch_diff": "diff --git a/config/db.go b/config/db.go\n--- a/config/db.go\n+++ b/config/db.go\n@@ -5,8 +5,9 @@\n func NewDBConn() (*sql.DB, error) {\n-\tdsn := os.Getenv(\"DATABASE_URL\")\n-\tif dsn == \"\" {\n-\t\treturn nil, fmt.Errorf(\"DATABASE_URL not set\")\n-\t}\n+\tdsn := \"postgres://admin:s3cretP@ss!@db.prod.internal:5432/myapp?sslmode=disable\"\n \treturn sql.Open(\"postgres\", dsn)\n }\n",
+      "changed_files": ["config/db.go"],
+      "context_bundle": "Database connection configuration. This file is committed to version control.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "config/db.go",
+          "line": 8,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-insecure-random",
+      "patch_diff": "diff --git a/auth/token.go b/auth/token.go\n--- a/auth/token.go\n+++ b/auth/token.go\n@@ -3,10 +3,10 @@\n import (\n-\tcrypto_rand \"crypto/rand\"\n-\t\"encoding/hex\"\n+\t\"fmt\"\n+\t\"math/rand\"\n+\t\"time\"\n )\n \n func GenerateSessionToken() string {\n-\tb := make([]byte, 32)\n-\tcrypto_rand.Read(b)\n-\treturn hex.EncodeToString(b)\n+\trand.Seed(time.Now().UnixNano())\n+\treturn fmt.Sprintf(\"%016x\", rand.Int63())\n }\n",
+      "changed_files": ["auth/token.go"],
+      "context_bundle": "Session token generator used for user authentication. Tokens are stored in cookies.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "auth/token.go",
+          "line": 10,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-command-injection",
+      "patch_diff": "diff --git a/tools/git.go b/tools/git.go\n--- a/tools/git.go\n+++ b/tools/git.go\n@@ -8,9 +8,8 @@\n func CloneRepo(url string, dest string) error {\n-\tcmd := exec.Command(\"git\", \"clone\", \"--depth=1\", url, dest)\n+\tcmd := exec.Command(\"sh\", \"-c\", \"git clone --depth=1 \"+url+\" \"+dest)\n \tcmd.Stdout = os.Stdout\n \tcmd.Stderr = os.Stderr\n \treturn cmd.Run()\n }\n",
+      "changed_files": ["tools/git.go"],
+      "context_bundle": "Git helper used to clone user-specified repositories. URL comes from API request body.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "tools/git.go",
+          "line": 10,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-open-redirect",
+      "patch_diff": "diff --git a/web/login.go b/web/login.go\n--- a/web/login.go\n+++ b/web/login.go\n@@ -18,10 +18,7 @@\n func (s *Server) LoginCallback(w http.ResponseWriter, r *http.Request) {\n \tsession.Set(\"user_id\", user.ID)\n-\tnext := r.URL.Query().Get(\"next\")\n-\tif !strings.HasPrefix(next, \"/\") || strings.HasPrefix(next, \"//\") {\n-\t\tnext = \"/dashboard\"\n-\t}\n+\tnext := r.URL.Query().Get(\"next\")\n \thttp.Redirect(w, r, next, http.StatusFound)\n }\n",
+      "changed_files": ["web/login.go"],
+      "context_bundle": "OAuth login callback. Redirects user after successful authentication. next parameter comes from the login form.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "web/login.go",
+          "line": 23,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-skip-tls-verify",
+      "patch_diff": "diff --git a/client/http.go b/client/http.go\n--- a/client/http.go\n+++ b/client/http.go\n@@ -10,7 +10,12 @@\n func NewAPIClient(baseURL string) *APIClient {\n \treturn &APIClient{\n-\t\tclient: &http.Client{Timeout: 30 * time.Second},\n+\t\tclient: &http.Client{\n+\t\t\tTimeout: 30 * time.Second,\n+\t\t\tTransport: &http.Transport{\n+\t\t\t\tTLSClientConfig: &tls.Config{InsecureSkipVerify: true},\n+\t\t\t},\n+\t\t},\n \t\tbase: baseURL,\n \t}\n }\n",
+      "changed_files": ["client/http.go"],
+      "context_bundle": "HTTP client used for API calls to external payment processor. Handles credit card data.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "client/http.go",
+          "line": 15,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-goroutine-leak",
+      "patch_diff": "diff --git a/worker/pool.go b/worker/pool.go\n--- a/worker/pool.go\n+++ b/worker/pool.go\n@@ -12,15 +12,11 @@\n func (p *Pool) Submit(task func()) {\n-\tselect {\n-\tcase p.tasks <- task:\n-\tcase <-p.done:\n-\t\treturn\n-\t}\n+\tgo task()\n }\n",
+      "changed_files": ["worker/pool.go"],
+      "context_bundle": "Worker pool for background job processing. Submit is called from HTTP handlers for each incoming request. Pool processes 100K+ tasks/day.",
+      "expected_findings": [
+        {
+          "category": "concurrency",
+          "file": "worker/pool.go",
+          "line": 14,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-unbounded-alloc",
+      "patch_diff": "diff --git a/api/upload.go b/api/upload.go\n--- a/api/upload.go\n+++ b/api/upload.go\n@@ -10,10 +10,8 @@\n func (s *Server) UploadHandler(w http.ResponseWriter, r *http.Request) {\n-\tr.Body = http.MaxBytesReader(w, r.Body, 10<<20)\n-\tbody, err := io.ReadAll(r.Body)\n+\tbody, err := io.ReadAll(r.Body)\n \tif err != nil {\n \t\thttp.Error(w, \"read failed\", http.StatusBadRequest)\n \t\treturn\n \t}\n \ts.processUpload(body)\n }\n",
+      "changed_files": ["api/upload.go"],
+      "context_bundle": "File upload endpoint exposed to the internet. Processes user-uploaded files.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "api/upload.go",
+          "line": 12,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-toctou-race",
+      "patch_diff": "diff --git a/fs/safe.go b/fs/safe.go\n--- a/fs/safe.go\n+++ b/fs/safe.go\n@@ -10,13 +10,10 @@\n func WriteIfNotExists(path string, data []byte) error {\n-\tf, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)\n-\tif err != nil {\n-\t\treturn err\n-\t}\n-\tdefer f.Close()\n-\t_, err = f.Write(data)\n-\treturn err\n+\tif _, err := os.Stat(path); err == nil {\n+\t\treturn fmt.Errorf(\"file already exists: %s\", path)\n+\t}\n+\treturn os.WriteFile(path, data, 0644)\n }\n",
+      "changed_files": ["fs/safe.go"],
+      "context_bundle": "File utility used in a concurrent web server to write unique upload files. Multiple goroutines may call this for the same path.",
+      "expected_findings": [
+        {
+          "category": "concurrency",
+          "file": "fs/safe.go",
+          "line": 12,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-missing-authz-check",
+      "patch_diff": "diff --git a/api/admin.go b/api/admin.go\n--- a/api/admin.go\n+++ b/api/admin.go\n@@ -15,12 +15,8 @@\n func (s *Server) DeleteUser(w http.ResponseWriter, r *http.Request) {\n \tuid := r.URL.Query().Get(\"user_id\")\n-\tcaller := r.Context().Value(ctxKeyUser).(*User)\n-\tif !caller.IsAdmin {\n-\t\thttp.Error(w, \"forbidden\", http.StatusForbidden)\n-\t\treturn\n-\t}\n \tif err := s.store.DeleteUser(r.Context(), uid); err != nil {\n \t\thttp.Error(w, \"delete failed\", http.StatusInternalServerError)\n \t\treturn\n \t}\n \tw.WriteHeader(http.StatusNoContent)\n }\n",
+      "changed_files": ["api/admin.go"],
+      "context_bundle": "Admin API endpoint for user management. Authentication middleware runs before this handler but does not enforce roles.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "api/admin.go",
+          "line": 17,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-logging-sensitive-data",
+      "patch_diff": "diff --git a/auth/login.go b/auth/login.go\n--- a/auth/login.go\n+++ b/auth/login.go\n@@ -18,8 +18,9 @@\n func (s *AuthService) Login(ctx context.Context, email, password string) (*Session, error) {\n+\ts.logger.Info(\"login attempt\", \"email\", email, \"password\", password)\n \tuser, err := s.store.FindByEmail(ctx, email)\n \tif err != nil {\n-\t\ts.logger.Warn(\"login failed\", \"email\", email)\n+\t\ts.logger.Warn(\"login failed\", \"email\", email, \"password\", password)\n \t\treturn nil, ErrInvalidCredentials\n \t}\n",
+      "changed_files": ["auth/login.go"],
+      "context_bundle": "Authentication service. Logs are shipped to centralized logging (ELK stack) accessible by operations team.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "auth/login.go",
+          "line": 19,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-out-of-bounds",
+      "patch_diff": "diff --git a/parse/csv.go b/parse/csv.go\n--- a/parse/csv.go\n+++ b/parse/csv.go\n@@ -12,12 +12,8 @@\n func ParseRecord(fields []string) Record {\n-\tif len(fields) < 4 {\n-\t\treturn Record{}\n-\t}\n \treturn Record{\n \t\tID:    fields[0],\n \t\tName:  fields[1],\n \t\tEmail: fields[2],\n \t\tRole:  fields[3],\n \t}\n }\n",
+      "changed_files": ["parse/csv.go"],
+      "context_bundle": "CSV parser for importing user data. Input files come from third-party integrations with varying column counts.",
+      "expected_findings": [
+        {
+          "category": "correctness",
+          "file": "parse/csv.go",
+          "line": 14,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-weak-hash-password",
+      "patch_diff": "diff --git a/auth/password.go b/auth/password.go\n--- a/auth/password.go\n+++ b/auth/password.go\n@@ -3,12 +3,9 @@\n import (\n-\t\"golang.org/x/crypto/bcrypt\"\n+\t\"crypto/md5\"\n+\t\"encoding/hex\"\n )\n \n func HashPassword(password string) (string, error) {\n-\thash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)\n-\tif err != nil {\n-\t\treturn \"\", err\n-\t}\n-\treturn string(hash), nil\n+\th := md5.Sum([]byte(password))\n+\treturn hex.EncodeToString(h[:]), nil\n }\n",
+      "changed_files": ["auth/password.go"],
+      "context_bundle": "Password hashing for user accounts. Hashes stored in the users table.",
+      "expected_findings": [
+        {
+          "category": "security",
+          "file": "auth/password.go",
+          "line": 9,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "sample-clean-add-tests",
+      "patch_diff": "diff --git a/utils/format_test.go b/utils/format_test.go\n--- /dev/null\n+++ b/utils/format_test.go\n@@ -0,0 +1,20 @@\n+package utils\n+\n+import \"testing\"\n+\n+func TestFormatName(t *testing.T) {\n+\tgot := FormatName(\"Jane\", \"Doe\")\n+\tif got != \"Jane Doe\" {\n+\t\tt.Errorf(\"FormatName = %q, want %q\", got, \"Jane Doe\")\n+\t}\n+}\n+\n+func TestFormatFullName(t *testing.T) {\n+\tgot := FormatFullName(\"Jane\", \"M\", \"Doe\")\n+\tif got != \"Jane M Doe\" {\n+\t\tt.Errorf(\"FormatFullName = %q, want %q\", got, \"Jane M Doe\")\n+\t}\n+}\n",
+      "changed_files": ["utils/format_test.go"],
+      "context_bundle": "Adding unit tests for existing formatting utility functions. No behavioral changes.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "sample-clean-rename-variable",
+      "patch_diff": "diff --git a/store/repo.go b/store/repo.go\n--- a/store/repo.go\n+++ b/store/repo.go\n@@ -10,10 +10,10 @@\n func (s *Store) GetByID(ctx context.Context, id string) (*Item, error) {\n-\tvar x Item\n-\terr := s.db.QueryRowContext(ctx, \"SELECT id, name, price FROM items WHERE id = ?\", id).Scan(&x.ID, &x.Name, &x.Price)\n+\tvar item Item\n+\terr := s.db.QueryRowContext(ctx, \"SELECT id, name, price FROM items WHERE id = ?\", id).Scan(&item.ID, &item.Name, &item.Price)\n \tif err != nil {\n \t\treturn nil, fmt.Errorf(\"get item by id: %w\", err)\n \t}\n-\treturn &x, nil\n+\treturn &item, nil\n }\n",
+      "changed_files": ["store/repo.go"],
+      "context_bundle": "Database store layer. Renaming a variable for readability, no logic changes.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "sample-off-by-one",
+      "patch_diff": "diff --git a/pagination/page.go b/pagination/page.go\n--- a/pagination/page.go\n+++ b/pagination/page.go\n@@ -5,9 +5,9 @@\n func Paginate(items []string, page, perPage int) []string {\n \tif perPage <= 0 {\n \t\tperPage = 20\n \t}\n-\tstart := page * perPage\n+\tstart := (page + 1) * perPage\n \tif start >= len(items) {\n \t\treturn nil\n \t}\n \tend := start + perPage\n \tif end > len(items) {\n \t\tend = len(items)\n \t}\n \treturn items[start:end]\n }\n",
+      "changed_files": ["pagination/page.go"],
+      "context_bundle": "Pagination helper. Pages are 0-indexed (page 0 = first page). Used across all list endpoints.",
+      "expected_findings": [
+        {
+          "category": "correctness",
+          "file": "pagination/page.go",
+          "line": 8,
+          "severity": "medium"
+        }
+      ]
     }
   ]
 }
