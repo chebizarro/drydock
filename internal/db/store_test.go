@@ -103,3 +103,77 @@ func TestGetRecentFewShotsZeroLimit(t *testing.T) {
 		t.Fatalf("expected nil for zero limit, got %v", results)
 	}
 }
+
+func TestIsPatchSuperseded(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	// Seed: insert two patches in the same thread.
+	// patch-1 is the root, patch-2 is a newer revision.
+	_, err := store.db.ExecContext(ctx,
+		`INSERT INTO patch_events(event_id, repo_id, kind, author_pubkey, root_id, created_at, content, raw_event_json, seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"patch-1", "repo-1", 1617, "author-1", "patch-1", 1000, "diff v1", "{}", 1000,
+	)
+	if err != nil {
+		t.Fatalf("insert patch-1: %v", err)
+	}
+	_, err = store.db.ExecContext(ctx,
+		`INSERT INTO patch_events(event_id, repo_id, kind, author_pubkey, root_id, created_at, content, raw_event_json, seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"patch-2", "repo-1", 1617, "author-1", "patch-1", 2000, "diff v2", "{}", 2000,
+	)
+	if err != nil {
+		t.Fatalf("insert patch-2: %v", err)
+	}
+
+	t.Run("root patch is superseded by child", func(t *testing.T) {
+		sup, err := store.IsPatchSuperseded(ctx, "patch-1", "patch-1", "repo-1")
+		if err != nil {
+			t.Fatalf("IsPatchSuperseded: %v", err)
+		}
+		if !sup {
+			t.Error("expected root patch to be superseded (child exists)")
+		}
+	})
+
+	t.Run("latest patch is not superseded", func(t *testing.T) {
+		sup, err := store.IsPatchSuperseded(ctx, "patch-2", "patch-1", "repo-1")
+		if err != nil {
+			t.Fatalf("IsPatchSuperseded: %v", err)
+		}
+		if sup {
+			t.Error("expected latest patch to NOT be superseded")
+		}
+	})
+
+	t.Run("single patch not superseded", func(t *testing.T) {
+		// Insert an isolated patch.
+		_, err := store.db.ExecContext(ctx,
+			`INSERT INTO patch_events(event_id, repo_id, kind, author_pubkey, root_id, created_at, content, raw_event_json, seen_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			"patch-solo", "repo-2", 1617, "author-1", "patch-solo", 3000, "solo diff", "{}", 3000,
+		)
+		if err != nil {
+			t.Fatalf("insert patch-solo: %v", err)
+		}
+		sup, err := store.IsPatchSuperseded(ctx, "patch-solo", "patch-solo", "repo-2")
+		if err != nil {
+			t.Fatalf("IsPatchSuperseded: %v", err)
+		}
+		if sup {
+			t.Error("expected solo patch to NOT be superseded")
+		}
+	})
+
+	t.Run("different repo not counted", func(t *testing.T) {
+		// patch-1 in repo-1 is superseded, but not in repo-3.
+		sup, err := store.IsPatchSuperseded(ctx, "patch-1", "patch-1", "repo-3")
+		if err != nil {
+			t.Fatalf("IsPatchSuperseded: %v", err)
+		}
+		if sup {
+			t.Error("expected patch in different repo to NOT be superseded")
+		}
+	})
+}

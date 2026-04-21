@@ -1095,6 +1095,39 @@ func (s *Store) ResetStuckReviews(ctx context.Context) (int64, error) {
 	return res.RowsAffected()
 }
 
+// IsPatchSuperseded returns true if a newer patch event exists for the same
+// root_id and repo_id. A patch is considered superseded when a later revision
+// has been submitted to the same thread.
+func (s *Store) IsPatchSuperseded(ctx context.Context, eventID, rootID, repoID string) (bool, error) {
+	if rootID == "" || rootID == eventID {
+		// This IS the root event — check if any children exist with later timestamps.
+		var count int64
+		err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM patch_events
+			WHERE root_id=? AND repo_id=? AND event_id!=? AND kind IN (1617,1618,1619)`,
+			eventID, repoID, eventID,
+		).Scan(&count)
+		if err != nil {
+			return false, fmt.Errorf("check superseded (root): %w", err)
+		}
+		return count > 0, nil
+	}
+
+	// Non-root patch: superseded if a newer event in the same thread exists.
+	var newerCount int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM patch_events
+		WHERE root_id=? AND repo_id=? AND event_id!=?
+		AND kind IN (1617,1618,1619)
+		AND created_at > (SELECT created_at FROM patch_events WHERE event_id=?)`,
+		rootID, repoID, eventID, eventID,
+	).Scan(&newerCount)
+	if err != nil {
+		return false, fmt.Errorf("check superseded: %w", err)
+	}
+	return newerCount > 0, nil
+}
+
 // --- Prompt Gap Queue ---
 
 // InsertPromptGap enqueues a prompt gap identified by meta-review.

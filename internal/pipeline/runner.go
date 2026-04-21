@@ -187,7 +187,20 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 8. Compute mean confidence
 	confidence := meanConfidence(result.Review.Findings)
 
-	// 9. Publish review
+	// 9. Check if this patch has been superseded by a newer revision
+	superseded := false
+	if sup, err := r.store.IsPatchSuperseded(ctx, task.PatchEventID, patchRec.RootID, task.RepoID); err != nil {
+		r.logger.Warn("failed to check superseded status, assuming not superseded",
+			"patch_event_id", task.PatchEventID, "error", err)
+	} else {
+		superseded = sup
+		if superseded {
+			r.logger.Info("patch is superseded, using short TTL",
+				"patch_event_id", task.PatchEventID, "root_id", patchRec.RootID)
+		}
+	}
+
+	// 10. Publish review
 	reviewEventID, err := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
 		PatchEventID:         task.PatchEventID,
 		RepoID:               task.RepoID,
@@ -198,13 +211,13 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		Confidence:           confidence,
 		ContextLayersUsed:    bundle.LayersUsed,
 		ContextLayersDropped: bundle.LayersDropped,
-		Superseded:           false,
+		Superseded:           superseded,
 	})
 	if err != nil {
 		return fmt.Errorf("publish review: %w", err)
 	}
 
-	// 10. Log success (MarkReviewPublished is already called inside PublishReview)
+	// 11. Log success (MarkReviewPublished is already called inside PublishReview)
 	r.logger.Info("review published",
 		"patch_event_id", task.PatchEventID,
 		"repo_id", task.RepoID,
@@ -212,7 +225,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		"findings", len(result.Review.Findings),
 	)
 
-	// 11. Async meta-review (non-blocking)
+	// 12. Async meta-review (non-blocking)
 	if r.metaSvc != nil {
 		r.metaSvc.RunAsync(ctx, metareview.Input{
 			PatchEventID:  task.PatchEventID,
