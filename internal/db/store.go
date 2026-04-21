@@ -639,6 +639,20 @@ func (s *Store) CountRepositories(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
+// GetReviewStatus returns the current status of a review (pending, reviewing,
+// published, failed) or empty string if no review log entry exists.
+func (s *Store) GetReviewStatus(ctx context.Context, patchEventID, repoID string) (string, error) {
+	var status string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT status FROM review_log WHERE patch_event_id=? AND repo_id=?`,
+		patchEventID, repoID,
+	).Scan(&status)
+	if err != nil {
+		return "", fmt.Errorf("get review status: %w", err)
+	}
+	return status, nil
+}
+
 func (s *Store) CountReviewLog(ctx context.Context) (int64, error) {
 	var n int64
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_log`).Scan(&n); err != nil {
