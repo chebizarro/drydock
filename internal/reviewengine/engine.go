@@ -30,6 +30,10 @@ type RunInput struct {
 	// reviewer system prompt. Checklist, security preamble, and few-shot
 	// examples are still appended.
 	ReviewerSystemPromptOverride string
+	// TestCoverageGaps lists modified symbols that lack test references.
+	// When non-empty, an extra checklist item is appended reminding the
+	// reviewer to consider flagging absent test coverage.
+	TestCoverageGaps []string
 }
 
 type RunOutput struct {
@@ -67,6 +71,11 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	}
 
 	checklist := BuildChecklist(in.ChangedFiles)
+	if len(in.TestCoverageGaps) > 0 {
+		checklist = append(checklist,
+			fmt.Sprintf("Missing test coverage: symbols %s have no test references — consider flagging as a finding",
+				strings.Join(in.TestCoverageGaps, ", ")))
+	}
 	system := reviewerSystemPrompt(in.ReviewerSystemPromptOverride, checklist, IsSecuritySensitive(in.ChangedFiles), in.FewShot)
 	user := reviewerUserPrompt(in.ContextBundle, planner)
 

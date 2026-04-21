@@ -176,6 +176,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		ChangedFiles:                 changedFilesFromBundle(bundle),
 		FewShot:                      fewShot,
 		ReviewerSystemPromptOverride: promptOverride,
+		TestCoverageGaps:             bundle.TestCoverageGaps,
 	})
 	if err != nil {
 		return fmt.Errorf("review engine: %w", err)

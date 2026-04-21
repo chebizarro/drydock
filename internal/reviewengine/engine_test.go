@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -55,6 +56,48 @@ func TestEngineRoutesPlannerToLLM70B(t *testing.T) {
 	}
 	if len(out.Checklist) == 0 {
 		t.Fatalf("expected non-empty checklist for auth file")
+	}
+}
+
+func TestEngineTestCoverageGapsAddedToChecklist(t *testing.T) {
+	fake := &fakeLLM{
+		responses: []string{
+			`{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
+			`{"summary":"missing tests","findings":[],"needs_more_context":[]}`,
+		},
+	}
+	engine := New(Config{
+		Planner:  ModelEndpoint{BaseURL: "http://planner", Model: "planner-model"},
+		Coder32B: ModelEndpoint{BaseURL: "http://32b", Model: "32b-model"},
+		LLM70B:   ModelEndpoint{BaseURL: "http://70b", Model: "70b-model"},
+		Coder14B: ModelEndpoint{BaseURL: "http://14b", Model: "14b-model"},
+	}, fake, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	out, err := engine.Run(context.Background(), RunInput{
+		ContextBundle:    "ctx",
+		ChangedFiles:     []string{"main.go"},
+		TestCoverageGaps: []string{"Foo", "Bar"},
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// Should have at least one checklist item about missing test coverage
+	found := false
+	for _, item := range out.Checklist {
+		if strings.Contains(item, "Foo") && strings.Contains(item, "Bar") && strings.Contains(item, "test coverage") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected checklist item about test coverage gaps, got: %v", out.Checklist)
+	}
+
+	// The system prompt should contain the coverage gap checklist
+	reviewerReq := fake.requests[1]
+	if !strings.Contains(reviewerReq.System, "Foo") || !strings.Contains(reviewerReq.System, "Bar") {
+		t.Fatalf("expected coverage gap symbols in system prompt, got: %s", reviewerReq.System)
 	}
 }
 

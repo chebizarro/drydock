@@ -162,6 +162,55 @@ func TestBuilderNoExcludedFilesWhenAllSourceCode(t *testing.T) {
 }
 
 
+func TestBuilderTestCoverageGapsExtracted(t *testing.T) {
+	// The tests layer content includes finding-candidate markers.
+	testsContent := "### Foo\nfoo_test.go:12: func TestFoo ...\n\n" +
+		TestCoverageGapPrefix + "Bar\n" +
+		TestCoverageGapPrefix + "Baz"
+
+	b := &Builder{
+		TokenBudget: 100_000,
+		Counter:     byteCounter{},
+		Providers: []Provider{
+			fakeProvider{name: LayerTests, priority: 4, content: testsContent},
+		},
+	}
+
+	out, err := b.Build(context.Background(), BuildInput{})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+
+	if len(out.TestCoverageGaps) != 2 {
+		t.Fatalf("expected 2 coverage gaps, got %d: %v", len(out.TestCoverageGaps), out.TestCoverageGaps)
+	}
+	if out.TestCoverageGaps[0] != "Bar" || out.TestCoverageGaps[1] != "Baz" {
+		t.Fatalf("unexpected gaps: %v", out.TestCoverageGaps)
+	}
+}
+
+func TestBuilderNoCoverageGapsWhenAllCovered(t *testing.T) {
+	testsContent := "### Foo\nfoo_test.go:12: func TestFoo ...\n\n" +
+		"### Bar\nbar_test.go:5: func TestBar ..."
+
+	b := &Builder{
+		TokenBudget: 100_000,
+		Counter:     byteCounter{},
+		Providers: []Provider{
+			fakeProvider{name: LayerTests, priority: 4, content: testsContent},
+		},
+	}
+
+	out, err := b.Build(context.Background(), BuildInput{})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+
+	if len(out.TestCoverageGaps) != 0 {
+		t.Fatalf("expected no coverage gaps, got %v", out.TestCoverageGaps)
+	}
+}
+
 func TestBuilderDeterministicOrderByPriorityThenName(t *testing.T) {
 	b := &Builder{
 		TokenBudget: 100,

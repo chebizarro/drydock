@@ -18,6 +18,11 @@ const (
 	LayerImportsExports   = "imports-exports"
 	LayerCommitHistory    = "commit-history"
 	LayerProjectDocs      = "project-docs"
+
+	// TestCoverageGapPrefix is the line prefix used by the tests provider to
+	// mark symbols that have no test references. The builder scans for these
+	// to populate ContextBundle.TestCoverageGaps.
+	TestCoverageGapPrefix = "FINDING-CANDIDATE: no test coverage for "
 )
 
 type BuildInput struct {
@@ -40,6 +45,9 @@ type ContextBundle struct {
 	// LLM sees a notification about these so it can flag dependency or
 	// schema changes that deserve human attention.
 	ExcludedFiles []string
+	// TestCoverageGaps lists symbol names that were modified by the patch
+	// but have no test references. Surfaced as finding candidates.
+	TestCoverageGaps []string
 }
 
 type TokenCounter interface {
@@ -196,6 +204,23 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		usedNames = append(usedNames, lr.name)
 	}
 
+	// Scan the tests layer for coverage gap markers and extract symbol names.
+	var testCoverageGaps []string
+	for _, lr := range used {
+		if lr.name != LayerTests {
+			continue
+		}
+		for _, line := range strings.Split(lr.content, "\n") {
+			if strings.HasPrefix(line, TestCoverageGapPrefix) {
+				sym := strings.TrimPrefix(line, TestCoverageGapPrefix)
+				sym = strings.TrimSpace(sym)
+				if sym != "" {
+					testCoverageGaps = append(testCoverageGaps, sym)
+				}
+			}
+		}
+	}
+
 	// Append a notification about excluded non-source files so the reviewer
 	// can flag dependency / schema changes that deserve human attention.
 	if len(excludedFiles) > 0 {
@@ -212,12 +237,13 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 	}
 
 	return ContextBundle{
-		Content:       strings.Join(parts, "\n\n"),
-		TokenBudget:   b.TokenBudget,
-		TokenCount:    usedTokens,
-		LayersUsed:    usedNames,
-		LayersDropped: dropped,
-		ExcludedFiles: excludedFiles,
+		Content:          strings.Join(parts, "\n\n"),
+		TokenBudget:      b.TokenBudget,
+		TokenCount:       usedTokens,
+		LayersUsed:       usedNames,
+		LayersDropped:    dropped,
+		ExcludedFiles:    excludedFiles,
+		TestCoverageGaps: testCoverageGaps,
 	}, nil
 }
 

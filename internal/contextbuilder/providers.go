@@ -249,30 +249,39 @@ func (p testsProvider) Build(ctx context.Context, in BuildInput) (string, error)
 	}
 	symbols := extractChangedSymbols(in.PatchEventContent)
 	if len(symbols) == 0 {
-		return "No tests reference modified symbols.", nil
+		return "", nil
 	}
 	var out strings.Builder
-	foundAny := false
 	srch := p.search
 	if srch == nil {
 		srch = newSearcher()
 	}
 
+	var uncovered []string
 	for _, sym := range symbols {
 		lines, _ := srch.SearchSymbolTests(ctx, in.RepoPath, sym, in.WorkspaceRoots)
 		if strings.TrimSpace(lines) == "" {
+			uncovered = append(uncovered, sym)
 			continue
 		}
-		foundAny = true
 		out.WriteString("### ")
 		out.WriteString(sym)
 		out.WriteString("\n")
 		out.WriteString(lines)
 		out.WriteString("\n")
 	}
-	if !foundAny {
-		return "No tests reference modified symbols.", nil
+
+	// Explicitly flag symbols without test coverage as finding candidates
+	// so the reviewer considers missing tests rather than silently ignoring them.
+	if len(uncovered) > 0 {
+		out.WriteString("\n")
+		for _, sym := range uncovered {
+			out.WriteString(TestCoverageGapPrefix)
+			out.WriteString(sym)
+			out.WriteString("\n")
+		}
 	}
+
 	return strings.TrimSpace(out.String()), nil
 }
 
