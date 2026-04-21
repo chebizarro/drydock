@@ -25,13 +25,17 @@ services:
       DRYDOCK_CODER14B_BASE_URL: ${DRYDOCK_CODER14B_BASE_URL:-http://host.docker.internal:11434/v1}
       DRYDOCK_CODER14B_MODEL: ${DRYDOCK_CODER14B_MODEL:-qwen2.5-coder-14b-instruct-q4_k_m}
       DRYDOCK_META_BASE_URL: ${DRYDOCK_META_BASE_URL:-http://host.docker.internal:11436/v1}
-      DRYDOCK_META_MODEL: ${DRYDOCK_META_MODEL:-gpt-5-codex}
+      DRYDOCK_META_MODEL: ${DRYDOCK_META_MODEL:-llama-3.3-70b-instruct-q4_k_m}
+      DRYDOCK_REPO_CACHE_MAX_COUNT: ${DRYDOCK_REPO_CACHE_MAX_COUNT:-50}
+      DRYDOCK_REPO_CACHE_MAX_SIZE_MB: ${DRYDOCK_REPO_CACHE_MAX_SIZE_MB:-10240}
     volumes:
       - drydock_data:/data
       - ./eval:/app/eval:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    network_mode: host  # use host networking on Lemmy so container reaches 192.168.30.10:8080 directly
+    # Note: If deploying to Lemmy or other hosts where LLM endpoints are on the
+    # local network, override DRYDOCK_*_BASE_URL env vars or use extra_hosts above.
+    # Avoid network_mode: host as it bypasses Docker isolation and is not portable.
 
 volumes:
   drydock_data:
