@@ -294,14 +294,22 @@ func main() {
 	// --- Run ---
 	errCh := make(chan error, 2)
 
+	listenerDone := make(chan struct{})
 	go func() {
+		defer close(listenerDone)
 		if err := svc.Run(ctx); err != nil {
 			errCh <- err
 		}
 	}()
 
+	pipelineDone := make(chan struct{})
 	if pipelineRunner != nil {
-		go pipelineRunner.Run(ctx)
+		go func() {
+			defer close(pipelineDone)
+			pipelineRunner.Run(ctx)
+		}()
+	} else {
+		close(pipelineDone)
 	}
 
 	// --- Background prompt refinement loop (checks every 5 minutes) ---
@@ -333,7 +341,29 @@ func main() {
 		logger.Error("service exited with error", "error", err)
 		os.Exit(1)
 	case <-ctx.Done():
-		logger.Info("shutting down")
+		logger.Info("shutting down, waiting for in-flight work to drain")
+	}
+
+	// Mark unhealthy so load balancer stops sending traffic during drain.
+	healthSrv.SetReady(false)
+
+	// Graceful drain: wait for pipeline and listener to finish, with a deadline.
+	const drainTimeout = 60 * time.Second
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer drainCancel()
+
+	allDone := make(chan struct{})
+	go func() {
+		<-pipelineDone
+		<-listenerDone
+		close(allDone)
+	}()
+
+	select {
+	case <-allDone:
+		logger.Info("graceful shutdown complete")
+	case <-drainCtx.Done():
+		logger.Warn("graceful shutdown timed out, exiting", "timeout", drainTimeout)
 	}
 }
 
