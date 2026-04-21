@@ -34,3 +34,32 @@ func TestPRTipCommitMissing(t *testing.T) {
 		t.Fatalf("expected error for missing c tag")
 	}
 }
+
+func TestIsSafeCloneURL(t *testing.T) {
+	safe := []string{
+		"https://github.com/user/repo.git",
+		"https://example.com/repo",
+		"git://example.com/repo.git",
+		"git@github.com:user/repo.git",
+	}
+	for _, u := range safe {
+		if !isSafeCloneURL(u) {
+			t.Errorf("expected safe: %s", u)
+		}
+	}
+
+	unsafe := []string{
+		"",
+		"ext::sh -c evil%",
+		"file:///etc/passwd",
+		"http://example.com/repo.git",
+		"ssh://user;rm -rf //@host/repo",
+		"git@host:repo;evil",
+		"ftp://example.com/repo",
+	}
+	for _, u := range unsafe {
+		if isSafeCloneURL(u) {
+			t.Errorf("expected unsafe: %s", u)
+		}
+	}
+}

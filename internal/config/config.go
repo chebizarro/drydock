@@ -34,7 +34,7 @@ type Config struct {
 
 func FromEnv() Config {
 	return Config{
-		DatabaseURL:         envOrDefault("DRYDOCK_DATABASE_URL", "file:drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"),
+		DatabaseURL:         envOrDefault("DRYDOCK_DATABASE_URL", "file:drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)"),
 		RepoCacheDir:        envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
 		Relays: splitCSV(
 			envOrDefault(
@@ -58,7 +58,7 @@ func FromEnv() Config {
 		SignerBunkerURL:     envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
 		SignerNsec:          envOrDefault("DRYDOCK_SIGNER_NSEC", ""),
 		MetaBaseURL:         envOrDefault("DRYDOCK_META_BASE_URL", "http://127.0.0.1:11436/v1"),
-		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", "gpt-5-codex"),
+		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", "llama-3.3-70b-instruct-q4_k_m"),
 		EvalDatasetPath:     envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
 	}
 }

@@ -25,6 +25,16 @@ func NewProcessor(store *db.Store, logger *slog.Logger) *Processor {
 }
 
 func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayURL string) error {
+	// Verify event signature before processing. Reject forged or unsigned events.
+	if !event.VerifySignature() {
+		p.logger.Warn("rejected event with invalid signature",
+			"event_id", event.ID.Hex(),
+			"kind", int(event.Kind),
+			"relay", relayURL,
+		)
+		return nil // drop silently — do not propagate invalid events
+	}
+
 	inserted, err := p.store.InsertIngestedEvent(ctx, event)
 	if err != nil {
 		return err

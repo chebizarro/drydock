@@ -41,6 +41,9 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// SQLite supports only one concurrent writer. Limit open connections
+	// to avoid "database is locked" errors under load.
+	db.SetMaxOpenConns(1)
 	if err := db.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}

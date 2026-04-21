@@ -1,0 +1,34 @@
+# Binaries
+drydock
+drydock-eval
+*.exe
+bin/
+dist/
+
+# Database
+*.db
+*.sqlite
+
+# Environment files with secrets
+.env
+.env.local
+.env.*.local
+
+# Repo cache
+repos/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+
+# Node (if any tooling uses it)
+node_modules/

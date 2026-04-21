@@ -3,9 +3,11 @@ package pipeline
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
@@ -13,6 +15,8 @@ import (
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
+
+	"fiatjaf.com/nostr"
 )
 
 // Runner reads review tasks from a channel and executes the full pipeline:
@@ -62,11 +66,20 @@ func New(
 }
 
 // Run starts worker goroutines and blocks until ctx is cancelled.
+// It waits for all in-flight work to finish before returning.
 func (r *Runner) Run(ctx context.Context) {
+	var wg sync.WaitGroup
 	for i := 0; i < r.workers; i++ {
-		go r.work(ctx, i)
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			r.work(ctx, id)
+		}(i)
 	}
 	<-ctx.Done()
+	r.logger.Info("pipeline shutdown: waiting for in-flight reviews to finish")
+	wg.Wait()
+	r.logger.Info("pipeline shutdown: all workers stopped")
 }
 
 func (r *Runner) work(ctx context.Context, id int) {
@@ -97,22 +110,30 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return fmt.Errorf("prepare patch series: %w", err)
 	}
 
-	// 2. Get patch event content for context builder
+	// 2. Get patch event for context builder and meta-review
 	patchRec, err := r.store.GetPatchEvent(ctx, task.PatchEventID)
 	if err != nil {
 		return fmt.Errorf("get patch event: %w", err)
 	}
 
-	// 3. Build context bundle
+	// 3. Extract actual diff content from the raw event.
+	// The context builder expects unified diff content, not the JSON envelope.
+	var patchEvent nostr.Event
+	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
+		return fmt.Errorf("decode patch event for context: %w", err)
+	}
+	patchDiffContent := patchEvent.Content
+
+	// 4. Build context bundle
 	bundle, err := r.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
-		PatchEventContent: patchRec.RawEvent,
+		PatchEventContent: patchDiffContent,
 		RepoPath:          prep.RepoPath,
 	})
 	if err != nil {
 		return fmt.Errorf("build context: %w", err)
 	}
 
-	// 4. Run LLM review engine
+	// 5. Run LLM review engine
 	result, err := r.engine.Run(ctx, reviewengine.RunInput{
 		ContextBundle: bundle.Content,
 		ChangedFiles:  changedFilesFromBundle(bundle),
@@ -121,13 +142,13 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return fmt.Errorf("review engine: %w", err)
 	}
 
-	// 5. Compute context hash
+	// 6. Compute context hash
 	ctxHash := fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content)))
 
-	// 6. Compute mean confidence
+	// 7. Compute mean confidence
 	confidence := meanConfidence(result.Review.Findings)
 
-	// 7. Publish review
+	// 8. Publish review
 	reviewEventID, err := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
 		PatchEventID:         task.PatchEventID,
 		RepoID:               task.RepoID,
@@ -144,11 +165,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return fmt.Errorf("publish review: %w", err)
 	}
 
-	// 8. Mark published
-	if err := r.store.MarkReviewPublished(ctx, task.PatchEventID, task.RepoID, reviewEventID); err != nil {
-		r.logger.Warn("failed to mark review published in db", "error", err)
-	}
-
+	// 9. Log success (MarkReviewPublished is already called inside PublishReview)
 	r.logger.Info("review published",
 		"patch_event_id", task.PatchEventID,
 		"repo_id", task.RepoID,
@@ -156,12 +173,12 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		"findings", len(result.Review.Findings),
 	)
 
-	// 9. Async meta-review (non-blocking)
+	// 10. Async meta-review (non-blocking)
 	if r.metaSvc != nil {
 		r.metaSvc.RunAsync(ctx, metareview.Input{
 			PatchEventID:  task.PatchEventID,
 			RepoID:        task.RepoID,
-			PatchDiff:     patchRec.RawEvent,
+			PatchDiff:     patchDiffContent,
 			ContextBundle: bundle.Content,
 			ContextHash:   ctxHash,
 			ChangedFiles:  changedFilesFromBundle(bundle),

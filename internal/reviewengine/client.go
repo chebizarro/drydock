@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -57,6 +58,12 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 	}
 	defer res.Body.Close()
 
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
+		return "", fmt.Errorf("llm request failed: HTTP %d %s: %s",
+			res.StatusCode, res.Status, string(body))
+	}
+
 	var decoded struct {
 		Choices []struct {
 			Message struct {
@@ -68,7 +75,7 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 		return "", fmt.Errorf("decode llm response: %w", err)
 	}
 	if len(decoded.Choices) == 0 {
-		return "", fmt.Errorf("llm response has no choices")
+		return "", fmt.Errorf("llm response has no choices (model=%s)", req.Model)
 	}
 	return decoded.Choices[0].Message.Content, nil
 }

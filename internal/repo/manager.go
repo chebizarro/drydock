@@ -43,8 +43,20 @@ func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []str
 	if err := os.MkdirAll(filepath.Dir(repoPath), 0o755); err != nil {
 		return "", fmt.Errorf("create repo cache dir: %w", err)
 	}
-	// Safe: len(cloneURLs) > 0 checked above
-	cloneURL := cloneURLs[0]
+
+	// Find first safe clone URL
+	var cloneURL string
+	for _, u := range cloneURLs {
+		if isSafeCloneURL(u) {
+			cloneURL = u
+			break
+		}
+		m.logger.Warn("skipping unsafe clone URL", "url", u, "repo_id", repoID)
+	}
+	if cloneURL == "" {
+		return "", fmt.Errorf("no safe clone urls for repository %s", repoID)
+	}
+
 	if out, err := exec.CommandContext(ctx, "git", "clone", cloneURL, repoPath).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git clone %s: %w: %s", cloneURL, err, strings.TrimSpace(string(out)))
 	}
@@ -92,7 +104,7 @@ func (m *Manager) EnsureCommitAvailable(ctx context.Context, repoPath, eventID, 
 
 	for _, cloneURL := range cloneURLs {
 		cloneURL = strings.TrimSpace(cloneURL)
-		if cloneURL == "" {
+		if cloneURL == "" || !isSafeCloneURL(cloneURL) {
 			continue
 		}
 		if eventID != "" {
@@ -210,4 +222,30 @@ func shortID(v string) string {
 		return v
 	}
 	return v[:12]
+}
+
+// isSafeCloneURL validates that a clone URL uses a safe protocol.
+// Blocks dangerous git URL schemes that could execute arbitrary commands
+// (e.g. ext::, file://, or URLs with embedded credentials/commands).
+func isSafeCloneURL(raw string) bool {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return false
+	}
+	lower := strings.ToLower(u)
+	// Allow only https:// and git:// protocols
+	if strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "git://") {
+		return true
+	}
+	// Allow SSH-style URLs (git@host:path) but only with simple structure
+	if strings.Contains(u, "@") && strings.Contains(u, ":") && !strings.Contains(u, "://") {
+		// Reject if it contains spaces, semicolons, or backticks (injection attempts)
+		for _, c := range u {
+			if c == ' ' || c == ';' || c == '`' || c == '$' || c == '|' || c == '&' || c == '\n' || c == '\r' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }

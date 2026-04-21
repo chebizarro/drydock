@@ -13,14 +13,52 @@ import (
 	"fiatjaf.com/nostr"
 )
 
+// signEvent signs the event with the given secret key (sets ID, PubKey, Sig).
+func signEvent(t *testing.T, sk nostr.SecretKey, event *nostr.Event) {
+	t.Helper()
+	if err := event.Sign(sk); err != nil {
+		t.Fatalf("sign event: %v", err)
+	}
+}
+
+func TestProcessorRejectsInvalidSignature(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	// Create an event with no valid signature (forged event)
+	event := nostr.Event{
+		ID:        nostr.MustIDFromHex("f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"),
+		PubKey:    nostr.MustPubKeyFromHex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"),
+		Kind:      30617,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"d", "repo-1"},
+		},
+		// Sig is zero/empty — invalid
+	}
+
+	// Should not error (drops silently) but should not persist
+	if err := processor.ProcessEvent(ctx, event, "wss://relay.test"); err != nil {
+		t.Fatalf("process should not error on invalid sig: %v", err)
+	}
+
+	ingested, err := store.CountIngestedEvents(ctx)
+	if err != nil {
+		t.Fatalf("count ingested events: %v", err)
+	}
+	if ingested != 0 {
+		t.Fatalf("expected 0 ingested events for invalid signature, got %d", ingested)
+	}
+}
+
 func TestProcessorDedupesByEventID(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
+	sk := nostr.Generate()
 
 	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	event := nostr.Event{
-		ID:        nostr.MustIDFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		PubKey:    nostr.MustPubKeyFromHex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"),
 		Kind:      30617,
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
@@ -29,6 +67,7 @@ func TestProcessorDedupesByEventID(t *testing.T) {
 			{"clone", "https://example.com/repo-1.git"},
 		},
 	}
+	signEvent(t, sk, &event)
 
 	if err := processor.ProcessEvent(ctx, event, "wss://relay.test"); err != nil {
 		t.Fatalf("first process failed: %v", err)
@@ -57,19 +96,35 @@ func TestProcessorDedupesByEventID(t *testing.T) {
 func TestProcessorCreatesPatchReviewGateOnce(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
+	repoSK := nostr.Generate()
+	patchSK := nostr.Generate()
 
 	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	// First, seed the repo announcement so the patch has a valid repo_id
+	repoEvt := nostr.Event{
+		Kind:      30617,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"d", "repo-1"},
+			{"clone", "https://example.com/repo-1.git"},
+		},
+	}
+	signEvent(t, repoSK, &repoEvt)
+	if err := processor.ProcessEvent(ctx, repoEvt, "wss://relay.test"); err != nil {
+		t.Fatalf("process repo failed: %v", err)
+	}
+
 	event := nostr.Event{
-		ID:        nostr.MustIDFromHex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-		PubKey:    nostr.MustPubKeyFromHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
 		Kind:      1617,
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
-			{"a", "30617:79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798:repo-1"},
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
 			{"e", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "", "root"},
 		},
 		Content: "diff --git a/main.go b/main.go\nindex 0000000..1111111 100644\n--- a/main.go\n+++ b/main.go\n@@ -0,0 +1 @@\n+package main\n",
 	}
+	signEvent(t, patchSK, &event)
 
 	if err := processor.ProcessEvent(ctx, event, "wss://relay.test"); err != nil {
 		t.Fatalf("first process failed: %v", err)
@@ -82,8 +137,9 @@ func TestProcessorCreatesPatchReviewGateOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count ingested events: %v", err)
 	}
-	if ingested != 1 {
-		t.Fatalf("expected 1 ingested event, got %d", ingested)
+	// 2 events: repo announcement + patch
+	if ingested != 2 {
+		t.Fatalf("expected 2 ingested events, got %d", ingested)
 	}
 
 	patches, err := store.CountPatchEvents(ctx)
@@ -108,12 +164,11 @@ func TestProcessorSkipsPatchWhenSnapshotAlreadyContainsTip(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 
-	repoOwner := "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+	repoSK := nostr.Generate()
+	patchSK := nostr.Generate()
 	snapshotTip := "1111111111111111111111111111111111111111"
 
 	snapshot := nostr.Event{
-		ID:        nostr.MustIDFromHex("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
-		PubKey:    nostr.MustPubKeyFromHex(repoOwner),
 		Kind:      30618,
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
@@ -122,22 +177,22 @@ func TestProcessorSkipsPatchWhenSnapshotAlreadyContainsTip(t *testing.T) {
 			{"HEAD", "ref: refs/heads/main"},
 		},
 	}
+	signEvent(t, repoSK, &snapshot)
 
 	if err := processor.ProcessEvent(ctx, snapshot, "wss://relay.test"); err != nil {
 		t.Fatalf("process snapshot failed: %v", err)
 	}
 
 	patch := nostr.Event{
-		ID:        nostr.MustIDFromHex("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
-		PubKey:    nostr.MustPubKeyFromHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
 		Kind:      1618,
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
-			{"a", "30617:" + repoOwner + ":repo-1"},
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
 			{"c", snapshotTip},
 			{"e", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "", "root"},
 		},
 	}
+	signEvent(t, patchSK, &patch)
 
 	if err := processor.ProcessEvent(ctx, patch, "wss://relay.test"); err != nil {
 		t.Fatalf("process patch failed: %v", err)
@@ -173,49 +228,66 @@ func TestProcessorSkipsWhenRootStatusClosed(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 
-	repoOwner := "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-	if err := processor.ProcessEvent(ctx, nostr.Event{
-		ID:        nostr.MustIDFromHex("5757575757575757575757575757575757575757575757575757575757575757"),
-		PubKey:    nostr.MustPubKeyFromHex(repoOwner),
+	repoSK := nostr.Generate()
+	patchSK := nostr.Generate()
+
+	repoEvt := nostr.Event{
 		Kind:      30617,
 		CreatedAt: nostr.Now(),
 		Tags:      nostr.Tags{{"d", "repo-1"}},
-	}, "wss://relay.test"); err != nil {
+	}
+	signEvent(t, repoSK, &repoEvt)
+	if err := processor.ProcessEvent(ctx, repoEvt, "wss://relay.test"); err != nil {
 		t.Fatalf("process announcement failed: %v", err)
 	}
-	rootPatchID := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+	// Create a root patch event so the status author check works
+	rootPatch := nostr.Event{
+		Kind:      1617,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
+		},
+		Content: "diff",
+	}
+	signEvent(t, patchSK, &rootPatch)
+	if err := processor.ProcessEvent(ctx, rootPatch, "wss://relay.test"); err != nil {
+		t.Fatalf("process root patch failed: %v", err)
+	}
 
 	status := nostr.Event{
-		ID:        nostr.MustIDFromHex("5656565656565656565656565656565656565656565656565656565656565656"),
-		PubKey:    nostr.MustPubKeyFromHex(repoOwner),
 		Kind:      1632,
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
-			{"a", "30617:" + repoOwner + ":repo-1"},
-			{"e", rootPatchID, "", "root"},
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
+			{"e", rootPatch.ID.Hex(), "", "root"},
 		},
 	}
+	signEvent(t, repoSK, &status) // signed by repo owner = authorized
 	if err := processor.ProcessEvent(ctx, status, "wss://relay.test"); err != nil {
 		t.Fatalf("process status failed: %v", err)
 	}
 
-	patch := nostr.Event{
-		ID:        nostr.MustIDFromHex("6767676767676767676767676767676767676767676767676767676767676767"),
-		PubKey:    nostr.MustPubKeyFromHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+	// New patch on the same root — should be skipped because root is closed
+	patch2 := nostr.Event{
 		Kind:      1617,
 		CreatedAt: nostr.Now(),
-		Tags:      nostr.Tags{{"a", "30617:" + repoOwner + ":repo-1"}, {"e", rootPatchID, "", "root"}},
+		Tags:      nostr.Tags{{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"}, {"e", rootPatch.ID.Hex(), "", "root"}},
+		Content:   "diff2",
 	}
-	if err := processor.ProcessEvent(ctx, patch, "wss://relay.test"); err != nil {
+	signEvent(t, patchSK, &patch2)
+	if err := processor.ProcessEvent(ctx, patch2, "wss://relay.test"); err != nil {
 		t.Fatalf("process patch failed: %v", err)
 	}
 
+	// The root patch should have review_log but the second should be skipped
 	reviewRows, err := store.CountReviewLog(ctx)
 	if err != nil {
 		t.Fatalf("count review log: %v", err)
 	}
-	if reviewRows != 0 {
-		t.Fatalf("expected 0 review rows when root is closed, got %d", reviewRows)
+	// 1 row from root patch; second patch skipped because root is closed
+	if reviewRows != 1 {
+		t.Fatalf("expected 1 review row (second patch skipped for closed root), got %d", reviewRows)
 	}
 }
 
@@ -224,37 +296,57 @@ func TestProcessorIgnoresUnauthorizedClosedStatus(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 
-	repoOwner := "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-	if err := processor.ProcessEvent(ctx, nostr.Event{
-		ID:        nostr.MustIDFromHex("7878787878787878787878787878787878787878787878787878787878787878"),
-		PubKey:    nostr.MustPubKeyFromHex(repoOwner),
+	repoSK := nostr.Generate()
+	patchSK := nostr.Generate()
+	randomSK := nostr.Generate() // unauthorized third party
+
+	repoEvt := nostr.Event{
 		Kind:      30617,
 		CreatedAt: nostr.Now(),
 		Tags:      nostr.Tags{{"d", "repo-1"}},
-	}, "wss://relay.test"); err != nil {
+	}
+	signEvent(t, repoSK, &repoEvt)
+	if err := processor.ProcessEvent(ctx, repoEvt, "wss://relay.test"); err != nil {
 		t.Fatalf("process announcement failed: %v", err)
 	}
 
-	rootPatchID := "8989898989898989898989898989898989898989898989898989898989898989"
+	// Create a root patch
+	rootPatch := nostr.Event{
+		Kind:      1617,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
+		},
+		Content: "diff",
+	}
+	signEvent(t, patchSK, &rootPatch)
+	if err := processor.ProcessEvent(ctx, rootPatch, "wss://relay.test"); err != nil {
+		t.Fatalf("process root patch failed: %v", err)
+	}
+
+	// Status from unauthorized third party — should be ignored
 	status := nostr.Event{
-		ID:        nostr.MustIDFromHex("8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a"),
-		PubKey:    nostr.MustPubKeyFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		Kind:      1632,
 		CreatedAt: nostr.Now(),
-		Tags:      nostr.Tags{{"a", "30617:" + repoOwner + ":repo-1"}, {"e", rootPatchID, "", "root"}},
+		Tags: nostr.Tags{
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
+			{"e", rootPatch.ID.Hex(), "", "root"},
+		},
 	}
+	signEvent(t, randomSK, &status) // signed by random user = unauthorized
 	if err := processor.ProcessEvent(ctx, status, "wss://relay.test"); err != nil {
 		t.Fatalf("process status failed: %v", err)
 	}
 
-	patch := nostr.Event{
-		ID:        nostr.MustIDFromHex("8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b"),
-		PubKey:    nostr.MustPubKeyFromHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+	// Another patch on the same root — should NOT be skipped because status was unauthorized
+	patch2 := nostr.Event{
 		Kind:      1617,
 		CreatedAt: nostr.Now(),
-		Tags:      nostr.Tags{{"a", "30617:" + repoOwner + ":repo-1"}, {"e", rootPatchID, "", "root"}},
+		Tags:      nostr.Tags{{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"}, {"e", rootPatch.ID.Hex(), "", "root"}},
+		Content:   "diff2",
 	}
-	if err := processor.ProcessEvent(ctx, patch, "wss://relay.test"); err != nil {
+	signEvent(t, patchSK, &patch2)
+	if err := processor.ProcessEvent(ctx, patch2, "wss://relay.test"); err != nil {
 		t.Fatalf("process patch failed: %v", err)
 	}
 
@@ -262,8 +354,9 @@ func TestProcessorIgnoresUnauthorizedClosedStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count review log: %v", err)
 	}
-	if reviewRows != 1 {
-		t.Fatalf("expected 1 review row (status should be ignored), got %d", reviewRows)
+	// Both patches should have review_log entries (status from random user is ignored)
+	if reviewRows != 2 {
+		t.Fatalf("expected 2 review rows (unauthorized status should be ignored), got %d", reviewRows)
 	}
 }
 
@@ -272,21 +365,21 @@ func TestProcessorUsesEAsRootForPRUpdates(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 
-	repoOwner := "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+	repoSK := nostr.Generate()
+	patchSK := nostr.Generate()
 	rootPRID := "9999999999999999999999999999999999999999999999999999999999999999"
 
 	evt := nostr.Event{
-		ID:        nostr.MustIDFromHex("4545454545454545454545454545454545454545454545454545454545454545"),
-		PubKey:    nostr.MustPubKeyFromHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
 		Kind:      1619,
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
-			{"a", "30617:" + repoOwner + ":repo-1"},
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
 			{"E", rootPRID},
-			{"P", repoOwner},
+			{"P", nostr.GetPublicKey(repoSK).Hex()},
 			{"c", "1111111111111111111111111111111111111111"},
 		},
 	}
+	signEvent(t, patchSK, &evt)
 	if err := processor.ProcessEvent(ctx, evt, "wss://relay.test"); err != nil {
 		t.Fatalf("process pr update failed: %v", err)
 	}
@@ -302,41 +395,41 @@ func TestProcessorUsesEAsRootForPRUpdates(t *testing.T) {
 func TestProcessorMarksTaskForRetryWhenQueueFull(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
+	repoSK := nostr.Generate()
+	patchSK := nostr.Generate()
 
-	repoOwner := "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-	if err := store.UpsertRepositoryAnnouncement(ctx, nostr.Event{
-		ID:        nostr.MustIDFromHex("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"),
-		PubKey:    nostr.MustPubKeyFromHex(repoOwner),
+	repoEvt := nostr.Event{
 		Kind:      30617,
 		CreatedAt: nostr.Now(),
 		Tags:      nostr.Tags{{"d", "repo-1"}},
-	}); err != nil {
+	}
+	signEvent(t, repoSK, &repoEvt)
+	if err := store.UpsertRepositoryAnnouncement(ctx, repoEvt); err != nil {
 		t.Fatalf("seed repo: %v", err)
 	}
-
-	// Create processor with a queue of size 1
-	processor := &ingest.Processor{
-		ReviewQueue: make(chan db.ReviewTask, 1),
+	// Also insert the ingested event so the processor doesn't reject it for sig check
+	if _, err := store.InsertIngestedEvent(ctx, repoEvt); err != nil {
+		t.Fatalf("insert ingested repo event: %v", err)
 	}
-	// Manually construct a processor with a tiny queue to test overflow.
-	// The exported Processor struct has a ReviewQueue field we can replace.
+
+	// Create processor with a tiny queue to test overflow.
 	smallProcessor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	// Fill the queue completely.
 	for i := 0; i < cap(smallProcessor.ReviewQueue); i++ {
 		smallProcessor.ReviewQueue <- db.ReviewTask{PatchEventID: "filler", RepoID: "filler"}
 	}
-	_ = processor // unused, use smallProcessor
 
 	patch := nostr.Event{
-		ID:        nostr.MustIDFromHex("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"),
-		PubKey:    nostr.MustPubKeyFromHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
 		Kind:      1617,
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
-			{"a", "30617:" + repoOwner + ":repo-1"},
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
 			{"e", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "", "root"},
 		},
+		Content: "diff",
 	}
+	signEvent(t, patchSK, &patch)
+
 	// Process should not fail even when queue is full — task gets marked for retry.
 	if err := smallProcessor.ProcessEvent(ctx, patch, "wss://relay.test"); err != nil {
 		t.Fatalf("process should not error on full queue: %v", err)
