@@ -197,7 +197,7 @@ func main() {
 	var pipelineRunner *pipeline.Runner
 	if pubSvc != nil {
 		pipelineRunner = pipeline.New(
-			pipeline.Config{Workers: 2},
+			pipeline.Config{Workers: cfg.PipelineWorkers},
 			store,
 			repoSvc,
 			ctxBuilder,
@@ -212,10 +212,7 @@ func main() {
 	}
 
 	// --- Health check server ---
-	healthAddr := os.Getenv("DRYDOCK_HEALTH_ADDR")
-	if healthAddr == "" {
-		healthAddr = ":8081"
-	}
+	healthAddr := cfg.HealthAddr
 	healthSrv := health.New(store, logger)
 	go func() {
 		if err := healthSrv.ListenAndServe(healthAddr); err != nil {

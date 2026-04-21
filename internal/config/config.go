@@ -32,6 +32,8 @@ type Config struct {
 	MetaBaseURL     string
 	MetaModel       string
 	EvalDatasetPath string
+	HealthAddr      string
+	PipelineWorkers int
 }
 
 func FromEnv() Config {
@@ -64,6 +66,8 @@ func FromEnv() Config {
 		MetaBaseURL:         envOrDefault("DRYDOCK_META_BASE_URL", "http://127.0.0.1:11436/v1"),
 		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", "llama-3.3-70b-instruct-q4_k_m"),
 		EvalDatasetPath:     envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
+		HealthAddr:          envOrDefault("DRYDOCK_HEALTH_ADDR", ":8081"),
+		PipelineWorkers:     parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
 	}
 }
 

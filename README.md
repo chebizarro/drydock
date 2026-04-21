@@ -1,93 +1,107 @@
 # Drydock
 
-Drydock is an automated NIP-34 code review agent that ingests patch and PR events from Nostr, builds repository context, runs local model reviews, and publishes structured kind `1111` review comments.
+Automated code review for [NIP-34](https://github.com/nostr-protocol/nips/blob/master/34.md) Nostr repositories. Drydock listens for patch and pull request events on Nostr relays, reviews them with local LLMs, and publishes structured review comments back to the protocol.
 
-## Current bootstrap scope
+## How It Works
 
-- Go service skeleton with package boundaries for listener/ingest/db.
-- SQLite schema for:
-  - `repositories`
-  - `patch_events`
-  - `review_events`
-  - `thread_cache`
-  - `review_log`
-  - `meta_review_log`
-- Idempotency/state transition API for `review_log`:
-  - `pending -> reviewing -> published|failed`
-  - unique `(patch_event_id, repo_id)` gate
-- Nostr listener wired to kinds:
-  - `30617`, `30618`
-  - `1617`, `1618`, `1619`
-  - `1621`, `1111`
-  - `1630-1633`
-  - `1985`
-- Ingestion path reuses `fiatjaf.com/nostr/nip34` for repository and patch parsing.
-- 30618 snapshot integration:
-  - stores latest repository state per repo (`repository_snapshots`)
-  - skips review queue enqueue when patch/PR tip commit is already present in latest snapshot refs
-- Deterministic context builder module (`internal/contextbuilder`):
-  - strict priority layers with hard 64K token budget
-  - deterministic drop behavior (`context-layers-used` / `context-layers-dropped`)
-  - exclusion rules for generated/binary/lock artifacts
-- LLM planner+reviewer routing engine (`internal/reviewengine`):
-  - planner JSON output with explicit `model_route` (`coder32b|llm70b|coder14b`)
-  - route-aware reviewer execution against OpenAI-compatible local endpoints
-  - file-type checklist injection and security-sensitive prompt augmentation
-  - strict reviewer findings schema validation
-- Review publisher (`internal/publisher`):
-  - builds and publishes kind `1111` summary comments (+ high/critical detail comments)
-  - includes required metadata footer fields (`context-layers-dropped` always present)
-  - relay fanout = patch-seen relays + repository announcement relays
-  - explicit guard to never emit status kinds `1631` / `1632`
-- Bunker signer helper (`internal/signing`):
-  - supports NIP-46 bunker / NIP-05 bunker identity inputs only (no embedded nsec requirement path)
-- Meta-review pipeline (`internal/metareview`):
-  - gating: low confidence, security-sensitive paths, random baseline sample
-  - context-hash dedupe with changed-line Jaccard reuse
-  - persisted critique logs + feedback routing decisions
-  - few-shot positive/negative example updates with cap pruning
-- Held-out eval harness (`internal/eval` + `cmd/drydock-eval`):
-  - dataset-driven monthly run flow with persisted `eval_runs`
-  - metrics: recall, false-positive rate, confidence calibration (MAE), high-confidence precision
-  - sample dataset at `eval/heldout-sample.json` (5 cases covering security, correctness, concurrency, and clean-pass scenarios)
+```
+Nostr Relays ──subscribe──▶ Listener ──▶ Ingest ──▶ Pipeline Workers
+                                                        │
+                                         ┌──────────────┼──────────────┐
+                                         ▼              ▼              ▼
+                                    Clone Repo    Build Context    LLM Review
+                                                  (64K tokens)    (planner→reviewer)
+                                                                       │
+                                                                       ▼
+Nostr Relays ◀──publish──────────────────────────────── Publisher (kind 1111)
+```
 
-## Run
+Drydock subscribes to NIP-34 event kinds (patches, PRs, repository announcements, status updates). When a new patch arrives, it clones the referenced repository, builds a deterministic context bundle within a 64K token budget, routes the patch through a planner→reviewer LLM pipeline, and publishes structured kind 1111 review comments. A meta-review loop evaluates review quality and feeds improvements back into the system.
+
+All inference runs locally via OpenAI-compatible endpoints (Ollama, llama.cpp, vLLM). No code leaves your infrastructure.
+
+## Quick Start
 
 ```bash
+# Clone and build
+git clone https://github.com/user/drydock.git && cd drydock
+go build ./...
+
+# Configure
+cp .env.example .env
+# Edit .env — set your signing identity and LLM endpoints
+
+# Run
 go run ./cmd/drydock
 ```
 
-## Run eval harness
+See [Deployment](docs/deployment.md) for Docker, multi-GPU, and production setups.
 
-```bash
-go run ./cmd/drydock-eval
+## Prerequisites
+
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| Go | 1.26+ | `CGO_ENABLED=0` — no C toolchain needed |
+| Git | any | Used at runtime for clone, fetch, grep |
+| Ollama (or compatible) | any | OpenAI-compatible `/chat/completions` endpoint |
+
+## Configuration
+
+All configuration is via `DRYDOCK_*` environment variables. See the full reference: **[docs/configuration.md](docs/configuration.md)**
+
+Key settings:
+- `DRYDOCK_SIGNER_BUNKER_URL` or `DRYDOCK_SIGNER_NSEC` — Nostr signing identity
+- `DRYDOCK_RELAYS` — comma-separated relay URLs
+- `DRYDOCK_PLANNER_BASE_URL`, `DRYDOCK_LLM70B_BASE_URL`, etc. — LLM endpoints
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](docs/architecture.md) | Component map, data flow, state machine, concurrency model |
+| [Configuration](docs/configuration.md) | Complete environment variable reference |
+| [Deployment](docs/deployment.md) | Native, Docker, signing, LLM setup, production hardening |
+| [Nostr Protocol](docs/nostr-protocol.md) | Subscribed kinds, NIP-42 AUTH, comment structure, publishing rules |
+| [Review Engine](docs/review-engine.md) | Two-stage planner→reviewer pipeline, model routing, finding schema |
+| [Context Builder](docs/context-builder.md) | 7-layer priority system, token budget, exclusion rules |
+| [Meta-Review](docs/meta-review.md) | Self-improvement loop, gating logic, feedback routing |
+| [Evaluation](docs/eval.md) | Held-out eval harness, metrics, dataset format |
+| [Scaling](docs/scaling.md) | Bottlenecks, worker tuning, repo cache sizing, multi-instance |
+| [Payments](docs/payments.md) | Forward-looking NWC and Cashu ecash integration architecture |
+
+## Project Structure
+
+```
+cmd/
+  drydock/          # Main service binary
+  drydock-eval/     # Evaluation harness binary
+internal/
+  config/           # Environment variable parsing
+  listener/         # Nostr relay subscription and event dispatch
+  ingest/           # Event verification, dedup, and review queue
+  pipeline/         # Worker pool orchestrating the review lifecycle
+  contextbuilder/   # Deterministic context assembly (7 layers, 64K budget)
+  reviewengine/     # Planner→reviewer LLM pipeline with retry
+  publisher/        # Kind 1111 comment construction and relay fanout
+  metareview/       # Self-improvement loop with few-shot management
+  repo/             # Git repo cloning, patching, and LRU cache
+  signing/          # NIP-46 bunker and local nsec signers
+  db/               # SQLite storage, schema, and queries
+  health/           # /healthz and /readyz HTTP endpoints
+  eval/             # Evaluation harness and metrics
+eval/
+  heldout-sample.json  # Labeled evaluation dataset
 ```
 
-## Container deployment
-
-1. Copy env template:
-```bash
-cp .env.example .env
-```
-2. Build and run:
-```bash
-docker compose up --build -d
-```
-
-Listener mode uses `DRYDOCK_MODE=listener` (default).  
-Eval mode uses `DRYDOCK_MODE=eval`.
-
-### Makefile shortcuts
+## Development
 
 ```bash
-make up      # build + start listener service
-make logs    # follow logs
-make eval    # run eval harness in container
-make down    # stop stack
+make build    # go build ./...
+make test     # go test ./...
 ```
 
-## Environment
+This project uses [beads](https://github.com/beads-project/beads) for issue tracking. Run `bd ready` to find available work.
 
-- `DRYDOCK_DATABASE_URL` (default: `file:drydock.db?...`)
-- `DRYDOCK_RELAYS` (comma-separated)
-- `DRYDOCK_LOG_LEVEL` (`debug|info|warn|error`)
+## License
+
+MIT
