@@ -36,6 +36,24 @@ type MetaReviewReuse struct {
 	ResponseJSON string
 }
 
+// MetaReviewSample is a meta-review record returned by SampleRecentMetaReviews.
+type MetaReviewSample struct {
+	ID           int64
+	PatchEventID string
+	RepoID       string
+	GateReason   string
+	ResponseJSON string
+	CreatedAt    int64
+}
+
+// DriftFlag records a human-flagged meta-review that exhibits convention drift.
+type DriftFlag struct {
+	ID           int64
+	MetaReviewID int64
+	Notes        string
+	FlaggedAt    int64
+}
+
 func Open(ctx context.Context, dsn string) (*Store, error) {
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -1377,6 +1395,104 @@ func (s *Store) GetPromptVersionByNumber(ctx context.Context, promptName string,
 		pv.EvalScore = &evalScore.Float64
 	}
 	return pv, nil
+}
+
+// --- Drift Guard ---
+
+// SampleRecentMetaReviews returns a random sample of N recent meta-reviews.
+func (s *Store) SampleRecentMetaReviews(ctx context.Context, n int) ([]MetaReviewSample, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, patch_event_id, repo_id, gate_reason, response_json, created_at
+		FROM meta_review_log
+		WHERE response_json != ''
+		ORDER BY RANDOM()
+		LIMIT ?`, n,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sample meta reviews: %w", err)
+	}
+	defer rows.Close()
+
+	var samples []MetaReviewSample
+	for rows.Next() {
+		var s MetaReviewSample
+		if err := rows.Scan(&s.ID, &s.PatchEventID, &s.RepoID, &s.GateReason, &s.ResponseJSON, &s.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan meta review sample: %w", err)
+		}
+		samples = append(samples, s)
+	}
+	return samples, rows.Err()
+}
+
+// InsertDriftFlag marks a meta-review as exhibiting convention drift.
+func (s *Store) InsertDriftFlag(ctx context.Context, metaReviewID int64, notes string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO drift_flags(meta_review_id, notes, flagged_at) VALUES (?, ?, ?)`,
+		metaReviewID, notes, time.Now().Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("insert drift flag: %w", err)
+	}
+	return nil
+}
+
+// GetDriftFlaggedExamples returns the response_json and notes for all drift-flagged meta-reviews.
+func (s *Store) GetDriftFlaggedExamples(ctx context.Context, limit int) ([]DriftFlag, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT df.id, df.meta_review_id, df.notes, df.flagged_at
+		FROM drift_flags df
+		ORDER BY df.flagged_at DESC
+		LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get drift flagged examples: %w", err)
+	}
+	defer rows.Close()
+
+	var flags []DriftFlag
+	for rows.Next() {
+		var f DriftFlag
+		if err := rows.Scan(&f.ID, &f.MetaReviewID, &f.Notes, &f.FlaggedAt); err != nil {
+			return nil, fmt.Errorf("scan drift flag: %w", err)
+		}
+		flags = append(flags, f)
+	}
+	return flags, rows.Err()
+}
+
+// GetDriftFlaggedResponses returns response JSON and notes for flagged reviews,
+// used as negative examples in the meta-reviewer prompt.
+func (s *Store) GetDriftFlaggedResponses(ctx context.Context, limit int) ([]struct {
+	ResponseJSON string
+	Notes        string
+}, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT m.response_json, df.notes
+		FROM drift_flags df
+		JOIN meta_review_log m ON m.id = df.meta_review_id
+		ORDER BY df.flagged_at DESC
+		LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get drift flagged responses: %w", err)
+	}
+	defer rows.Close()
+
+	var results []struct {
+		ResponseJSON string
+		Notes        string
+	}
+	for rows.Next() {
+		var r struct {
+			ResponseJSON string
+			Notes        string
+		}
+		if err := rows.Scan(&r.ResponseJSON, &r.Notes); err != nil {
+			return nil, fmt.Errorf("scan drift flagged response: %w", err)
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
 }
 
 // GetLatestEvalRecall returns the recall from the most recent eval run, or 0 if none.

@@ -2,17 +2,20 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
+	"drydock/internal/db"
+	"drydock/internal/driftguard"
 	"drydock/internal/embedding"
 	"drydock/internal/health"
-	"drydock/internal/db"
 	"drydock/internal/ingest"
 	"drydock/internal/listener"
 	"drydock/internal/lspbridge"
@@ -37,6 +40,12 @@ func main() {
 	// --- NIP ingest mode: run and exit ---
 	if mode := os.Getenv("DRYDOCK_MODE"); mode == "nip-ingest" {
 		runNIPIngest(cfg, logger)
+		return
+	}
+
+	// --- Drift guard mode: export/flag/list and exit ---
+	if mode := os.Getenv("DRYDOCK_MODE"); mode == "drift-guard" {
+		runDriftGuard(cfg, logger)
 		return
 	}
 
@@ -381,6 +390,74 @@ func main() {
 		logger.Info("graceful shutdown complete")
 	case <-drainCtx.Done():
 		logger.Warn("graceful shutdown timed out, exiting", "timeout", drainTimeout)
+	}
+}
+
+// runDriftGuard runs the convention drift guard CLI and exits.
+func runDriftGuard(cfg config.Config, logger *slog.Logger) {
+	ctx := context.Background()
+
+	store, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to open database", "error", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+
+	svc := driftguard.NewService(store, logger)
+
+	args := os.Args[1:]
+	if len(args) == 0 {
+		args = []string{"export"}
+	}
+
+	switch args[0] {
+	case "export":
+		n := 20
+		if len(args) > 1 {
+			if _, err := fmt.Sscanf(args[1], "%d", &n); err != nil {
+				logger.Error("invalid sample size", "arg", args[1])
+				os.Exit(1)
+			}
+		}
+		count, err := svc.ExportSample(ctx, os.Stdout, n)
+		if err != nil {
+			logger.Error("export failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("drift guard export complete", "count", count)
+
+	case "flag":
+		if len(args) < 2 {
+			logger.Error("usage: drydock flag <meta-review-id> [notes]")
+			os.Exit(1)
+		}
+		var id int64
+		if _, err := fmt.Sscanf(args[1], "%d", &id); err != nil {
+			logger.Error("invalid meta-review ID", "arg", args[1])
+			os.Exit(1)
+		}
+		notes := ""
+		if len(args) > 2 {
+			notes = strings.Join(args[2:], " ")
+		}
+		if err := svc.FlagReview(ctx, id, notes); err != nil {
+			logger.Error("flag failed", "error", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stdout, "Flagged meta-review %d as convention drift.\n", id)
+
+	case "list":
+		count, err := svc.ListFlagged(ctx, os.Stdout)
+		if err != nil {
+			logger.Error("list failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("drift guard list complete", "count", count)
+
+	default:
+		logger.Error("unknown drift-guard subcommand", "cmd", args[0], "valid", "export, flag, list")
+		os.Exit(1)
 	}
 }
 

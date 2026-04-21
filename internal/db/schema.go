@@ -183,4 +183,12 @@ CREATE TABLE IF NOT EXISTS prompt_versions (
   UNIQUE(prompt_name, version)
 );
 CREATE INDEX IF NOT EXISTS idx_prompt_versions_name_status ON prompt_versions(prompt_name, status);
+
+CREATE TABLE IF NOT EXISTS drift_flags (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  meta_review_id INTEGER NOT NULL,
+  notes TEXT NOT NULL DEFAULT '',
+  flagged_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_drift_flags_meta_review_id ON drift_flags(meta_review_id);
 `
