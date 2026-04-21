@@ -116,6 +116,15 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 	return result, nil
 }
 
+func (s *Service) CleanupReviewBranch(ctx context.Context, repoPath, branch string) {
+	if branch == "" || repoPath == "" {
+		return
+	}
+	if err := s.manager.CleanupReviewBranch(ctx, repoPath, branch); err != nil {
+		s.logger.Warn("failed to clean up review branch", "branch", branch, "error", err)
+	}
+}
+
 func cloneURLsFromEvent(event nostr.Event) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, 2)

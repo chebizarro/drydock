@@ -65,7 +65,7 @@ type Builder struct {
 func NewDefault() *Builder {
 	return &Builder{
 		TokenBudget: DefaultTokenBudget,
-		Counter:     ApproxTokenCounter{},
+		Counter:     DefaultTiktokenCounter(),
 		Providers:   DefaultProviders(),
 	}
 }

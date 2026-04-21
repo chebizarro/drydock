@@ -107,8 +107,14 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 1. Prepare repo + apply patch series
 	prep, err := r.repoSvc.PreparePatchSeries(ctx, task.PatchEventID)
 	if err != nil {
+		// Publish a review comment about the apply failure so the patch author gets feedback
+		if prep.FailureHint != "" && r.pubSvc != nil {
+			r.publishApplyFailure(ctx, task, prep.FailureHint)
+		}
 		return fmt.Errorf("prepare patch series: %w", err)
 	}
+	// Clean up the throwaway review branch when done (success or failure)
+	defer r.repoSvc.CleanupReviewBranch(ctx, prep.RepoPath, prep.Branch)
 
 	// 2. Get patch event for context builder and meta-review
 	patchRec, err := r.store.GetPatchEvent(ctx, task.PatchEventID)
@@ -133,22 +139,30 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return fmt.Errorf("build context: %w", err)
 	}
 
-	// 5. Run LLM review engine
+	// 5. Retrieve few-shot examples for reviewer prompt injection
+	fewShot, err := r.store.GetRecentFewShots(ctx, 3)
+	if err != nil {
+		r.logger.Warn("failed to retrieve few-shot examples, continuing without", "error", err)
+		fewShot = nil
+	}
+
+	// 6. Run LLM review engine
 	result, err := r.engine.Run(ctx, reviewengine.RunInput{
 		ContextBundle: bundle.Content,
 		ChangedFiles:  changedFilesFromBundle(bundle),
+		FewShot:       fewShot,
 	})
 	if err != nil {
 		return fmt.Errorf("review engine: %w", err)
 	}
 
-	// 6. Compute context hash
+	// 7. Compute context hash
 	ctxHash := fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content)))
 
-	// 7. Compute mean confidence
+	// 8. Compute mean confidence
 	confidence := meanConfidence(result.Review.Findings)
 
-	// 8. Publish review
+	// 9. Publish review
 	reviewEventID, err := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
 		PatchEventID:         task.PatchEventID,
 		RepoID:               task.RepoID,
@@ -165,7 +179,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return fmt.Errorf("publish review: %w", err)
 	}
 
-	// 9. Log success (MarkReviewPublished is already called inside PublishReview)
+	// 10. Log success (MarkReviewPublished is already called inside PublishReview)
 	r.logger.Info("review published",
 		"patch_event_id", task.PatchEventID,
 		"repo_id", task.RepoID,
@@ -173,7 +187,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		"findings", len(result.Review.Findings),
 	)
 
-	// 10. Async meta-review (non-blocking)
+	// 11. Async meta-review (non-blocking)
 	if r.metaSvc != nil {
 		r.metaSvc.RunAsync(ctx, metareview.Input{
 			PatchEventID:  task.PatchEventID,
@@ -187,6 +201,38 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	return nil
+}
+
+func (r *Runner) publishApplyFailure(ctx context.Context, task db.ReviewTask, hint string) {
+	summary := fmt.Sprintf(
+		"This patch does not apply cleanly to the current HEAD.\n\nReason: %s\n\n"+
+			"The patch may need to be rebased or updated to resolve conflicts.",
+		hint,
+	)
+	_, err := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
+		PatchEventID:         task.PatchEventID,
+		RepoID:               task.RepoID,
+		Summary:              summary,
+		Findings:             nil,
+		Model:                "none",
+		ContextHash:          "",
+		Confidence:           0,
+		ContextLayersUsed:    nil,
+		ContextLayersDropped: nil,
+		Superseded:           false,
+	})
+	if err != nil {
+		r.logger.Warn("failed to publish apply-failure review",
+			"patch_event_id", task.PatchEventID,
+			"repo_id", task.RepoID,
+			"error", err,
+		)
+	} else {
+		r.logger.Info("published apply-failure review",
+			"patch_event_id", task.PatchEventID,
+			"repo_id", task.RepoID,
+		)
+	}
 }
 
 func changedFilesFromBundle(b contextbuilder.ContextBundle) []string {

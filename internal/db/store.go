@@ -730,6 +730,34 @@ func (s *Store) InsertFewShot(ctx context.Context, patchEventID, repoID, example
 	return nil
 }
 
+func (s *Store) GetRecentFewShots(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT content FROM few_shot_reviews
+		WHERE example_type = 'positive'
+		ORDER BY created_at DESC
+		LIMIT ?`,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get recent few shots: %w", err)
+	}
+	defer rows.Close()
+
+	var results []string
+	for rows.Next() {
+		var content string
+		if err := rows.Scan(&content); err != nil {
+			return nil, fmt.Errorf("scan few shot row: %w", err)
+		}
+		results = append(results, content)
+	}
+	return results, rows.Err()
+}
+
 func (s *Store) PruneFewShotToCap(ctx context.Context, cap int) error {
 	if cap <= 0 {
 		return nil
