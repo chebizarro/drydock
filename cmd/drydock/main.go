@@ -18,6 +18,7 @@ import (
 	"drydock/internal/lspbridge"
 	"drydock/internal/metareview"
 	"drydock/internal/pipeline"
+	"drydock/internal/promptrefine"
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
@@ -246,6 +247,13 @@ func main() {
 		MaxConcurrent:    2,
 	}, store, metaClient, logger)
 
+	// --- Prompt refinement (reuses the meta-review LLM endpoint) ---
+	prSvc := promptrefine.New(promptrefine.Config{
+		Threshold:          promptrefine.DefaultThreshold,
+		Endpoint:           reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.MetaModel},
+		EvalScoreTolerance: 0.05,
+	}, store, metaClient, logger)
+
 	// --- Pipeline runner ---
 	var pipelineRunner *pipeline.Runner
 	if pubSvc != nil {
@@ -259,6 +267,7 @@ func main() {
 			metaSvc,
 			processor.ReviewQueue,
 			logger,
+			pipeline.WithPromptRefiner(prSvc),
 		)
 	} else {
 		logger.Warn("pipeline runner disabled (no signer configured)")
@@ -285,6 +294,28 @@ func main() {
 	if pipelineRunner != nil {
 		go pipelineRunner.Run(ctx)
 	}
+
+	// --- Background prompt refinement loop (checks every 5 minutes) ---
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				result, err := prSvc.CheckAndRefine(ctx)
+				if err != nil {
+					logger.Warn("prompt refinement check failed", "error", err)
+				} else if result.Triggered {
+					logger.Info("prompt refinement triggered",
+						"gaps_processed", result.GapsProcessed,
+						"new_version_id", result.NewVersionID,
+					)
+				}
+			}
+		}
+	}()
 
 	healthSrv.SetReady(true)
 

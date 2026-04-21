@@ -9,6 +9,7 @@ import (
 	"drydock/internal/config"
 	"drydock/internal/db"
 	"drydock/internal/eval"
+	"drydock/internal/promptrefine"
 	"drydock/internal/reviewengine"
 )
 
@@ -57,5 +58,20 @@ func main() {
 	out, _ := json.MarshalIndent(metrics, "", "  ")
 	_, _ = os.Stdout.Write(out)
 	_, _ = os.Stdout.WriteString("\n")
+
+	// --- Prompt refinement eval gate ---
+	// After each eval run, check if the active prompt version should be
+	// rolled back due to eval score regression.
+	prSvc := promptrefine.New(promptrefine.Config{
+		EvalScoreTolerance: 0.05,
+	}, store, nil, logger) // nil LLM client — rollback doesn't need LLM
+	rbResult, err := prSvc.EvalAndMaybeRollback(ctx)
+	if err != nil {
+		logger.Warn("prompt version eval check failed", "error", err)
+	} else if rbResult.RolledBack {
+		logger.Warn("prompt version rolled back after eval regression",
+			"reason", rbResult.RollbackReason,
+		)
+	}
 }
 

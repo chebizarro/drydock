@@ -12,6 +12,7 @@ import (
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/metareview"
+	"drydock/internal/promptrefine"
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
@@ -21,20 +22,34 @@ import (
 
 // Runner reads review tasks from a channel and executes the full pipeline:
 // repo prepare → context build → LLM review → publish → meta-review.
+// PromptRefiner is the subset of promptrefine.Service used by the pipeline.
+type PromptRefiner interface {
+	ActiveReviewerPrompt(ctx context.Context) string
+}
+
 type Runner struct {
-	store      *db.Store
-	repoSvc    *repo.Service
-	ctxBuilder *contextbuilder.Builder
-	engine     *reviewengine.Engine
-	pubSvc     *publisher.Service
-	metaSvc    *metareview.Service
-	queue      <-chan db.ReviewTask
-	workers    int
-	logger     *slog.Logger
+	store         *db.Store
+	repoSvc       *repo.Service
+	ctxBuilder    *contextbuilder.Builder
+	engine        *reviewengine.Engine
+	pubSvc        *publisher.Service
+	metaSvc       *metareview.Service
+	promptRefiner PromptRefiner
+	queue         <-chan db.ReviewTask
+	workers       int
+	logger        *slog.Logger
 }
 
 type Config struct {
 	Workers int
+}
+
+// WithPromptRefiner sets an optional prompt refinement service on the runner.
+// When set, the runner uses the active versioned reviewer prompt for each review.
+func WithPromptRefiner(pr *promptrefine.Service) func(*Runner) {
+	return func(r *Runner) {
+		r.promptRefiner = pr
+	}
 }
 
 func New(
@@ -47,12 +62,13 @@ func New(
 	metaSvc *metareview.Service,
 	queue <-chan db.ReviewTask,
 	logger *slog.Logger,
+	opts ...func(*Runner),
 ) *Runner {
 	workers := cfg.Workers
 	if workers <= 0 {
 		workers = 2
 	}
-	return &Runner{
+	r := &Runner{
 		store:      store,
 		repoSvc:    repoSvc,
 		ctxBuilder: ctxBuilder,
@@ -63,6 +79,10 @@ func New(
 		workers:    workers,
 		logger:     logger,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Run starts worker goroutines and blocks until ctx is cancelled.
@@ -146,11 +166,16 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		fewShot = nil
 	}
 
-	// 6. Run LLM review engine
+	// 6. Run LLM review engine (with active prompt version override if available)
+	var promptOverride string
+	if r.promptRefiner != nil {
+		promptOverride = r.promptRefiner.ActiveReviewerPrompt(ctx)
+	}
 	result, err := r.engine.Run(ctx, reviewengine.RunInput{
-		ContextBundle: bundle.Content,
-		ChangedFiles:  changedFilesFromBundle(bundle),
-		FewShot:       fewShot,
+		ContextBundle:                bundle.Content,
+		ChangedFiles:                 changedFilesFromBundle(bundle),
+		FewShot:                      fewShot,
+		ReviewerSystemPromptOverride: promptOverride,
 	})
 	if err != nil {
 		return fmt.Errorf("review engine: %w", err)
