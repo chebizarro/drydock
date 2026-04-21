@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 
+	"drydock/internal/symbols"
+
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
 )
 
@@ -22,10 +24,12 @@ func DefaultProviders(opts ...BuilderOptions) []Provider {
 		opt = opts[0]
 	}
 
+	extractor := symbols.New()
+
 	providers := []Provider{
 		patchDiffProvider{},
 		fileContextProvider{},
-		symbolsCallsitesProvider{lspClient: opt.lspClient},
+		symbolsCallsitesProvider{lspClient: opt.lspClient, extractor: extractor},
 		testsProvider{},
 		importsExportsProvider{},
 		commitHistoryProvider{},
@@ -107,7 +111,8 @@ func (fileContextProvider) Build(_ context.Context, in BuildInput) (string, erro
 }
 
 type symbolsCallsitesProvider struct {
-	lspClient interface{} // optional *lspbridge.Client for enhanced analysis
+	lspClient interface{}        // optional *lspbridge.Client for enhanced analysis
+	extractor  *symbols.Extractor // tree-sitter symbol extractor
 }
 
 func (p symbolsCallsitesProvider) LayerName() string { return LayerSymbolsCallsites }
@@ -116,20 +121,27 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 	if in.RepoPath == "" {
 		return "", nil
 	}
-	symbols := extractChangedSymbols(in.PatchEventContent)
-	if len(symbols) == 0 {
+
+	// Try tree-sitter extraction first for accurate, AST-based symbol detection.
+	// Falls back to regex for unsupported languages or when tree-sitter is unavailable.
+	syms := p.extractWithTreeSitter(in)
+	if len(syms) == 0 {
+		syms = extractChangedSymbols(in.PatchEventContent)
+	}
+	if len(syms) == 0 {
 		return "", nil
 	}
+
 	var out strings.Builder
 	out.WriteString("symbols: ")
-	out.WriteString(strings.Join(symbols, ", "))
+	out.WriteString(strings.Join(syms, ", "))
 	out.WriteString("\n")
 
 	// TODO: When lspClient is set and reachable, query LSP bridge for
 	// type-aware symbol definitions and references. For now, always
 	// use git grep as the fallback.
 
-	for _, sym := range symbols {
+	for _, sym := range syms {
 		lines, err := gitGrep(ctx, in.RepoPath, sym)
 		if err != nil || lines == "" {
 			continue
@@ -141,6 +153,81 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 		out.WriteString("\n")
 	}
 	return strings.TrimSpace(out.String()), nil
+}
+
+// extractWithTreeSitter parses changed files from the diff using tree-sitter
+// and returns symbol names that overlap with changed line ranges.
+func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput) []string {
+	if p.extractor == nil {
+		return nil
+	}
+
+	files, err := parsePatch(in.PatchEventContent)
+	if err != nil {
+		return nil
+	}
+
+	var names []string
+	for _, f := range files {
+		path := pickPath(f)
+		if path == "" || isExcludedPath(path) {
+			continue
+		}
+
+		ext := filepath.Ext(path)
+		lang := symbols.LangFromExt(ext)
+		if lang == "" {
+			continue
+		}
+
+		abs := filepath.Join(in.RepoPath, path)
+		source, err := os.ReadFile(abs)
+		if err != nil {
+			continue
+		}
+
+		changedLines := extractChangedLineNumbers(f)
+		result, err := p.extractor.ExtractChanged(lang, source, changedLines)
+		if err != nil {
+			continue
+		}
+
+		for _, s := range result {
+			names = append(names, s.Name)
+		}
+	}
+
+	slices.Sort(names)
+	names = slices.Compact(names)
+	if len(names) > 12 {
+		names = names[:12]
+	}
+	return names
+}
+
+// extractChangedLineNumbers returns 0-based line numbers from the new file
+// that correspond to added lines in the diff.
+func extractChangedLineNumbers(f *gitdiff.File) []uint32 {
+	var lines []uint32
+	for _, frag := range f.TextFragments {
+		if frag == nil {
+			continue
+		}
+		// NewPosition is 1-based; tree-sitter uses 0-based
+		newLine := uint32(frag.NewPosition) - 1
+		for _, line := range frag.Lines {
+			switch line.Op {
+			case gitdiff.OpAdd:
+				lines = append(lines, newLine)
+				newLine++
+			case gitdiff.OpDelete:
+				// Deleted lines don't exist in the new file
+			default: // context
+				newLine++
+			}
+		}
+	}
+	return lines
 }
 
 type testsProvider struct{}
