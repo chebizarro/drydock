@@ -313,6 +313,64 @@ func TestPublishReviewExcludedFilesInFooter(t *testing.T) {
 	}
 }
 
+// failNthRelayPublisher fails on specific 0-based call indices.
+type failNthRelayPublisher struct {
+	failOnIndices map[int]bool
+	callIndex     int
+	calls         []publishCall
+}
+
+func (f *failNthRelayPublisher) Publish(_ context.Context, relays []string, event nostr.Event) error {
+	idx := f.callIndex
+	f.callIndex++
+	f.calls = append(f.calls, publishCall{relays: append([]string(nil), relays...), event: event})
+	if f.failOnIndices[idx] {
+		return fmt.Errorf("simulated relay failure on call %d", idx)
+	}
+	return nil
+}
+
+func TestPublishReviewDetailFailureDoesNotBreakSummary(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	// Fail on calls 1 and 2 (the detail findings); call 0 (summary) succeeds.
+	fakePub := &failNthRelayPublisher{failOnIndices: map[int]bool{1: true, 2: true}}
+	svc := New(Config{
+		DefaultRelays:       []string{"wss://fallback.example"},
+		DetailSeverityFloor: "high",
+	}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	eventID, err := svc.PublishReview(ctx, PublishInput{
+		PatchEventID:      patchID,
+		RepoID:            repoID,
+		Summary:           "Found issues.",
+		Model:             "test-model",
+		ContextHash:       "hash-detail-fail",
+		Confidence:        0.8,
+		ContextLayersUsed: []string{"patch"},
+		Findings: []reviewengine.Finding{
+			{Severity: "critical", Category: "security", File: "auth.go", Line: 5, Evidence: "x", Explanation: "bad", Suggestion: "fix"},
+			{Severity: "high", Category: "correctness", File: "main.go", Line: 10, Evidence: "y", Explanation: "wrong", Suggestion: "change"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected success (summary published), got error: %v", err)
+	}
+	if strings.TrimSpace(eventID) == "" {
+		t.Fatal("expected non-empty summary event id")
+	}
+
+	// Summary was published (call 0), detail attempts were made (calls 1,2) but failed.
+	if len(fakePub.calls) != 3 {
+		t.Fatalf("expected 3 publish calls (1 summary + 2 detail attempts), got %d", len(fakePub.calls))
+	}
+}
+
 func TestPublishReviewPartialRelayFailureStillSucceeds(t *testing.T) {
 	// This test verifies that when the publisher succeeds (returns nil),
 	// the service treats it as success. The real NostrRelayPublisher handles

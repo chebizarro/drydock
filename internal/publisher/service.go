@@ -75,6 +75,25 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	if strings.TrimSpace(in.RepoID) == "" {
 		return "", errors.New("repo id is required")
 	}
+
+	// Idempotency check: if a prior run already published a review event for
+	// this patch/repo but crashed before marking it published in the DB,
+	// skip re-publishing and just mark it published now.
+	if priorEventID, err := s.store.GetReviewEventID(ctx, in.PatchEventID, in.RepoID); err == nil && priorEventID != "" {
+		s.logger.Info("review already published by prior run, marking published",
+			"patch_event_id", in.PatchEventID,
+			"repo_id", in.RepoID,
+			"review_event_id", priorEventID,
+		)
+		if err := s.store.MarkReviewPublished(ctx, in.PatchEventID, in.RepoID, priorEventID); err != nil {
+			// If it's already published, that's fine.
+			if !errors.Is(err, db.ErrReviewNotFound) {
+				return priorEventID, nil
+			}
+		}
+		return priorEventID, nil
+	}
+
 	patchRec, err := s.store.GetPatchEvent(ctx, in.PatchEventID)
 	if err != nil {
 		return "", err
@@ -115,6 +134,16 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	if summaryEvent.Kind == 1631 || summaryEvent.Kind == 1632 {
 		return "", errors.New("publisher must not emit status events 1631/1632")
 	}
+
+	// Record the review event ID in review_log *before* publishing to relays.
+	// This creates a crash-recovery breadcrumb: if we crash after relay
+	// publish but before MarkReviewPublished, the idempotency check at the
+	// top of PublishReview will detect the prior event and skip re-publishing.
+	if err := s.store.SetReviewEventID(ctx, in.PatchEventID, in.RepoID, summaryEvent.ID.Hex()); err != nil {
+		s.logger.Warn("failed to pre-record review event ID (continuing)",
+			"patch_event_id", in.PatchEventID, "error", err)
+	}
+
 	if err := s.publish.Publish(ctx, relays, summaryEvent); err != nil {
 		return "", fmt.Errorf("publish summary review event: %w", err)
 	}
@@ -122,10 +151,12 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 		return "", err
 	}
 
+	var detailEligible, detailPublished int
 	for _, finding := range in.Findings {
 		if !isAtOrAboveSeverity(finding.Severity, s.cfg.DetailSeverityFloor) {
 			continue
 		}
+		detailEligible++
 		detail := nostr.Event{
 			Kind:      nostr.KindComment,
 			CreatedAt: nostr.Now(),
@@ -133,14 +164,30 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 			Content:   buildFindingContent(finding, in),
 		}
 		if err := s.signer.SignEvent(ctx, &detail); err != nil {
-			s.logger.Error("failed to sign detail finding event", "patch_event_id", in.PatchEventID, "error", err)
+			s.logger.Error("failed to sign detail finding event",
+				"patch_event_id", in.PatchEventID, "finding_file", finding.File,
+				"finding_line", finding.Line, "error", err)
 			continue
 		}
 		if err := s.publish.Publish(ctx, relays, detail); err != nil {
-			s.logger.Error("failed to publish detail finding event", "patch_event_id", in.PatchEventID, "error", err)
+			s.logger.Error("failed to publish detail finding event",
+				"patch_event_id", in.PatchEventID, "finding_file", finding.File,
+				"finding_line", finding.Line, "error", err)
 			continue
 		}
-		_ = s.store.InsertReviewEvent(ctx, detail, in.PatchEventID, in.RepoID)
+		if err := s.store.InsertReviewEvent(ctx, detail, in.PatchEventID, in.RepoID); err != nil {
+			s.logger.Error("failed to store detail finding event",
+				"patch_event_id", in.PatchEventID, "detail_event_id", detail.ID.Hex(),
+				"error", err)
+		}
+		detailPublished++
+	}
+	if detailEligible > 0 && detailPublished < detailEligible {
+		s.logger.Warn("some detail findings failed to publish",
+			"patch_event_id", in.PatchEventID,
+			"eligible", detailEligible,
+			"published", detailPublished,
+			"failed", detailEligible-detailPublished)
 	}
 
 	if err := s.store.MarkReviewPublished(ctx, in.PatchEventID, in.RepoID, summaryEvent.ID.Hex()); err != nil {

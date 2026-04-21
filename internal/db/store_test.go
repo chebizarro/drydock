@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func mustOpenStore(t *testing.T, ctx context.Context) *Store {
@@ -176,4 +177,128 @@ func TestIsPatchSuperseded(t *testing.T) {
 			t.Error("expected patch in different repo to NOT be superseded")
 		}
 	})
+}
+
+func TestGetAndSetReviewEventID(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	// Seed a review_log entry via BeginReview.
+	_, err := store.db.ExecContext(ctx,
+		`INSERT INTO review_log(patch_event_id, repo_id, status, created_at, updated_at)
+		VALUES (?, ?, 'reviewing', 1000, 1000)`,
+		"patch-id-1", "repo-id-1",
+	)
+	if err != nil {
+		t.Fatalf("insert review_log: %v", err)
+	}
+
+	// Initially no review_event_id.
+	eid, err := store.GetReviewEventID(ctx, "patch-id-1", "repo-id-1")
+	if err != nil {
+		t.Fatalf("GetReviewEventID: %v", err)
+	}
+	if eid != "" {
+		t.Fatalf("expected empty review event id, got %q", eid)
+	}
+
+	// Set the review event ID.
+	if err := store.SetReviewEventID(ctx, "patch-id-1", "repo-id-1", "review-evt-abc"); err != nil {
+		t.Fatalf("SetReviewEventID: %v", err)
+	}
+
+	// Now it should be returned.
+	eid, err = store.GetReviewEventID(ctx, "patch-id-1", "repo-id-1")
+	if err != nil {
+		t.Fatalf("GetReviewEventID after set: %v", err)
+	}
+	if eid != "review-evt-abc" {
+		t.Fatalf("expected 'review-evt-abc', got %q", eid)
+	}
+
+	// Setting again should not overwrite (only updates when NULL).
+	if err := store.SetReviewEventID(ctx, "patch-id-1", "repo-id-1", "review-evt-xyz"); err != nil {
+		t.Fatalf("SetReviewEventID (second): %v", err)
+	}
+	eid, err = store.GetReviewEventID(ctx, "patch-id-1", "repo-id-1")
+	if err != nil {
+		t.Fatalf("GetReviewEventID after second set: %v", err)
+	}
+	if eid != "review-evt-abc" {
+		t.Fatalf("expected original 'review-evt-abc', got %q (should not overwrite)", eid)
+	}
+
+	// Non-existent entry returns empty.
+	eid, err = store.GetReviewEventID(ctx, "nonexistent", "repo-id-1")
+	if err != nil {
+		t.Fatalf("GetReviewEventID (nonexistent): %v", err)
+	}
+	if eid != "" {
+		t.Fatalf("expected empty for nonexistent, got %q", eid)
+	}
+}
+
+func TestRequeueFailedReviews(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	// Use real time so that the RequeueFailedReviews function's time.Now()
+	// matches our test data expectations.
+	now := time.Now().Unix()
+
+	// Seed two failed reviews — one old enough to requeue, one too recent.
+	_, err := store.db.ExecContext(ctx,
+		`INSERT INTO review_log(patch_event_id, repo_id, status, failure_reason, created_at, updated_at)
+		VALUES (?, ?, 'failed', 'queue full', ?, ?)`,
+		"old-patch", "repo-1", now-600, now-600,
+	)
+	if err != nil {
+		t.Fatalf("insert old failed: %v", err)
+	}
+	_, err = store.db.ExecContext(ctx,
+		`INSERT INTO review_log(patch_event_id, repo_id, status, failure_reason, created_at, updated_at)
+		VALUES (?, ?, 'failed', 'llm error', ?, ?)`,
+		"recent-patch", "repo-1", now-60, now-60,
+	)
+	if err != nil {
+		t.Fatalf("insert recent failed: %v", err)
+	}
+	// Also add one in pending state — should not be touched.
+	_, err = store.db.ExecContext(ctx,
+		`INSERT INTO review_log(patch_event_id, repo_id, status, created_at, updated_at)
+		VALUES (?, ?, 'pending', ?, ?)`,
+		"pending-patch", "repo-1", now-1000, now-1000,
+	)
+	if err != nil {
+		t.Fatalf("insert pending: %v", err)
+	}
+
+	// Requeue with minAge=300s — only old-patch should match.
+	tasks, err := store.RequeueFailedReviews(ctx, 300, 10)
+	if err != nil {
+		t.Fatalf("RequeueFailedReviews: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 requeued task, got %d", len(tasks))
+	}
+	if tasks[0].PatchEventID != "old-patch" {
+		t.Fatalf("expected 'old-patch', got %q", tasks[0].PatchEventID)
+	}
+
+	// Verify old-patch is now pending.
+	var status string
+	store.db.QueryRowContext(ctx,
+		`SELECT status FROM review_log WHERE patch_event_id='old-patch'`,
+	).Scan(&status)
+	if status != "pending" {
+		t.Fatalf("expected 'pending' after requeue, got %q", status)
+	}
+
+	// recent-patch should still be failed.
+	store.db.QueryRowContext(ctx,
+		`SELECT status FROM review_log WHERE patch_event_id='recent-patch'`,
+	).Scan(&status)
+	if status != "failed" {
+		t.Fatalf("expected 'failed' for recent patch, got %q", status)
+	}
 }

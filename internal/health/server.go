@@ -17,6 +17,7 @@ type Checker interface {
 // Server provides /healthz and /readyz HTTP endpoints.
 type Server struct {
 	mux    *http.ServeMux
+	srv    *http.Server
 	logger *slog.Logger
 	db     Checker
 	ready  atomic.Bool
@@ -41,14 +42,24 @@ func (s *Server) SetReady(ready bool) {
 
 // ListenAndServe starts the health check server on the given address.
 func (s *Server) ListenAndServe(addr string) error {
-	srv := &http.Server{
+	s.srv = &http.Server{
 		Addr:         addr,
 		Handler:      s.mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	}
 	s.logger.Info("health server listening", "addr", addr)
-	return srv.ListenAndServe()
+	return s.srv.ListenAndServe()
+}
+
+// Shutdown gracefully shuts down the health server, waiting for in-flight
+// requests to complete within the given context deadline.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.srv == nil {
+		return nil
+	}
+	s.logger.Info("shutting down health server")
+	return s.srv.Shutdown(ctx)
 }
 
 type healthResponse struct {

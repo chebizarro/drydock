@@ -360,6 +360,38 @@ func main() {
 		}
 	}()
 
+	// --- Background failed-review requeue sweep (every 10 minutes) ---
+	// Recovers tasks that failed due to transient issues (queue overflow,
+	// temporary LLM failures) by moving them back to pending after a cooldown.
+	if pipelineRunner != nil {
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					// Requeue tasks that have been in "failed" state for at least 5 minutes.
+					tasks, err := store.RequeueFailedReviews(ctx, 300, 20)
+					if err != nil {
+						logger.Warn("failed review requeue sweep error", "error", err)
+					} else if len(tasks) > 0 {
+						logger.Info("requeued failed reviews", "count", len(tasks))
+						for _, task := range tasks {
+							select {
+							case processor.ReviewQueue <- task:
+							default:
+								logger.Warn("review queue still full during requeue",
+									"patch_event_id", task.PatchEventID)
+							}
+						}
+					}
+				}
+			}
+		}()
+	}
+
 	healthSrv.SetReady(true)
 
 	select {
@@ -390,6 +422,11 @@ func main() {
 		logger.Info("graceful shutdown complete")
 	case <-drainCtx.Done():
 		logger.Warn("graceful shutdown timed out, exiting", "timeout", drainTimeout)
+	}
+
+	// Shut down the health server after draining work.
+	if err := healthSrv.Shutdown(drainCtx); err != nil {
+		logger.Warn("health server shutdown error", "error", err)
 	}
 }
 

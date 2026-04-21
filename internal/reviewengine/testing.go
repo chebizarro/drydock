@@ -3,7 +3,10 @@ package reviewengine
 import "context"
 
 // FakeLLMForTest is a test double for LLMClient that returns canned responses.
-// Exported so other packages can use it in their tests.
+//
+// Deprecated: Use testutil.FakeLLM instead. This type remains for backward
+// compatibility with existing test files but will be removed in a future version.
+// It should not be used in new test code.
 type FakeLLMForTest struct {
 	Responses []string
 	Requests  []ChatRequest

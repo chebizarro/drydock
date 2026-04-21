@@ -671,6 +671,43 @@ func (s *Store) GetReviewStatus(ctx context.Context, patchEventID, repoID string
 	return status, nil
 }
 
+// GetReviewEventID returns the review_event_id for a review log entry, or empty
+// string if no review event has been recorded yet. Used to detect partially-
+// completed publishes from prior runs (crash recovery idempotency).
+func (s *Store) GetReviewEventID(ctx context.Context, patchEventID, repoID string) (string, error) {
+	var reviewEventID sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT review_event_id FROM review_log WHERE patch_event_id=? AND repo_id=?`,
+		patchEventID, repoID,
+	).Scan(&reviewEventID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("get review event id: %w", err)
+	}
+	if reviewEventID.Valid {
+		return reviewEventID.String, nil
+	}
+	return "", nil
+}
+
+// SetReviewEventID records the signed review event ID on the review_log entry
+// before publishing to relays. This is the crash-recovery breadcrumb: if the
+// process crashes after relay publish but before MarkReviewPublished, the
+// idempotency check in PublishReview will find this event ID and skip
+// re-publishing.
+func (s *Store) SetReviewEventID(ctx context.Context, patchEventID, repoID, reviewEventID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE review_log SET review_event_id=? WHERE patch_event_id=? AND repo_id=? AND review_event_id IS NULL`,
+		reviewEventID, patchEventID, repoID,
+	)
+	if err != nil {
+		return fmt.Errorf("set review event id: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) CountReviewLog(ctx context.Context) (int64, error) {
 	var n int64
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_log`).Scan(&n); err != nil {
@@ -1125,6 +1162,48 @@ func (s *Store) ResetStuckReviews(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("reset stuck reviews: %w", err)
 	}
 	return res.RowsAffected()
+}
+
+// RequeueFailedReviews transitions entries in "failed" state back to "pending"
+// if they were last updated more than minAge seconds ago. This recovers tasks
+// that failed due to transient issues (queue overflow, temporary LLM failures).
+// Returns the tasks that were requeued.
+func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, limit int) ([]ReviewTask, error) {
+	now := time.Now().Unix()
+	cutoff := now - minAgeSeconds
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT patch_event_id, repo_id FROM review_log
+		WHERE status='failed' AND updated_at < ?
+		ORDER BY updated_at ASC
+		LIMIT ?`, cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query failed reviews: %w", err)
+	}
+	defer rows.Close()
+
+	var tasks []ReviewTask
+	for rows.Next() {
+		var t ReviewTask
+		if err := rows.Scan(&t.PatchEventID, &t.RepoID); err != nil {
+			return nil, fmt.Errorf("scan failed review: %w", err)
+		}
+		tasks = append(tasks, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate failed reviews: %w", err)
+	}
+
+	for _, t := range tasks {
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE review_log SET status='pending', failure_reason=NULL, updated_at=?
+			WHERE patch_event_id=? AND repo_id=? AND status='failed'`,
+			now, t.PatchEventID, t.RepoID)
+		if err != nil {
+			return nil, fmt.Errorf("requeue failed review %s: %w", t.PatchEventID, err)
+		}
+	}
+	return tasks, nil
 }
 
 // IsPatchSuperseded returns true if a newer patch event exists for the same

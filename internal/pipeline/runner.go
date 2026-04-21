@@ -184,6 +184,11 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 	patchDiffContent := patchEvent.Content
 
+	// 3b. Validate that the patch diff is non-empty to avoid wasting an LLM call.
+	if strings.TrimSpace(patchDiffContent) == "" {
+		return fmt.Errorf("patch event %s has empty diff content", task.PatchEventID)
+	}
+
 	// 4. Build context bundle
 	bundle, err := r.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
 		PatchEventContent: patchDiffContent,

@@ -48,6 +48,13 @@ func NewManager(baseDir string, logger *slog.Logger, opts ...ManagerOption) *Man
 	return m
 }
 
+// Git operation timeouts.
+const (
+	gitCloneTimeout = 5 * time.Minute
+	gitFetchTimeout = 2 * time.Minute
+	gitApplyTimeout = 1 * time.Minute
+)
+
 func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []string) (string, error) {
 	if len(cloneURLs) == 0 {
 		return "", fmt.Errorf("no clone urls for repository %s", repoID)
@@ -55,7 +62,9 @@ func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []str
 	repoPath := m.repoPath(repoID)
 
 	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
-		if _, err := m.runGit(ctx, repoPath, "fetch", "--all", "--prune"); err != nil {
+		fetchCtx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
+		defer cancel()
+		if _, err := m.runGit(fetchCtx, repoPath, "fetch", "--all", "--prune"); err != nil {
 			return "", fmt.Errorf("git fetch: %w", err)
 		}
 		m.touchAccess(repoPath)
@@ -82,7 +91,9 @@ func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []str
 		return "", fmt.Errorf("no safe clone urls for repository %s", repoID)
 	}
 
-	if out, err := exec.CommandContext(ctx, "git", "clone", cloneURL, repoPath).CombinedOutput(); err != nil {
+	cloneCtx, cloneCancel := context.WithTimeout(ctx, gitCloneTimeout)
+	defer cloneCancel()
+	if out, err := exec.CommandContext(cloneCtx, "git", "clone", cloneURL, repoPath).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git clone %s: %w: %s", cloneURL, err, strings.TrimSpace(string(out)))
 	}
 	m.touchAccess(repoPath)
@@ -194,7 +205,9 @@ func (m *Manager) CleanupReviewBranch(ctx context.Context, repoPath, branch stri
 }
 
 func (m *Manager) applySinglePatch(ctx context.Context, repoPath, patchContent string) error {
-	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "apply", "--3way", "--index", "-")
+	applyCtx, cancel := context.WithTimeout(ctx, gitApplyTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(applyCtx, "git", "-C", repoPath, "apply", "--3way", "--index", "-")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("open stdin: %w", err)
