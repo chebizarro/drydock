@@ -36,6 +36,7 @@ type Config struct {
 	EmbedBaseURL    string
 	EmbedModel      string
 	EmbedAPIKey     string
+	LSPBridgeURL    string
 	MetaBaseURL     string
 	MetaModel       string
 	EvalDatasetPath string
@@ -77,6 +78,7 @@ func FromEnv() Config {
 		EmbedBaseURL:        envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
 		EmbedModel:          envOrDefault("DRYDOCK_EMBED_MODEL", "nomic-embed-text"),
 		EmbedAPIKey:         envOrDefault("DRYDOCK_EMBED_API_KEY", ""),
+		LSPBridgeURL:        envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
 		MetaBaseURL:         envOrDefault("DRYDOCK_META_BASE_URL", "http://127.0.0.1:11436/v1"),
 		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", "llama-3.3-70b-instruct-q4_k_m"),
 		EvalDatasetPath:     envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
