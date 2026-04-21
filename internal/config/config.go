@@ -29,6 +29,11 @@ type Config struct {
 	LLMAPIKey       string
 	SignerBunkerURL string
 	SignerNsec      string
+	QdrantURL       string
+	QdrantAPIKey    string
+	EmbedBaseURL    string
+	EmbedModel      string
+	EmbedAPIKey     string
 	MetaBaseURL     string
 	MetaModel       string
 	EvalDatasetPath string
@@ -63,6 +68,11 @@ func FromEnv() Config {
 		LLMAPIKey:           envOrDefault("DRYDOCK_LLM_API_KEY", ""),
 		SignerBunkerURL:     envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
 		SignerNsec:          envOrDefault("DRYDOCK_SIGNER_NSEC", ""),
+		QdrantURL:           envOrDefault("DRYDOCK_QDRANT_URL", ""),
+		QdrantAPIKey:        envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
+		EmbedBaseURL:        envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
+		EmbedModel:          envOrDefault("DRYDOCK_EMBED_MODEL", "nomic-embed-text"),
+		EmbedAPIKey:         envOrDefault("DRYDOCK_EMBED_API_KEY", ""),
 		MetaBaseURL:         envOrDefault("DRYDOCK_META_BASE_URL", "http://127.0.0.1:11436/v1"),
 		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", "llama-3.3-70b-instruct-q4_k_m"),
 		EvalDatasetPath:     envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
