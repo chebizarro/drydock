@@ -148,8 +148,12 @@ func main() {
 	// --- Context builder ---
 	ctxBuilder := contextbuilder.NewDefault()
 
-	// --- Review engine ---
-	llmClient := reviewengine.NewOpenAICompatClient()
+	// --- Review engine (with retry for transient LLM failures) ---
+	llmClient := reviewengine.NewRetryingClient(
+		reviewengine.NewOpenAICompatClient(),
+		reviewengine.RetryConfig{MaxAttempts: 3},
+		logger,
+	)
 	engine := reviewengine.New(reviewengine.Config{
 		Planner:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.PlannerModel},
 		Coder32B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.Coder32BModel},
@@ -171,8 +175,12 @@ func main() {
 		}, store, signer, relayPub, logger)
 	}
 
-	// --- Meta-review ---
-	metaClient := reviewengine.NewOpenAICompatClient()
+	// --- Meta-review (with retry) ---
+	metaClient := reviewengine.NewRetryingClient(
+		reviewengine.NewOpenAICompatClient(),
+		reviewengine.RetryConfig{MaxAttempts: 3},
+		logger,
+	)
 	metaSvc := metareview.New(metareview.Config{
 		Endpoint:         reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.MetaModel},
 		RandomSampleRate: 0.15,

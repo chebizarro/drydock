@@ -1,6 +1,6 @@
 # Binaries
-drydock
-drydock-eval
+/drydock
+/drydock-eval
 *.exe
 bin/
 dist/

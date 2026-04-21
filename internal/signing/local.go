@@ -28,11 +28,16 @@ func NewLocalSigner(nsecOrHex string) (nostr.Signer, error) {
 		if prefix != "nsec" {
 			return nil, errors.New("expected nsec bech32")
 		}
-		b, ok := data.([]byte)
-		if !ok {
+		switch v := data.(type) {
+		case nostr.SecretKey:
+			skBytes = v[:]
+		case [32]byte:
+			skBytes = v[:]
+		case []byte:
+			skBytes = v
+		default:
 			return nil, errors.New("unexpected nsec data type")
 		}
-		skBytes = b
 	} else {
 		b, err := hex.DecodeString(nsecOrHex)
 		if err != nil {

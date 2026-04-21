@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 type fakeLLM struct {
@@ -65,6 +66,111 @@ func TestReviewerSchemaRejectsLowConfidenceWithoutNeedsMoreContext(t *testing.T)
 	}`)
 	if err == nil {
 		t.Fatalf("expected validation error for low-confidence finding without needs_more_context")
+	}
+}
+
+func TestIsTransient(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		expect bool
+	}{
+		{"nil", nil, false},
+		{"http 429", &LLMHTTPError{StatusCode: 429}, true},
+		{"http 500", &LLMHTTPError{StatusCode: 500}, true},
+		{"http 503", &LLMHTTPError{StatusCode: 503}, true},
+		{"http 400", &LLMHTTPError{StatusCode: 400}, false},
+		{"http 401", &LLMHTTPError{StatusCode: 401}, false},
+		{"http 404", &LLMHTTPError{StatusCode: 404}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsTransient(tc.err); got != tc.expect {
+				t.Fatalf("IsTransient(%v) = %v, want %v", tc.err, got, tc.expect)
+			}
+		})
+	}
+}
+
+type failingLLM struct {
+	errors []error
+	calls  int
+}
+
+func (f *failingLLM) ChatCompletion(_ context.Context, _ ChatRequest) (string, error) {
+	f.calls++
+	if len(f.errors) > 0 {
+		err := f.errors[0]
+		f.errors = f.errors[1:]
+		return "", err
+	}
+	return `{"ok":true}`, nil
+}
+
+func TestRetryingClientRetriesTransientErrors(t *testing.T) {
+	inner := &failingLLM{
+		errors: []error{
+			&LLMHTTPError{StatusCode: 503, Status: "503 Service Unavailable", Body: "overloaded"},
+			&LLMHTTPError{StatusCode: 429, Status: "429 Too Many Requests", Body: "rate limited"},
+		},
+	}
+	rc := NewRetryingClient(inner, RetryConfig{
+		MaxAttempts: 3,
+		BaseDelay:   1 * time.Millisecond, // fast for tests
+		MaxDelay:    10 * time.Millisecond,
+	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	result, err := rc.ChatCompletion(context.Background(), ChatRequest{Model: "test"})
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if result != `{"ok":true}` {
+		t.Fatalf("unexpected result: %s", result)
+	}
+	if inner.calls != 3 {
+		t.Fatalf("expected 3 attempts (2 transient + 1 success), got %d", inner.calls)
+	}
+}
+
+func TestRetryingClientFailsImmediatelyOnNonTransient(t *testing.T) {
+	inner := &failingLLM{
+		errors: []error{
+			&LLMHTTPError{StatusCode: 400, Status: "400 Bad Request", Body: "invalid"},
+		},
+	}
+	rc := NewRetryingClient(inner, RetryConfig{
+		MaxAttempts: 3,
+		BaseDelay:   1 * time.Millisecond,
+	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	_, err := rc.ChatCompletion(context.Background(), ChatRequest{Model: "test"})
+	if err == nil {
+		t.Fatal("expected error for non-transient failure")
+	}
+	if inner.calls != 1 {
+		t.Fatalf("expected 1 attempt (immediate fail), got %d", inner.calls)
+	}
+}
+
+func TestRetryingClientExhaustsAttempts(t *testing.T) {
+	inner := &failingLLM{
+		errors: []error{
+			&LLMHTTPError{StatusCode: 500, Status: "500", Body: "err1"},
+			&LLMHTTPError{StatusCode: 500, Status: "500", Body: "err2"},
+			&LLMHTTPError{StatusCode: 500, Status: "500", Body: "err3"},
+		},
+	}
+	rc := NewRetryingClient(inner, RetryConfig{
+		MaxAttempts: 3,
+		BaseDelay:   1 * time.Millisecond,
+	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	_, err := rc.ChatCompletion(context.Background(), ChatRequest{Model: "test"})
+	if err == nil {
+		t.Fatal("expected error after exhausting attempts")
+	}
+	if inner.calls != 3 {
+		t.Fatalf("expected 3 attempts, got %d", inner.calls)
 	}
 }
 
