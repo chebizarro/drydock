@@ -158,4 +158,29 @@ CREATE TABLE IF NOT EXISTS eval_runs (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_eval_runs_created_at ON eval_runs(created_at);
+
+CREATE TABLE IF NOT EXISTS prompt_gap_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  patch_event_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  gap_text TEXT NOT NULL,
+  consumed INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_gap_queue_consumed ON prompt_gap_queue(consumed);
+
+CREATE TABLE IF NOT EXISTS prompt_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  prompt_name TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  parent_version INTEGER NOT NULL DEFAULT 0,
+  source_gap_ids TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'candidate'
+    CHECK (status IN ('active', 'candidate', 'rolled_back')),
+  eval_score REAL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(prompt_name, version)
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_versions_name_status ON prompt_versions(prompt_name, status);
 `

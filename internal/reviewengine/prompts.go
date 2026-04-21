@@ -16,14 +16,21 @@ func plannerUserPrompt(contextBundle string, changedFiles []string) string {
 	return fmt.Sprintf("Changed files:\n%s\n\nContext:\n%s", strings.Join(changedFiles, "\n"), contextBundle)
 }
 
-func reviewerSystemPrompt(checklist []string, securitySensitive bool, fewShot []string) string {
+// reviewerSystemPrompt builds the reviewer system prompt. If baseOverride is
+// non-empty it replaces the default preamble; checklist, security, and few-shot
+// sections are always appended.
+func reviewerSystemPrompt(baseOverride string, checklist []string, securitySensitive bool, fewShot []string) string {
 	var b strings.Builder
-	b.WriteString(`You are a code review agent.
+	if baseOverride != "" {
+		b.WriteString(baseOverride)
+	} else {
+		b.WriteString(`You are a code review agent.
 Return JSON ONLY with keys:
 summary, findings, needs_more_context.
 Each finding must include:
 severity, category, file, line, evidence, explanation, suggestion, confidence.
 If confidence < 0.6, add required items to needs_more_context instead of asserting uncertain findings.`)
+	}
 
 	if len(checklist) > 0 {
 		b.WriteString("\n\nChecklist:\n- ")

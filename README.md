@@ -83,8 +83,9 @@ internal/
   contextbuilder/   # Deterministic context assembly (7 layers, 64K budget)
   reviewengine/     # Planner→reviewer LLM pipeline with retry
   publisher/        # Kind 1111 comment construction and relay fanout
-  metareview/       # Self-improvement loop with few-shot management
-  repo/             # Git repo cloning, patching, and LRU cache
+    metareview/       # Self-improvement loop with few-shot management
+    promptrefine/     # Automated prompt versioning with eval-gated rollback
+    repo/             # Git repo cloning, patching, and LRU cache
   signing/          # NIP-46 bunker and local nsec signers
   db/               # SQLite storage, schema, and queries
   health/           # /healthz and /readyz HTTP endpoints

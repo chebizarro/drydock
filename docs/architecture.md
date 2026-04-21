@@ -81,6 +81,7 @@ Drydock is a Go-based NIP-34 automated code review agent. The core review pipeli
 | `reviewengine` | Two-stage LLM pipeline: planner selects a model route, reviewer produces findings |
 | `publisher` | Constructs and publishes kind 1111 (NIP-22 comment) Nostr events with relay fanout |
 | `metareview` | Self-improvement loop: evaluates review quality and routes feedback for prompt tuning |
+| `promptrefine` | Automated prompt versioning: batches prompt gaps, refines via LLM, activates with eval-gated rollback |
 | `repo` | Clones/fetches git repositories with URL validation and LRU cache eviction |
 | `signing` | Signer chain: NIP-46 bunker → NIP-5F Unix socket (Signet) → NIP-55L DBus (Linux) → local nsec |
 | `vectorstore` | Qdrant REST API client — CRUD, search, scroll, collection management |

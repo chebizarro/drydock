@@ -26,6 +26,10 @@ type RunInput struct {
 	ContextBundle string
 	ChangedFiles  []string
 	FewShot       []string
+	// ReviewerSystemPromptOverride, if non-empty, replaces the default base
+	// reviewer system prompt. Checklist, security preamble, and few-shot
+	// examples are still appended.
+	ReviewerSystemPromptOverride string
 }
 
 type RunOutput struct {
@@ -63,7 +67,7 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	}
 
 	checklist := BuildChecklist(in.ChangedFiles)
-	system := reviewerSystemPrompt(checklist, IsSecuritySensitive(in.ChangedFiles), in.FewShot)
+	system := reviewerSystemPrompt(in.ReviewerSystemPromptOverride, checklist, IsSecuritySensitive(in.ChangedFiles), in.FewShot)
 	user := reviewerUserPrompt(in.ContextBundle, planner)
 
 	endpoint, err := e.routeEndpoint(planner.ModelRoute)

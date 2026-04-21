@@ -1094,3 +1094,255 @@ func (s *Store) ResetStuckReviews(ctx context.Context) (int64, error) {
 	}
 	return res.RowsAffected()
 }
+
+// --- Prompt Gap Queue ---
+
+// InsertPromptGap enqueues a prompt gap identified by meta-review.
+func (s *Store) InsertPromptGap(ctx context.Context, patchEventID, repoID, gapText string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO prompt_gap_queue(patch_event_id, repo_id, gap_text, consumed, created_at)
+		VALUES (?, ?, ?, 0, ?)`,
+		patchEventID, repoID, gapText, time.Now().Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("insert prompt gap: %w", err)
+	}
+	return nil
+}
+
+// CountUnconsumedPromptGaps returns the number of prompt gaps not yet processed.
+func (s *Store) CountUnconsumedPromptGaps(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM prompt_gap_queue WHERE consumed=0`,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count unconsumed prompt gaps: %w", err)
+	}
+	return n, nil
+}
+
+// PromptGapRecord is a single prompt gap entry from the queue.
+type PromptGapRecord struct {
+	ID      int64
+	GapText string
+}
+
+// FetchUnconsumedPromptGaps retrieves up to limit unconsumed prompt gaps ordered by creation time.
+func (s *Store) FetchUnconsumedPromptGaps(ctx context.Context, limit int) ([]PromptGapRecord, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, gap_text FROM prompt_gap_queue
+		WHERE consumed=0
+		ORDER BY created_at ASC
+		LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("fetch unconsumed prompt gaps: %w", err)
+	}
+	defer rows.Close()
+
+	var gaps []PromptGapRecord
+	for rows.Next() {
+		var g PromptGapRecord
+		if err := rows.Scan(&g.ID, &g.GapText); err != nil {
+			return nil, fmt.Errorf("scan prompt gap row: %w", err)
+		}
+		gaps = append(gaps, g)
+	}
+	return gaps, rows.Err()
+}
+
+// MarkPromptGapsConsumed sets consumed=1 for the given gap IDs.
+func (s *Store) MarkPromptGapsConsumed(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE prompt_gap_queue SET consumed=1 WHERE id IN (`+strings.Join(placeholders, ",")+`)`,
+		args...,
+	)
+	if err != nil {
+		return fmt.Errorf("mark prompt gaps consumed: %w", err)
+	}
+	return nil
+}
+
+// --- Prompt Versions ---
+
+// PromptVersion represents a stored version of a named prompt.
+type PromptVersion struct {
+	ID            int64
+	PromptName    string
+	Version       int
+	Content       string
+	ParentVersion int
+	SourceGapIDs  string
+	Status        string
+	EvalScore     *float64
+	CreatedAt     int64
+}
+
+// InsertPromptVersion stores a new prompt version as candidate.
+// Returns the auto-generated row ID.
+func (s *Store) InsertPromptVersion(ctx context.Context, promptName, content string, parentVersion int, sourceGapIDs string) (int64, error) {
+	// Determine next version number for this prompt.
+	var maxVersion int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(version), 0) FROM prompt_versions WHERE prompt_name=?`,
+		promptName,
+	).Scan(&maxVersion)
+	if err != nil {
+		return 0, fmt.Errorf("get max prompt version: %w", err)
+	}
+	nextVersion := maxVersion + 1
+	now := time.Now().Unix()
+
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO prompt_versions(prompt_name, version, content, parent_version, source_gap_ids, status, created_at)
+		VALUES (?, ?, ?, ?, ?, 'candidate', ?)`,
+		promptName, nextVersion, content, parentVersion, sourceGapIDs, now,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert prompt version: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// GetActivePromptVersion returns the active version for the given prompt name.
+// Returns sql.ErrNoRows wrapped in error if no active version exists.
+func (s *Store) GetActivePromptVersion(ctx context.Context, promptName string) (PromptVersion, error) {
+	var pv PromptVersion
+	var evalScore sql.NullFloat64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, prompt_name, version, content, parent_version, source_gap_ids, status, eval_score, created_at
+		FROM prompt_versions
+		WHERE prompt_name=? AND status='active'
+		ORDER BY version DESC LIMIT 1`,
+		promptName,
+	).Scan(&pv.ID, &pv.PromptName, &pv.Version, &pv.Content, &pv.ParentVersion, &pv.SourceGapIDs, &pv.Status, &evalScore, &pv.CreatedAt)
+	if err != nil {
+		return PromptVersion{}, fmt.Errorf("get active prompt version %q: %w", promptName, err)
+	}
+	if evalScore.Valid {
+		pv.EvalScore = &evalScore.Float64
+	}
+	return pv, nil
+}
+
+// ActivatePromptVersion sets the given version to 'active' and demotes any
+// previously active version for the same prompt_name to 'candidate'.
+func (s *Store) ActivatePromptVersion(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var promptName string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT prompt_name FROM prompt_versions WHERE id=?`, id,
+	).Scan(&promptName); err != nil {
+		return fmt.Errorf("lookup prompt version for activation: %w", err)
+	}
+
+	// Demote current active version(s).
+	_, err = tx.ExecContext(ctx,
+		`UPDATE prompt_versions SET status='candidate'
+		WHERE prompt_name=? AND status='active'`, promptName)
+	if err != nil {
+		return fmt.Errorf("demote active prompt version: %w", err)
+	}
+
+	// Activate the requested version.
+	_, err = tx.ExecContext(ctx,
+		`UPDATE prompt_versions SET status='active' WHERE id=?`, id)
+	if err != nil {
+		return fmt.Errorf("activate prompt version: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// RollbackPromptVersion marks a version as rolled_back and re-activates its parent.
+func (s *Store) RollbackPromptVersion(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var promptName string
+	var parentVersion int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT prompt_name, parent_version FROM prompt_versions WHERE id=?`, id,
+	).Scan(&promptName, &parentVersion); err != nil {
+		return fmt.Errorf("lookup prompt version for rollback: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx,
+		`UPDATE prompt_versions SET status='rolled_back' WHERE id=?`, id)
+	if err != nil {
+		return fmt.Errorf("mark prompt version rolled back: %w", err)
+	}
+
+	// Re-activate the parent version if it exists.
+	if parentVersion > 0 {
+		_, err = tx.ExecContext(ctx,
+			`UPDATE prompt_versions SET status='active'
+			WHERE prompt_name=? AND version=?`, promptName, parentVersion)
+		if err != nil {
+			return fmt.Errorf("re-activate parent prompt version: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// SetPromptVersionEvalScore records the evaluation score for a prompt version.
+func (s *Store) SetPromptVersionEvalScore(ctx context.Context, id int64, score float64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE prompt_versions SET eval_score=? WHERE id=?`, score, id)
+	if err != nil {
+		return fmt.Errorf("set prompt version eval score: %w", err)
+	}
+	return nil
+}
+
+// GetPromptVersionByNumber returns a prompt version by its name and version number.
+func (s *Store) GetPromptVersionByNumber(ctx context.Context, promptName string, version int) (PromptVersion, error) {
+	var pv PromptVersion
+	var evalScore sql.NullFloat64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, prompt_name, version, content, parent_version, source_gap_ids, status, eval_score, created_at
+		FROM prompt_versions
+		WHERE prompt_name=? AND version=?`,
+		promptName, version,
+	).Scan(&pv.ID, &pv.PromptName, &pv.Version, &pv.Content, &pv.ParentVersion, &pv.SourceGapIDs, &pv.Status, &evalScore, &pv.CreatedAt)
+	if err != nil {
+		return PromptVersion{}, fmt.Errorf("get prompt version %q v%d: %w", promptName, version, err)
+	}
+	if evalScore.Valid {
+		pv.EvalScore = &evalScore.Float64
+	}
+	return pv, nil
+}
+
+// GetLatestEvalRecall returns the recall from the most recent eval run, or 0 if none.
+func (s *Store) GetLatestEvalRecall(ctx context.Context) (float64, error) {
+	var recall float64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT recall FROM eval_runs ORDER BY created_at DESC LIMIT 1`,
+	).Scan(&recall)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("get latest eval recall: %w", err)
+	}
+	return recall, nil
+}

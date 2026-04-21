@@ -72,7 +72,20 @@ Each missed finding includes a `why_missed` reason that maps to an action:
 | `model_limitation` | `flag-model-routing-review` | The planner may have selected the wrong model route |
 | `prompt_gap` | `queue-prompt-refinement` | The system prompt needs a new instruction |
 
-These actions are persisted to `meta_review_routes` for analysis. They are currently informational — automatic prompt modification is not yet implemented.
+These actions are persisted to `meta_review_routes` for analysis.
+
+### Automated Prompt Refinement
+
+When `why_missed` is `prompt_gap`, the identified prompt gap text from `MetaReviewOutput.prompt_gaps` is also enqueued in the `prompt_gap_queue` table. Once the queue accumulates a configurable threshold of gaps (default 20), the `promptrefine.Service` triggers an automated refinement cycle:
+
+1. **Batch** — Fetch all unconsumed prompt gaps from the queue.
+2. **Refine** — Send the current active reviewer system prompt plus the batched gap descriptions to a frontier LLM, which rewrites the prompt to address the gaps while preserving existing capabilities.
+3. **Version** — Store the refined prompt as a new version in `prompt_versions` and activate it immediately.
+4. **Eval gate** — After the next eval run completes, `EvalAndMaybeRollback` compares the new version's recall against the parent version. If recall drops beyond the configured tolerance, the version is automatically rolled back to the parent.
+
+Prompt versions track full provenance: parent version number, source gap IDs (CSV of `prompt_gap_queue` IDs), status (`active`, `candidate`, `rolled_back`), and eval score.
+
+The active reviewer prompt version, if any, overrides the default hardcoded system prompt via `RunInput.ReviewerSystemPromptOverride` in the review engine.
 
 ## Few-Shot Example Management
 

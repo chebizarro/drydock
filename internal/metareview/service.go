@@ -148,6 +148,9 @@ func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
 	if err := s.routeFeedback(ctx, in, parsed); err != nil {
 		return Result{}, err
 	}
+	if err := s.queuePromptGaps(ctx, in, parsed); err != nil {
+		return Result{}, err
+	}
 	if err := s.updateFewShot(ctx, in, parsed); err != nil {
 		return Result{}, err
 	}
@@ -196,6 +199,19 @@ func (s *Service) routeFeedback(ctx context.Context, in Input, out MetaReviewOut
 			action = ActionQueuePromptRefinement
 		}
 		if err := s.store.InsertMetaReviewRoute(ctx, in.PatchEventID, in.RepoID, mf.WhyMissed, action); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) queuePromptGaps(ctx context.Context, in Input, out MetaReviewOutput) error {
+	for _, gap := range out.PromptGaps {
+		gap = strings.TrimSpace(gap)
+		if gap == "" {
+			continue
+		}
+		if err := s.store.InsertPromptGap(ctx, in.PatchEventID, in.RepoID, gap); err != nil {
 			return err
 		}
 	}
