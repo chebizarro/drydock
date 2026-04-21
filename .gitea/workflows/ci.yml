@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.26']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Go module cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build all packages
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: Run vet
+        run: CGO_ENABLED=0 go vet ./...
+
+      - name: Run tests (no CGO)
+        run: CGO_ENABLED=0 go test -count=1 -timeout=5m ./...
+
+  build-cgo:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.26']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Install C toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Go module cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-cgo-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-cgo-${{ runner.os }}-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build with CGO (tree-sitter)
+        run: CGO_ENABLED=1 go build ./...
+
+      - name: Run tests with CGO
+        run: CGO_ENABLED=1 go test -count=1 -timeout=5m ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    if: github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t drydock:ci .

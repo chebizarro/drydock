@@ -1,4 +1,4 @@
-.PHONY: up down eval logs build test ps config
+.PHONY: up down eval logs build test test-cgo vet ci ps config
 
 COMPOSE ?= docker compose
 SERVICE ?= drydock
@@ -16,10 +16,18 @@ eval:
 	DRYDOCK_MODE=eval $(COMPOSE) run --rm $(SERVICE)
 
 build:
-	go build ./...
+	CGO_ENABLED=0 go build ./...
+
+vet:
+	CGO_ENABLED=0 go vet ./...
 
 test:
-	go test ./...
+	CGO_ENABLED=0 go test -count=1 ./...
+
+test-cgo:
+	CGO_ENABLED=1 go test -count=1 ./...
+
+ci: vet build test
 
 ps:
 	$(COMPOSE) ps
