@@ -10,7 +10,7 @@ cp .env.example .env
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DRYDOCK_MODE` | `listener` \| `eval` | `listener` | Operating mode. `listener` runs the full review pipeline; `eval` runs the evaluation harness and exits. |
+| `DRYDOCK_MODE` | `listener` \| `eval` | `listener` | Operating mode. The eval binary (`cmd/drydock-eval`) is separate; this variable is unused by `cmd/drydock`. |
 | `DRYDOCK_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` | Structured JSON log level. `debug` is verbose and includes raw LLM responses. |
 
 ## Database & Storage
@@ -40,17 +40,21 @@ Drydock supports separate relay lists for reading (subscribing to events) and wr
 
 ## Signing
 
-Drydock needs a Nostr identity to sign review comments. Two signing methods are supported, checked in order:
+Drydock needs a Nostr identity to sign review comments. Four signing methods are supported, checked in priority order:
 
 1. **NIP-46 Bunker** (recommended for production) — key never touches disk
-2. **Local nsec** — for development and testing only
+2. **NIP-5F Unix socket** (Signet) — JSON-RPC over local socket
+3. **NIP-55L DBus** (Linux only) — session bus signer
+4. **Local nsec** — for development and testing only
 
-If neither is configured, the listener and ingest pipeline still run, but the review pipeline is disabled (no reviews are published).
+If none is configured, the listener and ingest pipeline still run, but the review pipeline is disabled (no reviews are published).
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_SIGNER_BUNKER_URL` | string | *(empty)* | NIP-46 bunker URL (`bunker://...`) or NIP-05 bunker identifier. Checked first. |
-| `DRYDOCK_SIGNER_NSEC` | string | *(empty)* | Raw nsec bech32 key or 64-character hex private key. **Warning**: this is a plaintext secret. Use Docker secrets or a secrets manager in production. |
+| `DRYDOCK_SIGNER_SOCKET_PATH` | path | *(empty)* | Path to a NIP-5F Unix domain socket signer. Auto-detected at `~/.local/share/nostr/signer.sock` if not set. Checked second. |
+| `DRYDOCK_SIGNER_DBUS` | `true`/`false` | `false` | Enable NIP-55L DBus session bus signer (Linux only, `org.nostr.Signer` interface). Checked third. |
+| `DRYDOCK_SIGNER_NSEC` | string | *(empty)* | Raw nsec bech32 key or 64-character hex private key. **Warning**: this is a plaintext secret. Use Docker secrets or a secrets manager in production. Checked last. |
 
 ## LLM Endpoints
 
@@ -83,6 +87,38 @@ DRYDOCK_META_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
 This works but serializes all LLM calls through one instance — see [Scaling](scaling.md) for multi-endpoint setups.
+
+## Qdrant Vector Store (Optional)
+
+Qdrant provides vector similarity search for NIP spec retrieval, project documentation, and few-shot review examples. All Qdrant features are disabled when `DRYDOCK_QDRANT_URL` is empty.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_QDRANT_URL` | URL | *(empty)* | Qdrant REST API endpoint (e.g., `http://qdrant:6333`). Empty disables all RAG features. |
+| `DRYDOCK_QDRANT_API_KEY` | string | *(empty)* | API key for Qdrant authentication. Not needed for local/Docker deployments. |
+
+Drydock auto-creates three collections on startup:
+- `nip_specs` — Nostr Improvement Proposal documentation chunks
+- `project_docs` — Per-project documentation embeddings
+- `few_shot_reviews` — Positive/negative review examples for prompt enrichment
+
+## Embedding Model (Optional)
+
+Required when Qdrant is enabled. Any OpenAI-compatible `/embeddings` endpoint works.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_EMBED_BASE_URL` | URL | *(empty)* | Embedding server base URL (e.g., `http://host.docker.internal:11434/v1` for Ollama). |
+| `DRYDOCK_EMBED_MODEL` | string | `nomic-embed-text` | Model name for embedding requests. |
+| `DRYDOCK_EMBED_API_KEY` | string | *(empty)* | API key for the embedding endpoint. |
+
+## LSP Bridge (Optional)
+
+The LSP bridge is a separate HTTP service that manages language servers for type-aware symbol analysis. Activate via the `lsp` Docker profile.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_LSP_BRIDGE_URL` | URL | *(empty)* | LSP bridge endpoint (e.g., `http://lsp-bridge:8082`). Empty disables LSP-enhanced analysis; drydock falls back to tree-sitter + ripgrep. |
 
 ## Pipeline
 
