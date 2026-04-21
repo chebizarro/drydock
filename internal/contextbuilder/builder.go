@@ -28,6 +28,9 @@ const (
 type BuildInput struct {
 	PatchEventContent string
 	RepoPath          string
+	// RepoID is the unique repository identifier. Used by the Qdrant provider
+	// to filter project_docs results to the current repository.
+	RepoID string
 	// WorkspaceRoots are relative paths of detected monorepo workspaces that
 	// contain changed files. Empty means "whole repo" (no workspace isolation).
 	// Set automatically by Builder.Build when a workspace config is detected.

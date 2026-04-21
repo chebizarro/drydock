@@ -27,6 +27,13 @@ type PromptRefiner interface {
 	ActiveReviewerPrompt(ctx context.Context) string
 }
 
+// DocIngester indexes project documentation into the vector store.
+// Called after repo preparation so that project docs are searchable
+// by the QdrantProvider during context building.
+type DocIngester interface {
+	IngestRepoDocs(ctx context.Context, repoPath, repoID string) error
+}
+
 type Runner struct {
 	store            *db.Store
 	repoSvc          *repo.Service
@@ -36,6 +43,7 @@ type Runner struct {
 	metaSvc          *metareview.Service
 	promptRefiner    PromptRefiner
 	fewShotRetriever FewShotRetriever
+	docIngester      DocIngester
 	queue            <-chan db.ReviewTask
 	workers          int
 	logger           *slog.Logger
@@ -58,6 +66,15 @@ func WithPromptRefiner(pr *promptrefine.Service) func(*Runner) {
 func WithFewShotRetriever(fsr FewShotRetriever) func(*Runner) {
 	return func(r *Runner) {
 		r.fewShotRetriever = fsr
+	}
+}
+
+// WithDocIngester sets an optional documentation ingester. When set, the
+// runner indexes project docs after repo preparation so the QdrantProvider
+// can retrieve them during context building.
+func WithDocIngester(di DocIngester) func(*Runner) {
+	return func(r *Runner) {
+		r.docIngester = di
 	}
 }
 
@@ -145,6 +162,14 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// Clean up the throwaway review branch when done (success or failure)
 	defer r.repoSvc.CleanupReviewBranch(ctx, prep.RepoPath, prep.Branch)
 
+	// 1b. Index project documentation (non-fatal).
+	if r.docIngester != nil {
+		if err := r.docIngester.IngestRepoDocs(ctx, prep.RepoPath, task.RepoID); err != nil {
+			r.logger.Warn("doc ingestion failed, continuing without",
+				"repo_id", task.RepoID, "error", err)
+		}
+	}
+
 	// 2. Get patch event for context builder and meta-review
 	patchRec, err := r.store.GetPatchEvent(ctx, task.PatchEventID)
 	if err != nil {
@@ -163,6 +188,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	bundle, err := r.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
 		PatchEventContent: patchDiffContent,
 		RepoPath:          prep.RepoPath,
+		RepoID:            task.RepoID,
 	})
 	if err != nil {
 		return fmt.Errorf("build context: %w", err)
