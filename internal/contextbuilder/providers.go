@@ -25,12 +25,13 @@ func DefaultProviders(opts ...BuilderOptions) []Provider {
 	}
 
 	extractor := symbols.New()
+	srch := newSearcher()
 
 	providers := []Provider{
 		patchDiffProvider{},
 		fileContextProvider{},
-		symbolsCallsitesProvider{lspClient: opt.lspClient, extractor: extractor},
-		testsProvider{},
+		symbolsCallsitesProvider{lspClient: opt.lspClient, extractor: extractor, search: srch},
+		testsProvider{search: srch},
 		importsExportsProvider{},
 		commitHistoryProvider{},
 		projectDocsProvider{},
@@ -113,6 +114,7 @@ func (fileContextProvider) Build(_ context.Context, in BuildInput) (string, erro
 type symbolsCallsitesProvider struct {
 	lspClient interface{}        // optional *lspbridge.Client for enhanced analysis
 	extractor  *symbols.Extractor // tree-sitter symbol extractor
+	search    *searcher           // ripgrep with git grep fallback
 }
 
 func (p symbolsCallsitesProvider) LayerName() string { return LayerSymbolsCallsites }
@@ -141,8 +143,13 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 	// type-aware symbol definitions and references. For now, always
 	// use git grep as the fallback.
 
+	srch := p.search
+	if srch == nil {
+		srch = newSearcher()
+	}
+
 	for _, sym := range syms {
-		lines, err := gitGrep(ctx, in.RepoPath, sym)
+		lines, err := srch.SearchSymbol(ctx, in.RepoPath, sym)
 		if err != nil || lines == "" {
 			continue
 		}
@@ -230,11 +237,13 @@ func extractChangedLineNumbers(f *gitdiff.File) []uint32 {
 	return lines
 }
 
-type testsProvider struct{}
+type testsProvider struct {
+	search *searcher
+}
 
-func (testsProvider) LayerName() string { return LayerTests }
-func (testsProvider) Priority() int     { return 4 }
-func (testsProvider) Build(ctx context.Context, in BuildInput) (string, error) {
+func (p testsProvider) LayerName() string { return LayerTests }
+func (p testsProvider) Priority() int     { return 4 }
+func (p testsProvider) Build(ctx context.Context, in BuildInput) (string, error) {
 	if in.RepoPath == "" {
 		return "", nil
 	}
@@ -244,8 +253,13 @@ func (testsProvider) Build(ctx context.Context, in BuildInput) (string, error) {
 	}
 	var out strings.Builder
 	foundAny := false
+	srch := p.search
+	if srch == nil {
+		srch = newSearcher()
+	}
+
 	for _, sym := range symbols {
-		lines, _ := gitGrepTests(ctx, in.RepoPath, sym)
+		lines, _ := srch.SearchSymbolTests(ctx, in.RepoPath, sym)
 		if strings.TrimSpace(lines) == "" {
 			continue
 		}
@@ -390,13 +404,6 @@ func extractImportExportLines(diff string) []string {
 	return lines
 }
 
-func gitGrep(ctx context.Context, repoPath, symbol string) (string, error) {
-	return runGit(ctx, repoPath, "grep", "-n", "-E", "\\b"+regexp.QuoteMeta(symbol)+"\\b", "--", ".")
-}
-
-func gitGrepTests(ctx context.Context, repoPath, symbol string) (string, error) {
-	return runGit(ctx, repoPath, "grep", "-n", "-E", "\\b"+regexp.QuoteMeta(symbol)+"\\b", "--", "*test*", "*_test.go", "*.spec.*", "*.test.*")
-}
 
 func runGit(ctx context.Context, repoPath string, args ...string) (string, error) {
 	full := append([]string{"-C", repoPath}, args...)

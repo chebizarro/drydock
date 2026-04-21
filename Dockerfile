@@ -12,7 +12,7 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o /out/drydock ./cmd/drydock
 
 FROM alpine:3.22
 
-RUN apk add --no-cache ca-certificates tzdata git bash
+RUN apk add --no-cache ca-certificates tzdata git bash ripgrep
 WORKDIR /app
 
 COPY --from=builder /out/drydock /usr/local/bin/drydock
