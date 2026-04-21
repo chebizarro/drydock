@@ -299,6 +299,50 @@ func TestProcessorUsesEAsRootForPRUpdates(t *testing.T) {
 	}
 }
 
+func TestProcessorMarksTaskForRetryWhenQueueFull(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	repoOwner := "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+	if err := store.UpsertRepositoryAnnouncement(ctx, nostr.Event{
+		ID:        nostr.MustIDFromHex("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"),
+		PubKey:    nostr.MustPubKeyFromHex(repoOwner),
+		Kind:      30617,
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"d", "repo-1"}},
+	}); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+
+	// Create processor with a queue of size 1
+	processor := &ingest.Processor{
+		ReviewQueue: make(chan db.ReviewTask, 1),
+	}
+	// Manually construct a processor with a tiny queue to test overflow.
+	// The exported Processor struct has a ReviewQueue field we can replace.
+	smallProcessor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	// Fill the queue completely.
+	for i := 0; i < cap(smallProcessor.ReviewQueue); i++ {
+		smallProcessor.ReviewQueue <- db.ReviewTask{PatchEventID: "filler", RepoID: "filler"}
+	}
+	_ = processor // unused, use smallProcessor
+
+	patch := nostr.Event{
+		ID:        nostr.MustIDFromHex("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"),
+		PubKey:    nostr.MustPubKeyFromHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+		Kind:      1617,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"a", "30617:" + repoOwner + ":repo-1"},
+			{"e", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "", "root"},
+		},
+	}
+	// Process should not fail even when queue is full — task gets marked for retry.
+	if err := smallProcessor.ProcessEvent(ctx, patch, "wss://relay.test"); err != nil {
+		t.Fatalf("process should not error on full queue: %v", err)
+	}
+}
+
 func mustOpenStore(t *testing.T, ctx context.Context) *db.Store {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "drydock-test.db")

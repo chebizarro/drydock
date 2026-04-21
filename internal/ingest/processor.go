@@ -79,12 +79,15 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			return err
 		}
 		if acquired {
-			p.logger.Info("queued patch review", "event_id", event.ID.Hex(), "repo_id", repoID, "kind", int(event.Kind))
 			task := db.ReviewTask{PatchEventID: event.ID.Hex(), RepoID: repoID}
 			select {
 			case p.ReviewQueue <- task:
+				p.logger.Info("queued patch review", "event_id", event.ID.Hex(), "repo_id", repoID, "kind", int(event.Kind))
 			default:
-				p.logger.Warn("review queue full, dropping task", "event_id", event.ID.Hex(), "repo_id", repoID)
+				// Queue is full — mark task back to failed so it can be retried
+				// by the next startup's ResetStuckReviews or a future re-enqueue sweep.
+				p.logger.Warn("review queue full, marking task for retry", "event_id", event.ID.Hex(), "repo_id", repoID)
+				_ = p.store.MarkReviewFailed(ctx, event.ID.Hex(), repoID, "review queue full")
 			}
 		}
 		return nil

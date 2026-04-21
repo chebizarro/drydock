@@ -20,6 +20,9 @@ import (
 	"drydock/internal/reviewengine"
 	"drydock/internal/signing"
 
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip11"
+
 )
 
 func main() {
@@ -49,13 +52,6 @@ func main() {
 		logger.Info("reset stuck reviews to pending", "count", n)
 	}
 
-	// --- Ingest / Listener ---
-	processor := ingest.NewProcessor(store, logger)
-	svc := listener.New(listener.Config{
-		Relays:          cfg.Relays,
-		LookbackMinutes: cfg.ListenerLookbackMin,
-	}, processor, logger)
-
 	// --- Signer ---
 	var signer publisher.Signer
 	if cfg.SignerBunkerURL != "" {
@@ -83,6 +79,68 @@ func main() {
 		logger.Warn("no signer configured (set DRYDOCK_SIGNER_BUNKER_URL or DRYDOCK_SIGNER_NSEC) — review publishing disabled")
 	}
 
+	// --- Shared Nostr pool (with NIP-42 AUTH if signer available) ---
+	poolOpts := nostr.PoolOptions{}
+	if signer != nil {
+		poolOpts.AuthRequiredHandler = func(authCtx context.Context, evt *nostr.Event) error {
+			return signer.SignEvent(authCtx, evt)
+		}
+		logger.Info("NIP-42 relay auth handler enabled")
+	}
+	pool := nostr.NewPool(poolOpts)
+
+	// --- NIP-11 relay capability probe (non-blocking, log-only) ---
+	allRelays := make(map[string]struct{})
+	for _, r := range cfg.Relays {
+		allRelays[r] = struct{}{}
+	}
+	for _, r := range cfg.ReadRelays {
+		allRelays[r] = struct{}{}
+	}
+	for _, r := range cfg.WriteRelays {
+		allRelays[r] = struct{}{}
+	}
+	for relayURL := range allRelays {
+		info, err := nip11.Fetch(ctx, relayURL)
+		if err != nil {
+			logger.Warn("NIP-11 probe failed", "relay", relayURL, "error", err)
+			continue
+		}
+		logger.Info("relay probed",
+			"relay", relayURL,
+			"name", info.Name,
+			"software", info.Software,
+			"supported_nips", info.SupportedNIPs,
+		)
+		if info.Limitation != nil {
+			if info.Limitation.AuthRequired && signer == nil {
+				logger.Warn("relay requires auth but no signer configured",
+					"relay", relayURL,
+				)
+			}
+			if info.Limitation.PaymentRequired {
+				logger.Warn("relay requires payment", "relay", relayURL)
+			}
+		}
+	}
+
+	// --- Relay lists (read/write separation with fallback to DRYDOCK_RELAYS) ---
+	readRelays := cfg.ReadRelays
+	if len(readRelays) == 0 {
+		readRelays = cfg.Relays
+	}
+	writeRelays := cfg.WriteRelays
+	if len(writeRelays) == 0 {
+		writeRelays = cfg.Relays
+	}
+
+	// --- Ingest / Listener ---
+	processor := ingest.NewProcessor(store, logger)
+	svc := listener.New(listener.Config{
+		Relays:          readRelays,
+		LookbackMinutes: cfg.ListenerLookbackMin,
+	}, processor, logger, listener.WithPool(pool), listener.WithStore(store))
+
 	// --- Repo service ---
 	repoManager := repo.NewManager(cfg.RepoCacheDir, logger)
 	repoSvc := repo.NewService(store, repoManager, logger)
@@ -104,9 +162,9 @@ func main() {
 	// --- Publisher ---
 	var pubSvc *publisher.Service
 	if signer != nil {
-		relayPub := publisher.NewNostrRelayPublisher()
+		relayPub := publisher.NewNostrRelayPublisher(pool, logger)
 		pubSvc = publisher.New(publisher.Config{
-			DefaultRelays:       cfg.Relays,
+			DefaultRelays:       writeRelays,
 			DetailSeverityFloor: "high",
 			DefaultTTL:          90 * 24 * time.Hour,
 			SupersededTTL:       7 * 24 * time.Hour,

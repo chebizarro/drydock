@@ -11,6 +11,8 @@ type Config struct {
 	DatabaseURL         string
 	RepoCacheDir        string
 	Relays              []string
+	ReadRelays          []string
+	WriteRelays         []string
 	LogLevel            slog.Level
 	ListenerLookbackMin int
 
@@ -40,6 +42,8 @@ func FromEnv() Config {
 				"wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net",
 			),
 		),
+		ReadRelays:  splitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
+		WriteRelays: splitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
 		LogLevel:            parseLogLevel(envOrDefault("DRYDOCK_LOG_LEVEL", "info")),
 		ListenerLookbackMin: parseIntOrDefault(envOrDefault("DRYDOCK_LISTENER_LOOKBACK_MIN", "5"), 5),
 		PlannerBaseURL:      envOrDefault("DRYDOCK_PLANNER_BASE_URL", "http://127.0.0.1:11434/v1"),

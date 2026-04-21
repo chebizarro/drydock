@@ -1003,6 +1003,43 @@ func jaccard(a, b []string) float64 {
 	return float64(intersection) / float64(len(union))
 }
 
+// GetListenerHighWaterMark returns the timestamp of the most recently processed
+// event, or 0 if no events have been tracked yet.
+func (s *Store) GetListenerHighWaterMark(ctx context.Context) (int64, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM listener_state WHERE key='high_water_mark'`,
+	).Scan(&value)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("get listener high water mark: %w", err)
+	}
+	var ts int64
+	if _, err := fmt.Sscanf(value, "%d", &ts); err != nil {
+		return 0, nil
+	}
+	return ts, nil
+}
+
+// UpdateListenerHighWaterMark persists the timestamp of the most recently processed
+// event so it can be used for lookback on restart.
+func (s *Store) UpdateListenerHighWaterMark(ctx context.Context, ts int64) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO listener_state(key, value, updated_at)
+		VALUES ('high_water_mark', ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+		WHERE CAST(excluded.value AS INTEGER) > CAST(listener_state.value AS INTEGER)`,
+		fmt.Sprintf("%d", ts), now,
+	)
+	if err != nil {
+		return fmt.Errorf("update listener high water mark: %w", err)
+	}
+	return nil
+}
+
 // ReviewTask is a queued patch/repo pair ready for pipeline execution.
 type ReviewTask struct {
 	PatchEventID string

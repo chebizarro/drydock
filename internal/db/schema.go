@@ -135,6 +135,12 @@ CREATE TABLE IF NOT EXISTS few_shot_reviews (
 );
 CREATE INDEX IF NOT EXISTS idx_few_shot_reviews_created_at ON few_shot_reviews(created_at);
 
+CREATE TABLE IF NOT EXISTS listener_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS eval_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   dataset_id TEXT NOT NULL,

@@ -2,6 +2,7 @@ package publisher
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -38,6 +39,15 @@ func (f *fakeRelayPublisher) Publish(_ context.Context, relays []string, event n
 	copied := append([]string(nil), relays...)
 	f.calls = append(f.calls, publishCall{relays: copied, event: event})
 	return nil
+}
+
+// failingRelayPublisher always returns an error simulating all-relay rejection.
+type failingRelayPublisher struct {
+	err error
+}
+
+func (f *failingRelayPublisher) Publish(_ context.Context, _ []string, _ nostr.Event) error {
+	return f.err
 }
 
 func TestPublishReviewSummaryAndHighDetail(t *testing.T) {
@@ -233,4 +243,72 @@ func contains(items []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func TestPublishReviewFailsGracefullyWhenAllRelaysReject(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	rejectPub := &failingRelayPublisher{err: fmt.Errorf("publish failed on all relays: wss://relay.test: msg: blocked: spam")}
+	svc := New(Config{
+		DefaultRelays:       []string{"wss://fallback.example"},
+		DetailSeverityFloor: "high",
+	}, store, fakeSigner{sk: nostr.Generate()}, rejectPub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	_, err := svc.PublishReview(ctx, PublishInput{
+		PatchEventID:      patchID,
+		RepoID:            repoID,
+		Summary:           "Review summary.",
+		Model:             "test-model",
+		ContextHash:       "hash123",
+		Confidence:        0.5,
+		ContextLayersUsed: []string{"patch"},
+	})
+	if err == nil {
+		t.Fatal("expected error when all relays reject, got nil")
+	}
+	if !strings.Contains(err.Error(), "publish summary review event") {
+		t.Fatalf("expected publish error, got: %v", err)
+	}
+}
+
+func TestPublishReviewPartialRelayFailureStillSucceeds(t *testing.T) {
+	// This test verifies that when the publisher succeeds (returns nil),
+	// the service treats it as success. The real NostrRelayPublisher handles
+	// partial failure internally (success > 0 means ok).
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	fakePub := &fakeRelayPublisher{}
+	svc := New(Config{
+		DefaultRelays:       []string{"wss://fallback.example"},
+		DetailSeverityFloor: "high",
+	}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	eventID, err := svc.PublishReview(ctx, PublishInput{
+		PatchEventID:      patchID,
+		RepoID:            repoID,
+		Summary:           "All good.",
+		Model:             "test-model",
+		ContextHash:       "hash456",
+		Confidence:        0.9,
+		ContextLayersUsed: []string{"patch"},
+	})
+	if err != nil {
+		t.Fatalf("publish should succeed: %v", err)
+	}
+	if strings.TrimSpace(eventID) == "" {
+		t.Fatal("expected non-empty event id")
+	}
+	if len(fakePub.calls) == 0 {
+		t.Fatal("expected at least one publish call")
+	}
 }
