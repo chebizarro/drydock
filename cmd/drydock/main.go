@@ -17,6 +17,7 @@ import (
 	"drydock/internal/listener"
 	"drydock/internal/lspbridge"
 	"drydock/internal/metareview"
+	"drydock/internal/nipingest"
 	"drydock/internal/pipeline"
 	"drydock/internal/promptrefine"
 	"drydock/internal/publisher"
@@ -27,12 +28,17 @@ import (
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip11"
-
 )
 
 func main() {
 	cfg := config.FromEnv()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+
+	// --- NIP ingest mode: run and exit ---
+	if mode := os.Getenv("DRYDOCK_MODE"); mode == "nip-ingest" {
+		runNIPIngest(cfg, logger)
+		return
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -376,6 +382,34 @@ func main() {
 	case <-drainCtx.Done():
 		logger.Warn("graceful shutdown timed out, exiting", "timeout", drainTimeout)
 	}
+}
+
+// runNIPIngest runs the NIP spec ingest pipeline and exits.
+func runNIPIngest(cfg config.Config, logger *slog.Logger) {
+	if cfg.NIPsDir == "" {
+		logger.Error("DRYDOCK_NIPS_DIR must be set for nip-ingest mode")
+		os.Exit(1)
+	}
+	if cfg.QdrantURL == "" || cfg.EmbedBaseURL == "" {
+		logger.Error("DRYDOCK_QDRANT_URL and DRYDOCK_EMBED_BASE_URL must be set for nip-ingest mode")
+		os.Exit(1)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	qdrantClient := vectorstore.NewClient(cfg.QdrantURL, cfg.QdrantAPIKey)
+	embedClient := embedding.NewClient(cfg.EmbedBaseURL, cfg.EmbedAPIKey, cfg.EmbedModel)
+
+	ingester := nipingest.NewIngester(qdrantClient, embedClient, logger)
+	n, err := ingester.Run(ctx, nipingest.Config{
+		NIPsDir: cfg.NIPsDir,
+	})
+	if err != nil {
+		logger.Error("NIP ingest failed", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("NIP ingest complete", "chunks_upserted", n)
 }
 
 // socketSignerAvailable checks if the default NIP-5F socket path exists.
