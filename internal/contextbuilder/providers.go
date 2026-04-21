@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"drydock/internal/lspbridge"
 	"drydock/internal/symbols"
 
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
@@ -112,7 +113,7 @@ func (fileContextProvider) Build(_ context.Context, in BuildInput) (string, erro
 }
 
 type symbolsCallsitesProvider struct {
-	lspClient interface{}        // optional *lspbridge.Client for enhanced analysis
+	lspClient *lspbridge.Client   // optional LSP bridge for type-aware analysis
 	extractor  *symbols.Extractor // tree-sitter symbol extractor
 	search    *searcher           // ripgrep with git grep fallback
 }
@@ -139,10 +140,16 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 	out.WriteString(strings.Join(syms, ", "))
 	out.WriteString("\n")
 
-	// TODO: When lspClient is set and reachable, query LSP bridge for
-	// type-aware symbol definitions and references. For now, always
-	// use git grep as the fallback.
+	// Try LSP bridge for type-aware definitions and references when available.
+	// Falls back to git grep on any error (bridge down, timeout, etc.).
+	if p.lspClient != nil {
+		if lspContent := p.queryLSP(ctx, in, syms); lspContent != "" {
+			out.WriteString(lspContent)
+			return strings.TrimSpace(out.String()), nil
+		}
+	}
 
+	// Fallback: git grep / ripgrep search.
 	srch := p.search
 	if srch == nil {
 		srch = newSearcher()
@@ -210,6 +217,86 @@ func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput) []string 
 		names = names[:12]
 	}
 	return names
+}
+
+// queryLSP calls the LSP bridge for type-aware symbol analysis.
+// Returns formatted context string, or empty string on any error (caller falls
+// back to git grep). Changed files are extracted from the patch diff.
+func (p symbolsCallsitesProvider) queryLSP(ctx context.Context, in BuildInput, syms []string) string {
+	files, err := parsePatch(in.PatchEventContent)
+	if err != nil {
+		return ""
+	}
+	var changedFiles []string
+	for _, f := range files {
+		path := pickPath(f)
+		if path != "" {
+			changedFiles = append(changedFiles, path)
+		}
+	}
+
+	resp, err := p.lspClient.Analyze(ctx, lspbridge.AnalyzeRequest{
+		RepoPath:     in.RepoPath,
+		ChangedFiles: changedFiles,
+		Symbols:      syms,
+	})
+	if err != nil {
+		return ""
+	}
+	if resp.Error != "" {
+		return ""
+	}
+
+	// Only use LSP results if they returned something useful.
+	if len(resp.Definitions) == 0 && len(resp.References) == 0 && len(resp.Diagnostics) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+
+	// Definitions: group by symbol for readability.
+	if len(resp.Definitions) > 0 {
+		out.WriteString("\n## Definitions (LSP)\n")
+		for _, def := range resp.Definitions {
+			out.WriteString(fmt.Sprintf("- **%s** (%s) — %s:%d", def.Name, def.Kind, def.File, def.Line))
+			if def.Detail != "" {
+				out.WriteString(fmt.Sprintf(" `%s`", def.Detail))
+			}
+			out.WriteString("\n")
+		}
+	}
+
+	// References: show up to 20 to keep context within budget.
+	if len(resp.References) > 0 {
+		out.WriteString("\n## References (LSP)\n")
+		refs := resp.References
+		if len(refs) > 20 {
+			refs = refs[:20]
+		}
+		for _, ref := range refs {
+			out.WriteString(fmt.Sprintf("- %s → %s:%d:%d\n", ref.Symbol, ref.File, ref.Line, ref.Column))
+		}
+		if len(resp.References) > 20 {
+			out.WriteString(fmt.Sprintf("- ... and %d more references\n", len(resp.References)-20))
+		}
+	}
+
+	// Diagnostics from the language server (warnings/errors in changed files).
+	if len(resp.Diagnostics) > 0 {
+		out.WriteString("\n## Diagnostics (LSP)\n")
+		diags := resp.Diagnostics
+		if len(diags) > 10 {
+			diags = diags[:10]
+		}
+		for _, d := range diags {
+			out.WriteString(fmt.Sprintf("- [%s] %s:%d — %s (%s)\n", d.Severity, d.File, d.Line, d.Message, d.Source))
+		}
+		if len(resp.Diagnostics) > 10 {
+			out.WriteString(fmt.Sprintf("- ... and %d more diagnostics\n", len(resp.Diagnostics)-10))
+		}
+	}
+
+	return out.String()
 }
 
 // extractChangedLineNumbers returns 0-based line numbers from the new file

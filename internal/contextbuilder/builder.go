@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"unicode/utf8"
+
+	"drydock/internal/lspbridge"
 )
 
 const DefaultTokenBudget = 64_000
@@ -81,11 +83,10 @@ type Provider interface {
 type BuilderOptions struct {
 	QdrantClient  interface{ /* *vectorstore.Client */ } // nil = no Qdrant retrieval
 	EmbedClient   interface{ /* *embedding.Client */ }   // nil = no embedding
-	LSPClient     interface{ /* *lspbridge.Client */ }    // nil = git grep fallback
 
 	// Typed accessors set internally. Use the With* helpers.
 	qdrantProvider Provider
-	lspClient      interface{}
+	lspClient      *lspbridge.Client
 }
 
 type Builder struct {
