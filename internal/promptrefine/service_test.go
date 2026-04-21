@@ -270,6 +270,117 @@ func TestActiveReviewerPromptReturnsActive(t *testing.T) {
 	}
 }
 
+func TestInferGapCategory(t *testing.T) {
+	tests := []struct {
+		gap  string
+		want string
+	}{
+		{"Missing SQL injection detection in user input", "security"},
+		{"Fails to catch XSS in template rendering", "security"},
+		{"Did not flag insecure TLS configuration", "security"},
+		{"Missed nil pointer dereference after FindUser", "correctness"},
+		{"Off-by-one error in pagination not detected", "correctness"},
+		{"Should flag missing error handling on Write call", "correctness"},
+		{"Race condition on shared map not flagged", "concurrency"},
+		{"Missed potential deadlock in transfer logic", "concurrency"},
+		{"Unbounded memory allocation from user input", "performance"},
+		{"Cache miss rate too high for hot path", "performance"},
+		{"Inconsistent naming convention not flagged", "style"},
+		{"Missing documentation on exported function", "style"},
+		{"Unclear gap that matches nothing specific", "other"},
+	}
+	for _, tt := range tests {
+		got := inferGapCategory(tt.gap)
+		if got != tt.want {
+			t.Errorf("inferGapCategory(%q) = %q, want %q", tt.gap, got, tt.want)
+		}
+	}
+}
+
+func TestClusterGaps(t *testing.T) {
+	gaps := []string{
+		"Missing SQL injection detection",
+		"Race condition on shared map not flagged",
+		"Missed nil dereference after lookup",
+		"XSS in template output not caught",
+		"Deadlock in concurrent transfer",
+	}
+	clusters := clusterGaps(gaps)
+
+	// Should be sorted alphabetically by category.
+	if len(clusters) != 3 {
+		t.Fatalf("expected 3 clusters, got %d", len(clusters))
+	}
+
+	// concurrency, correctness, security (alphabetical)
+	if clusters[0].category != "concurrency" {
+		t.Errorf("first cluster = %q, want concurrency", clusters[0].category)
+	}
+	if len(clusters[0].gaps) != 2 {
+		t.Errorf("concurrency cluster has %d gaps, want 2", len(clusters[0].gaps))
+	}
+	if clusters[1].category != "correctness" {
+		t.Errorf("second cluster = %q, want correctness", clusters[1].category)
+	}
+	if len(clusters[1].gaps) != 1 {
+		t.Errorf("correctness cluster has %d gaps, want 1", len(clusters[1].gaps))
+	}
+	if clusters[2].category != "security" {
+		t.Errorf("third cluster = %q, want security", clusters[2].category)
+	}
+	if len(clusters[2].gaps) != 2 {
+		t.Errorf("security cluster has %d gaps, want 2", len(clusters[2].gaps))
+	}
+}
+
+func TestClusterGapsEmpty(t *testing.T) {
+	clusters := clusterGaps(nil)
+	if len(clusters) != 0 {
+		t.Errorf("expected 0 clusters for nil input, got %d", len(clusters))
+	}
+}
+
+func TestClusterGapsAllSameCategory(t *testing.T) {
+	gaps := []string{
+		"SQL injection in query builder",
+		"Missing XSS escaping in template",
+		"Hardcoded credentials in config",
+	}
+	clusters := clusterGaps(gaps)
+	if len(clusters) != 1 {
+		t.Fatalf("expected 1 cluster, got %d", len(clusters))
+	}
+	if clusters[0].category != "security" {
+		t.Errorf("category = %q, want security", clusters[0].category)
+	}
+	if len(clusters[0].gaps) != 3 {
+		t.Errorf("cluster has %d gaps, want 3", len(clusters[0].gaps))
+	}
+}
+
+func TestRefinementUserPromptClustered(t *testing.T) {
+	gaps := []string{
+		"Missing SQL injection check",
+		"Race condition not detected",
+		"Nil pointer after lookup",
+	}
+	result := refinementUserPrompt("test prompt", gaps)
+
+	// Should contain category headers.
+	if !contains(result, "### SECURITY") {
+		t.Error("expected SECURITY cluster header in prompt")
+	}
+	if !contains(result, "### CONCURRENCY") {
+		t.Error("expected CONCURRENCY cluster header in prompt")
+	}
+	if !contains(result, "### CORRECTNESS") {
+		t.Error("expected CORRECTNESS cluster header in prompt")
+	}
+	if !contains(result, "clustered by category") {
+		t.Error("expected 'clustered by category' header")
+	}
+}
+
 func TestStripCodeFences(t *testing.T) {
 	tests := []struct {
 		input string

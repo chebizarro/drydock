@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"drydock/internal/db"
@@ -272,18 +273,21 @@ func (s *Service) callRefinementLLM(ctx context.Context, currentPrompt string, g
 
 func refinementSystemPrompt() string {
 	return `You are a prompt engineering specialist.
-You will receive the current code review system prompt and a batch of identified prompt gaps.
-Each gap describes a category of issues that the current prompt fails to catch.
+You will receive the current code review system prompt and a batch of identified prompt gaps
+clustered by category (security, correctness, concurrency, performance, style, other).
+Each gap describes an issue category that the current prompt fails to catch.
 
 Your task:
-1. Analyze the gaps and identify which sections of the prompt need modification.
-2. Rewrite the prompt to address the gaps while preserving all existing capabilities.
-3. Return ONLY the complete revised prompt text — no explanation, no markdown fences, no commentary.
+1. Process each cluster in order — gaps within the same cluster often reveal a pattern.
+2. For each cluster, identify which prompt sections need modification to address the pattern.
+3. Rewrite the prompt to address ALL gaps while preserving existing capabilities.
+4. Return ONLY the complete revised prompt text — no explanation, no markdown fences, no commentary.
 
 Rules:
 - Keep the JSON output format specification unchanged.
 - Do not remove existing instructions unless they directly conflict with a gap fix.
 - Be specific and actionable in new instructions.
+- Address cluster patterns holistically — one well-written instruction can cover multiple related gaps.
 - Keep the prompt concise — do not bloat it with redundant text.`
 }
 
@@ -291,11 +295,94 @@ func refinementUserPrompt(currentPrompt string, gaps []string) string {
 	var b strings.Builder
 	b.WriteString("CURRENT PROMPT:\n")
 	b.WriteString(currentPrompt)
-	b.WriteString("\n\nIDENTIFIED GAPS:\n")
-	for i, gap := range gaps {
-		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, gap))
+	b.WriteString("\n\nIDENTIFIED GAPS (clustered by category):\n\n")
+
+	clusters := clusterGaps(gaps)
+	for _, cl := range clusters {
+		b.WriteString(fmt.Sprintf("### %s (%d gap", strings.ToUpper(cl.category), len(cl.gaps)))
+		if len(cl.gaps) != 1 {
+			b.WriteString("s")
+		}
+		b.WriteString(")\n")
+		for i, gap := range cl.gaps {
+			b.WriteString(fmt.Sprintf("  %d. %s\n", i+1, gap))
+		}
+		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// gapCluster groups prompt gaps by inferred category.
+type gapCluster struct {
+	category string
+	gaps     []string
+}
+
+// clusterGaps groups gap texts by keyword-based category inference.
+// Categories are sorted alphabetically for deterministic output.
+func clusterGaps(gaps []string) []gapCluster {
+	buckets := make(map[string][]string)
+	for _, gap := range gaps {
+		cat := inferGapCategory(gap)
+		buckets[cat] = append(buckets[cat], gap)
+	}
+
+	cats := make([]string, 0, len(buckets))
+	for cat := range buckets {
+		cats = append(cats, cat)
+	}
+	sort.Strings(cats)
+
+	clusters := make([]gapCluster, len(cats))
+	for i, cat := range cats {
+		clusters[i] = gapCluster{category: cat, gaps: buckets[cat]}
+	}
+	return clusters
+}
+
+// categoryKeywords maps categories to keywords that indicate membership.
+var categoryKeywords = []struct {
+	category string
+	keywords []string
+}{
+	{"security", []string{
+		"security", "injection", "xss", "ssrf", "csrf", "auth", "credential",
+		"password", "token", "encrypt", "tls", "ssl", "certificate",
+		"vulnerability", "sanitize", "escape", "traversal", "redirect",
+		"secret", "hardcoded", "insecure", "permission", "privilege",
+	}},
+	{"correctness", []string{
+		"null", "nil", "error handling", "panic", "bounds", "overflow",
+		"off-by-one", "validation", "incorrect", "wrong", "bug", "crash",
+		"undefined", "missing check", "return value", "type", "cast",
+	}},
+	{"concurrency", []string{
+		"race", "deadlock", "mutex", "goroutine", "concurrent", "atomic",
+		"sync", "lock", "thread", "channel", "data race", "parallel",
+	}},
+	{"performance", []string{
+		"performance", "memory", "leak", "allocation", "cache", "complexity",
+		"O(n", "slow", "efficient", "optimize", "latency", "throughput",
+		"resource", "unbounded",
+	}},
+	{"style", []string{
+		"style", "naming", "format", "convention", "readability",
+		"documentation", "comment", "lint", "idiomatic", "consistency",
+		"spelling", "whitespace",
+	}},
+}
+
+// inferGapCategory classifies a gap text into a category by keyword matching.
+func inferGapCategory(gap string) string {
+	lower := strings.ToLower(gap)
+	for _, entry := range categoryKeywords {
+		for _, kw := range entry.keywords {
+			if strings.Contains(lower, kw) {
+				return entry.category
+			}
+		}
+	}
+	return "other"
 }
 
 func stripCodeFences(s string) string {
