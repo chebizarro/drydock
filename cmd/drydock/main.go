@@ -10,16 +10,19 @@ import (
 
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
+	"drydock/internal/embedding"
 	"drydock/internal/health"
 	"drydock/internal/db"
 	"drydock/internal/ingest"
 	"drydock/internal/listener"
+	"drydock/internal/lspbridge"
 	"drydock/internal/metareview"
 	"drydock/internal/pipeline"
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
 	"drydock/internal/signing"
+	"drydock/internal/vectorstore"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip11"
@@ -53,7 +56,7 @@ func main() {
 		logger.Info("reset stuck reviews to pending", "count", n)
 	}
 
-	// --- Signer ---
+	// --- Signer (chain: bunker → socket → nsec) ---
 	var signer publisher.Signer
 	if cfg.SignerBunkerURL != "" {
 		s, err := signing.NewBunkerSigner(ctx, signing.BunkerSignerConfig{
@@ -68,7 +71,19 @@ func main() {
 		}
 		signer = s
 		logger.Info("NIP-46 bunker signer ready")
-	} else if cfg.SignerNsec != "" {
+	}
+	if signer == nil && (cfg.SignerSocketPath != "" || socketSignerAvailable()) {
+		s, err := signing.NewSocketSigner(ctx, signing.SocketSignerConfig{
+			SocketPath: cfg.SignerSocketPath,
+		})
+		if err != nil {
+			logger.Warn("NIP-5F socket signer not available", "error", err)
+		} else {
+			signer = s
+			logger.Info("NIP-5F socket signer ready")
+		}
+	}
+	if signer == nil && cfg.SignerNsec != "" {
 		s, err := signing.NewLocalSigner(cfg.SignerNsec)
 		if err != nil {
 			logger.Error("failed to create local signer", "error", err)
@@ -76,8 +91,9 @@ func main() {
 		}
 		signer = s
 		logger.Info("local nsec signer ready")
-	} else {
-		logger.Warn("no signer configured (set DRYDOCK_SIGNER_BUNKER_URL or DRYDOCK_SIGNER_NSEC) — review publishing disabled")
+	}
+	if signer == nil {
+		logger.Warn("no signer configured — review publishing disabled")
 	}
 
 	// --- Shared Nostr pool (with NIP-42 AUTH if signer available) ---
@@ -149,8 +165,45 @@ func main() {
 	)
 	repoSvc := repo.NewService(store, repoManager, logger)
 
+	// --- Optional service clients ---
+	var builderOpts []func(*contextbuilder.BuilderOptions)
+
+	// Qdrant + embedding
+	var qdrantClient *vectorstore.Client
+	var embedClient *embedding.Client
+	if cfg.QdrantURL != "" && cfg.EmbedBaseURL != "" {
+		qdrantClient = vectorstore.NewClient(cfg.QdrantURL, cfg.QdrantAPIKey)
+		embedClient = embedding.NewClient(cfg.EmbedBaseURL, cfg.EmbedAPIKey, cfg.EmbedModel)
+
+		// Ensure collections exist (non-fatal).
+		vectorDim := 768 // default for nomic-embed
+		for _, col := range []string{vectorstore.CollectionNIPSpecs, vectorstore.CollectionProjectDocs, vectorstore.CollectionFewShot} {
+			if err := qdrantClient.EnsureCollection(ctx, col, vectorDim); err != nil {
+				logger.Warn("failed to ensure Qdrant collection", "collection", col, "error", err)
+			}
+		}
+
+		builderOpts = append(builderOpts, contextbuilder.WithQdrant(qdrantClient, embedClient))
+		logger.Info("Qdrant + embedding configured", "qdrant", cfg.QdrantURL, "embed_model", cfg.EmbedModel)
+	} else if cfg.QdrantURL != "" || cfg.EmbedBaseURL != "" {
+		logger.Warn("both DRYDOCK_QDRANT_URL and DRYDOCK_EMBED_BASE_URL must be set for RAG features")
+	}
+
+	// LSP bridge
+	var lspClient *lspbridge.Client
+	if cfg.LSPBridgeURL != "" {
+		lspClient = lspbridge.NewClient(cfg.LSPBridgeURL)
+		if err := lspClient.Ping(ctx); err != nil {
+			logger.Warn("LSP bridge not reachable, falling back to git grep", "url", cfg.LSPBridgeURL, "error", err)
+			lspClient = nil
+		} else {
+			builderOpts = append(builderOpts, contextbuilder.WithLSPBridge(lspClient))
+			logger.Info("LSP bridge connected", "url", cfg.LSPBridgeURL)
+		}
+	}
+
 	// --- Context builder ---
-	ctxBuilder := contextbuilder.NewDefault()
+	ctxBuilder := contextbuilder.NewWithOptions(contextbuilder.NewBuilderOptions(builderOpts...))
 
 	// --- Review engine (with retry for transient LLM failures) ---
 	llmClient := reviewengine.NewRetryingClient(
@@ -244,4 +297,13 @@ func main() {
 	}
 }
 
+// socketSignerAvailable checks if the default NIP-5F socket path exists.
+func socketSignerAvailable() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(home + "/.local/share/nostr/signer.sock")
+	return err == nil
+}
 
