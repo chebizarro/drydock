@@ -28,6 +28,7 @@ import (
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
+	"drydock/internal/securityscan"
 	"drydock/internal/signing"
 	"drydock/internal/vectorstore"
 
@@ -250,6 +251,12 @@ func main() {
 		}
 	}
 
+	// --- Security scanner ---
+	secScanner := securityscan.New()
+	secProvider := securityscan.NewProvider(secScanner)
+	builderOpts = append(builderOpts, contextbuilder.WithExtraProviders(secProvider))
+	logger.Info("security scanner enabled", "rules", len(securityscan.BuiltinRules()))
+
 	// --- Context builder ---
 	ctxBuilder := contextbuilder.NewWithOptions(contextbuilder.NewBuilderOptions(builderOpts...))
 
@@ -310,6 +317,7 @@ func main() {
 	if pubSvc != nil {
 		var pipelineOpts []func(*pipeline.Runner)
 		pipelineOpts = append(pipelineOpts, pipeline.WithPromptRefiner(prSvc))
+		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityScanner(secScanner))
 		if qdrantClient != nil && embedClient != nil {
 			pipelineOpts = append(pipelineOpts,
 				pipeline.WithFewShotRetriever(

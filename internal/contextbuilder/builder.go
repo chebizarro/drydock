@@ -101,6 +101,7 @@ type BuilderOptions struct {
 	// Typed accessors set internally. Use the With* helpers.
 	qdrantProvider Provider
 	lspClient      *lspbridge.Client
+	extraProviders []Provider
 }
 
 type Builder struct {

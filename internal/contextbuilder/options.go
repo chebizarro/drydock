@@ -26,6 +26,14 @@ func WithLSPBridge(client *lspbridge.Client) func(*BuilderOptions) {
 	}
 }
 
+// WithExtraProviders adds additional context providers (e.g. security scanner).
+// They are appended after the default providers.
+func WithExtraProviders(providers ...Provider) func(*BuilderOptions) {
+	return func(opts *BuilderOptions) {
+		opts.extraProviders = append(opts.extraProviders, providers...)
+	}
+}
+
 // NewBuilderOptions creates BuilderOptions from a list of option functions.
 func NewBuilderOptions(fns ...func(*BuilderOptions)) BuilderOptions {
 	var opts BuilderOptions

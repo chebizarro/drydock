@@ -18,6 +18,7 @@ import (
 	"drydock/internal/repo"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
+	"drydock/internal/securityscan"
 
 	"fiatjaf.com/nostr"
 )
@@ -46,6 +47,7 @@ type Runner struct {
 	promptRefiner    PromptRefiner
 	fewShotRetriever FewShotRetriever
 	docIngester      DocIngester
+	secScanner       *securityscan.Scanner
 	queue            <-chan db.ReviewTask
 	workers          int
 	logger           *slog.Logger
@@ -77,6 +79,14 @@ func WithFewShotRetriever(fsr FewShotRetriever) func(*Runner) {
 func WithDocIngester(di DocIngester) func(*Runner) {
 	return func(r *Runner) {
 		r.docIngester = di
+	}
+}
+
+// WithSecurityScanner enables deterministic SAST scanning alongside LLM review.
+// Scanner findings are deduplicated with LLM findings and merged into the final output.
+func WithSecurityScanner(scanner *securityscan.Scanner) func(*Runner) {
+	return func(r *Runner) {
+		r.secScanner = scanner
 	}
 }
 
@@ -279,11 +289,29 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return fmt.Errorf("review engine: %w", err)
 	}
 
+	// 6d. Run security scanner (deterministic SAST, parallel with LLM review is possible
+	// but kept sequential here for simplicity and determinism).
+	var scanFindings []securityscan.SecurityFinding
+	if r.secScanner != nil && len(changedFiles) > 0 {
+		scanResult := r.secScanner.ScanFiles(ctx, prep.RepoPath, changedFiles, patchDiffContent)
+		scanFindings = scanResult.Findings
+		if len(scanFindings) > 0 {
+			metrics.SecurityScanFindings.Add(int64(len(scanFindings)))
+			r.logger.Info("security scan complete",
+				"patch_event_id", task.PatchEventID,
+				"files_scanned", scanResult.FilesScanned,
+				"findings", len(scanFindings))
+		}
+	}
+
 	// 7. Compute context hash
 	ctxHash := fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content)))
 
-	// 7b. Apply deterministic review policy filtering.
-	filteredReview := applyReviewPolicy(result.Review, repoCfg)
+	// 7b. Deduplicate scanner findings with LLM findings, then apply review policy.
+	mergedFindings := securityscan.DeduplicateFindings(scanFindings, result.Review.Findings)
+	mergedReview := result.Review
+	mergedReview.Findings = mergedFindings
+	filteredReview := applyReviewPolicy(mergedReview, repoCfg)
 
 	// 8. Compute mean confidence
 	confidence := meanConfidence(filteredReview.Findings)

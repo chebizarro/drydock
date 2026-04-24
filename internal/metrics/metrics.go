@@ -151,6 +151,9 @@ var (
 	// Requeue
 	ReviewsRequeued = &Counter{}
 
+	// Security scan
+	SecurityScanFindings = &Counter{}
+
 	// Conversations
 	ConversationRepliesReceived = &Counter{}
 	ConversationResponsesSent   = &Counter{}
@@ -242,6 +245,10 @@ func writeMetrics(w io.Writer) {
 	// Requeue
 	writeCounter(w, "drydock_reviews_requeued_total",
 		"Reviews requeued from failed state.", ReviewsRequeued)
+
+	// Security scan
+	writeCounter(w, "drydock_security_scan_findings_total",
+		"Security findings from deterministic SAST scanner.", SecurityScanFindings)
 
 	// Conversations
 	writeCounter(w, "drydock_conversation_replies_received_total",

@@ -43,6 +43,9 @@ func DefaultProviders(opts ...BuilderOptions) []Provider {
 		providers = append(providers, opt.qdrantProvider)
 	}
 
+	// Add any extra providers (e.g. security scanner).
+	providers = append(providers, opt.extraProviders...)
+
 	return providers
 }
 
