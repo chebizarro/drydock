@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"drydock/internal/codeindex"
-	"drydock/internal/dashboard"
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/conversation"
+	"drydock/internal/dashboard"
 	"drydock/internal/db"
 	"drydock/internal/driftguard"
 	"drydock/internal/embedding"
@@ -22,6 +22,7 @@ import (
 	"drydock/internal/ingest"
 	"drydock/internal/listener"
 	"drydock/internal/lspbridge"
+	"drydock/internal/marketplace"
 	"drydock/internal/metareview"
 	"drydock/internal/metrics"
 	"drydock/internal/nipingest"
@@ -463,6 +464,10 @@ func main() {
 			}
 		}()
 	}
+
+	// --- Background marketplace assignment expiry (checks every 5 minutes) ---
+	expirySvc := marketplace.NewExpiryService(marketplace.DefaultExpiryConfig(), store, logger)
+	go expirySvc.Run(ctx)
 
 	healthSrv.SetReady(true)
 
