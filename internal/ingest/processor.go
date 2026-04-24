@@ -12,18 +12,36 @@ import (
 	"fiatjaf.com/nostr"
 )
 
-type Processor struct {
-	store       *db.Store
-	logger      *slog.Logger
-	ReviewQueue chan db.ReviewTask
+// ConversationHandler processes reply events targeting Drydock reviews.
+type ConversationHandler interface {
+	HandleReply(ctx context.Context, replyEvent nostr.Event, relayURL string) error
+	IsReplyToUs(ctx context.Context, event nostr.Event) bool
 }
 
-func NewProcessor(store *db.Store, logger *slog.Logger) *Processor {
-	return &Processor{
+type Processor struct {
+	store        *db.Store
+	logger       *slog.Logger
+	ReviewQueue  chan db.ReviewTask
+	conversation ConversationHandler
+}
+
+// WithConversation sets the conversation handler for processing reply events.
+func WithConversation(ch ConversationHandler) func(*Processor) {
+	return func(p *Processor) {
+		p.conversation = ch
+	}
+}
+
+func NewProcessor(store *db.Store, logger *slog.Logger, opts ...func(*Processor)) *Processor {
+	p := &Processor{
 		store:       store,
 		logger:      logger,
 		ReviewQueue: make(chan db.ReviewTask, 256),
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayURL string) error {
@@ -107,6 +125,19 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 				p.logger.Warn("review queue full, marking task for retry", "event_id", event.ID.Hex(), "repo_id", repoID)
 				_ = p.store.MarkReviewFailed(ctx, event.ID.Hex(), repoID, "review queue full")
 			}
+		}
+		return nil
+	case nostr.KindComment:
+		// Reply to one of our reviews? Route to conversation handler.
+		if p.conversation != nil && p.conversation.IsReplyToUs(ctx, event) {
+			go func() {
+				if err := p.conversation.HandleReply(ctx, event, relayURL); err != nil {
+					p.logger.Error("conversation handler failed",
+						"event_id", event.ID.Hex(),
+						"error", err,
+					)
+				}
+			}()
 		}
 		return nil
 	default:

@@ -12,6 +12,7 @@ import (
 
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
+	"drydock/internal/conversation"
 	"drydock/internal/db"
 	"drydock/internal/driftguard"
 	"drydock/internal/embedding"
@@ -177,8 +178,29 @@ func main() {
 		writeRelays = cfg.Relays
 	}
 
+	// --- Conversation handler ---
+	var convHandler *conversation.Handler
+	if signer != nil {
+		convClient := reviewengine.NewRetryingClient(
+			reviewengine.NewOpenAICompatClient(),
+			reviewengine.RetryConfig{MaxAttempts: 2},
+			logger,
+		)
+		relayPub := publisher.NewNostrRelayPublisher(pool, logger)
+		convHandler = conversation.New(conversation.Config{
+			Endpoint:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.PlannerModel},
+			Temperature:   0.3,
+			DefaultRelays: writeRelays,
+			ResponseTTL:   30 * 24 * time.Hour,
+		}, store, convClient, signer, relayPub, logger)
+	}
+
 	// --- Ingest / Listener ---
-	processor := ingest.NewProcessor(store, logger)
+	var processorOpts []func(*ingest.Processor)
+	if convHandler != nil {
+		processorOpts = append(processorOpts, ingest.WithConversation(convHandler))
+	}
+	processor := ingest.NewProcessor(store, logger, processorOpts...)
 	svc := listener.New(listener.Config{
 		Relays:          readRelays,
 		LookbackMinutes: cfg.ListenerLookbackMin,

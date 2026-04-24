@@ -72,6 +72,12 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// DB returns the underlying *sql.DB for direct queries by packages
+// that need ad-hoc access (e.g. conversation thread lookups).
+func (s *Store) DB() *sql.DB {
+	return s.db
+}
+
 // Ping verifies database connectivity.
 func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
@@ -1587,4 +1593,208 @@ func (s *Store) GetLatestEvalRecall(ctx context.Context) (float64, error) {
 		return 0, fmt.Errorf("get latest eval recall: %w", err)
 	}
 	return recall, nil
+}
+
+// --- Conversations ---
+
+// ConversationTurn represents a single turn in a review conversation.
+type ConversationTurn struct {
+	ID              int64
+	ReviewEventID   string
+	ReplyEventID    string
+	ResponseEventID string
+	RepoID          string
+	PatchEventID    string
+	ReplyAuthor     string
+	ReplyContent    string
+	ResponseContent string
+	TurnNumber      int
+	Status          string
+	CreatedAt       int64
+}
+
+var ErrConversationRateLimited = errors.New("conversation rate limit reached")
+
+// BeginConversationTurn atomically checks the turn limit and inserts a new
+// conversation turn in a single transaction. Returns the assigned turn number
+// or ErrConversationRateLimited if the limit is reached.
+// If the reply_event_id already exists with status "failed", it is retried.
+func (s *Store) BeginConversationTurn(ctx context.Context, turn ConversationTurn, maxTurns int) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin conversation tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Check if this reply was already processed (duplicate or retry).
+	var existingStatus string
+	var existingTurn int
+	err = tx.QueryRowContext(ctx,
+		`SELECT turn_number, status FROM conversations WHERE reply_event_id=?`,
+		turn.ReplyEventID,
+	).Scan(&existingTurn, &existingStatus)
+	if err == nil {
+		// Row exists.
+		if existingStatus == "published" {
+			return existingTurn, nil // already done — idempotent
+		}
+		if existingStatus == "failed" || existingStatus == "pending" {
+			// Allow retry — return the existing turn number.
+			if err := tx.Commit(); err != nil {
+				return 0, fmt.Errorf("commit conversation retry: %w", err)
+			}
+			return existingTurn, nil
+		}
+		return existingTurn, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("check existing conversation: %w", err)
+	}
+
+	// Count existing turns (atomically within transaction).
+	var turnCount int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM conversations WHERE review_event_id=?`,
+		turn.ReviewEventID,
+	).Scan(&turnCount); err != nil {
+		return 0, fmt.Errorf("count conversation turns: %w", err)
+	}
+	if turnCount >= maxTurns {
+		return 0, ErrConversationRateLimited
+	}
+
+	nextTurn := turnCount + 1
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO conversations(review_event_id, reply_event_id, response_event_id, repo_id, patch_event_id,
+			reply_author, reply_content, response_content, turn_number, status, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+		turn.ReviewEventID, turn.ReplyEventID, turn.ResponseEventID, turn.RepoID, turn.PatchEventID,
+		turn.ReplyAuthor, turn.ReplyContent, turn.ResponseContent, nextTurn, turn.CreatedAt,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint") {
+			// Race with another goroutine — treat as duplicate.
+			return 0, nil
+		}
+		return 0, fmt.Errorf("insert conversation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit conversation: %w", err)
+	}
+	return nextTurn, nil
+}
+
+// CountConversationTurns returns the number of conversation turns for a review event.
+func (s *Store) CountConversationTurns(ctx context.Context, reviewEventID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM conversations WHERE review_event_id=?`,
+		reviewEventID,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count conversation turns: %w", err)
+	}
+	return n, nil
+}
+
+// InsertConversation records a new conversation turn. Returns the auto-generated row ID.
+// Prefer BeginConversationTurn for rate-limited atomic inserts.
+func (s *Store) InsertConversation(ctx context.Context, turn ConversationTurn) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO conversations(review_event_id, reply_event_id, response_event_id, repo_id, patch_event_id,
+			reply_author, reply_content, response_content, turn_number, status, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+		turn.ReviewEventID, turn.ReplyEventID, turn.ResponseEventID, turn.RepoID, turn.PatchEventID,
+		turn.ReplyAuthor, turn.ReplyContent, turn.ResponseContent, turn.TurnNumber, turn.CreatedAt,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert conversation: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// SetConversationResponse updates the response event ID, content, and status after publishing.
+func (s *Store) SetConversationResponse(ctx context.Context, replyEventID, responseEventID, responseContent string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE conversations SET response_event_id=?, response_content=?, status='published' WHERE reply_event_id=?`,
+		responseEventID, responseContent, replyEventID,
+	)
+	if err != nil {
+		return fmt.Errorf("set conversation response: %w", err)
+	}
+	return nil
+}
+
+// MarkConversationFailed marks a conversation turn as failed for retry.
+func (s *Store) MarkConversationFailed(ctx context.Context, replyEventID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE conversations SET status='failed' WHERE reply_event_id=?`,
+		replyEventID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark conversation failed: %w", err)
+	}
+	return nil
+}
+
+// GetConversationHistory returns all prior conversation turns for a review,
+// ordered by turn number ascending.
+func (s *Store) GetConversationHistory(ctx context.Context, reviewEventID string) ([]ConversationTurn, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, review_event_id, reply_event_id, COALESCE(response_event_id,''), repo_id, patch_event_id,
+			reply_author, reply_content, response_content, turn_number, status, created_at
+			FROM conversations
+			WHERE review_event_id=?
+			ORDER BY turn_number ASC`,
+		reviewEventID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get conversation history: %w", err)
+	}
+	defer rows.Close()
+
+	var turns []ConversationTurn
+	for rows.Next() {
+		var t ConversationTurn
+		if err := rows.Scan(&t.ID, &t.ReviewEventID, &t.ReplyEventID, &t.ResponseEventID,
+			&t.RepoID, &t.PatchEventID, &t.ReplyAuthor, &t.ReplyContent, &t.ResponseContent,
+			&t.TurnNumber, &t.Status, &t.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan conversation turn: %w", err)
+		}
+		turns = append(turns, t)
+	}
+	return turns, rows.Err()
+}
+
+// FindReviewForReply looks up which review event a reply is targeting.
+// It searches the review_events table for an event matching the given ID.
+// Returns the review event ID, patch event ID, and repo ID, or empty strings if not found.
+func (s *Store) FindReviewForReply(ctx context.Context, targetEventID string) (reviewEventID, patchEventID, repoID string, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT event_id, patch_event_id, repo_id FROM review_events WHERE event_id=?`,
+		targetEventID,
+	).Scan(&reviewEventID, &patchEventID, &repoID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", "", nil
+		}
+		return "", "", "", fmt.Errorf("find review for reply: %w", err)
+	}
+	return reviewEventID, patchEventID, repoID, nil
+}
+
+// GetReviewSummary returns the raw content of the review summary event.
+func (s *Store) GetReviewSummary(ctx context.Context, reviewEventID string) (string, error) {
+	var rawJSON string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT raw_event_json FROM review_events WHERE event_id=?`,
+		reviewEventID,
+	).Scan(&rawJSON)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("review event %s not found", reviewEventID)
+		}
+		return "", fmt.Errorf("get review summary: %w", err)
+	}
+	return rawJSON, nil
 }

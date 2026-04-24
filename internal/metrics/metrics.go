@@ -151,6 +151,12 @@ var (
 	// Requeue
 	ReviewsRequeued = &Counter{}
 
+	// Conversations
+	ConversationRepliesReceived = &Counter{}
+	ConversationResponsesSent   = &Counter{}
+	ConversationRateLimited     = &Counter{}
+	ConversationErrors          = &Counter{}
+
 	// Uptime
 	startTime = time.Now()
 )
@@ -236,6 +242,16 @@ func writeMetrics(w io.Writer) {
 	// Requeue
 	writeCounter(w, "drydock_reviews_requeued_total",
 		"Reviews requeued from failed state.", ReviewsRequeued)
+
+	// Conversations
+	writeCounter(w, "drydock_conversation_replies_received_total",
+		"Reply events received targeting Drydock reviews.", ConversationRepliesReceived)
+	writeCounter(w, "drydock_conversation_responses_sent_total",
+		"Conversation responses published.", ConversationResponsesSent)
+	writeCounter(w, "drydock_conversation_rate_limited_total",
+		"Replies dropped due to per-review turn limit.", ConversationRateLimited)
+	writeCounter(w, "drydock_conversation_errors_total",
+		"Conversation processing errors.", ConversationErrors)
 }
 
 // --- Prometheus text format helpers ---

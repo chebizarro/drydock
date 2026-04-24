@@ -191,4 +191,23 @@ CREATE TABLE IF NOT EXISTS drift_flags (
   flagged_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_drift_flags_meta_review_id ON drift_flags(meta_review_id);
+
+CREATE TABLE IF NOT EXISTS conversations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  review_event_id TEXT NOT NULL,
+  reply_event_id TEXT NOT NULL UNIQUE,
+  response_event_id TEXT,
+  repo_id TEXT NOT NULL,
+  patch_event_id TEXT NOT NULL,
+  reply_author TEXT NOT NULL,
+  reply_content TEXT NOT NULL,
+  response_content TEXT NOT NULL DEFAULT '',
+  turn_number INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'published', 'failed')),
+  created_at INTEGER NOT NULL,
+  UNIQUE(review_event_id, turn_number)
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_review ON conversations(review_event_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_reply ON conversations(reply_event_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_response ON conversations(response_event_id);
 `
