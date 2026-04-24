@@ -56,6 +56,8 @@ Key settings:
 
 ## Documentation
 
+### Core
+
 | Document | Description |
 |----------|-------------|
 | [Architecture](docs/architecture.md) | Component map, data flow, state machine, concurrency model |
@@ -67,7 +69,16 @@ Key settings:
 | [Meta-Review](docs/meta-review.md) | Self-improvement loop, gating logic, feedback routing |
 | [Evaluation](docs/eval.md) | Held-out eval harness, metrics, dataset format |
 | [Scaling](docs/scaling.md) | Bottlenecks, worker tuning, repo cache sizing, multi-instance |
-| [Payments](docs/payments.md) | Forward-looking NWC and Cashu ecash integration architecture |
+| [Payments](docs/payments.md) | NWC and Cashu ecash integration for paid reviews |
+
+### Platform Features
+
+| Document | Description |
+|----------|-------------|
+| [Ensemble Review](docs/ensemble-review.md) | Multi-model parallel review with consensus scoring |
+| [Codebase Chat](docs/codebase-chat.md) | Repository Q&A via Nostr encrypted DMs |
+| [IDE Integration](docs/ide-integration.md) | Real-time diagnostics in VS Code and Neovim |
+| [Marketplace](docs/marketplace.md) | Community reviewer registry with reputation system |
 
 ## Project Structure
 
@@ -75,21 +86,30 @@ Key settings:
 cmd/
   drydock/          # Main service binary
   drydock-eval/     # Evaluation harness binary
+  lsp-bridge/       # Multi-language LSP server manager
 internal/
   config/           # Environment variable parsing
   listener/         # Nostr relay subscription and event dispatch
   ingest/           # Event verification, dedup, and review queue
   pipeline/         # Worker pool orchestrating the review lifecycle
   contextbuilder/   # Deterministic context assembly (7 layers, 64K budget)
-  reviewengine/     # Planner→reviewer LLM pipeline with retry
+  reviewengine/     # Planner→reviewer LLM pipeline with retry and ensemble
   publisher/        # Kind 1111 comment construction and relay fanout
-    metareview/       # Self-improvement loop with few-shot management
-    promptrefine/     # Automated prompt versioning with eval-gated rollback
-    repo/             # Git repo cloning, patching, and LRU cache
+  metareview/       # Self-improvement loop with few-shot management
+  promptrefine/     # Automated prompt versioning with eval-gated rollback
+  repo/             # Git repo cloning, patching, and LRU cache
   signing/          # NIP-46 bunker and local nsec signers
   db/               # SQLite storage, schema, and queries
   health/           # /healthz and /readyz HTTP endpoints
   eval/             # Evaluation harness and metrics
+  codechat/         # Codebase Q&A via Nostr encrypted DMs
+  idegateway/       # IDE integration protocol handler
+  marketplace/      # Community reviewer registry and routing
+  conversation/     # Multi-turn review thread handler
+  securityscan/     # Deterministic SAST scanner
+  payment/          # NWC and Cashu payment integration
+extensions/
+  vscode-drydock/   # VS Code extension for IDE integration
 eval/
   heldout-sample.json  # Labeled evaluation dataset
 ```
