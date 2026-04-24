@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"drydock/internal/db"
 	"drydock/internal/metrics"
 
 	"fiatjaf.com/nostr"
@@ -38,6 +39,7 @@ type RouterConfig struct {
 type Router struct {
 	cfg       RouterConfig
 	registry  *Registry
+	store     *db.Store
 	signer    Signer
 	publisher RelayPublisher
 	logger    *slog.Logger
@@ -47,6 +49,7 @@ type Router struct {
 func NewRouter(
 	cfg RouterConfig,
 	registry *Registry,
+	store *db.Store,
 	signer Signer,
 	publisher RelayPublisher,
 	logger *slog.Logger,
@@ -67,6 +70,7 @@ func NewRouter(
 	return &Router{
 		cfg:       cfg,
 		registry:  registry,
+		store:     store,
 		signer:    signer,
 		publisher: publisher,
 		logger:    logger,
@@ -293,8 +297,16 @@ func (r *Router) publishAssignment(ctx context.Context, assignment ReviewAssignm
 
 // generateAssignmentID creates a deterministic assignment ID.
 func generateAssignmentID(patchEventID, reviewerPubkey string) string {
-	// Simple combination for now - could be a hash
-	return fmt.Sprintf("%s-%s", patchEventID[:16], reviewerPubkey[:16])
+	// Use safe substring with min length
+	patchPrefix := patchEventID
+	if len(patchPrefix) > 16 {
+		patchPrefix = patchPrefix[:16]
+	}
+	reviewerPrefix := reviewerPubkey
+	if len(reviewerPrefix) > 16 {
+		reviewerPrefix = reviewerPrefix[:16]
+	}
+	return fmt.Sprintf("%s-%s", patchPrefix, reviewerPrefix)
 }
 
 // HandleAcceptance processes a reviewer accepting an assignment.
@@ -341,7 +353,104 @@ func (r *Router) HandleRejection(ctx context.Context, event nostr.Event) error {
 		"reason", rejection.Reason,
 	)
 
-	// TODO: Reassign to another reviewer if available
+	// Attempt to reassign to another reviewer
+	if err := r.attemptReassignment(ctx, rejection.AssignmentID); err != nil {
+		r.logger.Warn("reassignment failed",
+			"assignment_id", rejection.AssignmentID,
+			"error", err,
+		)
+		// Don't return error - rejection was already recorded successfully
+	}
+
+	return nil
+}
+
+// attemptReassignment tries to assign a patch to another reviewer after rejection.
+func (r *Router) attemptReassignment(ctx context.Context, originalAssignmentID string) error {
+	if r.store == nil {
+		return fmt.Errorf("store not configured for reassignment")
+	}
+
+	// Look up the original assignment
+	original, err := r.store.GetAssignmentByEventID(ctx, originalAssignmentID)
+	if err != nil {
+		return fmt.Errorf("lookup original assignment: %w", err)
+	}
+
+	// Get all existing assignments for this patch to build exclusion list
+	existingAssignments, err := r.store.ListAssignmentsForPatch(ctx, original.PatchEventID)
+	if err != nil {
+		return fmt.Errorf("list existing assignments: %w", err)
+	}
+
+	// Build set of reviewers to exclude (already assigned, rejected, or completed)
+	excludePubkeys := make(map[string]bool)
+	for _, a := range existingAssignments {
+		excludePubkeys[a.ReviewerPubkey] = true
+	}
+
+	// Find new candidate reviewers
+	// We need to detect languages from the patch - but we don't have changed files here
+	// So we'll use a broad search and rely on prior assignment info
+	criteria := RoutingCriteria{
+		MinReputation: r.cfg.MinReputation,
+		MaxPriceSats:  original.PriceSats,
+	}
+
+	matches, err := r.registry.FindReviewers(ctx, criteria, 10)
+	if err != nil {
+		return fmt.Errorf("find reviewers: %w", err)
+	}
+
+	// Filter out excluded reviewers and patch author
+	var candidates []MatchedReviewer
+	for _, m := range matches {
+		if !excludePubkeys[m.Profile.Pubkey] && m.Profile.Pubkey != original.RequesterPubkey {
+			candidates = append(candidates, m)
+		}
+	}
+
+	if len(candidates) == 0 {
+		r.logger.Info("no alternative reviewers available for reassignment",
+			"patch_event_id", original.PatchEventID,
+			"excluded_count", len(excludePubkeys),
+		)
+		return nil // Not an error, just no alternatives
+	}
+
+	// Pick the best candidate
+	candidate := candidates[0]
+
+	// Create new assignment
+	now := time.Now()
+	deadline := now.Add(r.cfg.DefaultDeadline)
+
+	newAssignment := ReviewAssignment{
+		AssignmentID:   generateAssignmentID(original.PatchEventID, candidate.Profile.Pubkey),
+		PatchEventID:   original.PatchEventID,
+		RepoID:         original.RepoID,
+		ReviewerPubkey: candidate.Profile.Pubkey,
+		PriceSats:      candidate.Profile.PricePerReview,
+		Deadline:       deadline.Unix(),
+		CreatedAt:      now.Unix(),
+	}
+
+	// Publish assignment event
+	if err := r.publishAssignment(ctx, newAssignment); err != nil {
+		return fmt.Errorf("publish reassignment: %w", err)
+	}
+
+	// Record in database
+	if err := r.registry.RecordAssignment(ctx, newAssignment); err != nil {
+		return fmt.Errorf("record reassignment: %w", err)
+	}
+
+	metrics.MarketplaceAssignmentsCreated.Inc()
+	r.logger.Info("patch reassigned to new reviewer",
+		"patch_event_id", original.PatchEventID,
+		"new_reviewer", candidate.Profile.Pubkey,
+		"rejected_by", original.ReviewerPubkey,
+	)
 
 	return nil
 }

@@ -375,6 +375,37 @@ func (s *Store) ListPendingAssignments(ctx context.Context, pubkey string) ([]Re
 	return assignments, rows.Err()
 }
 
+// ListAssignmentsForPatch returns all assignments for a given patch.
+func (s *Store) ListAssignmentsForPatch(ctx context.Context, patchEventID string) ([]ReviewAssignment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
+			status, priority, price_sats, assignment_event_id,
+			expires_at, created_at, updated_at
+		FROM review_assignments
+		WHERE patch_event_id = ?
+		ORDER BY created_at DESC
+	`, patchEventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var assignments []ReviewAssignment
+	for rows.Next() {
+		var a ReviewAssignment
+		if err := rows.Scan(
+			&a.ID, &a.PatchEventID, &a.RepoID, &a.ReviewerPubkey, &a.RequesterPubkey,
+			&a.Status, &a.Priority, &a.PriceSats, &a.AssignmentEventID,
+			&a.ExpiresAt, &a.CreatedAt, &a.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		assignments = append(assignments, a)
+	}
+
+	return assignments, rows.Err()
+}
+
 // ExpireStaleAssignments marks assignments past their expiry as expired.
 func (s *Store) ExpireStaleAssignments(ctx context.Context) (int64, error) {
 	now := time.Now().Unix()
