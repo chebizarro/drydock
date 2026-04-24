@@ -23,14 +23,16 @@ Omit both if the fix requires broad refactoring or is ambiguous.
 Example finding with suggested_diff:
 {"severity":"medium","category":"correctness","file":"auth.go","line":42,"evidence":"err is not checked","explanation":"The error from Validate() is discarded, which could allow invalid tokens to pass.","suggestion":"Check the error return value.","suggested_diff":"@@ -42,1 +42,3 @@\n-\tValidate(token)\n+\tif err := Validate(token); err != nil {\n+\t\treturn fmt.Errorf(\"invalid token: %w\", err)\n+\t}","confidence":0.95}
 
-If confidence < 0.6, add required items to needs_more_context instead of asserting uncertain findings.`
+If confidence < 0.6, add required items to needs_more_context instead of asserting uncertain findings.
+If the context includes a change-impact section with high or critical blast radius, mention the downstream impact explicitly in the summary and consider compatibility and architecture implications.`
 }
 
 func plannerSystemPrompt() string {
 	return `You are a code review planner.
 Return JSON ONLY with keys:
 change_type, risk_areas, needed_context, review_focus, model_route.
-Allowed model_route: coder32b | llm70b | coder14b.`
+Allowed model_route: coder32b | llm70b | coder14b.
+If the context includes a change-impact section with high or critical blast radius, factor that into review_focus and prefer a route that can reason about downstream compatibility.`
 }
 
 func plannerUserPrompt(contextBundle string, changedFiles []string) string {

@@ -21,6 +21,7 @@ const (
 	LayerImportsExports   = "imports-exports"
 	LayerCommitHistory    = "commit-history"
 	LayerProjectDocs      = "project-docs"
+	LayerChangeImpact     = "change-impact"
 
 	// TestCoverageGapPrefix is the line prefix used by the tests provider to
 	// mark symbols that have no test references. The builder scans for these

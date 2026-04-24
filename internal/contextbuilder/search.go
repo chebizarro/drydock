@@ -174,6 +174,53 @@ func (s *searcher) rgSearch(ctx context.Context, repoPath, pattern string, globs
 	return result, nil
 }
 
+// searchHit represents a single structured search match.
+type searchHit struct {
+	File string
+	Line int
+	Text string
+}
+
+// SearchSymbolHits returns structured search hits for a symbol, suitable for
+// blast-radius analysis. Returns file-level match data instead of formatted text.
+func (s *searcher) SearchSymbolHits(ctx context.Context, repoPath, symbol string, workspaceRoots []string) ([]searchHit, error) {
+	raw, err := s.SearchSymbol(ctx, repoPath, symbol, workspaceRoots)
+	if err != nil || raw == "" {
+		return nil, err
+	}
+	return parseSearchHits(raw), nil
+}
+
+// parseSearchHits parses file:line:text formatted output into structured hits.
+func parseSearchHits(raw string) []searchHit {
+	var hits []searchHit
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: file:line:text
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		lineNum := 0
+		if len(parts) >= 2 {
+			fmt.Sscanf(parts[1], "%d", &lineNum)
+		}
+		text := ""
+		if len(parts) >= 3 {
+			text = parts[2]
+		}
+		hits = append(hits, searchHit{
+			File: parts[0],
+			Line: lineNum,
+			Text: strings.TrimSpace(text),
+		})
+	}
+	return hits
+}
+
 // UseRipgrep returns true if ripgrep is available.
 func (s *searcher) UseRipgrep() bool {
 	s.init()
