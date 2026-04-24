@@ -147,6 +147,31 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 	return result, nil
 }
 
+// AutoFixSuggestion is a single eligible finding for auto-fix patch generation.
+type AutoFixSuggestion struct {
+	FilePath      string
+	SuggestedDiff string
+	Confidence    float64
+}
+
+// AutoFixResult describes the outcome of auto-fix patch synthesis.
+type AutoFixResult struct {
+	PatchDiff    string   // combined unified diff of all applied fixes
+	AppliedCount int      // number of suggestions that applied cleanly
+	AppliedFiles []string // files modified by applied fixes
+}
+
+// BuildAutoFixPatch synthesizes a combined diff from the given suggestions on
+// the current review branch. Only suggestions whose diffs apply cleanly are
+// included. The working tree is restored to its pre-fix state afterward so
+// branch cleanup can proceed normally.
+func (s *Service) BuildAutoFixPatch(ctx context.Context, repoPath string, suggestions []AutoFixSuggestion) (AutoFixResult, error) {
+	if len(suggestions) == 0 {
+		return AutoFixResult{}, nil
+	}
+	return s.manager.buildAutoFixPatch(ctx, repoPath, suggestions)
+}
+
 func (s *Service) CleanupReviewBranch(ctx context.Context, repoPath, branch string) {
 	if branch == "" || repoPath == "" {
 		return

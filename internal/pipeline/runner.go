@@ -424,6 +424,17 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		}
 	}
 
+	// 11c. Auto-fix patch generation (best-effort, non-fatal).
+	if r.pubSvc != nil && repoCfg.AutoFix.Enabled {
+		fixResult := r.tryAutoFix(ctx, task, prep, filteredReview, repoCfg, reviewEventID, modelName(result.Route, r.engine))
+		if fixResult != nil && fixResult.Published {
+			r.logger.Info("auto-fix patch published",
+				"patch_event_id", task.PatchEventID,
+				"fix_event_id", fixResult.EventID,
+				"applied_count", fixResult.AppliedCount)
+		}
+	}
+
 	// 12. Async meta-review (non-blocking, uses filtered review)
 	if r.metaSvc != nil {
 		r.metaSvc.RunAsync(ctx, metareview.Input{
@@ -469,6 +480,91 @@ func (r *Runner) publishApplyFailure(ctx context.Context, task db.ReviewTask, hi
 			"patch_event_id", task.PatchEventID,
 			"repo_id", task.RepoID,
 		)
+	}
+}
+
+// autoFixResult is the pipeline-local view of a fix-patch publish outcome.
+type autoFixResult struct {
+	Published    bool
+	EventID      string
+	AppliedCount int
+}
+
+// tryAutoFix filters eligible findings, synthesizes a combined fix patch on the
+// review branch, and publishes it as a NIP-34 kind 1617 event. Returns nil on
+// skip, non-nil on attempt (success or failure logged internally).
+func (r *Runner) tryAutoFix(
+	ctx context.Context,
+	task db.ReviewTask,
+	prep repo.PrepareResult,
+	review reviewengine.ReviewerOutput,
+	cfg repoconfig.RepoConfig,
+	reviewEventID string,
+	model string,
+) *autoFixResult {
+	// 1. Filter eligible findings.
+	var suggestions []repo.AutoFixSuggestion
+	for _, f := range review.Findings {
+		if f.SuggestedDiff == "" {
+			continue
+		}
+		if f.Confidence < cfg.AutoFix.MinConfidence {
+			continue
+		}
+		suggestions = append(suggestions, repo.AutoFixSuggestion{
+			FilePath:      f.File,
+			SuggestedDiff: f.SuggestedDiff,
+			Confidence:    f.Confidence,
+		})
+		if len(suggestions) >= cfg.AutoFix.MaxFindings {
+			break
+		}
+	}
+
+	if len(suggestions) == 0 {
+		metrics.AutoFixSkipped.Inc()
+		r.logger.Debug("autofix: no eligible findings",
+			"patch_event_id", task.PatchEventID)
+		return nil
+	}
+
+	// 2. Synthesize combined patch on the review branch.
+	fixResult, err := r.repoSvc.BuildAutoFixPatch(ctx, prep.RepoPath, suggestions)
+	if err != nil {
+		r.logger.Warn("autofix: patch synthesis failed",
+			"patch_event_id", task.PatchEventID,
+			"error", err)
+		return nil
+	}
+	if fixResult.AppliedCount == 0 || fixResult.PatchDiff == "" {
+		metrics.AutoFixSkipped.Inc()
+		r.logger.Debug("autofix: no suggestions applied cleanly",
+			"patch_event_id", task.PatchEventID,
+			"attempted", len(suggestions))
+		return nil
+	}
+
+	// 3. Publish the fix patch.
+	pubResult, err := r.pubSvc.PublishFixPatch(ctx, publisher.PublishFixPatchInput{
+		PatchEventID:  task.PatchEventID,
+		RepoID:        task.RepoID,
+		ReviewEventID: reviewEventID,
+		PatchDiff:     fixResult.PatchDiff,
+		AppliedCount:  fixResult.AppliedCount,
+		AppliedFiles:  fixResult.AppliedFiles,
+		Model:         model,
+	})
+	if err != nil {
+		r.logger.Warn("autofix: publish failed (non-fatal)",
+			"patch_event_id", task.PatchEventID,
+			"error", err)
+		return &autoFixResult{Published: false}
+	}
+
+	return &autoFixResult{
+		Published:    pubResult.Published,
+		EventID:      pubResult.EventID,
+		AppliedCount: fixResult.AppliedCount,
 	}
 }
 

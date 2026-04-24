@@ -29,6 +29,7 @@ type RepoConfig struct {
 	Review       ReviewConfig  `yaml:"review"`
 	Context      ContextConfig `yaml:"context"`
 	Status       StatusConfig  `yaml:"status"`
+	AutoFix      AutoFixConfig `yaml:"autofix"`
 	Instructions string        `yaml:"instructions"`
 }
 
@@ -45,6 +46,15 @@ type ContextConfig struct {
 	TokenBudget  int      `yaml:"token_budget"`
 	ExcludePaths []string `yaml:"exclude_paths"`
 	IncludeDocs  *bool    `yaml:"include_docs"` // pointer to distinguish missing from false
+}
+
+// AutoFixConfig controls automatic fix-patch generation and publication.
+// When enabled, Drydock synthesizes a combined NIP-34 kind 1617 patch event
+// from high-confidence SuggestedDiff findings that apply cleanly.
+type AutoFixConfig struct {
+	Enabled       bool    `yaml:"enabled"`
+	MinConfidence float64 `yaml:"min_confidence"` // minimum finding confidence to include
+	MaxFindings   int     `yaml:"max_findings"`   // cap on findings per auto-fix patch
 }
 
 // StatusConfig controls NIP-34 review status event publication.
@@ -74,6 +84,11 @@ func Default() RepoConfig {
 			Enabled:           false,
 			OpenSeverityFloor: "critical",
 			MinConfidence:     0.90,
+		},
+		AutoFix: AutoFixConfig{
+			Enabled:       false,
+			MinConfidence: 0.97,
+			MaxFindings:   3,
 		},
 	}
 }
@@ -192,6 +207,17 @@ func Parse(data []byte) (RepoConfig, error) {
 	}
 	if raw.Status.MinConfidence < 0 || raw.Status.MinConfidence > 1 {
 		return Default(), fmt.Errorf(".drydock.yaml: status.min_confidence must be in [0,1], got %f", raw.Status.MinConfidence)
+	}
+
+	// Validate and default autofix config.
+	if raw.AutoFix.Enabled && raw.AutoFix.MinConfidence == 0 {
+		raw.AutoFix.MinConfidence = 0.97
+	}
+	if raw.AutoFix.MinConfidence < 0 || raw.AutoFix.MinConfidence > 1 {
+		return Default(), fmt.Errorf(".drydock.yaml: autofix.min_confidence must be in [0,1], got %f", raw.AutoFix.MinConfidence)
+	}
+	if raw.AutoFix.MaxFindings <= 0 {
+		raw.AutoFix.MaxFindings = 3
 	}
 
 	// Validate instructions length.

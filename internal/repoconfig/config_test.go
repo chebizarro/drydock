@@ -331,6 +331,58 @@ status:
 	}
 }
 
+func TestAutoFixConfigDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.AutoFix.Enabled {
+		t.Error("autofix should be disabled by default")
+	}
+	if cfg.AutoFix.MinConfidence != 0.97 {
+		t.Errorf("expected default min_confidence 0.97, got %f", cfg.AutoFix.MinConfidence)
+	}
+	if cfg.AutoFix.MaxFindings != 3 {
+		t.Errorf("expected default max_findings 3, got %d", cfg.AutoFix.MaxFindings)
+	}
+}
+
+func TestAutoFixConfigValid(t *testing.T) {
+	yml := "version: 1\nautofix:\n  enabled: true\n  min_confidence: 0.95\n  max_findings: 5\n"
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.AutoFix.Enabled {
+		t.Error("expected autofix enabled")
+	}
+	if cfg.AutoFix.MinConfidence != 0.95 {
+		t.Errorf("expected min_confidence 0.95, got %f", cfg.AutoFix.MinConfidence)
+	}
+	if cfg.AutoFix.MaxFindings != 5 {
+		t.Errorf("expected max_findings 5, got %d", cfg.AutoFix.MaxFindings)
+	}
+}
+
+func TestAutoFixConfigDefaultsMinConfidence(t *testing.T) {
+	yml := "version: 1\nautofix:\n  enabled: true\n"
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AutoFix.MinConfidence != 0.97 {
+		t.Errorf("expected default min_confidence 0.97, got %f", cfg.AutoFix.MinConfidence)
+	}
+	if cfg.AutoFix.MaxFindings != 3 {
+		t.Errorf("expected default max_findings 3, got %d", cfg.AutoFix.MaxFindings)
+	}
+}
+
+func TestAutoFixConfigInvalidConfidence(t *testing.T) {
+	yml := "version: 1\nautofix:\n  enabled: true\n  min_confidence: 1.5\n"
+	_, err := Parse([]byte(yml))
+	if err == nil {
+		t.Fatal("expected error for out-of-range autofix confidence")
+	}
+}
+
 func TestMissingSeverityFloorDefaults(t *testing.T) {
 	yaml := `
 version: 1

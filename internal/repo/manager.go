@@ -439,6 +439,197 @@ func (m *Manager) evictIfNeeded() {
 	}
 }
 
+// buildAutoFixPatch synthesizes a combined patch from eligible suggestions.
+//
+// Algorithm:
+//  1. Commit the current index as a snapshot (so we have a baseline)
+//  2. For each suggestion, try applying. If it works, keep it; otherwise skip.
+//  3. Generate a combined diff from snapshot to current state.
+//  4. Reset to snapshot to restore clean state for branch cleanup.
+func (m *Manager) buildAutoFixPatch(ctx context.Context, repoPath string, suggestions []AutoFixSuggestion) (AutoFixResult, error) {
+	mu := m.getRepoLock(repoPath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// 1. Commit snapshot: the reviewed patch is applied but possibly only staged.
+	if err := m.commitSnapshot(ctx, repoPath); err != nil {
+		return AutoFixResult{}, fmt.Errorf("autofix snapshot commit: %w", err)
+	}
+
+	// 2. Try applying each suggestion sequentially.
+	var appliedCount int
+	appliedFiles := map[string]struct{}{}
+
+	for _, s := range suggestions {
+		patch, err := normalizeSuggestedPatch(s.FilePath, s.SuggestedDiff)
+		if err != nil {
+			m.logger.Debug("autofix: skipping malformed suggestion",
+				"file", s.FilePath, "error", err)
+			continue
+		}
+
+		// Check first without mutating
+		if err := m.checkPatchApplies(ctx, repoPath, patch); err != nil {
+			m.logger.Debug("autofix: suggestion does not apply cleanly",
+				"file", s.FilePath, "error", err)
+			continue
+		}
+
+		// Apply for real
+		if err := m.applyPatchContent(ctx, repoPath, patch); err != nil {
+			m.logger.Warn("autofix: apply failed after check passed",
+				"file", s.FilePath, "error", err)
+			// Reset to last known good state and continue
+			if _, resetErr := m.runGit(ctx, repoPath, "checkout", "--", "."); resetErr != nil {
+				return AutoFixResult{}, fmt.Errorf("autofix: reset after failed apply: %w", resetErr)
+			}
+			continue
+		}
+
+		appliedCount++
+		appliedFiles[s.FilePath] = struct{}{}
+	}
+
+	var result AutoFixResult
+	if appliedCount == 0 {
+		// Reset to snapshot
+		if _, err := m.runGit(ctx, repoPath, "reset", "--hard", "HEAD"); err != nil {
+			return AutoFixResult{}, fmt.Errorf("autofix: reset after no applies: %w", err)
+		}
+		return result, nil
+	}
+
+	// 3. Stage all changes and generate combined diff.
+	if _, err := m.runGit(ctx, repoPath, "add", "-A"); err != nil {
+		return AutoFixResult{}, fmt.Errorf("autofix: stage changes: %w", err)
+	}
+
+	diff, err := m.runGit(ctx, repoPath, "diff", "--cached", "HEAD")
+	if err != nil {
+		return AutoFixResult{}, fmt.Errorf("autofix: generate diff: %w", err)
+	}
+
+	// 4. Reset to snapshot so cleanup works normally.
+	if _, err := m.runGit(ctx, repoPath, "reset", "--hard", "HEAD"); err != nil {
+		return AutoFixResult{}, fmt.Errorf("autofix: final reset: %w", err)
+	}
+
+	files := make([]string, 0, len(appliedFiles))
+	for f := range appliedFiles {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+
+	result.PatchDiff = diff
+	result.AppliedCount = appliedCount
+	result.AppliedFiles = files
+	return result, nil
+}
+
+// commitSnapshot commits the current index state as a temporary snapshot.
+// This creates a baseline for diffing auto-fix changes.
+func (m *Manager) commitSnapshot(ctx context.Context, repoPath string) error {
+	// Stage everything first
+	if _, err := m.runGit(ctx, repoPath, "add", "-A"); err != nil {
+		return fmt.Errorf("stage: %w", err)
+	}
+	// Check if there's anything to commit
+	status, _ := m.runGit(ctx, repoPath, "status", "--porcelain")
+	if strings.TrimSpace(status) == "" {
+		// Nothing to commit — working tree is already clean
+		return nil
+	}
+	if _, err := m.runGit(ctx, repoPath,
+		"-c", "user.name=drydock",
+		"-c", "user.email=drydock@autofix.local",
+		"commit", "-m", "drydock: autofix snapshot", "--no-verify"); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// checkPatchApplies tests if a patch applies cleanly without modifying the tree.
+func (m *Manager) checkPatchApplies(ctx context.Context, repoPath, patch string) error {
+	applyCtx, cancel := context.WithTimeout(ctx, gitApplyTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(applyCtx, "git", "-C", repoPath, "apply", "--check", "-")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		defer stdin.Close()
+		io.WriteString(stdin, patch)
+	}()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// applyPatchContent applies a patch to the working tree.
+func (m *Manager) applyPatchContent(ctx context.Context, repoPath, patch string) error {
+	applyCtx, cancel := context.WithTimeout(ctx, gitApplyTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(applyCtx, "git", "-C", repoPath, "apply", "--index", "-")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		defer stdin.Close()
+		io.WriteString(stdin, patch)
+	}()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// normalizeSuggestedPatch ensures a LLM-generated diff hunk has proper
+// unified diff headers so git apply can process it.
+func normalizeSuggestedPatch(filePath, suggestedDiff string) (string, error) {
+	diff := strings.TrimSpace(suggestedDiff)
+	if diff == "" {
+		return "", fmt.Errorf("empty suggested diff")
+	}
+
+	// If it already starts with "diff --git", assume it's well-formed.
+	if strings.HasPrefix(diff, "diff --git") {
+		return diff + "\n", nil
+	}
+
+	// If it starts with @@ hunk header, add diff/--- /+++ headers.
+	if strings.HasPrefix(diff, "@@") {
+		var b strings.Builder
+		fmt.Fprintf(&b, "diff --git a/%s b/%s\n", filePath, filePath)
+		fmt.Fprintf(&b, "--- a/%s\n", filePath)
+		fmt.Fprintf(&b, "+++ b/%s\n", filePath)
+		b.WriteString(diff)
+		b.WriteByte('\n')
+		return b.String(), nil
+	}
+
+	// If it contains +/- lines (hunk content without header), we can't
+	// safely reconstruct line numbers. Return error.
+	hasHunkContent := false
+	for _, line := range strings.Split(diff, "\n") {
+		if len(line) > 0 && (line[0] == '+' || line[0] == '-') &&
+			!strings.HasPrefix(line, "+++") && !strings.HasPrefix(line, "---") {
+			hasHunkContent = true
+			break
+		}
+	}
+	if !hasHunkContent {
+		return "", fmt.Errorf("does not resemble a unified diff")
+	}
+
+	// Has hunk content but no @@ header — can't safely apply.
+	return "", fmt.Errorf("missing hunk header (@@)")
+}
+
 // isSafeCloneURL validates that a clone URL uses a safe protocol.
 // Blocks dangerous git URL schemes that could execute arbitrary commands
 // (e.g. ext::, file://, or URLs with embedded credentials/commands).

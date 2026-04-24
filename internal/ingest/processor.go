@@ -19,16 +19,26 @@ type ConversationHandler interface {
 }
 
 type Processor struct {
-	store        *db.Store
-	logger       *slog.Logger
-	ReviewQueue  chan db.ReviewTask
-	conversation ConversationHandler
+	store             *db.Store
+	logger            *slog.Logger
+	ReviewQueue       chan db.ReviewTask
+	conversation      ConversationHandler
+	localAutofixPubKey string // if set, skip review of patches from this pubkey
 }
 
 // WithConversation sets the conversation handler for processing reply events.
 func WithConversation(ch ConversationHandler) func(*Processor) {
 	return func(p *Processor) {
 		p.conversation = ch
+	}
+}
+
+// WithLocalAutofixAuthor configures the processor to skip review of patch
+// events authored by the given public key. This prevents Drydock from
+// recursively reviewing its own auto-fix patches.
+func WithLocalAutofixAuthor(pubkey string) func(*Processor) {
+	return func(p *Processor) {
+		p.localAutofixPubKey = pubkey
 	}
 }
 
@@ -80,6 +90,15 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 		}
 		if err := p.store.RecordPatchEventRelay(ctx, event.ID.Hex(), relayURL); err != nil {
 			return err
+		}
+		// Loop suppression: skip autofix patches we published ourselves.
+		// Requires BOTH conditions: authored by our signer AND tagged as autofix.
+		// This avoids suppressing legitimate patches from the same identity.
+		if p.localAutofixPubKey != "" && event.PubKey.Hex() == p.localAutofixPubKey && hasAutofixTag(event) {
+			p.logger.Info("skipping self-authored autofix patch",
+				"event_id", event.ID.Hex(),
+				"pubkey", p.localAutofixPubKey)
+			return nil
 		}
 		repoID := db.RepoIDFromPatch(event)
 		if repoID == "" {
@@ -143,4 +162,14 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 	default:
 		return nil
 	}
+}
+
+// hasAutofixTag checks if an event carries the drydock-autofix tag.
+func hasAutofixTag(event nostr.Event) bool {
+	for _, tag := range event.Tags {
+		if len(tag) >= 2 && tag[0] == "t" && tag[1] == "drydock-autofix" {
+			return true
+		}
+	}
+	return false
 }

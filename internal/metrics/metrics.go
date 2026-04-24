@@ -157,6 +157,12 @@ var (
 	// Requeue
 	ReviewsRequeued = &Counter{}
 
+	// Auto-fix
+	AutoFixPublishAttempts  = &Counter{}
+	AutoFixPublishSuccesses = &Counter{}
+	AutoFixPublishFailures  = &Counter{}
+	AutoFixSkipped          = &Counter{}
+
 	// Security scan
 	SecurityScanFindings = &Counter{}
 
@@ -261,6 +267,16 @@ func writeMetrics(w io.Writer) {
 	// Requeue
 	writeCounter(w, "drydock_reviews_requeued_total",
 		"Reviews requeued from failed state.", ReviewsRequeued)
+
+	// Auto-fix
+	writeCounter(w, "drydock_autofix_publish_attempts_total",
+		"Auto-fix patch publish attempts.", AutoFixPublishAttempts)
+	writeCounter(w, "drydock_autofix_publish_successes_total",
+		"Successful auto-fix patch publishes.", AutoFixPublishSuccesses)
+	writeCounter(w, "drydock_autofix_publish_failures_total",
+		"Failed auto-fix patch publishes.", AutoFixPublishFailures)
+	writeCounter(w, "drydock_autofix_skipped_total",
+		"Auto-fix skipped (disabled, no eligible findings, etc).", AutoFixSkipped)
 
 	// Security scan
 	writeCounter(w, "drydock_security_scan_findings_total",

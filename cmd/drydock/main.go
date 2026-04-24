@@ -203,6 +203,16 @@ func main() {
 	if convHandler != nil {
 		processorOpts = append(processorOpts, ingest.WithConversation(convHandler))
 	}
+	// Loop suppression: resolve our own signer pubkey so the processor can
+	// skip auto-fix patches we publish (preventing recursive self-review).
+	if signer != nil {
+		if signerPubKey, err := signer.GetPublicKey(ctx); err == nil {
+			processorOpts = append(processorOpts, ingest.WithLocalAutofixAuthor(signerPubKey.Hex()))
+			logger.Info("autofix loop suppression enabled", "signer_pubkey", signerPubKey.Hex())
+		} else {
+			logger.Warn("failed to resolve signer pubkey for autofix loop suppression", "error", err)
+		}
+	}
 	processor := ingest.NewProcessor(store, logger, processorOpts...)
 	svc := listener.New(listener.Config{
 		Relays:          readRelays,
