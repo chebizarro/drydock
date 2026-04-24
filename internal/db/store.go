@@ -88,7 +88,46 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+
+	// Idempotent column migrations for existing databases.
+	for _, col := range []struct {
+		table, name, ddl string
+	}{
+		{"review_log", "status_event_id", "ALTER TABLE review_log ADD COLUMN status_event_id TEXT"},
+		{"review_log", "status_event_kind", "ALTER TABLE review_log ADD COLUMN status_event_kind INTEGER NOT NULL DEFAULT 0"},
+		{"review_log", "status_published_at", "ALTER TABLE review_log ADD COLUMN status_published_at INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if !s.hasColumn(ctx, col.table, col.name) {
+			if _, err := s.db.ExecContext(ctx, col.ddl); err != nil {
+				return fmt.Errorf("migrate %s.%s: %w", col.table, col.name, err)
+			}
+		}
+	}
+
 	return nil
+}
+
+// hasColumn checks whether a table has a specific column.
+func (s *Store) hasColumn(ctx context.Context, table, column string) bool {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull int
+		var dfltValue *string
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk); err != nil {
+			continue
+		}
+		if name == column {
+			return true
+		}
+	}
+	return false
 }
 
 // InsertIngestedEvent inserts a raw event idempotently.
@@ -615,6 +654,71 @@ func (s *Store) MarkReviewPublished(ctx context.Context, patchEventID, repoID, r
 		return ErrReviewNotFound
 	}
 	return nil
+}
+
+// GetPublishedStatusEvent returns the previously published NIP-34 status event
+// for a given patch/repo pair, if any. Returns empty strings and zero values
+// when no status has been published.
+func (s *Store) GetPublishedStatusEvent(ctx context.Context, patchEventID, repoID string) (eventID string, kind int, publishedAt int64, err error) {
+	err = s.db.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(status_event_id, ''), status_event_kind, status_published_at
+		FROM review_log WHERE patch_event_id=? AND repo_id=?`,
+		patchEventID, repoID,
+	).Scan(&eventID, &kind, &publishedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", 0, 0, nil
+		}
+		return "", 0, 0, fmt.Errorf("get published status event: %w", err)
+	}
+	return eventID, kind, publishedAt, nil
+}
+
+// RecordStatusPublished records a successfully published NIP-34 status event
+// in the review_log for duplicate suppression. Only writes if no status has
+// been recorded yet for this patch/repo pair.
+func (s *Store) RecordStatusPublished(ctx context.Context, patchEventID, repoID, eventID string, kind int) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE review_log
+		SET status_event_id=?, status_event_kind=?, status_published_at=?, updated_at=?
+		WHERE patch_event_id=? AND repo_id=?
+		AND (status_event_id IS NULL OR status_event_id = '')`,
+		eventID, kind, now, now, patchEventID, repoID,
+	)
+	if err != nil {
+		return fmt.Errorf("record status published: %w", err)
+	}
+	return nil
+}
+
+// GetRootStatus returns the current effective NIP-34 status for a root event
+// in a given repository. Returns ok=false if no status exists.
+func (s *Store) GetRootStatus(ctx context.Context, rootID, repoID string) (kind int, eventID string, createdAt int64, ok bool, err error) {
+	err = s.db.QueryRowContext(
+		ctx,
+		`SELECT status_kind, status_event_id, created_at
+		FROM root_statuses
+		WHERE root_event_id=? AND (repo_id=? OR repo_id='')
+		ORDER BY created_at DESC LIMIT 1`,
+		rootID, repoID,
+	).Scan(&kind, &eventID, &createdAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, "", 0, false, nil
+		}
+		return 0, "", 0, false, fmt.Errorf("get root status: %w", err)
+	}
+	return kind, eventID, createdAt, true, nil
+}
+
+// CanStatusAuthor checks whether the given pubkey is authorized to publish
+// NIP-34 status events for the given root event in the given repository.
+// This is a public wrapper around the existing isStatusAuthorAllowed logic.
+func (s *Store) CanStatusAuthor(ctx context.Context, rootID, repoID string, author nostr.PubKey) (bool, error) {
+	return s.isStatusAuthorAllowed(ctx, rootID, repoID, author)
 }
 
 func (s *Store) MarkReviewFailed(ctx context.Context, patchEventID, repoID, reason string) error {

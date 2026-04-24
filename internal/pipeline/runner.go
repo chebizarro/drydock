@@ -389,6 +389,41 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		"findings", len(filteredReview.Findings),
 	)
 
+	// 11b. Publish NIP-34 review status event (best-effort, non-fatal).
+	if r.pubSvc != nil {
+		statusResult, statusErr := r.pubSvc.PublishStatus(ctx, publisher.PublishStatusInput{
+			PatchEventID:  task.PatchEventID,
+			RepoID:        task.RepoID,
+			ReviewEventID: reviewEventID,
+			Summary:       filteredReview.Summary,
+			Findings:      filteredReview.Findings,
+			Model:         modelName(result.Route, r.engine),
+			Confidence:    confidence,
+			Superseded:    superseded,
+			Policy: publisher.StatusPolicy{
+				Enabled:           repoCfg.Status.Enabled,
+				OpenSeverityFloor: repoCfg.Status.OpenSeverityFloor,
+				MinConfidence:     repoCfg.Status.MinConfidence,
+			},
+		})
+		if statusErr != nil {
+			r.logger.Warn("NIP-34 status publish failed (non-fatal)",
+				"patch_event_id", task.PatchEventID,
+				"repo_id", task.RepoID,
+				"error", statusErr)
+		} else if statusResult.Published {
+			r.logger.Info("NIP-34 status event published",
+				"patch_event_id", task.PatchEventID,
+				"status_event_id", statusResult.EventID,
+				"kind", int(statusResult.Kind),
+				"reason", statusResult.Reason)
+		} else {
+			r.logger.Debug("NIP-34 status skipped",
+				"patch_event_id", task.PatchEventID,
+				"reason", statusResult.Reason)
+		}
+	}
+
 	// 12. Async meta-review (non-blocking, uses filtered review)
 	if r.metaSvc != nil {
 		r.metaSvc.RunAsync(ctx, metareview.Input{

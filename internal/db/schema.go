@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS review_log (
   status TEXT NOT NULL CHECK (status IN ('pending', 'reviewing', 'published', 'failed')),
   review_event_id TEXT,
   failure_reason TEXT,
+  status_event_id TEXT,
+  status_event_kind INTEGER NOT NULL DEFAULT 0,
+  status_published_at INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE(patch_event_id, repo_id)

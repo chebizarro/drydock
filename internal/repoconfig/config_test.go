@@ -267,6 +267,70 @@ reveiw:
 	}
 }
 
+func TestStatusConfigDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.Status.Enabled {
+		t.Error("status should be disabled by default")
+	}
+}
+
+func TestStatusConfigValid(t *testing.T) {
+	yml := "version: 1\nstatus:\n  enabled: true\n  open_severity_floor: high\n  min_confidence: 0.85\n"
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.Status.Enabled {
+		t.Error("expected status enabled")
+	}
+	if cfg.Status.OpenSeverityFloor != "high" {
+		t.Errorf("expected open_severity_floor 'high', got %q", cfg.Status.OpenSeverityFloor)
+	}
+	if cfg.Status.MinConfidence != 0.85 {
+		t.Errorf("expected min_confidence 0.85, got %f", cfg.Status.MinConfidence)
+	}
+}
+
+func TestStatusConfigDefaultsMinConfidence(t *testing.T) {
+	yml := "version: 1\nstatus:\n  enabled: true\n"
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Status.MinConfidence != 0.90 {
+		t.Errorf("expected default min_confidence 0.90, got %f", cfg.Status.MinConfidence)
+	}
+	if cfg.Status.OpenSeverityFloor != "critical" {
+		t.Errorf("expected default open_severity_floor 'critical', got %q", cfg.Status.OpenSeverityFloor)
+	}
+}
+
+func TestStatusConfigInvalidSeverity(t *testing.T) {
+	yaml := `
+version: 1
+status:
+	enabled: true
+	open_severity_floor: extreme
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for invalid status severity")
+	}
+}
+
+func TestStatusConfigInvalidConfidence(t *testing.T) {
+	yaml := `
+version: 1
+status:
+	enabled: true
+	min_confidence: 1.5
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for out-of-range confidence")
+	}
+}
+
 func TestMissingSeverityFloorDefaults(t *testing.T) {
 	yaml := `
 version: 1

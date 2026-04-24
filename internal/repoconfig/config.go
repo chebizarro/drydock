@@ -25,10 +25,11 @@ const (
 
 // RepoConfig is the per-repository review configuration.
 type RepoConfig struct {
-	Version      int          `yaml:"version"`
-	Review       ReviewConfig `yaml:"review"`
+	Version      int           `yaml:"version"`
+	Review       ReviewConfig  `yaml:"review"`
 	Context      ContextConfig `yaml:"context"`
-	Instructions string       `yaml:"instructions"`
+	Status       StatusConfig  `yaml:"status"`
+	Instructions string        `yaml:"instructions"`
 }
 
 // ReviewConfig controls which findings are published.
@@ -46,6 +47,15 @@ type ContextConfig struct {
 	IncludeDocs  *bool    `yaml:"include_docs"` // pointer to distinguish missing from false
 }
 
+// StatusConfig controls NIP-34 review status event publication.
+// Status events are opt-in; when disabled (default), Drydock only publishes
+// review comments and never emits kind 1630 status events.
+type StatusConfig struct {
+	Enabled           bool    `yaml:"enabled"`
+	OpenSeverityFloor string  `yaml:"open_severity_floor"` // findings at or above this trigger a 1630 status
+	MinConfidence     float64 `yaml:"min_confidence"`       // minimum review confidence to publish status
+}
+
 // Default returns a RepoConfig with sensible defaults.
 func Default() RepoConfig {
 	includeDocs := true
@@ -59,6 +69,11 @@ func Default() RepoConfig {
 		},
 		Context: ContextConfig{
 			IncludeDocs: &includeDocs,
+		},
+		Status: StatusConfig{
+			Enabled:           false,
+			OpenSeverityFloor: "critical",
+			MinConfidence:     0.90,
 		},
 	}
 }
@@ -162,6 +177,21 @@ func Parse(data []byte) (RepoConfig, error) {
 			}
 		}
 		raw.Context.ExcludePaths = valid
+	}
+
+	// Validate and default status config.
+	if raw.Status.OpenSeverityFloor == "" {
+		raw.Status.OpenSeverityFloor = "critical"
+	}
+	raw.Status.OpenSeverityFloor = strings.ToLower(strings.TrimSpace(raw.Status.OpenSeverityFloor))
+	if !reviewengine.IsValidSeverity(raw.Status.OpenSeverityFloor) {
+		return Default(), fmt.Errorf(".drydock.yaml: invalid status.open_severity_floor %q", raw.Status.OpenSeverityFloor)
+	}
+	if raw.Status.Enabled && raw.Status.MinConfidence == 0 {
+		raw.Status.MinConfidence = 0.90
+	}
+	if raw.Status.MinConfidence < 0 || raw.Status.MinConfidence > 1 {
+		return Default(), fmt.Errorf(".drydock.yaml: status.min_confidence must be in [0,1], got %f", raw.Status.MinConfidence)
 	}
 
 	// Validate instructions length.

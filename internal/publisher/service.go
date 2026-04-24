@@ -137,8 +137,8 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	if err := s.signer.SignEvent(ctx, &summaryEvent); err != nil {
 		return "", fmt.Errorf("sign summary review event: %w", err)
 	}
-	if summaryEvent.Kind == 1631 || summaryEvent.Kind == 1632 {
-		return "", errors.New("publisher must not emit status events 1631/1632")
+	if summaryEvent.Kind >= 1630 && summaryEvent.Kind <= 1633 {
+		return "", errors.New("PublishReview must not emit NIP-34 status events (1630-1633); use PublishStatus instead")
 	}
 
 	// Record the review event ID in review_log *before* publishing to relays.

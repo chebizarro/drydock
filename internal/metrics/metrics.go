@@ -148,6 +148,12 @@ var (
 	PublishSuccesses = &Counter{}
 	PublishFailures  = &Counter{}
 
+	// NIP-34 Status
+	StatusPublishAttempts  = &Counter{}
+	StatusPublishSuccesses = &Counter{}
+	StatusPublishSkipped   = &Counter{}
+	StatusPublishFailures  = &Counter{}
+
 	// Requeue
 	ReviewsRequeued = &Counter{}
 
@@ -241,6 +247,16 @@ func writeMetrics(w io.Writer) {
 		"Successful review publishes.", PublishSuccesses)
 	writeCounter(w, "drydock_publish_failures_total",
 		"Failed review publishes.", PublishFailures)
+
+	// NIP-34 Status
+	writeCounter(w, "drydock_status_publish_attempts_total",
+		"NIP-34 status publish attempts.", StatusPublishAttempts)
+	writeCounter(w, "drydock_status_publish_successes_total",
+		"Successful NIP-34 status publishes.", StatusPublishSuccesses)
+	writeCounter(w, "drydock_status_publish_skipped_total",
+		"NIP-34 status publishes skipped (policy, auth, etc).", StatusPublishSkipped)
+	writeCounter(w, "drydock_status_publish_failures_total",
+		"Failed NIP-34 status publishes.", StatusPublishFailures)
 
 	// Requeue
 	writeCounter(w, "drydock_reviews_requeued_total",
