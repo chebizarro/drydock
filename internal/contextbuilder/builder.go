@@ -3,6 +3,7 @@ package contextbuilder
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -37,6 +38,15 @@ type BuildInput struct {
 	// contain changed files. Empty means "whole repo" (no workspace isolation).
 	// Set automatically by Builder.Build when a workspace config is detected.
 	WorkspaceRoots []string
+
+	// TokenBudgetOverride, if > 0, overrides the builder's default token budget
+	// for this build only. The effective budget is min(override, builder default).
+	TokenBudgetOverride int
+	// ExcludePaths are repo-config-specified path patterns to exclude from review.
+	// These are merged with the built-in exclusions (lock files, generated code).
+	ExcludePaths []string
+	// DisableDocs, if true, skips documentation providers and marks them as dropped.
+	DisableDocs bool
 }
 
 type ContextBundle struct {
@@ -53,6 +63,10 @@ type ContextBundle struct {
 	// TestCoverageGaps lists symbol names that were modified by the patch
 	// but have no test references. Surfaced as finding candidates.
 	TestCoverageGaps []string
+	// ChangedFiles lists the reviewable changed file paths extracted from
+	// the filtered patch diff, before token budgeting. This is authoritative
+	// and should be used instead of scraping the rendered bundle content.
+	ChangedFiles []string
 }
 
 type TokenCounter interface {
@@ -109,12 +123,47 @@ func NewWithOptions(opts BuilderOptions) *Builder {
 	}
 }
 
+// isDocLayer returns true if the layer name is a documentation provider.
+func isDocLayer(name string) bool {
+	return name == LayerProjectDocs || name == "qdrant-docs"
+}
+
+// matchesExcludePath checks if a file path matches any of the exclusion patterns.
+func matchesExcludePath(filePath string, patterns []string) bool {
+	for _, pattern := range patterns {
+		// Recursive directory prefix: "vendor/**" matches "vendor/foo/bar.go"
+		if strings.HasSuffix(pattern, "/**") {
+			prefix := strings.TrimSuffix(pattern, "/**")
+			if strings.HasPrefix(filePath, prefix+"/") || filePath == prefix {
+				return true
+			}
+			continue
+		}
+		// path.Match-style glob
+		if matched, _ := filepath.Match(pattern, filePath); matched {
+			return true
+		}
+		// Also try matching just the filename for patterns like "*.lock"
+		base := filepath.Base(filePath)
+		if matched, _ := filepath.Match(pattern, base); matched {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, error) {
 	if b.Counter == nil {
 		b.Counter = ApproxTokenCounter{}
 	}
-	if b.TokenBudget <= 0 {
-		b.TokenBudget = DefaultTokenBudget
+
+	// Compute per-build effective budget (never mutate b.TokenBudget).
+	effectiveBudget := b.TokenBudget
+	if effectiveBudget <= 0 {
+		effectiveBudget = DefaultTokenBudget
+	}
+	if in.TokenBudgetOverride > 0 && in.TokenBudgetOverride < effectiveBudget {
+		effectiveBudget = in.TokenBudgetOverride
 	}
 
 	// Auto-detect workspace boundaries for monorepo context isolation.
@@ -132,15 +181,23 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		}
 	}
 
-	// Pre-scan: identify excluded files so we can notify the reviewer.
+	// Pre-scan: identify excluded files (built-in + repo-config) and filter
+	// the patch to remove excluded file diffs from the context.
 	var excludedFiles []string
 	if in.PatchEventContent != "" {
 		patchFiles, _ := parsePatch(in.PatchEventContent)
 		for _, f := range patchFiles {
 			path := pickPath(f)
-			if path != "" && isExcludedPath(path) {
+			if path == "" {
+				continue
+			}
+			if isExcludedPath(path) || matchesExcludePath(path, in.ExcludePaths) {
 				excludedFiles = append(excludedFiles, path)
 			}
+		}
+		// Rebuild a filtered patch so all providers see the same filtered diff.
+		if len(excludedFiles) > 0 {
+			in = filterPatchInput(in, excludedFiles)
 		}
 	}
 
@@ -151,8 +208,29 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		tokens   int
 	}
 
+	// Extract changed files from the (possibly filtered) patch input.
+	// This is done before provider execution and token budgeting, so it
+	// captures the true set of reviewable files.
+	var changedFiles []string
+	if in.PatchEventContent != "" {
+		postFilterFiles, _ := parsePatch(in.PatchEventContent)
+		for _, f := range postFilterFiles {
+			if p := pickPath(f); p != "" {
+				changedFiles = append(changedFiles, p)
+			}
+		}
+	}
+
+	// Track doc layers that were disabled by repo config.
+	var docDropped []string
+
 	layers := make([]layer, 0, len(b.Providers))
 	for _, p := range b.Providers {
+		// Skip doc layers if DisableDocs is set.
+		if in.DisableDocs && isDocLayer(p.LayerName()) {
+			docDropped = append(docDropped, p.LayerName())
+			continue
+		}
 		content, err := p.Build(ctx, in)
 		if err != nil {
 			return ContextBundle{}, fmt.Errorf("build %s layer: %w", p.LayerName(), err)
@@ -190,7 +268,7 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 	dropped := make([]string, 0, len(layers))
 
 	for i, lr := range layers {
-		if usedTokens+lr.tokens > b.TokenBudget {
+		if usedTokens+lr.tokens > effectiveBudget {
 			// hard stop policy: once budget hit, this and all lower-priority layers are dropped
 			for _, d := range layers[i:] {
 				dropped = append(dropped, d.name)
@@ -234,20 +312,84 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 			"If these are dependency lock files, generated code, or schema definitions, " +
 			"note that changes may have security or compatibility implications."
 		noteTokens := b.Counter.Count(note)
-		if usedTokens+noteTokens <= b.TokenBudget {
+		if usedTokens+noteTokens <= effectiveBudget {
 			parts = append(parts, note)
 			usedTokens += noteTokens
 		}
 	}
 
+	// Append doc layers that were disabled by repo config to the dropped list.
+	dropped = append(dropped, docDropped...)
+
 	return ContextBundle{
 		Content:          strings.Join(parts, "\n\n"),
-		TokenBudget:      b.TokenBudget,
+		TokenBudget:      effectiveBudget,
 		TokenCount:       usedTokens,
 		LayersUsed:       usedNames,
 		LayersDropped:    dropped,
 		ExcludedFiles:    excludedFiles,
 		TestCoverageGaps: testCoverageGaps,
+		ChangedFiles:     changedFiles,
 	}, nil
+}
+
+// filterPatchInput returns a copy of in with PatchEventContent filtered to
+// exclude diffs for the given excluded files. Works at the raw text level
+// by splitting on "diff --git" boundaries.
+func filterPatchInput(in BuildInput, excludedFiles []string) BuildInput {
+	excluded := make(map[string]bool, len(excludedFiles))
+	for _, f := range excludedFiles {
+		excluded[f] = true
+	}
+
+	// Split the patch into per-file sections using "diff --git" as delimiter.
+	lines := strings.Split(in.PatchEventContent, "\n")
+	var sections [][]string
+	var current []string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "diff --git ") {
+			if len(current) > 0 {
+				sections = append(sections, current)
+			}
+			current = []string{line}
+		} else {
+			current = append(current, line)
+		}
+	}
+	if len(current) > 0 {
+		sections = append(sections, current)
+	}
+
+	var kept []string
+	for _, section := range sections {
+		if len(section) == 0 {
+			continue
+		}
+		// Extract file paths from "diff --git a/path b/path" or "+++ b/path".
+		skip := false
+		for _, line := range section {
+			if strings.HasPrefix(line, "+++ b/") {
+				path := strings.TrimPrefix(line, "+++ b/")
+				if excluded[path] {
+					skip = true
+					break
+				}
+			}
+			if strings.HasPrefix(line, "--- a/") {
+				path := strings.TrimPrefix(line, "--- a/")
+				if excluded[path] {
+					skip = true
+					break
+				}
+			}
+		}
+		if !skip {
+			kept = append(kept, strings.Join(section, "\n"))
+		}
+	}
+
+	result := in
+	result.PatchEventContent = strings.Join(kept, "\n")
+	return result
 }
 

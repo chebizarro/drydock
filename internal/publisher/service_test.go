@@ -371,6 +371,109 @@ func TestPublishReviewDetailFailureDoesNotBreakSummary(t *testing.T) {
 	}
 }
 
+func TestPublishReviewWithStructuredSuggestions(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	fakePub := &fakeRelayPublisher{}
+	svc := New(Config{
+		DefaultRelays:       []string{"wss://fallback.example"},
+		DetailSeverityFloor: "high",
+	}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	eventID, err := svc.PublishReview(ctx, PublishInput{
+		PatchEventID:      patchID,
+		RepoID:            repoID,
+		Summary:           "Found a bug.",
+		Model:             "test-model",
+		ContextHash:       "hash-suggest",
+		Confidence:        0.9,
+		ContextLayersUsed: []string{"patch"},
+		Findings: []reviewengine.Finding{
+			{
+				Severity:      "high",
+				Category:      "correctness",
+				File:          "main.go",
+				Line:          42,
+				Evidence:      "err ignored",
+				Explanation:   "error not checked",
+				Suggestion:    "check error",
+				SuggestedDiff: "@@ -42,1 +42,3 @@\n-\tValidate(token)\n+\tif err := Validate(token); err != nil {\n+\t\treturn err\n+\t}",
+				Confidence:    0.95,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("publish review: %v", err)
+	}
+	if strings.TrimSpace(eventID) == "" {
+		t.Fatalf("expected non-empty event id")
+	}
+
+	// Should have 2 publish calls: summary + high-severity detail.
+	if len(fakePub.calls) != 2 {
+		t.Fatalf("expected 2 publish calls, got %d", len(fakePub.calls))
+	}
+
+	// Summary should contain "fix available" marker.
+	summaryContent := fakePub.calls[0].event.Content
+	if !strings.Contains(summaryContent, "fix available") {
+		t.Fatalf("expected 'fix available' in summary, got: %s", summaryContent)
+	}
+
+	// Detail should contain fenced diff block.
+	detailContent := fakePub.calls[1].event.Content
+	if !strings.Contains(detailContent, "```diff") {
+		t.Fatalf("expected fenced diff block in detail, got: %s", detailContent)
+	}
+	if !strings.Contains(detailContent, "Validate(token)") {
+		t.Fatalf("expected diff content in detail, got: %s", detailContent)
+	}
+}
+
+func TestPublishReviewPerRequestDetailFloor(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	fakePub := &fakeRelayPublisher{}
+	svc := New(Config{
+		DefaultRelays:       []string{"wss://fallback.example"},
+		DetailSeverityFloor: "high", // Service default
+	}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	// Override to "medium" — the medium finding should now get a detail event.
+	_, err := svc.PublishReview(ctx, PublishInput{
+		PatchEventID:        patchID,
+		RepoID:              repoID,
+		Summary:             "Review with overridden floor.",
+		Model:               "test-model",
+		ContextHash:         "hash-floor",
+		Confidence:          0.85,
+		ContextLayersUsed:   []string{"patch"},
+		DetailSeverityFloor: "medium",
+		Findings: []reviewengine.Finding{
+			{Severity: "medium", Category: "correctness", File: "main.go", Line: 10, Evidence: "x", Explanation: "medium issue", Suggestion: "fix", Confidence: 0.9},
+			{Severity: "low", Category: "style", File: "main.go", Line: 20, Evidence: "y", Explanation: "low issue", Suggestion: "optional", Confidence: 0.8},
+		},
+	})
+	if err != nil {
+		t.Fatalf("publish should succeed: %v", err)
+	}
+
+	// Summary + medium detail = 2 calls (low is still below "medium" floor).
+	if len(fakePub.calls) != 2 {
+		t.Fatalf("expected 2 publish calls (summary + medium detail), got %d", len(fakePub.calls))
+	}
+}
+
 func TestPublishReviewPartialRelayFailureStillSucceeds(t *testing.T) {
 	// This test verifies that when the publisher succeeds (returns nil),
 	// the service treats it as success. The real NostrRelayPublisher handles

@@ -401,10 +401,5 @@ func stripCodeFences(s string) string {
 }
 
 func defaultReviewerPrompt() string {
-	return `You are a code review agent.
-Return JSON ONLY with keys:
-summary, findings, needs_more_context.
-Each finding must include:
-severity, category, file, line, evidence, explanation, suggestion, confidence.
-If confidence < 0.6, add required items to needs_more_context instead of asserting uncertain findings.`
+	return reviewengine.DefaultReviewerSystemPrompt()
 }

@@ -197,6 +197,39 @@ func (m *Manager) CheckoutCommitOnBranch(ctx context.Context, repoPath, branch, 
 	return nil
 }
 
+// ReadFileAtRef reads a file from the repository at the specified git ref
+// without touching the working tree. Returns the file content, or an error.
+// ErrNotFound is returned if the file doesn't exist at that ref.
+func (m *Manager) ReadFileAtRef(ctx context.Context, repoPath, ref, relPath string) ([]byte, error) {
+	mu := m.getRepoLock(repoPath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	out, err := m.runGit(ctx, repoPath, "show", ref+":"+relPath)
+	if err != nil {
+		return nil, fmt.Errorf("read %s at %s: %w", relPath, ref, err)
+	}
+	return []byte(out), nil
+}
+
+// ReadFileAtDefaultRef reads a file from the canonical default branch.
+// Tries refs/remotes/origin/HEAD first, falls back to HEAD.
+// Returns nil, nil if the file doesn't exist.
+func (m *Manager) ReadFileAtDefaultRef(ctx context.Context, repoPath, relPath string) ([]byte, error) {
+	// Try origin/HEAD first (canonical upstream ref).
+	data, err := m.ReadFileAtRef(ctx, repoPath, "refs/remotes/origin/HEAD", relPath)
+	if err == nil {
+		return data, nil
+	}
+	// Fallback to HEAD.
+	data, err = m.ReadFileAtRef(ctx, repoPath, "HEAD", relPath)
+	if err != nil {
+		// File doesn't exist at HEAD either — not an error for optional config.
+		return nil, nil
+	}
+	return data, nil
+}
+
 func (m *Manager) CleanupReviewBranch(ctx context.Context, repoPath, branch string) error {
 	if branch == "" {
 		return nil

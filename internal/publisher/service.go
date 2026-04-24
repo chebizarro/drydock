@@ -46,6 +46,9 @@ type PublishInput struct {
 	ContextLayersDropped []string
 	ExcludedFiles        []string
 	Superseded           bool
+	// DetailSeverityFloor overrides the service-level detail severity floor
+	// for this specific review. Empty means use the service default.
+	DetailSeverityFloor  string
 }
 
 type Service struct {
@@ -154,9 +157,14 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 		return "", err
 	}
 
+	detailFloor := s.cfg.DetailSeverityFloor
+	if in.DetailSeverityFloor != "" {
+		detailFloor = in.DetailSeverityFloor
+	}
+
 	var detailEligible, detailPublished int
 	for _, finding := range in.Findings {
-		if !isAtOrAboveSeverity(finding.Severity, s.cfg.DetailSeverityFloor) {
+		if !reviewengine.IsAtOrAboveSeverity(finding.Severity, detailFloor) {
 			continue
 		}
 		detailEligible++
@@ -296,11 +304,21 @@ func dedupeNonEmpty(items []string) []string {
 	return out
 }
 
-func isAtOrAboveSeverity(severity, threshold string) bool {
-	order := map[string]int{
-		"info": 1, "low": 2, "medium": 3, "high": 4, "critical": 5,
+// maxSuggestionBytes is the maximum size for suggested_diff/suggested_code
+// blocks to prevent oversized relay events.
+const maxSuggestionBytes = 4096
+
+func truncateSuggestion(s string) string {
+	if len(s) <= maxSuggestionBytes {
+		return s
 	}
-	return order[strings.ToLower(severity)] >= order[strings.ToLower(threshold)]
+	return s[:maxSuggestionBytes] + "\n[truncated]"
+}
+
+// escapeFenceContent ensures triple backticks inside model output don't
+// break fenced code blocks.
+func escapeFenceContent(s string) string {
+	return strings.ReplaceAll(s, "```", "` ` `")
 }
 
 func footer(in PublishInput) string {
@@ -321,7 +339,11 @@ func buildSummaryContent(in PublishInput) string {
 	if len(in.Findings) > 0 {
 		b.WriteString("\n\nFindings\n")
 		for _, f := range in.Findings {
-			b.WriteString(fmt.Sprintf("%s | %s | %s:%d | %s\n", f.Severity, f.Category, f.File, f.Line, plainText(strings.TrimSpace(f.Explanation))))
+			line := fmt.Sprintf("%s | %s | %s:%d | %s", f.Severity, f.Category, f.File, f.Line, plainText(strings.TrimSpace(f.Explanation)))
+			if f.HasSuggestion() {
+				line += " | fix available"
+			}
+			b.WriteString(line + "\n")
 		}
 	}
 	b.WriteString(footer(in))
@@ -329,11 +351,23 @@ func buildSummaryContent(in PublishInput) string {
 }
 
 func buildFindingContent(f reviewengine.Finding, in PublishInput) string {
-	content := fmt.Sprintf(
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf(
 		"Automated review finding\nSeverity: %s\nCategory: %s\nLocation: %s:%d\nEvidence: %s\nExplanation: %s\nSuggestion: %s",
 		f.Severity, f.Category, f.File, f.Line, plainText(f.Evidence), plainText(f.Explanation), plainText(f.Suggestion),
-	)
-	return content + footer(in)
+	))
+	if f.SuggestedDiff != "" {
+		b.WriteString("\n\nSuggested diff:\n```diff\n")
+		b.WriteString(escapeFenceContent(truncateSuggestion(f.SuggestedDiff)))
+		b.WriteString("\n```")
+	}
+	if f.SuggestedCode != "" {
+		b.WriteString("\n\nSuggested code:\n```\n")
+		b.WriteString(escapeFenceContent(truncateSuggestion(f.SuggestedCode)))
+		b.WriteString("\n```")
+	}
+	b.WriteString(footer(in))
+	return b.String()
 }
 
 func plainText(v string) string {

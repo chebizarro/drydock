@@ -30,6 +30,9 @@ type RunInput struct {
 	// reviewer system prompt. Checklist, security preamble, and few-shot
 	// examples are still appended.
 	ReviewerSystemPromptOverride string
+	// AdditionalInstructions contains repo-specific instructions that are
+	// appended to the reviewer system prompt without replacing the base.
+	AdditionalInstructions string
 	// TestCoverageGaps lists modified symbols that lack test references.
 	// When non-empty, an extra checklist item is appended reminding the
 	// reviewer to consider flagging absent test coverage.
@@ -76,7 +79,7 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 			fmt.Sprintf("Missing test coverage: symbols %s have no test references — consider flagging as a finding",
 				strings.Join(in.TestCoverageGaps, ", ")))
 	}
-	system := reviewerSystemPrompt(in.ReviewerSystemPromptOverride, checklist, IsSecuritySensitive(in.ChangedFiles), in.FewShot)
+	system := reviewerSystemPrompt(in.ReviewerSystemPromptOverride, in.AdditionalInstructions, checklist, IsSecuritySensitive(in.ChangedFiles), in.FewShot)
 	user := reviewerUserPrompt(in.ContextBundle, planner)
 
 	endpoint, err := e.routeEndpoint(planner.ModelRoute)

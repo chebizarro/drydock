@@ -25,6 +25,9 @@ type PrepareResult struct {
 	RootID      string
 	AppliedIDs  []string
 	FailureHint string
+	// BaseRepoConfig is the raw .drydock.yaml content from the canonical
+	// base branch (before patch application). Nil if the file is absent.
+	BaseRepoConfig []byte
 }
 
 func NewService(store *db.Store, manager *Manager, logger *slog.Logger) *Service {
@@ -62,6 +65,13 @@ func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecor
 		return PrepareResult{}, err
 	}
 
+	// Read .drydock.yaml from the base ref BEFORE applying patches.
+	baseConfig, cfgErr := s.manager.ReadFileAtDefaultRef(ctx, repoPath, ".drydock.yaml")
+	if cfgErr != nil {
+		s.logger.Warn("failed to read .drydock.yaml from base ref",
+			"repo_id", rec.RepoID, "error", cfgErr)
+	}
+
 	threadEvents, err := s.store.ListPatchThreadEvents(ctx, rec.RootID, rec.RepoID)
 	if err != nil {
 		return PrepareResult{}, err
@@ -80,7 +90,7 @@ func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecor
 		applied = append(applied, evt.ID.Hex())
 	}
 
-	result := PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, Branch: branch, AppliedIDs: applied}
+	result := PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, Branch: branch, AppliedIDs: applied, BaseRepoConfig: baseConfig}
 	s.logger.Info("prepared patch series on review branch", "patch_event_id", rec.EventID, "repo_id", rec.RepoID, "branch", branch, "series_len", len(applied))
 	return result, nil
 }
@@ -99,6 +109,27 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 		return PrepareResult{}, err
 	}
 
+	// Read .drydock.yaml from the canonical base repo, NOT the PR clone.
+	// For PRs, cloneURLs may come from the fork — we must source config
+	// from the canonical repository to prevent a fork/PR from influencing
+	// its own review policy.
+	var baseConfig []byte
+	canonicalURLs, canonErr := s.store.GetRepositoryCloneURLs(ctx, rec.RepoID)
+	if canonErr == nil && len(canonicalURLs) > 0 {
+		// Ensure the canonical repo is available (may be a different path than the PR clone).
+		canonPath, ensureErr := s.manager.EnsureRepo(ctx, rec.RepoID, canonicalURLs)
+		if ensureErr == nil {
+			baseConfig, _ = s.manager.ReadFileAtDefaultRef(ctx, canonPath, ".drydock.yaml")
+		} else {
+			s.logger.Warn("failed to ensure canonical repo for config read",
+				"repo_id", rec.RepoID, "error", ensureErr)
+		}
+	} else {
+		// No canonical URLs — skip config rather than trust PR URLs.
+		s.logger.Warn("no canonical clone URLs for repo, skipping .drydock.yaml",
+			"repo_id", rec.RepoID)
+	}
+
 	tip, err := prTipCommit(target)
 	if err != nil {
 		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, FailureHint: err.Error()}, err
@@ -111,7 +142,7 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, FailureHint: err.Error()}, err
 	}
 
-	result := PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, Branch: branch, AppliedIDs: []string{target.ID.Hex()}}
+	result := PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, Branch: branch, AppliedIDs: []string{target.ID.Hex()}, BaseRepoConfig: baseConfig}
 	s.logger.Info("prepared PR tip on review branch", "patch_event_id", rec.EventID, "repo_id", rec.RepoID, "branch", branch, "tip", tip)
 	return result, nil
 }

@@ -16,6 +16,7 @@ import (
 	"drydock/internal/promptrefine"
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
+	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
 
 	"fiatjaf.com/nostr"
@@ -172,8 +173,20 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// Clean up the throwaway review branch when done (success or failure)
 	defer r.repoSvc.CleanupReviewBranch(ctx, prep.RepoPath, prep.Branch)
 
-	// 1b. Index project documentation (non-fatal).
-	if r.docIngester != nil {
+	// 1b. Load per-repo config from the base branch (before patches).
+	repoCfg := repoconfig.Default()
+	if len(prep.BaseRepoConfig) > 0 {
+		var cfgErr error
+		repoCfg, cfgErr = repoconfig.Parse(prep.BaseRepoConfig)
+		if cfgErr != nil {
+			r.logger.Warn("failed to parse .drydock.yaml, using defaults",
+				"patch_event_id", task.PatchEventID, "repo_id", task.RepoID, "error", cfgErr)
+			repoCfg = repoconfig.Default()
+		}
+	}
+
+	// 1c. Index project documentation (non-fatal; skip if repo config disables docs).
+	if r.docIngester != nil && repoCfg.DocsEnabled() {
 		if err := r.docIngester.IngestRepoDocs(ctx, prep.RepoPath, task.RepoID); err != nil {
 			r.logger.Warn("doc ingestion failed, continuing without",
 				"repo_id", task.RepoID, "error", err)
@@ -199,11 +212,14 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return fmt.Errorf("patch event %s has empty diff content", task.PatchEventID)
 	}
 
-	// 4. Build context bundle
+	// 4. Build context bundle (with repo-config overrides)
 	bundle, err := r.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
-		PatchEventContent: patchDiffContent,
-		RepoPath:          prep.RepoPath,
-		RepoID:            task.RepoID,
+		PatchEventContent:   patchDiffContent,
+		RepoPath:            prep.RepoPath,
+		RepoID:              task.RepoID,
+		TokenBudgetOverride: repoCfg.Context.TokenBudget,
+		ExcludePaths:        repoCfg.Context.ExcludePaths,
+		DisableDocs:         !repoCfg.DocsEnabled(),
 	})
 	if err != nil {
 		return fmt.Errorf("build context: %w", err)
@@ -226,11 +242,36 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	if r.promptRefiner != nil {
 		promptOverride = r.promptRefiner.ActiveReviewerPrompt(ctx)
 	}
+
+	// 6b. Check if exclusions left no reviewable files.
+	changedFiles := bundle.ChangedFiles
+	if len(changedFiles) == 0 && len(bundle.ExcludedFiles) > 0 {
+		// All changed files were excluded by repo policy — skip LLM call.
+		reviewEventID, pubErr := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
+			PatchEventID:         task.PatchEventID,
+			RepoID:               task.RepoID,
+			Summary:              "This patch only modifies files excluded by repository review policy, so no automated review was run.",
+			Model:                "none",
+			ContextHash:          fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content))),
+			ContextLayersUsed:    bundle.LayersUsed,
+			ContextLayersDropped: bundle.LayersDropped,
+			ExcludedFiles:        bundle.ExcludedFiles,
+		})
+		if pubErr != nil {
+			return fmt.Errorf("publish exclusion-only review: %w", pubErr)
+		}
+		r.logger.Info("skipped LLM review (all files excluded by repo policy)",
+			"patch_event_id", task.PatchEventID, "review_event_id", reviewEventID,
+			"excluded_files", len(bundle.ExcludedFiles))
+		return nil
+	}
+
 	result, err := r.engine.Run(ctx, reviewengine.RunInput{
 		ContextBundle:                bundle.Content,
-		ChangedFiles:                 changedFilesFromBundle(bundle),
+		ChangedFiles:                 changedFiles,
 		FewShot:                      fewShot,
 		ReviewerSystemPromptOverride: promptOverride,
+		AdditionalInstructions:       repoCfg.PromptInstructions(),
 		TestCoverageGaps:             bundle.TestCoverageGaps,
 	})
 	if err != nil {
@@ -240,8 +281,11 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 7. Compute context hash
 	ctxHash := fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content)))
 
+	// 7b. Apply deterministic review policy filtering.
+	filteredReview := applyReviewPolicy(result.Review, repoCfg)
+
 	// 8. Compute mean confidence
-	confidence := meanConfidence(result.Review.Findings)
+	confidence := meanConfidence(filteredReview.Findings)
 
 	// 9. Check if this patch has been superseded by a newer revision
 	superseded := false
@@ -260,8 +304,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	reviewEventID, err := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
 		PatchEventID:         task.PatchEventID,
 		RepoID:               task.RepoID,
-		Summary:              result.Review.Summary,
-		Findings:             result.Review.Findings,
+		Summary:              filteredReview.Summary,
+		Findings:             filteredReview.Findings,
 		Model:                modelName(result.Route, r.engine),
 		ContextHash:          ctxHash,
 		Confidence:           confidence,
@@ -269,6 +313,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		ContextLayersDropped: bundle.LayersDropped,
 		ExcludedFiles:        bundle.ExcludedFiles,
 		Superseded:           superseded,
+		DetailSeverityFloor:  repoCfg.Review.DetailSeverityFloor,
 	})
 	if err != nil {
 		return fmt.Errorf("publish review: %w", err)
@@ -279,10 +324,10 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		"patch_event_id", task.PatchEventID,
 		"repo_id", task.RepoID,
 		"review_event_id", reviewEventID,
-		"findings", len(result.Review.Findings),
+		"findings", len(filteredReview.Findings),
 	)
 
-	// 12. Async meta-review (non-blocking)
+	// 12. Async meta-review (non-blocking, uses filtered review)
 	if r.metaSvc != nil {
 		r.metaSvc.RunAsync(ctx, metareview.Input{
 			PatchEventID:  task.PatchEventID,
@@ -290,8 +335,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			PatchDiff:     patchDiffContent,
 			ContextBundle: bundle.Content,
 			ContextHash:   ctxHash,
-			ChangedFiles:  changedFilesFromBundle(bundle),
-			LocalReview:   result.Review,
+			ChangedFiles:  changedFiles,
+			LocalReview:   filteredReview,
 		})
 	}
 
@@ -359,4 +404,26 @@ func meanConfidence(findings []reviewengine.Finding) float64 {
 
 func modelName(route reviewengine.ModelRoute, _ *reviewengine.Engine) string {
 	return string(route)
+}
+
+// applyReviewPolicy filters findings by the repo-config severity floor and
+// category restrictions. This is a deterministic post-filter — it ensures the
+// published review matches repo policy regardless of LLM compliance.
+func applyReviewPolicy(review reviewengine.ReviewerOutput, cfg repoconfig.RepoConfig) reviewengine.ReviewerOutput {
+	filtered := make([]reviewengine.Finding, 0, len(review.Findings))
+	suppressed := 0
+	for _, f := range review.Findings {
+		if !cfg.AllowsSeverity(f.Severity) || !cfg.AllowsCategory(f.Category) {
+			suppressed++
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+
+	result := review
+	result.Findings = filtered
+	if suppressed > 0 {
+		result.Summary += fmt.Sprintf("\n\nRepository review policy suppressed %d finding(s) outside configured severity/category scope.", suppressed)
+	}
+	return result
 }

@@ -101,6 +101,102 @@ func TestEngineTestCoverageGapsAddedToChecklist(t *testing.T) {
 	}
 }
 
+func TestEngineStructuredSuggestionsPreserved(t *testing.T) {
+	fake := &fakeLLM{
+		responses: []string{
+			`{"change_type":"bugfix","risk_areas":[],"needed_context":[],"review_focus":"correctness","model_route":"coder32b"}`,
+			`{"summary":"found a bug","findings":[{
+				"severity":"high","category":"correctness","file":"main.go","line":42,
+				"evidence":"err ignored","explanation":"error not checked",
+				"suggestion":"check error","confidence":0.95,
+				"suggested_diff":"@@ -42,1 +42,3 @@\n-\tValidate(token)\n+\tif err := Validate(token); err != nil {\n+\t\treturn err\n+\t}",
+				"suggested_code":"if err := Validate(token); err != nil {\n\treturn err\n}"
+			}],"needs_more_context":[]}`,
+		},
+	}
+	engine := New(Config{
+		Planner:  ModelEndpoint{BaseURL: "http://planner", Model: "p"},
+		Coder32B: ModelEndpoint{BaseURL: "http://32b", Model: "32b"},
+		LLM70B:   ModelEndpoint{BaseURL: "http://70b", Model: "70b"},
+		Coder14B: ModelEndpoint{BaseURL: "http://14b", Model: "14b"},
+	}, fake, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	out, err := engine.Run(context.Background(), RunInput{
+		ContextBundle: "ctx",
+		ChangedFiles:  []string{"main.go"},
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out.Review.Findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(out.Review.Findings))
+	}
+	f := out.Review.Findings[0]
+	if f.SuggestedDiff == "" {
+		t.Fatal("expected suggested_diff to be preserved")
+	}
+	if !strings.Contains(f.SuggestedDiff, "@@ -42,1 +42,3 @@") {
+		t.Fatalf("unexpected suggested_diff: %q", f.SuggestedDiff)
+	}
+	if f.SuggestedCode == "" {
+		t.Fatal("expected suggested_code to be preserved")
+	}
+}
+
+func TestMalformedSuggestedDiffIsSanitized(t *testing.T) {
+	// A suggested_diff that doesn't look like a diff should be cleared.
+	raw := `{"summary":"ok","findings":[{
+		"severity":"low","category":"style","file":"x.go","line":1,
+		"evidence":"e","explanation":"e","suggestion":"s","confidence":0.9,
+		"suggested_diff":"this is not a diff at all"
+	}],"needs_more_context":[]}`
+	out, err := ParseReviewerOutput(raw)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if out.Findings[0].SuggestedDiff != "" {
+		t.Fatalf("expected malformed suggested_diff to be cleared, got %q", out.Findings[0].SuggestedDiff)
+	}
+}
+
+func TestAdditionalInstructionsAppendedWithoutReplacingBase(t *testing.T) {
+	fake := &fakeLLM{
+		responses: []string{
+			`{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"design","model_route":"coder32b"}`,
+			`{"summary":"ok","findings":[],"needs_more_context":[]}`,
+		},
+	}
+	engine := New(Config{
+		Planner:  ModelEndpoint{BaseURL: "http://planner", Model: "p"},
+		Coder32B: ModelEndpoint{BaseURL: "http://32b", Model: "32b"},
+		LLM70B:   ModelEndpoint{BaseURL: "http://70b", Model: "70b"},
+		Coder14B: ModelEndpoint{BaseURL: "http://14b", Model: "14b"},
+	}, fake, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	_, err := engine.Run(context.Background(), RunInput{
+		ContextBundle:          "ctx",
+		ChangedFiles:           []string{"main.go"},
+		AdditionalInstructions: "Focus on API compatibility.",
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(fake.requests) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(fake.requests))
+	}
+	system := fake.requests[1].System
+	// Must contain the default prompt AND the additional instructions.
+	if !strings.Contains(system, "code review agent") {
+		t.Fatal("expected default prompt base in system prompt")
+	}
+	if !strings.Contains(system, "API compatibility") {
+		t.Fatal("expected additional instructions in system prompt")
+	}
+	if !strings.Contains(system, "Repository-specific instructions:") {
+		t.Fatal("expected instructions section header in system prompt")
+	}
+}
+
 func TestReviewerSchemaRejectsLowConfidenceWithoutNeedsMoreContext(t *testing.T) {
 	_, err := ParseReviewerOutput(`{
 		"summary":"s",
