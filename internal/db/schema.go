@@ -338,4 +338,11 @@ CREATE TABLE IF NOT EXISTS review_feedback (
 );
 CREATE INDEX IF NOT EXISTS idx_review_feedback_reviewer ON review_feedback(reviewer_pubkey);
 CREATE INDEX IF NOT EXISTS idx_review_feedback_assignment ON review_feedback(assignment_id);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key TEXT NOT NULL,
+  timestamp INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_limits_key_timestamp ON rate_limits(key, timestamp);
 `

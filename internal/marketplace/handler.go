@@ -8,26 +8,35 @@ import (
 
 	"drydock/internal/db"
 	"drydock/internal/metrics"
+	"drydock/internal/ratelimit"
 
 	"fiatjaf.com/nostr"
 )
 
 // Handler processes marketplace events from the Nostr network.
 type Handler struct {
-	registry *Registry
-	router   *Router
-	store    *db.Store
-	logger   *slog.Logger
+	registry        *Registry
+	router          *Router
+	store           *db.Store
+	logger          *slog.Logger
+	feedbackLimiter *ratelimit.Limiter // rate limits feedback submissions
 }
 
 // NewHandler creates a new marketplace handler.
 func NewHandler(registry *Registry, router *Router, store *db.Store, logger *slog.Logger) *Handler {
 	return &Handler{
-		registry: registry,
-		router:   router,
-		store:    store,
-		logger:   logger,
+		registry:        registry,
+		router:          router,
+		store:           store,
+		logger:          logger,
+		feedbackLimiter: nil, // set via WithFeedbackLimiter
 	}
+}
+
+// WithFeedbackLimiter sets a rate limiter for feedback submissions.
+func (h *Handler) WithFeedbackLimiter(limiter *ratelimit.Limiter) *Handler {
+	h.feedbackLimiter = limiter
+	return h
 }
 
 // HandleEvent processes a marketplace event.
@@ -154,6 +163,23 @@ func (h *Handler) handleRejection(ctx context.Context, event nostr.Event) error 
 
 // handleFeedback processes review feedback/rating events.
 func (h *Handler) handleFeedback(ctx context.Context, event nostr.Event) error {
+	senderPubkey := event.PubKey.Hex()
+
+	// Check per-user rate limit for feedback submissions.
+	if h.feedbackLimiter != nil {
+		result, err := h.feedbackLimiter.Allow(ctx, senderPubkey)
+		if err != nil {
+			h.logger.Warn("feedback rate limit check failed", "error", err)
+			// Continue on error - fail open
+		} else if !result.Allowed {
+			h.logger.Info("feedback rate limited",
+				"sender", senderPubkey,
+				"reset_at", result.ResetAt,
+			)
+			return nil // Silently drop rate-limited feedback
+		}
+	}
+
 	var feedback struct {
 		AssignmentID int    `json:"assignment_id"`
 		Rating       int    `json:"rating"`

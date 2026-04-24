@@ -16,6 +16,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/embedding"
 	"drydock/internal/metrics"
+	"drydock/internal/ratelimit"
 	"drydock/internal/reviewengine"
 	"drydock/internal/vectorstore"
 
@@ -62,16 +63,17 @@ type Config struct {
 
 // Handler processes encrypted DM events and generates codebase chat responses.
 type Handler struct {
-	cfg       Config
-	store     *db.Store
-	qdrant    *vectorstore.Client
-	embedder  *embedding.Client
-	client    reviewengine.LLMClient
-	keyer     Keyer
-	publish   RelayPublisher
-	logger    *slog.Logger
-	ourPubKey string        // cached hex pubkey
-	sem       chan struct{} // bounded concurrency semaphore
+	cfg         Config
+	store       *db.Store
+	qdrant      *vectorstore.Client
+	embedder    *embedding.Client
+	client      reviewengine.LLMClient
+	keyer       Keyer
+	publish     RelayPublisher
+	logger      *slog.Logger
+	ourPubKey   string             // cached hex pubkey
+	sem         chan struct{}      // bounded concurrency semaphore
+	rateLimiter *ratelimit.Limiter // per-user rate limiting
 }
 
 // New creates a new codechat Handler.
@@ -99,17 +101,24 @@ func New(
 	}
 
 	return &Handler{
-		cfg:       cfg,
-		store:     store,
-		qdrant:    qdrant,
-		embedder:  embedder,
-		client:    client,
-		keyer:     keyer,
-		publish:   relayPub,
-		logger:    logger,
-		ourPubKey: ourPubKey,
-		sem:       make(chan struct{}, maxConcurrent),
+		cfg:         cfg,
+		store:       store,
+		qdrant:      qdrant,
+		embedder:    embedder,
+		client:      client,
+		keyer:       keyer,
+		publish:     relayPub,
+		logger:      logger,
+		ourPubKey:   ourPubKey,
+		sem:         make(chan struct{}, maxConcurrent),
+		rateLimiter: nil, // set via WithRateLimiter
 	}
+}
+
+// WithRateLimiter sets a rate limiter for per-user request limiting.
+func (h *Handler) WithRateLimiter(limiter *ratelimit.Limiter) *Handler {
+	h.rateLimiter = limiter
+	return h
 }
 
 // HandleDM processes an encrypted DM event (kind 4 NIP-04 or kind 14 sealed).
@@ -117,6 +126,24 @@ func New(
 // publishes an encrypted reply.
 func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL string) error {
 	metrics.CodeChatDMsReceived.Inc()
+
+	senderPubKey := event.PubKey.Hex()
+
+	// Check per-user rate limit first (before expensive operations).
+	if h.rateLimiter != nil {
+		result, err := h.rateLimiter.Allow(ctx, senderPubKey)
+		if err != nil {
+			h.logger.Warn("rate limit check failed", "error", err)
+			// Continue on error - fail open
+		} else if !result.Allowed {
+			metrics.CodeChatRateLimited.Inc()
+			h.logger.Info("codechat user rate limited",
+				"sender", senderPubKey,
+				"reset_at", result.ResetAt,
+			)
+			return nil // Silently drop rate-limited requests
+		}
+	}
 
 	// Acquire semaphore slot (bounded concurrency).
 	select {
@@ -143,7 +170,6 @@ func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL stri
 	}
 
 	// 3. Rate limiting: check conversation turn count.
-	senderPubKey := event.PubKey.Hex()
 	turnNumber, err := h.store.BeginCodeChatTurn(ctx, db.CodeChatTurn{
 		SenderPubKey: senderPubKey,
 		EventID:      event.ID.Hex(),
