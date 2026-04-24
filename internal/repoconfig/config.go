@@ -36,6 +36,7 @@ type ReviewConfig struct {
 	SeverityFloor       string   `yaml:"severity_floor"`
 	Categories          []string `yaml:"categories"`
 	DetailSeverityFloor string   `yaml:"detail_severity_floor"`
+	Walkthrough         *bool    `yaml:"walkthrough"` // pointer to distinguish missing from false
 }
 
 // ContextConfig controls context builder behavior.
@@ -48,11 +49,13 @@ type ContextConfig struct {
 // Default returns a RepoConfig with sensible defaults.
 func Default() RepoConfig {
 	includeDocs := true
+	walkthrough := true
 	return RepoConfig{
 		Version: currentVersion,
 		Review: ReviewConfig{
 			SeverityFloor:       "info",
 			DetailSeverityFloor: "high",
+			Walkthrough:         &walkthrough,
 		},
 		Context: ContextConfig{
 			IncludeDocs: &includeDocs,
@@ -93,6 +96,9 @@ func Parse(data []byte) (RepoConfig, error) {
 	}
 	if raw.Context.IncludeDocs == nil {
 		raw.Context.IncludeDocs = defaults.Context.IncludeDocs
+	}
+	if raw.Review.Walkthrough == nil {
+		raw.Review.Walkthrough = defaults.Review.Walkthrough
 	}
 
 	// Normalize and validate severity floors.
@@ -186,6 +192,14 @@ func (c RepoConfig) AllowsCategory(category string) bool {
 // configured severity floor.
 func (c RepoConfig) AllowsSeverity(severity string) bool {
 	return reviewengine.IsAtOrAboveSeverity(severity, c.Review.SeverityFloor)
+}
+
+// WalkthroughEnabled returns true if walkthrough generation is enabled.
+func (c RepoConfig) WalkthroughEnabled() bool {
+	if c.Review.Walkthrough == nil {
+		return true
+	}
+	return *c.Review.Walkthrough
 }
 
 // DocsEnabled returns true if documentation ingestion is enabled.

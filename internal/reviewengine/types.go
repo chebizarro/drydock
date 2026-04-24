@@ -29,6 +29,18 @@ type ReviewerOutput struct {
 	NeedsMoreContext []string  `json:"needs_more_context"`
 }
 
+// FileSummary describes one changed file in a walkthrough.
+type FileSummary struct {
+	File    string `json:"file"`
+	Summary string `json:"summary"`
+}
+
+// WalkthroughOutput is the structured walkthrough of a patch.
+type WalkthroughOutput struct {
+	Walkthrough   string        `json:"walkthrough"`
+	FileSummaries []FileSummary `json:"file_summaries"`
+}
+
 type Finding struct {
 	Severity      string  `json:"severity"`
 	Category      string  `json:"category"`
@@ -49,6 +61,22 @@ func ParsePlannerOutput(raw string) (PlannerOutput, error) {
 	}
 	if err := out.Validate(); err != nil {
 		return PlannerOutput{}, err
+	}
+	return out, nil
+}
+
+// ParseWalkthroughOutput parses the walkthrough LLM response.
+// Lenient: if parsing fails, returns a zero-value output with an error.
+// The caller should treat walkthrough failures as non-fatal.
+func ParseWalkthroughOutput(raw string) (WalkthroughOutput, error) {
+	var out WalkthroughOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return WalkthroughOutput{}, fmt.Errorf("parse walkthrough json: %w", err)
+	}
+	out.Walkthrough = strings.TrimSpace(out.Walkthrough)
+	for i := range out.FileSummaries {
+		out.FileSummaries[i].File = strings.TrimSpace(out.FileSummaries[i].File)
+		out.FileSummaries[i].Summary = strings.TrimSpace(out.FileSummaries[i].Summary)
 	}
 	return out, nil
 }

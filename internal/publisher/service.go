@@ -49,6 +49,8 @@ type PublishInput struct {
 	// DetailSeverityFloor overrides the service-level detail severity floor
 	// for this specific review. Empty means use the service default.
 	DetailSeverityFloor  string
+	// Walkthrough is an optional change description prepended to the summary.
+	Walkthrough          reviewengine.WalkthroughOutput
 }
 
 type Service struct {
@@ -334,6 +336,20 @@ func footer(in PublishInput) string {
 
 func buildSummaryContent(in PublishInput) string {
 	var b strings.Builder
+
+	// Walkthrough section (if available)
+	if in.Walkthrough.Walkthrough != "" {
+		b.WriteString("Walkthrough\n")
+		b.WriteString(plainText(strings.TrimSpace(in.Walkthrough.Walkthrough)))
+		if len(in.Walkthrough.FileSummaries) > 0 {
+			b.WriteString("\n\nChanged files\n")
+			for _, fs := range in.Walkthrough.FileSummaries {
+				b.WriteString(fmt.Sprintf("%s: %s\n", fs.File, plainText(strings.TrimSpace(fs.Summary))))
+			}
+		}
+		b.WriteString("\n")
+	}
+
 	b.WriteString("Automated review summary\n")
 	b.WriteString(plainText(strings.TrimSpace(in.Summary)))
 	if len(in.Findings) > 0 {

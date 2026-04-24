@@ -69,6 +69,23 @@ func reviewerSystemPrompt(baseOverride string, additionalInstructions string, ch
 	return b.String()
 }
 
+func walkthroughSystemPrompt() string {
+	return `You are a code change summarizer.
+Describe what this patch does in 2-4 clear, concise sentences aimed at a reviewer who has not seen the code yet.
+Then list each changed file with a one-line summary of what changed in that file.
+
+Return JSON ONLY with keys:
+walkthrough, file_summaries.
+file_summaries is an array of {file, summary}.
+
+Example:
+{"walkthrough":"This patch adds retry logic to the HTTP client and updates the configuration to support backoff settings. Tests are added for the retry behavior.","file_summaries":[{"file":"client.go","summary":"Added exponential backoff retry wrapper around HTTP requests"},{"file":"config.go","summary":"Added RetryMaxAttempts and RetryBaseDelay configuration fields"},{"file":"client_test.go","summary":"Added tests for retry on transient errors and immediate failure on non-transient errors"}]}`
+}
+
+func walkthroughUserPrompt(contextBundle string, changedFiles []string) string {
+	return fmt.Sprintf("Changed files:\n%s\n\nPatch context:\n%s", strings.Join(changedFiles, "\n"), contextBundle)
+}
+
 func reviewerUserPrompt(contextBundle string, planner PlannerOutput) string {
 	return fmt.Sprintf(
 		"Review focus: %s\nRisk areas: %s\nNeeded context hints: %s\n\nContext bundle:\n%s",

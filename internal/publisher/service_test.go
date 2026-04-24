@@ -435,6 +435,62 @@ func TestPublishReviewWithStructuredSuggestions(t *testing.T) {
 	}
 }
 
+func TestPublishReviewWithWalkthrough(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	fakePub := &fakeRelayPublisher{}
+	svc := New(Config{
+		DefaultRelays:       []string{"wss://fallback.example"},
+		DetailSeverityFloor: "high",
+	}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	_, err := svc.PublishReview(ctx, PublishInput{
+		PatchEventID:      patchID,
+		RepoID:            repoID,
+		Summary:           "Looks good.",
+		Model:             "test-model",
+		ContextHash:       "hash-wt",
+		Confidence:        0.9,
+		ContextLayersUsed: []string{"patch"},
+		Walkthrough: reviewengine.WalkthroughOutput{
+			Walkthrough: "This PR adds retry logic to the HTTP client.",
+			FileSummaries: []reviewengine.FileSummary{
+				{File: "client.go", Summary: "Added exponential backoff"},
+				{File: "config.go", Summary: "Added retry settings"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("publish review: %v", err)
+	}
+
+	if len(fakePub.calls) == 0 {
+		t.Fatal("expected at least one publish call")
+	}
+	summaryContent := fakePub.calls[0].event.Content
+	// Should contain walkthrough section before the review summary.
+	if !strings.Contains(summaryContent, "Walkthrough") {
+		t.Fatalf("expected 'Walkthrough' section in summary, got: %s", summaryContent)
+	}
+	if !strings.Contains(summaryContent, "retry logic") {
+		t.Fatalf("expected walkthrough text in summary, got: %s", summaryContent)
+	}
+	if !strings.Contains(summaryContent, "client.go: Added exponential backoff") {
+		t.Fatalf("expected file summary in summary, got: %s", summaryContent)
+	}
+	// Walkthrough should appear BEFORE the review summary.
+	wtIdx := strings.Index(summaryContent, "Walkthrough")
+	summaryIdx := strings.Index(summaryContent, "Automated review summary")
+	if wtIdx > summaryIdx {
+		t.Fatalf("walkthrough should appear before review summary, wt=%d summary=%d", wtIdx, summaryIdx)
+	}
+}
+
 func TestPublishReviewPerRequestDetailFloor(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)

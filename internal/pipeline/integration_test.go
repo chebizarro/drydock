@@ -174,11 +174,12 @@ func TestIntegrationFullPipelineProcess(t *testing.T) {
 	// 4. Real context builder (no optional services)
 	ctxBuilder := contextbuilder.NewDefault()
 
-	// 5. Fake LLM that returns planner + reviewer responses
+	// 5. Fake LLM that returns planner + reviewer + walkthrough responses
 	fakeLLM := &reviewengine.FakeLLMForTest{
 		Responses: []string{
 			`{"change_type":"feature","risk_areas":["correctness"],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
-			`{"summary":"Code looks clean.","findings":[{"severity":"info","category":"style","file":"main.go","line":2,"evidence":"comment","explanation":"trivial comment added","suggestion":"consider docstring","confidence":0.75}],"needs_more_context":[]}`,
+			`{"summary":"Code looks clean.","findings":[{"severity":"info","category":"style","file":"main.go","line":2,"evidence":"comment","explanation":"trivial comment","suggestion":"remove","confidence":0.95}],"needs_more_context":[]}`,
+			`{"walkthrough":"This patch adds a hello world program.","file_summaries":[{"file":"main.go","summary":"New main function printing hello"}]}`,
 		},
 	}
 	engine := reviewengine.New(reviewengine.Config{
@@ -287,9 +288,9 @@ func TestIntegrationFullPipelineProcess(t *testing.T) {
 		t.Fatalf("expected wss://relay.test in relay list, got: %v", relayPub.relays[0])
 	}
 
-	// LLM should have received exactly 2 calls (planner + reviewer)
-	if len(fakeLLM.Requests) != 2 {
-		t.Fatalf("expected 2 LLM calls (planner + reviewer), got %d", len(fakeLLM.Requests))
+	// LLM should have received exactly 3 calls (planner + reviewer + walkthrough)
+	if len(fakeLLM.Requests) != 3 {
+		t.Fatalf("expected 3 LLM calls (planner + reviewer + walkthrough), got %d", len(fakeLLM.Requests))
 	}
 
 	// Review should be marked as published in the DB

@@ -37,13 +37,16 @@ type RunInput struct {
 	// When non-empty, an extra checklist item is appended reminding the
 	// reviewer to consider flagging absent test coverage.
 	TestCoverageGaps []string
+	// SkipWalkthrough disables the walkthrough generation step.
+	SkipWalkthrough bool
 }
 
 type RunOutput struct {
-	Planner  PlannerOutput
-	Review   ReviewerOutput
-	Route    ModelRoute
-	Checklist []string
+	Planner     PlannerOutput
+	Review      ReviewerOutput
+	Route       ModelRoute
+	Checklist   []string
+	Walkthrough WalkthroughOutput
 }
 
 type Engine struct {
@@ -102,12 +105,39 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 		return RunOutput{}, fmt.Errorf("reviewer output invalid: %w", err)
 	}
 
-	e.logger.Info("review engine completed", "route", planner.ModelRoute, "findings", len(review.Findings), "checklist_items", len(checklist))
+	// Generate walkthrough (using planner model — lightweight 14B)
+	var walkthrough WalkthroughOutput
+	if !in.SkipWalkthrough {
+		wtRaw, wtErr := e.client.ChatCompletion(ctx, ChatRequest{
+			BaseURL:     e.cfg.Planner.BaseURL,
+			APIKey:      e.cfg.Planner.APIKey,
+			Model:       e.cfg.Planner.Model,
+			Temperature: e.cfg.PlannerTemp,
+			System:      walkthroughSystemPrompt(),
+			User:        walkthroughUserPrompt(in.ContextBundle, in.ChangedFiles),
+		})
+		if wtErr != nil {
+			// Walkthrough is non-fatal — log and continue without it.
+			e.logger.Warn("walkthrough generation failed, continuing without",
+				"error", wtErr)
+		} else {
+			parsed, parseErr := ParseWalkthroughOutput(extractJSON(wtRaw))
+			if parseErr != nil {
+				e.logger.Warn("walkthrough parse failed, continuing without",
+					"error", parseErr)
+			} else {
+				walkthrough = parsed
+			}
+		}
+	}
+
+	e.logger.Info("review engine completed", "route", planner.ModelRoute, "findings", len(review.Findings), "checklist_items", len(checklist), "has_walkthrough", walkthrough.Walkthrough != "")
 	return RunOutput{
-		Planner:  planner,
-		Review:   review,
-		Route:    planner.ModelRoute,
-		Checklist: checklist,
+		Planner:     planner,
+		Review:      review,
+		Route:       planner.ModelRoute,
+		Checklist:   checklist,
+		Walkthrough: walkthrough,
 	}, nil
 }
 

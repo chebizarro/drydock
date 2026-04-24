@@ -273,6 +273,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		ReviewerSystemPromptOverride: promptOverride,
 		AdditionalInstructions:       repoCfg.PromptInstructions(),
 		TestCoverageGaps:             bundle.TestCoverageGaps,
+		SkipWalkthrough:              !repoCfg.WalkthroughEnabled(),
 	})
 	if err != nil {
 		return fmt.Errorf("review engine: %w", err)
@@ -314,6 +315,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		ExcludedFiles:        bundle.ExcludedFiles,
 		Superseded:           superseded,
 		DetailSeverityFloor:  repoCfg.Review.DetailSeverityFloor,
+		Walkthrough:          result.Walkthrough,
 	})
 	if err != nil {
 		return fmt.Errorf("publish review: %w", err)

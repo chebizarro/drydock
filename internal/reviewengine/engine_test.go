@@ -29,6 +29,7 @@ func TestEngineRoutesPlannerToLLM70B(t *testing.T) {
 		responses: []string{
 			`{"change_type":"feature","risk_areas":["architecture"],"needed_context":[],"review_focus":"design","model_route":"llm70b"}`,
 			`{"summary":"ok","findings":[{"severity":"high","category":"architecture","file":"a.go","line":10,"evidence":"x","explanation":"y","suggestion":"z","confidence":0.9}],"needs_more_context":[]}`,
+			`{"walkthrough":"This adds a feature.","file_summaries":[{"file":"a.go","summary":"Added feature"}]}`,
 		},
 	}
 	engine := New(Config{
@@ -48,8 +49,8 @@ func TestEngineRoutesPlannerToLLM70B(t *testing.T) {
 	if out.Route != RouteLLM70B {
 		t.Fatalf("expected route llm70b, got %s", out.Route)
 	}
-	if len(fake.requests) != 2 {
-		t.Fatalf("expected 2 requests, got %d", len(fake.requests))
+	if len(fake.requests) != 3 {
+		t.Fatalf("expected 3 requests (planner + reviewer + walkthrough), got %d", len(fake.requests))
 	}
 	if fake.requests[1].BaseURL != "http://70b" {
 		t.Fatalf("expected reviewer call to llm70b endpoint, got %s", fake.requests[1].BaseURL)
@@ -64,6 +65,7 @@ func TestEngineTestCoverageGapsAddedToChecklist(t *testing.T) {
 		responses: []string{
 			`{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
 			`{"summary":"missing tests","findings":[],"needs_more_context":[]}`,
+			`{"walkthrough":"Test changes.","file_summaries":[]}`,
 		},
 	}
 	engine := New(Config{
@@ -112,6 +114,7 @@ func TestEngineStructuredSuggestionsPreserved(t *testing.T) {
 				"suggested_diff":"@@ -42,1 +42,3 @@\n-\tValidate(token)\n+\tif err := Validate(token); err != nil {\n+\t\treturn err\n+\t}",
 				"suggested_code":"if err := Validate(token); err != nil {\n\treturn err\n}"
 			}],"needs_more_context":[]}`,
+			`{"walkthrough":"Fixes a bug.","file_summaries":[{"file":"main.go","summary":"Fixed error handling"}]}`,
 		},
 	}
 	engine := New(Config{
@@ -164,6 +167,7 @@ func TestAdditionalInstructionsAppendedWithoutReplacingBase(t *testing.T) {
 		responses: []string{
 			`{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"design","model_route":"coder32b"}`,
 			`{"summary":"ok","findings":[],"needs_more_context":[]}`,
+			`{"walkthrough":"Feature work.","file_summaries":[]}`,
 		},
 	}
 	engine := New(Config{
@@ -181,8 +185,8 @@ func TestAdditionalInstructionsAppendedWithoutReplacingBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
-	if len(fake.requests) != 2 {
-		t.Fatalf("expected 2 requests, got %d", len(fake.requests))
+	if len(fake.requests) != 3 {
+		t.Fatalf("expected 3 requests (planner + reviewer + walkthrough), got %d", len(fake.requests))
 	}
 	system := fake.requests[1].System
 	// Must contain the default prompt AND the additional instructions.
@@ -194,6 +198,74 @@ func TestAdditionalInstructionsAppendedWithoutReplacingBase(t *testing.T) {
 	}
 	if !strings.Contains(system, "Repository-specific instructions:") {
 		t.Fatal("expected instructions section header in system prompt")
+	}
+}
+
+func TestEngineWalkthroughGenerated(t *testing.T) {
+	fake := &fakeLLM{
+		responses: []string{
+			`{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
+			`{"summary":"ok","findings":[],"needs_more_context":[]}`,
+			`{"walkthrough":"This PR adds a caching layer to the HTTP client.","file_summaries":[{"file":"cache.go","summary":"New LRU cache implementation"},{"file":"client.go","summary":"Integrated cache into request pipeline"}]}`,
+		},
+	}
+	engine := New(Config{
+		Planner:  ModelEndpoint{BaseURL: "http://planner", Model: "p"},
+		Coder32B: ModelEndpoint{BaseURL: "http://32b", Model: "32b"},
+		LLM70B:   ModelEndpoint{BaseURL: "http://70b", Model: "70b"},
+		Coder14B: ModelEndpoint{BaseURL: "http://14b", Model: "14b"},
+	}, fake, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	out, err := engine.Run(context.Background(), RunInput{
+		ContextBundle: "ctx",
+		ChangedFiles:  []string{"cache.go", "client.go"},
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.Walkthrough.Walkthrough == "" {
+		t.Fatal("expected walkthrough text")
+	}
+	if !strings.Contains(out.Walkthrough.Walkthrough, "caching layer") {
+		t.Fatalf("unexpected walkthrough: %q", out.Walkthrough.Walkthrough)
+	}
+	if len(out.Walkthrough.FileSummaries) != 2 {
+		t.Fatalf("expected 2 file summaries, got %d", len(out.Walkthrough.FileSummaries))
+	}
+	// Walkthrough should use the planner endpoint (call index 2).
+	if fake.requests[2].BaseURL != "http://planner" {
+		t.Fatalf("expected walkthrough to use planner endpoint, got %s", fake.requests[2].BaseURL)
+	}
+}
+
+func TestEngineSkipWalkthrough(t *testing.T) {
+	fake := &fakeLLM{
+		responses: []string{
+			`{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
+			`{"summary":"ok","findings":[],"needs_more_context":[]}`,
+		},
+	}
+	engine := New(Config{
+		Planner:  ModelEndpoint{BaseURL: "http://planner", Model: "p"},
+		Coder32B: ModelEndpoint{BaseURL: "http://32b", Model: "32b"},
+		LLM70B:   ModelEndpoint{BaseURL: "http://70b", Model: "70b"},
+		Coder14B: ModelEndpoint{BaseURL: "http://14b", Model: "14b"},
+	}, fake, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	out, err := engine.Run(context.Background(), RunInput{
+		ContextBundle:   "ctx",
+		ChangedFiles:    []string{"main.go"},
+		SkipWalkthrough: true,
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.Walkthrough.Walkthrough != "" {
+		t.Fatal("expected empty walkthrough when skipped")
+	}
+	// Only 2 LLM calls (planner + reviewer), no walkthrough.
+	if len(fake.requests) != 2 {
+		t.Fatalf("expected 2 requests (no walkthrough), got %d", len(fake.requests))
 	}
 }
 
