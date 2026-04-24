@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drydock Dashboard</title>
+<script src="https://unpkg.com/htmx.org@2.0.4"></script>
+<style>
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --text: #e6edf3; --text-muted: #8b949e; --accent: #58a6ff;
+  --green: #3fb950; --red: #f85149; --yellow: #d29922; --purple: #bc8cff;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background: var(--bg); color: var(--text); line-height: 1.5; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.container { max-width: 1200px; margin: 0 auto; padding: 1rem; }
+header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0.75rem 1rem; }
+header h1 { font-size: 1.25rem; display: flex; align-items: center; gap: 0.5rem; }
+header h1 span { color: var(--accent); }
+nav { display: flex; gap: 1rem; margin-top: 0.5rem; }
+nav a { color: var(--text-muted); padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.875rem; cursor: pointer; }
+nav a.active, nav a:hover { color: var(--text); background: var(--border); }
+
+/* Cards */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin: 1rem 0; }
+.stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+.stat-card .label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.stat-card .value { font-size: 1.75rem; font-weight: 600; margin-top: 0.25rem; }
+.stat-card .value.green { color: var(--green); }
+.stat-card .value.red { color: var(--red); }
+.stat-card .value.yellow { color: var(--yellow); }
+.stat-card .value.accent { color: var(--accent); }
+
+/* Table */
+table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.875rem; }
+th { color: var(--text-muted); font-weight: 600; background: rgba(0,0,0,0.2); }
+tr:last-child td { border-bottom: none; }
+.badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+.badge-published { background: rgba(63,185,80,0.15); color: var(--green); }
+.badge-failed { background: rgba(248,81,73,0.15); color: var(--red); }
+.badge-pending { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.badge-reviewing { background: rgba(188,140,255,0.15); color: var(--purple); }
+
+/* Sections */
+.section { margin: 1.5rem 0; }
+.section h2 { font-size: 1rem; margin-bottom: 0.75rem; color: var(--text-muted); }
+.filters { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+.filters select, .filters input { background: var(--surface); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 0.375rem 0.5rem; font-size: 0.8125rem; }
+.pagination { display: flex; gap: 0.5rem; margin-top: 0.75rem; align-items: center; justify-content: center; }
+.pagination button { background: var(--surface); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 0.375rem 0.75rem; cursor: pointer; font-size: 0.8125rem; }
+.pagination button:hover { background: var(--border); }
+.pagination button:disabled { opacity: 0.4; cursor: default; }
+.mono { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.8125rem; }
+.truncate { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
+.empty { text-align: center; color: var(--text-muted); padding: 2rem; }
+.tab { display: none; }
+.tab.active { display: block; }
+.quality-table td:nth-child(n+3) { text-align: right; font-family: 'SFMono-Regular', Consolas, monospace; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🔧 <span>Drydock</span> Dashboard</h1>
+  <nav id="nav">
+    <a class="active" onclick="showTab('overview')">Overview</a>
+    <a onclick="showTab('reviews')">Reviews</a>
+    <a onclick="showTab('repos')">Repositories</a>
+    <a onclick="showTab('quality')">Quality</a>
+  </nav>
+</header>
+
+<div class="container">
+
+<!-- Overview Tab -->
+<div id="tab-overview" class="tab active">
+  <div class="stats-grid" id="stats-grid">
+    <div class="stat-card"><div class="label">Loading...</div><div class="value">—</div></div>
+  </div>
+</div>
+
+<!-- Reviews Tab -->
+<div id="tab-reviews" class="tab">
+  <div class="section">
+    <h2>Review History</h2>
+    <div class="filters">
+      <select id="status-filter" onchange="loadReviews()">
+        <option value="">All statuses</option>
+        <option value="published">Published</option>
+        <option value="failed">Failed</option>
+        <option value="pending">Pending</option>
+        <option value="reviewing">Reviewing</option>
+      </select>
+      <input id="repo-filter" type="text" placeholder="Filter by repo..." onchange="loadReviews()">
+    </div>
+    <div id="reviews-table"></div>
+  </div>
+</div>
+
+<!-- Repos Tab -->
+<div id="tab-repos" class="tab">
+  <div class="section">
+    <h2>Tracked Repositories</h2>
+    <div id="repos-table"></div>
+  </div>
+</div>
+
+<!-- Quality Tab -->
+<div id="tab-quality" class="tab">
+  <div class="section">
+    <h2>Quality Trends (Eval Runs)</h2>
+    <div id="quality-table"></div>
+  </div>
+</div>
+
+</div>
+
+<script>
+let currentPage = 1;
+const pageSize = 20;
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('#nav a').forEach(a => a.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.querySelector('#nav a[onclick*="' + name + '"]').classList.add('active');
+  
+  if (name === 'overview') loadStats();
+  if (name === 'reviews') { currentPage = 1; loadReviews(); }
+  if (name === 'repos') loadRepos();
+  if (name === 'quality') loadQuality();
+}
+
+function loadStats() {
+  fetch('/api/stats').then(r => r.json()).then(data => {
+    const grid = document.getElementById('stats-grid');
+    grid.innerHTML = `
+      <div class="stat-card"><div class="label">Events Ingested</div><div class="value accent">${fmt(data.events_ingested)}</div></div>
+      <div class="stat-card"><div class="label">Patches Received</div><div class="value accent">${fmt(data.patches_received)}</div></div>
+      <div class="stat-card"><div class="label">Reviews Published</div><div class="value green">${fmt(data.reviews_published)}</div></div>
+      <div class="stat-card"><div class="label">Reviews Failed</div><div class="value red">${fmt(data.reviews_failed)}</div></div>
+      <div class="stat-card"><div class="label">Reviews Pending</div><div class="value yellow">${fmt(data.reviews_pending)}</div></div>
+      <div class="stat-card"><div class="label">Repos Tracked</div><div class="value accent">${fmt(data.repos_tracked)}</div></div>
+      <div class="stat-card"><div class="label">Meta-Reviews</div><div class="value accent">${fmt(data.meta_reviews_run)}</div></div>
+      <div class="stat-card"><div class="label">Conversations</div><div class="value accent">${fmt(data.conversations)}</div></div>
+      <div class="stat-card"><div class="label">Uptime</div><div class="value">${fmtDuration(data.uptime_seconds)}</div></div>
+    `;
+  }).catch(() => {
+    document.getElementById('stats-grid').innerHTML = '<div class="empty">Failed to load stats</div>';
+  });
+}
+
+function loadReviews() {
+  const status = document.getElementById('status-filter').value;
+  const repo = document.getElementById('repo-filter').value;
+  let url = `/api/reviews?page=${currentPage}&limit=${pageSize}`;
+  if (status) url += `&status=${status}`;
+  if (repo) url += `&repo=${encodeURIComponent(repo)}`;
+  
+  fetch(url).then(r => r.json()).then(data => {
+    const totalPages = Math.ceil(data.total / data.limit) || 1;
+    let html = '';
+    if (data.reviews.length === 0) {
+      html = '<div class="empty">No reviews found</div>';
+    } else {
+      html = `<table><thead><tr><th>Patch Event</th><th>Repository</th><th>Status</th><th>Review Event</th><th>Updated</th></tr></thead><tbody>`;
+      for (const r of data.reviews) {
+        html += `<tr>
+          <td><span class="mono truncate" title="${r.patch_event_id}">${r.patch_event_id.slice(0, 12)}…</span></td>
+          <td>${esc(r.repo_id)}</td>
+          <td><span class="badge badge-${r.status}">${r.status}</span></td>
+          <td>${r.review_event_id ? `<span class="mono truncate" title="${r.review_event_id}">${r.review_event_id.slice(0, 12)}…</span>` : '—'}</td>
+          <td>${fmtTime(r.updated_at)}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      html += `<div class="pagination">
+        <button ${currentPage <= 1 ? 'disabled' : ''} onclick="currentPage--; loadReviews()">← Prev</button>
+        <span style="color: var(--text-muted); font-size: 0.8125rem">Page ${data.page} of ${totalPages} (${data.total} total)</span>
+        <button ${currentPage >= totalPages ? 'disabled' : ''} onclick="currentPage++; loadReviews()">Next →</button>
+      </div>`;
+    }
+    document.getElementById('reviews-table').innerHTML = html;
+  });
+}
+
+function loadRepos() {
+  fetch('/api/repos').then(r => r.json()).then(data => {
+    if (data.length === 0) {
+      document.getElementById('repos-table').innerHTML = '<div class="empty">No repositories tracked yet</div>';
+      return;
+    }
+    let html = '<table><thead><tr><th>Repository</th><th>Reviews</th><th>Last Activity</th></tr></thead><tbody>';
+    for (const r of data) {
+      html += `<tr>
+        <td>${esc(r.name || r.repo_id)}</td>
+        <td>${r.review_count}</td>
+        <td>${fmtTime(r.last_activity)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('repos-table').innerHTML = html;
+  });
+}
+
+function loadQuality() {
+  fetch('/api/quality').then(r => r.json()).then(data => {
+    if (data.length === 0) {
+      document.getElementById('quality-table').innerHTML = '<div class="empty">No eval runs yet</div>';
+      return;
+    }
+    let html = '<table class="quality-table"><thead><tr><th>Dataset</th><th>Date</th><th>Recall</th><th>FPR</th><th>Cal MAE</th></tr></thead><tbody>';
+    for (const e of data) {
+      html += `<tr>
+        <td>${esc(e.dataset_id)}</td>
+        <td>${fmtTime(e.created_at)}</td>
+        <td>${(e.recall * 100).toFixed(1)}%</td>
+        <td>${(e.fpr * 100).toFixed(1)}%</td>
+        <td>${e.calibration_mae.toFixed(3)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('quality-table').innerHTML = html;
+  });
+}
+
+// Helpers
+function fmt(n) { return n != null ? n.toLocaleString() : '—'; }
+function fmtDuration(s) {
+  if (!s) return '—';
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+function fmtTime(ts) {
+  if (!ts) return '—';
+  return new Date(ts * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+// Auto-load overview on page load.
+loadStats();
+// Auto-refresh stats every 30 seconds.
+setInterval(() => { if (document.getElementById('tab-overview').classList.contains('active')) loadStats(); }, 30000);
+</script>
+</body>
+</html>

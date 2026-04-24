@@ -38,6 +38,9 @@ func New(db Checker, logger *slog.Logger) *Server {
 	return s
 }
 
+// Mux returns the underlying ServeMux so additional handlers can be registered.
+func (s *Server) Mux() *http.ServeMux { return s.mux }
+
 // SetReady marks the service as ready to receive traffic.
 func (s *Server) SetReady(ready bool) {
 	s.ready.Store(ready)

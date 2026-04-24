@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"drydock/internal/codeindex"
+	"drydock/internal/dashboard"
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/conversation"
@@ -355,6 +356,12 @@ func main() {
 	// --- Health check server ---
 	healthAddr := cfg.HealthAddr
 	healthSrv := health.New(store, logger)
+
+	// --- Analytics dashboard ---
+	dash := dashboard.New(store, logger)
+	dash.Register(healthSrv.Mux())
+	logger.Info("analytics dashboard enabled", "path", "/dashboard/")
+
 	go func() {
 		if err := healthSrv.ListenAndServe(healthAddr); err != nil {
 			logger.Error("health server error", "error", err)
