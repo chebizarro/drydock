@@ -308,7 +308,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return nil
 	}
 
-	result, err := r.engine.Run(ctx, reviewengine.RunInput{
+	// 6c. Run review engine (single model or ensemble mode)
+	runInput := reviewengine.RunInput{
 		ContextBundle:                bundle.Content,
 		ChangedFiles:                 changedFiles,
 		FewShot:                      fewShot,
@@ -316,9 +317,24 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		AdditionalInstructions:       repoCfg.PromptInstructions(),
 		TestCoverageGaps:             bundle.TestCoverageGaps,
 		SkipWalkthrough:              !repoCfg.WalkthroughEnabled(),
-	})
-	if err != nil {
-		return fmt.Errorf("review engine: %w", err)
+	}
+
+	var result reviewengine.RunOutput
+	if repoCfg.Ensemble.Enabled {
+		ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
+		result, err = r.engine.RunEnsemble(ctx, runInput, ensembleCfg)
+		if err != nil {
+			return fmt.Errorf("ensemble review engine: %w", err)
+		}
+		r.logger.Info("ensemble review completed",
+			"patch_event_id", task.PatchEventID,
+			"models", len(ensembleCfg.Models),
+			"findings", len(result.Review.Findings))
+	} else {
+		result, err = r.engine.Run(ctx, runInput)
+		if err != nil {
+			return fmt.Errorf("review engine: %w", err)
+		}
 	}
 
 	// 6d. Run security scanner (deterministic SAST, parallel with LLM review is possible

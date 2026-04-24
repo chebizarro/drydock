@@ -461,3 +461,112 @@ review:
 		t.Errorf("expected default severity_floor 'info', got %q", cfg.Review.SeverityFloor)
 	}
 }
+
+func TestEnsembleConfigDefaults(t *testing.T) {
+	yml := "version: 1\n"
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Ensemble.Enabled {
+		t.Error("expected ensemble disabled by default")
+	}
+	// When disabled, models may be empty (defaults applied only when enabled)
+}
+
+func TestEnsembleConfigValid(t *testing.T) {
+	yml := `
+version: 1
+ensemble:
+  enabled: true
+  models:
+    - coder32b
+    - llm70b
+    - coder14b
+  consensus_boost: 0.15
+  require_consensus: true
+`
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.Ensemble.Enabled {
+		t.Error("expected ensemble enabled")
+	}
+	if len(cfg.Ensemble.Models) != 3 {
+		t.Errorf("expected 3 models, got %d", len(cfg.Ensemble.Models))
+	}
+	if cfg.Ensemble.ConsensusBoost != 0.15 {
+		t.Errorf("expected consensus_boost 0.15, got %f", cfg.Ensemble.ConsensusBoost)
+	}
+	if !cfg.Ensemble.RequireConsensus {
+		t.Error("expected require_consensus true")
+	}
+}
+
+func TestEnsembleConfigInvalidModel(t *testing.T) {
+	yml := `
+version: 1
+ensemble:
+  enabled: true
+  models:
+    - coder32b
+    - invalid_model
+`
+	_, err := Parse([]byte(yml))
+	if err == nil {
+		t.Fatal("expected error for invalid model")
+	}
+}
+
+func TestEnsembleConfigInvalidBoost(t *testing.T) {
+	yml := `
+version: 1
+ensemble:
+  enabled: true
+  models:
+    - coder32b
+  consensus_boost: 0.75
+`
+	_, err := Parse([]byte(yml))
+	if err == nil {
+		t.Fatal("expected error for consensus_boost > 0.5")
+	}
+}
+
+func TestEnsembleConfigDefaultModels(t *testing.T) {
+	yml := `
+version: 1
+ensemble:
+  enabled: true
+`
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Ensemble.Models) != 2 {
+		t.Errorf("expected 2 default models when enabled with no models specified, got %d", len(cfg.Ensemble.Models))
+	}
+}
+
+func TestEnsembleToReviewEngineConfig(t *testing.T) {
+	cfg := EnsembleConfig{
+		Enabled:          true,
+		Models:           []string{"coder32b", "llm70b"},
+		ConsensusBoost:   0.12,
+		RequireConsensus: true,
+	}
+	reCfg := cfg.ToReviewEngineEnsembleConfig()
+	if !reCfg.Enabled {
+		t.Error("expected enabled")
+	}
+	if len(reCfg.Models) != 2 {
+		t.Errorf("expected 2 routes, got %d", len(reCfg.Models))
+	}
+	if reCfg.ConsensusBoost != 0.12 {
+		t.Errorf("expected boost 0.12, got %f", reCfg.ConsensusBoost)
+	}
+	if !reCfg.RequireConsensus {
+		t.Error("expected require_consensus")
+	}
+}

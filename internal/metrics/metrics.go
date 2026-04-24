@@ -163,6 +163,12 @@ var (
 	AutoFixPublishFailures  = &Counter{}
 	AutoFixSkipped          = &Counter{}
 
+	// Ensemble mode
+	EnsembleReviewsRun     = &Counter{}
+	EnsembleModelsUsed     = NewCounterVec() // label: model route
+	EnsembleFindingsMerged = &Counter{}
+	EnsembleConsensusBoost = &Counter{} // findings boosted by consensus
+
 	// Security scan
 	SecurityScanFindings = &Counter{}
 
@@ -277,6 +283,16 @@ func writeMetrics(w io.Writer) {
 		"Failed auto-fix patch publishes.", AutoFixPublishFailures)
 	writeCounter(w, "drydock_autofix_skipped_total",
 		"Auto-fix skipped (disabled, no eligible findings, etc).", AutoFixSkipped)
+
+	// Ensemble mode
+	writeCounter(w, "drydock_ensemble_reviews_run_total",
+		"Reviews run in ensemble mode.", EnsembleReviewsRun)
+	writeCounterVec(w, "drydock_ensemble_models_used_total",
+		"Models used in ensemble reviews.", "model", EnsembleModelsUsed)
+	writeCounter(w, "drydock_ensemble_findings_merged_total",
+		"Findings merged from multiple models.", EnsembleFindingsMerged)
+	writeCounter(w, "drydock_ensemble_consensus_boost_total",
+		"Findings that received consensus boost.", EnsembleConsensusBoost)
 
 	// Security scan
 	writeCounter(w, "drydock_security_scan_findings_total",

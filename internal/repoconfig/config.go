@@ -25,13 +25,14 @@ const (
 
 // RepoConfig is the per-repository review configuration.
 type RepoConfig struct {
-	Version      int           `yaml:"version"`
-	Review       ReviewConfig  `yaml:"review"`
-	Context      ContextConfig `yaml:"context"`
-	Status       StatusConfig  `yaml:"status"`
-	AutoFix      AutoFixConfig `yaml:"autofix"`
+	Version      int            `yaml:"version"`
+	Review       ReviewConfig   `yaml:"review"`
+	Context      ContextConfig  `yaml:"context"`
+	Status       StatusConfig   `yaml:"status"`
+	AutoFix      AutoFixConfig  `yaml:"autofix"`
 	Payments     PaymentsConfig `yaml:"payments"`
-	Instructions string        `yaml:"instructions"`
+	Ensemble     EnsembleConfig `yaml:"ensemble"`
+	Instructions string         `yaml:"instructions"`
 }
 
 // ReviewConfig controls which findings are published.
@@ -58,6 +59,17 @@ type PaymentsConfig struct {
 	FreeReviewsPerDay     int   `yaml:"free_reviews_per_day"`    // free reviews per author per day
 	SubscriptionPriceSats int64 `yaml:"subscription_price_sats"` // subscription price in sats
 	SubscriptionDays      int   `yaml:"subscription_days"`       // subscription duration in days
+}
+
+// EnsembleConfig controls multi-model ensemble review mode.
+// When enabled, reviews run multiple models in parallel and merge findings
+// using consensus scoring — findings reported by multiple models get boosted
+// confidence.
+type EnsembleConfig struct {
+	Enabled          bool     `yaml:"enabled"`
+	Models           []string `yaml:"models"`            // model routes: coder32b, llm70b, coder14b
+	ConsensusBoost   float64  `yaml:"consensus_boost"`   // confidence boost per additional model (default 0.1)
+	RequireConsensus bool     `yaml:"require_consensus"` // only include findings from 2+ models
 }
 
 // AutoFixConfig controls automatic fix-patch generation and publication.
@@ -105,6 +117,12 @@ func Default() RepoConfig {
 		Payments: PaymentsConfig{
 			Enabled:           false,
 			FreeReviewsPerDay: 0,
+		},
+		Ensemble: EnsembleConfig{
+			Enabled:          false,
+			Models:           []string{"coder32b", "llm70b"},
+			ConsensusBoost:   0.10,
+			RequireConsensus: false,
 		},
 	}
 }
@@ -252,6 +270,27 @@ func Parse(data []byte) (RepoConfig, error) {
 		}
 	}
 
+	// Validate and default ensemble config.
+	if raw.Ensemble.Enabled {
+		if len(raw.Ensemble.Models) == 0 {
+			raw.Ensemble.Models = []string{"coder32b", "llm70b"}
+		}
+		for _, m := range raw.Ensemble.Models {
+			switch strings.ToLower(strings.TrimSpace(m)) {
+			case "coder32b", "llm70b", "coder14b":
+				// valid
+			default:
+				return Default(), fmt.Errorf(".drydock.yaml: invalid ensemble model %q", m)
+			}
+		}
+		if raw.Ensemble.ConsensusBoost == 0 {
+			raw.Ensemble.ConsensusBoost = 0.10
+		}
+		if raw.Ensemble.ConsensusBoost < 0 || raw.Ensemble.ConsensusBoost > 0.5 {
+			return Default(), fmt.Errorf(".drydock.yaml: ensemble.consensus_boost must be in [0,0.5], got %f", raw.Ensemble.ConsensusBoost)
+		}
+	}
+
 	// Validate instructions length.
 	raw.Instructions = strings.TrimSpace(raw.Instructions)
 	if len(raw.Instructions) > maxInstructionBytes {
@@ -309,6 +348,32 @@ func ContainsPaymentsConfig(data []byte) bool {
 		}
 	}
 	return false
+}
+
+// ToEnsembleRoutes converts the config's model strings to reviewengine.ModelRoute.
+func (c EnsembleConfig) ToEnsembleRoutes() []reviewengine.ModelRoute {
+	routes := make([]reviewengine.ModelRoute, 0, len(c.Models))
+	for _, m := range c.Models {
+		switch strings.ToLower(strings.TrimSpace(m)) {
+		case "coder32b":
+			routes = append(routes, reviewengine.RouteCoder32B)
+		case "llm70b":
+			routes = append(routes, reviewengine.RouteLLM70B)
+		case "coder14b":
+			routes = append(routes, reviewengine.RouteCoder14B)
+		}
+	}
+	return routes
+}
+
+// ToReviewEngineEnsembleConfig converts to the reviewengine's EnsembleConfig.
+func (c EnsembleConfig) ToReviewEngineEnsembleConfig() reviewengine.EnsembleConfig {
+	return reviewengine.EnsembleConfig{
+		Enabled:          c.Enabled,
+		Models:           c.ToEnsembleRoutes(),
+		ConsensusBoost:   c.ConsensusBoost,
+		RequireConsensus: c.RequireConsensus,
+	}
 }
 
 // PromptInstructions generates the repo-policy instruction text for the LLM.
