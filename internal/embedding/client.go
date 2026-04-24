@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"drydock/internal/circuitbreaker"
 )
 
 // Client calls an OpenAI-compatible embedding endpoint.
@@ -17,6 +19,7 @@ type Client struct {
 	apiKey     string
 	model      string
 	httpClient *http.Client
+	breaker    *circuitbreaker.Breaker
 }
 
 // NewClient creates an embedding client.
@@ -29,15 +32,38 @@ func NewClient(baseURL, apiKey, model string) *Client {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		breaker: circuitbreaker.New(circuitbreaker.Config{
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			Timeout:          30 * time.Second,
+		}),
 	}
 }
 
 // Embed returns the embedding vector for the given text.
+// Uses a circuit breaker to fail fast when the embedding service is unavailable.
 func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
 	if text == "" {
 		return nil, fmt.Errorf("embed: empty input text")
 	}
 
+	// Check circuit breaker
+	if !c.breaker.Allow() {
+		return nil, fmt.Errorf("embed: %w", circuitbreaker.ErrCircuitOpen)
+	}
+
+	vec, err := c.doEmbed(ctx, text)
+	if err != nil {
+		c.breaker.RecordFailure()
+		return nil, err
+	}
+
+	c.breaker.RecordSuccess()
+	return vec, nil
+}
+
+// doEmbed performs the actual embedding HTTP call.
+func (c *Client) doEmbed(ctx context.Context, text string) ([]float32, error) {
 	reqBody := embeddingRequest{
 		Model: c.model,
 		Input: text,
@@ -80,6 +106,11 @@ func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
 		return nil, fmt.Errorf("embed: response contains no embedding data")
 	}
 	return result.Data[0].Embedding, nil
+}
+
+// CircuitState returns the current circuit breaker state.
+func (c *Client) CircuitState() circuitbreaker.State {
+	return c.breaker.State()
 }
 
 // Model returns the configured model name.

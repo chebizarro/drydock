@@ -14,6 +14,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"drydock/internal/circuitbreaker"
 )
 
 // Client interacts with a Qdrant instance via its REST API.
@@ -21,6 +23,7 @@ type Client struct {
 	baseURL    string
 	apiKey     string
 	httpClient *http.Client
+	breaker    *circuitbreaker.Breaker
 }
 
 // NewClient creates a Qdrant REST client.
@@ -32,6 +35,11 @@ func NewClient(baseURL, apiKey string) *Client {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		breaker: circuitbreaker.New(circuitbreaker.Config{
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			Timeout:          30 * time.Second,
+		}),
 	}
 }
 
@@ -251,7 +259,25 @@ func (c *Client) Scroll(ctx context.Context, collection string, limit int, offse
 }
 
 // do executes an HTTP request against the Qdrant REST API.
+// Uses a circuit breaker to fail fast when the service is unavailable.
 func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte, error) {
+	// Check circuit breaker
+	if !c.breaker.Allow() {
+		return nil, fmt.Errorf("vectorstore: %w", circuitbreaker.ErrCircuitOpen)
+	}
+
+	respBody, err := c.doHTTP(ctx, method, path, body)
+	if err != nil {
+		c.breaker.RecordFailure()
+		return nil, err
+	}
+
+	c.breaker.RecordSuccess()
+	return respBody, nil
+}
+
+// doHTTP performs the actual HTTP request.
+func (c *Client) doHTTP(ctx context.Context, method, path string, body any) ([]byte, error) {
 	var reqBody io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -288,6 +314,11 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 	}
 
 	return respBody, nil
+}
+
+// CircuitState returns the current circuit breaker state.
+func (c *Client) CircuitState() circuitbreaker.State {
+	return c.breaker.State()
 }
 
 func truncate(s string, n int) string {

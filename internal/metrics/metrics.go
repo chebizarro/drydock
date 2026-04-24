@@ -205,6 +205,11 @@ var (
 	ConversationRateLimited     = &Counter{}
 	ConversationErrors          = &Counter{}
 
+	// Circuit breakers
+	CircuitBreakerOpened = NewCounterVec() // label: service (embedding, vectorstore, etc)
+	CircuitBreakerClosed = NewCounterVec() // label: service
+	CircuitBreakerRejected = NewCounterVec() // label: service (requests rejected due to open circuit)
+
 	// Uptime
 	startTime = time.Now()
 )
@@ -382,6 +387,14 @@ func writeMetrics(w io.Writer) {
 		"Replies dropped due to per-review turn limit.", ConversationRateLimited)
 	writeCounter(w, "drydock_conversation_errors_total",
 		"Conversation processing errors.", ConversationErrors)
+
+	// Circuit breakers
+	writeCounterVec(w, "drydock_circuit_breaker_opened_total",
+		"Times circuit breaker opened due to failures.", "service", CircuitBreakerOpened)
+	writeCounterVec(w, "drydock_circuit_breaker_closed_total",
+		"Times circuit breaker closed after recovery.", "service", CircuitBreakerClosed)
+	writeCounterVec(w, "drydock_circuit_breaker_rejected_total",
+		"Requests rejected due to open circuit breaker.", "service", CircuitBreakerRejected)
 }
 
 // --- Prometheus text format helpers ---
