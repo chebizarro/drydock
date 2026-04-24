@@ -169,6 +169,12 @@ var (
 	EnsembleFindingsMerged = &Counter{}
 	EnsembleConsensusBoost = &Counter{} // findings boosted by consensus
 
+	// Codechat (DM codebase Q&A)
+	CodeChatDMsReceived   = &Counter{}
+	CodeChatResponsesSent = &Counter{}
+	CodeChatRateLimited   = &Counter{}
+	CodeChatErrors        = &Counter{}
+
 	// Security scan
 	SecurityScanFindings = &Counter{}
 
@@ -293,6 +299,16 @@ func writeMetrics(w io.Writer) {
 		"Findings merged from multiple models.", EnsembleFindingsMerged)
 	writeCounter(w, "drydock_ensemble_consensus_boost_total",
 		"Findings that received consensus boost.", EnsembleConsensusBoost)
+
+	// Codechat (DM codebase Q&A)
+	writeCounter(w, "drydock_codechat_dms_received_total",
+		"Encrypted DMs received for codebase chat.", CodeChatDMsReceived)
+	writeCounter(w, "drydock_codechat_responses_sent_total",
+		"Codechat responses published.", CodeChatResponsesSent)
+	writeCounter(w, "drydock_codechat_rate_limited_total",
+		"Codechat requests dropped due to rate limit.", CodeChatRateLimited)
+	writeCounter(w, "drydock_codechat_errors_total",
+		"Codechat processing errors.", CodeChatErrors)
 
 	// Security scan
 	writeCounter(w, "drydock_security_scan_findings_total",

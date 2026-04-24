@@ -260,4 +260,18 @@ CREATE TABLE IF NOT EXISTS free_review_usage (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (author_pubkey, repo_id, usage_day)
 );
+
+CREATE TABLE IF NOT EXISTS codechat_turns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sender_pubkey TEXT NOT NULL,
+  event_id TEXT NOT NULL UNIQUE,
+  repo_id TEXT NOT NULL DEFAULT '',
+  question TEXT NOT NULL,
+  response TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'published', 'failed')),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codechat_turns_sender ON codechat_turns(sender_pubkey);
+CREATE INDEX IF NOT EXISTS idx_codechat_turns_sender_repo ON codechat_turns(sender_pubkey, repo_id);
+CREATE INDEX IF NOT EXISTS idx_codechat_turns_created ON codechat_turns(created_at);
 `

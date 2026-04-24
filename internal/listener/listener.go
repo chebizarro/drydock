@@ -21,6 +21,8 @@ var subscribedKinds = []nostr.Kind{
 	1621, nostr.KindComment,
 	1630, 1631, 1632, 1633,
 	1985,
+	nostr.KindEncryptedDirectMessage, // NIP-04 DMs (kind 4)
+	14,                                // NIP-17 sealed DMs
 }
 
 func SubscribedKinds() []nostr.Kind {

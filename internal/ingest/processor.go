@@ -18,11 +18,18 @@ type ConversationHandler interface {
 	IsReplyToUs(ctx context.Context, event nostr.Event) bool
 }
 
+// CodeChatHandler processes encrypted DM events for codebase Q&A.
+type CodeChatHandler interface {
+	HandleDM(ctx context.Context, event nostr.Event, relayURL string) error
+	IsDMToUs(ctx context.Context, event nostr.Event) bool
+}
+
 type Processor struct {
-	store             *db.Store
-	logger            *slog.Logger
-	ReviewQueue       chan db.ReviewTask
-	conversation      ConversationHandler
+	store              *db.Store
+	logger             *slog.Logger
+	ReviewQueue        chan db.ReviewTask
+	conversation       ConversationHandler
+	codeChat           CodeChatHandler
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
 }
 
@@ -39,6 +46,13 @@ func WithConversation(ch ConversationHandler) func(*Processor) {
 func WithLocalAutofixAuthor(pubkey string) func(*Processor) {
 	return func(p *Processor) {
 		p.localAutofixPubKey = pubkey
+	}
+}
+
+// WithCodeChat sets the codechat handler for processing encrypted DM events.
+func WithCodeChat(ch CodeChatHandler) func(*Processor) {
+	return func(p *Processor) {
+		p.codeChat = ch
 	}
 }
 
@@ -152,6 +166,19 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			go func() {
 				if err := p.conversation.HandleReply(ctx, event, relayURL); err != nil {
 					p.logger.Error("conversation handler failed",
+						"event_id", event.ID.Hex(),
+						"error", err,
+					)
+				}
+			}()
+		}
+		return nil
+	case nostr.KindEncryptedDirectMessage, 14: // NIP-04 kind 4 or NIP-17 kind 14
+		// Encrypted DM to us? Route to codechat handler.
+		if p.codeChat != nil && p.codeChat.IsDMToUs(ctx, event) {
+			go func() {
+				if err := p.codeChat.HandleDM(ctx, event, relayURL); err != nil {
+					p.logger.Error("codechat handler failed",
 						"event_id", event.ID.Hex(),
 						"error", err,
 					)
