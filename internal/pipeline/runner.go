@@ -260,10 +260,18 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return fmt.Errorf("build context: %w", err)
 	}
 
-	// 5. Retrieve few-shot examples for reviewer prompt injection
+	// 5. Extract changed files from the context bundle (used for few-shot, engine, etc.).
+	changedFiles := bundle.ChangedFiles
+
+	// 5b. Retrieve few-shot examples for reviewer prompt injection
 	var fewShot []string
 	if r.fewShotRetriever != nil {
-		fewShot, err = r.fewShotRetriever.RetrieveFewShots(ctx, patchDiffContent, 2)
+		fewShot, err = r.fewShotRetriever.RetrieveFewShots(ctx, FewShotQuery{
+			PatchDiff:  patchDiffContent,
+			Limit:      2,
+			Language:   DetectLanguage(changedFiles),
+			RepoID:     task.RepoID,
+		})
 	} else {
 		fewShot, err = r.store.GetRecentFewShots(ctx, 3)
 	}
@@ -279,7 +287,6 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	// 6b. Check if exclusions left no reviewable files.
-	changedFiles := bundle.ChangedFiles
 	if len(changedFiles) == 0 && len(bundle.ExcludedFiles) > 0 {
 		// All changed files were excluded by repo policy — skip LLM call.
 		reviewEventID, pubErr := r.pubSvc.PublishReview(ctx, publisher.PublishInput{

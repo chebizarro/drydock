@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"drydock/internal/db"
 	"drydock/internal/embedding"
 	"drydock/internal/reviewengine"
+	"drydock/internal/symbols"
 	"drydock/internal/vectorstore"
 	"golang.org/x/sync/semaphore"
 )
@@ -250,18 +253,26 @@ func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOut
 		}
 
 		// Embed and upsert into Qdrant for similarity-based retrieval.
+		// Include metadata for cross-repo learning: language, categories, timestamp.
 		if s.qdrant != nil && s.embedder != nil && in.PatchDiff != "" {
 			vec, err := s.embedder.Embed(ctx, in.PatchDiff)
 			if err != nil {
 				s.logger.Warn("failed to embed few-shot for Qdrant", "patch_event_id", in.PatchEventID, "error", err)
 			} else {
+				// Extract metadata for cross-repo learning.
+				lang := detectPrimaryLanguage(in.ChangedFiles)
+				categories := extractFindingCategories(in.LocalReview.Findings)
+
 				point := vectorstore.Point{
 					ID:     in.PatchEventID,
 					Vector: vec,
 					Payload: map[string]any{
-						"content":  content,
-						"repo_id":  in.RepoID,
-						"quality":  out.ReasoningQuality,
+						"content":    content,
+						"repo_id":    in.RepoID,
+						"quality":    out.ReasoningQuality,
+						"language":   lang,
+						"categories": categories,
+						"created_at": time.Now().Unix(),
 					},
 				}
 				if err := s.qdrant.Upsert(ctx, vectorstore.CollectionFewShot, []vectorstore.Point{point}); err != nil {
@@ -344,5 +355,49 @@ func extractJSON(raw string) string {
 		return raw[start : end+1]
 	}
 	return raw
+}
+
+// detectPrimaryLanguage returns the most common programming language
+// among the changed files, using the symbols package's extension mapping
+// for consistency with code indexing. First-seen language wins on ties.
+func detectPrimaryLanguage(changedFiles []string) string {
+	counts := make(map[string]int)
+	var order []string
+	for _, f := range changedFiles {
+		ext := strings.ToLower(filepath.Ext(f))
+		lang := symbols.LangFromExt(ext)
+		if lang != "" {
+			if counts[lang] == 0 {
+				order = append(order, lang)
+			}
+			counts[lang]++
+		}
+	}
+	if len(counts) == 0 {
+		return ""
+	}
+	best := ""
+	bestCount := 0
+	for _, lang := range order {
+		if counts[lang] > bestCount {
+			best = lang
+			bestCount = counts[lang]
+		}
+	}
+	return best
+}
+
+// extractFindingCategories returns unique finding categories from the local review.
+func extractFindingCategories(findings []reviewengine.Finding) []string {
+	seen := make(map[string]bool)
+	var cats []string
+	for _, f := range findings {
+		cat := strings.TrimSpace(f.Category)
+		if cat != "" && !seen[cat] {
+			seen[cat] = true
+			cats = append(cats, cat)
+		}
+	}
+	return cats
 }
 
