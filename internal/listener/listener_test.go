@@ -30,8 +30,11 @@ func TestSubscribedKindsSet(t *testing.T) {
 		1632:  true,
 		1633:  true,
 		1985:  true,
-		4:     true, // NIP-04 DMs
-		14:    true, // NIP-17 sealed DMs
+		4:     true,  // NIP-04 DMs
+		14:    true,  // NIP-17 sealed DMs
+		31650: true,  // IDE workspace session
+		1651:  true,  // IDE review request
+		1653:  true,  // IDE fix request
 	}
 
 	if len(kinds) != len(expected) {

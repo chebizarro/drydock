@@ -1,0 +1,80 @@
+{
+  "name": "vscode-drydock",
+  "displayName": "Drydock Code Review",
+  "description": "AI-powered code review via Nostr — review uncommitted changes, see inline diagnostics, and apply fixes with one click",
+  "version": "0.1.0",
+  "publisher": "drydock",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/drydock/drydock"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "drydock.reviewChanges",
+        "title": "Drydock: Review Uncommitted Changes"
+      },
+      {
+        "command": "drydock.applyFix",
+        "title": "Drydock: Apply Suggested Fix"
+      },
+      {
+        "command": "drydock.clearDiagnostics",
+        "title": "Drydock: Clear Diagnostics"
+      }
+    ],
+    "configuration": {
+      "title": "Drydock",
+      "properties": {
+        "drydock.relays": {
+          "type": "array",
+          "default": ["wss://relay.damus.io", "wss://nos.lol"],
+          "description": "Nostr relays to connect to"
+        },
+        "drydock.privateKey": {
+          "type": "string",
+          "default": "",
+          "description": "Nostr private key (nsec or hex) for authentication"
+        },
+        "drydock.drydockPubkey": {
+          "type": "string",
+          "default": "",
+          "description": "Drydock service public key to send review requests to"
+        },
+        "drydock.autoReview": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically review changes on save"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.80.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "nostr-tools": "^2.0.0"
+  }
+}

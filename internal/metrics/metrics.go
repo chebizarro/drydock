@@ -175,6 +175,14 @@ var (
 	CodeChatRateLimited   = &Counter{}
 	CodeChatErrors        = &Counter{}
 
+	// IDE Gateway
+	IDESessionsActive          = &Gauge{}
+	IDEReviewRequestsReceived  = &Counter{}
+	IDEReviewResponsesSent     = &Counter{}
+	IDEReviewErrors            = &Counter{}
+	IDEFixRequestsReceived     = &Counter{}
+	IDEFixResponsesSent        = &Counter{}
+
 	// Security scan
 	SecurityScanFindings = &Counter{}
 
@@ -309,6 +317,20 @@ func writeMetrics(w io.Writer) {
 		"Codechat requests dropped due to rate limit.", CodeChatRateLimited)
 	writeCounter(w, "drydock_codechat_errors_total",
 		"Codechat processing errors.", CodeChatErrors)
+
+	// IDE Gateway
+	writeGauge(w, "drydock_ide_sessions_active",
+		"Active IDE sessions.", IDESessionsActive)
+	writeCounter(w, "drydock_ide_review_requests_received_total",
+		"IDE review requests received.", IDEReviewRequestsReceived)
+	writeCounter(w, "drydock_ide_review_responses_sent_total",
+		"IDE review responses sent.", IDEReviewResponsesSent)
+	writeCounter(w, "drydock_ide_review_errors_total",
+		"IDE review processing errors.", IDEReviewErrors)
+	writeCounter(w, "drydock_ide_fix_requests_received_total",
+		"IDE fix requests received.", IDEFixRequestsReceived)
+	writeCounter(w, "drydock_ide_fix_responses_sent_total",
+		"IDE fix responses sent.", IDEFixResponsesSent)
 
 	// Security scan
 	writeCounter(w, "drydock_security_scan_findings_total",

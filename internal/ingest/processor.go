@@ -24,12 +24,18 @@ type CodeChatHandler interface {
 	IsDMToUs(ctx context.Context, event nostr.Event) bool
 }
 
+// IDEGatewayHandler processes IDE integration events.
+type IDEGatewayHandler interface {
+	HandleEvent(ctx context.Context, event nostr.Event, relayURL string) error
+}
+
 type Processor struct {
 	store              *db.Store
 	logger             *slog.Logger
 	ReviewQueue        chan db.ReviewTask
 	conversation       ConversationHandler
 	codeChat           CodeChatHandler
+	ideGateway         IDEGatewayHandler
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
 }
 
@@ -53,6 +59,13 @@ func WithLocalAutofixAuthor(pubkey string) func(*Processor) {
 func WithCodeChat(ch CodeChatHandler) func(*Processor) {
 	return func(p *Processor) {
 		p.codeChat = ch
+	}
+}
+
+// WithIDEGateway sets the IDE gateway handler for processing IDE events.
+func WithIDEGateway(h IDEGatewayHandler) func(*Processor) {
+	return func(p *Processor) {
+		p.ideGateway = h
 	}
 }
 
@@ -180,6 +193,20 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 				if err := p.codeChat.HandleDM(ctx, event, relayURL); err != nil {
 					p.logger.Error("codechat handler failed",
 						"event_id", event.ID.Hex(),
+						"error", err,
+					)
+				}
+			}()
+		}
+		return nil
+	case 31650, 1651, 1653: // IDE integration events
+		// Route to IDE gateway handler.
+		if p.ideGateway != nil {
+			go func() {
+				if err := p.ideGateway.HandleEvent(ctx, event, relayURL); err != nil {
+					p.logger.Error("IDE gateway handler failed",
+						"event_id", event.ID.Hex(),
+						"kind", int(event.Kind),
 						"error", err,
 					)
 				}
