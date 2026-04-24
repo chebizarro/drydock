@@ -274,4 +274,68 @@ CREATE TABLE IF NOT EXISTS codechat_turns (
 CREATE INDEX IF NOT EXISTS idx_codechat_turns_sender ON codechat_turns(sender_pubkey);
 CREATE INDEX IF NOT EXISTS idx_codechat_turns_sender_repo ON codechat_turns(sender_pubkey, repo_id);
 CREATE INDEX IF NOT EXISTS idx_codechat_turns_created ON codechat_turns(created_at);
+
+CREATE TABLE IF NOT EXISTS reviewer_profiles (
+  pubkey TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL DEFAULT '',
+  languages TEXT NOT NULL DEFAULT '',
+  domains TEXT NOT NULL DEFAULT '',
+  availability TEXT NOT NULL DEFAULT 'available'
+    CHECK (availability IN ('available', 'limited', 'unavailable')),
+  price_per_review INTEGER NOT NULL DEFAULT 0,
+  max_concurrent INTEGER NOT NULL DEFAULT 3,
+  event_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviewer_profiles_availability ON reviewer_profiles(availability);
+
+CREATE TABLE IF NOT EXISTS reviewer_reputations (
+  pubkey TEXT PRIMARY KEY,
+  overall_score REAL NOT NULL DEFAULT 0.5,
+  total_reviews INTEGER NOT NULL DEFAULT 0,
+  accepted_reviews INTEGER NOT NULL DEFAULT 0,
+  rejected_reviews INTEGER NOT NULL DEFAULT 0,
+  average_rating REAL NOT NULL DEFAULT 0,
+  acceptance_rate REAL NOT NULL DEFAULT 0,
+  last_review_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviewer_reputations_score ON reviewer_reputations(overall_score);
+
+CREATE TABLE IF NOT EXISTS review_assignments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  patch_event_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  reviewer_pubkey TEXT NOT NULL,
+  requester_pubkey TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'accepted', 'rejected', 'completed', 'expired')),
+  priority INTEGER NOT NULL DEFAULT 2,
+  price_sats INTEGER NOT NULL DEFAULT 0,
+  assignment_event_id TEXT NOT NULL UNIQUE,
+  acceptance_event_id TEXT,
+  completion_event_id TEXT,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(patch_event_id, reviewer_pubkey)
+);
+CREATE INDEX IF NOT EXISTS idx_review_assignments_reviewer ON review_assignments(reviewer_pubkey);
+CREATE INDEX IF NOT EXISTS idx_review_assignments_status ON review_assignments(status);
+CREATE INDEX IF NOT EXISTS idx_review_assignments_expires ON review_assignments(expires_at);
+
+CREATE TABLE IF NOT EXISTS review_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  assignment_id INTEGER NOT NULL,
+  reviewer_pubkey TEXT NOT NULL,
+  rater_pubkey TEXT NOT NULL,
+  rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+  comment TEXT NOT NULL DEFAULT '',
+  event_id TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_review_feedback_reviewer ON review_feedback(reviewer_pubkey);
+CREATE INDEX IF NOT EXISTS idx_review_feedback_assignment ON review_feedback(assignment_id);
 `

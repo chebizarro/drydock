@@ -35,6 +35,11 @@ func TestSubscribedKindsSet(t *testing.T) {
 		31650: true,  // IDE workspace session
 		1651:  true,  // IDE review request
 		1653:  true,  // IDE fix request
+		30620: true,  // Marketplace: reviewer profile
+		1660:  true,  // Marketplace: review assignment
+		1661:  true,  // Marketplace: assignment acceptance
+		1662:  true,  // Marketplace: assignment rejection
+		1663:  true,  // Marketplace: review feedback
 	}
 
 	if len(kinds) != len(expected) {

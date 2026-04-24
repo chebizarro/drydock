@@ -183,6 +183,19 @@ var (
 	IDEFixRequestsReceived     = &Counter{}
 	IDEFixResponsesSent        = &Counter{}
 
+	// Marketplace
+	MarketplaceRoutingAttempts    = &Counter{}
+	MarketplaceRoutingSuccesses   = &Counter{}
+	MarketplaceRoutingFailures    = &Counter{}
+	MarketplaceNoReviewersFound   = &Counter{}
+	MarketplaceAssignmentsCreated = &Counter{}
+	MarketplaceAssignmentsAccepted = &Counter{}
+	MarketplaceAssignmentsRejected = &Counter{}
+	MarketplaceAssignmentsExpired  = &Counter{}
+	MarketplaceReviewersActive     = &Gauge{}
+	MarketplaceFeedbackReceived    = &Counter{}
+	MarketplaceReputationUpdates   = &Counter{}
+
 	// Security scan
 	SecurityScanFindings = &Counter{}
 
@@ -331,6 +344,30 @@ func writeMetrics(w io.Writer) {
 		"IDE fix requests received.", IDEFixRequestsReceived)
 	writeCounter(w, "drydock_ide_fix_responses_sent_total",
 		"IDE fix responses sent.", IDEFixResponsesSent)
+
+	// Marketplace
+	writeCounter(w, "drydock_marketplace_routing_attempts_total",
+		"Patch routing attempts to community reviewers.", MarketplaceRoutingAttempts)
+	writeCounter(w, "drydock_marketplace_routing_successes_total",
+		"Successful patch routings to reviewers.", MarketplaceRoutingSuccesses)
+	writeCounter(w, "drydock_marketplace_routing_failures_total",
+		"Failed patch routing attempts.", MarketplaceRoutingFailures)
+	writeCounter(w, "drydock_marketplace_no_reviewers_found_total",
+		"Routing attempts with no matching reviewers.", MarketplaceNoReviewersFound)
+	writeCounter(w, "drydock_marketplace_assignments_created_total",
+		"Review assignments created.", MarketplaceAssignmentsCreated)
+	writeCounter(w, "drydock_marketplace_assignments_accepted_total",
+		"Review assignments accepted by reviewers.", MarketplaceAssignmentsAccepted)
+	writeCounter(w, "drydock_marketplace_assignments_rejected_total",
+		"Review assignments rejected by reviewers.", MarketplaceAssignmentsRejected)
+	writeCounter(w, "drydock_marketplace_assignments_expired_total",
+		"Review assignments that expired without response.", MarketplaceAssignmentsExpired)
+	writeGauge(w, "drydock_marketplace_reviewers_active",
+		"Number of active community reviewers.", MarketplaceReviewersActive)
+	writeCounter(w, "drydock_marketplace_feedback_received_total",
+		"Review feedback/ratings received.", MarketplaceFeedbackReceived)
+	writeCounter(w, "drydock_marketplace_reputation_updates_total",
+		"Reviewer reputation recalculations.", MarketplaceReputationUpdates)
 
 	// Security scan
 	writeCounter(w, "drydock_security_scan_findings_total",

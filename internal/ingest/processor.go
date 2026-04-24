@@ -29,6 +29,11 @@ type IDEGatewayHandler interface {
 	HandleEvent(ctx context.Context, event nostr.Event, relayURL string) error
 }
 
+// MarketplaceHandler processes review marketplace events.
+type MarketplaceHandler interface {
+	HandleEvent(ctx context.Context, event nostr.Event, relayURL string) error
+}
+
 type Processor struct {
 	store              *db.Store
 	logger             *slog.Logger
@@ -36,6 +41,7 @@ type Processor struct {
 	conversation       ConversationHandler
 	codeChat           CodeChatHandler
 	ideGateway         IDEGatewayHandler
+	marketplace        MarketplaceHandler
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
 }
 
@@ -66,6 +72,13 @@ func WithCodeChat(ch CodeChatHandler) func(*Processor) {
 func WithIDEGateway(h IDEGatewayHandler) func(*Processor) {
 	return func(p *Processor) {
 		p.ideGateway = h
+	}
+}
+
+// WithMarketplace sets the marketplace handler for processing reviewer events.
+func WithMarketplace(h MarketplaceHandler) func(*Processor) {
+	return func(p *Processor) {
+		p.marketplace = h
 	}
 }
 
@@ -205,6 +218,20 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			go func() {
 				if err := p.ideGateway.HandleEvent(ctx, event, relayURL); err != nil {
 					p.logger.Error("IDE gateway handler failed",
+						"event_id", event.ID.Hex(),
+						"kind", int(event.Kind),
+						"error", err,
+					)
+				}
+			}()
+		}
+		return nil
+	case 30620, 1660, 1661, 1662, 1663: // Marketplace events
+		// Route to marketplace handler.
+		if p.marketplace != nil {
+			go func() {
+				if err := p.marketplace.HandleEvent(ctx, event, relayURL); err != nil {
+					p.logger.Error("marketplace handler failed",
 						"event_id", event.ID.Hex(),
 						"kind", int(event.Kind),
 						"error", err,

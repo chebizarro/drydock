@@ -26,6 +26,11 @@ var subscribedKinds = []nostr.Kind{
 	31650,                             // IDE workspace session
 	1651,                              // IDE review request
 	1653,                              // IDE fix request
+	30620,                             // Reviewer profile (replaceable)
+	1660,                              // Review assignment
+	1661,                              // Assignment acceptance
+	1662,                              // Assignment rejection
+	1663,                              // Review feedback
 }
 
 func SubscribedKinds() []nostr.Kind {
