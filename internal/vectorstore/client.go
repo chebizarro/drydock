@@ -40,6 +40,7 @@ const (
 	CollectionNIPSpecs    = "nip_specs"
 	CollectionProjectDocs = "project_docs"
 	CollectionFewShot     = "few_shot_reviews"
+	CollectionCodeChunks  = "code_chunks"
 )
 
 // Point represents a vector point in Qdrant.

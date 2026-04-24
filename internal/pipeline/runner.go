@@ -37,6 +37,13 @@ type DocIngester interface {
 	IngestRepoDocs(ctx context.Context, repoPath, repoID string) error
 }
 
+// CodeIndexer indexes source code symbols into a vector store for
+// semantic code search. Called after repo preparation so that the
+// related-code provider can retrieve relevant code during context building.
+type CodeIndexer interface {
+	IndexRepo(ctx context.Context, repoPath, repoID string) error
+}
+
 type Runner struct {
 	store            *db.Store
 	repoSvc          *repo.Service
@@ -47,6 +54,7 @@ type Runner struct {
 	promptRefiner    PromptRefiner
 	fewShotRetriever FewShotRetriever
 	docIngester      DocIngester
+	codeIndexer      CodeIndexer
 	secScanner       *securityscan.Scanner
 	queue            <-chan db.ReviewTask
 	workers          int
@@ -79,6 +87,15 @@ func WithFewShotRetriever(fsr FewShotRetriever) func(*Runner) {
 func WithDocIngester(di DocIngester) func(*Runner) {
 	return func(r *Runner) {
 		r.docIngester = di
+	}
+}
+
+// WithCodeIndexer sets an optional code indexer. When set, the runner
+// indexes source code symbols after repo preparation so the related-code
+// provider can retrieve semantically similar code during context building.
+func WithCodeIndexer(ci CodeIndexer) func(*Runner) {
+	return func(r *Runner) {
+		r.codeIndexer = ci
 	}
 }
 
@@ -199,6 +216,14 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	if r.docIngester != nil && repoCfg.DocsEnabled() {
 		if err := r.docIngester.IngestRepoDocs(ctx, prep.RepoPath, task.RepoID); err != nil {
 			r.logger.Warn("doc ingestion failed, continuing without",
+				"repo_id", task.RepoID, "error", err)
+		}
+	}
+
+	// 1d. Index source code for semantic search (non-fatal; skip on error).
+	if r.codeIndexer != nil {
+		if err := r.codeIndexer.IndexRepo(ctx, prep.RepoPath, task.RepoID); err != nil {
+			r.logger.Warn("code indexing failed, continuing without",
 				"repo_id", task.RepoID, "error", err)
 		}
 	}

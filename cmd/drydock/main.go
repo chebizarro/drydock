@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"drydock/internal/codeindex"
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/conversation"
@@ -220,19 +221,28 @@ func main() {
 	// Qdrant + embedding
 	var qdrantClient *vectorstore.Client
 	var embedClient *embedding.Client
+	var codeIndexer *codeindex.Indexer
 	if cfg.QdrantURL != "" && cfg.EmbedBaseURL != "" {
 		qdrantClient = vectorstore.NewClient(cfg.QdrantURL, cfg.QdrantAPIKey)
 		embedClient = embedding.NewClient(cfg.EmbedBaseURL, cfg.EmbedAPIKey, cfg.EmbedModel)
 
 		// Ensure collections exist (non-fatal).
 		vectorDim := 768 // default for nomic-embed
-		for _, col := range []string{vectorstore.CollectionNIPSpecs, vectorstore.CollectionProjectDocs, vectorstore.CollectionFewShot} {
+		for _, col := range []string{vectorstore.CollectionNIPSpecs, vectorstore.CollectionProjectDocs, vectorstore.CollectionFewShot, vectorstore.CollectionCodeChunks} {
 			if err := qdrantClient.EnsureCollection(ctx, col, vectorDim); err != nil {
 				logger.Warn("failed to ensure Qdrant collection", "collection", col, "error", err)
 			}
 		}
 
 		builderOpts = append(builderOpts, contextbuilder.WithQdrant(qdrantClient, embedClient))
+
+		// Code index provider + indexer.
+		codeProvider := codeindex.NewProvider(qdrantClient, embedClient, logger)
+		if codeProvider != nil {
+			builderOpts = append(builderOpts, contextbuilder.WithExtraProviders(codeProvider))
+		}
+		codeIndexer = codeindex.New(qdrantClient, embedClient, logger)
+
 		logger.Info("Qdrant + embedding configured", "qdrant", cfg.QdrantURL, "embed_model", cfg.EmbedModel)
 	} else if cfg.QdrantURL != "" || cfg.EmbedBaseURL != "" {
 		logger.Warn("both DRYDOCK_QDRANT_URL and DRYDOCK_EMBED_BASE_URL must be set for RAG features")
@@ -318,6 +328,9 @@ func main() {
 		var pipelineOpts []func(*pipeline.Runner)
 		pipelineOpts = append(pipelineOpts, pipeline.WithPromptRefiner(prSvc))
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityScanner(secScanner))
+		if codeIndexer != nil {
+			pipelineOpts = append(pipelineOpts, pipeline.WithCodeIndexer(codeIndexer))
+		}
 		if qdrantClient != nil && embedClient != nil {
 			pipelineOpts = append(pipelineOpts,
 				pipeline.WithFewShotRetriever(
