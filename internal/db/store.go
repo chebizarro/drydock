@@ -1282,9 +1282,11 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 	now := time.Now().Unix()
 	cutoff := now - minAgeSeconds
 
+	// Exclude permanent payment denials from requeue (they start with 'payment_blocked:')
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT patch_event_id, repo_id FROM review_log
 		WHERE status='failed' AND updated_at < ?
+		AND (failure_reason IS NULL OR failure_reason = '' OR failure_reason NOT LIKE 'payment_blocked:%')
 		ORDER BY updated_at ASC
 		LIMIT ?`, cutoff, limit)
 	if err != nil {

@@ -213,4 +213,51 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE INDEX IF NOT EXISTS idx_conversations_review ON conversations(review_event_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_reply ON conversations(reply_event_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_response ON conversations(response_event_id);
+
+CREATE TABLE IF NOT EXISTS review_payments (
+  patch_event_id TEXT PRIMARY KEY,
+  repo_id TEXT NOT NULL,
+  author_pubkey TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'authorized')),
+  access_kind TEXT NOT NULL DEFAULT ''
+    CHECK (access_kind IN ('', 'free_tier', 'subscription', 'cashu_review', 'cashu_subscription')),
+  requested_mode TEXT NOT NULL DEFAULT 'review'
+    CHECK (requested_mode IN ('review', 'subscription')),
+  token_hash TEXT,
+  mint_url TEXT NOT NULL DEFAULT '',
+  token_amount_sats INTEGER NOT NULL DEFAULT 0,
+  invoice_id TEXT NOT NULL DEFAULT '',
+  invoice_request TEXT NOT NULL DEFAULT '',
+  invoice_expires_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_payments_token_hash
+  ON review_payments(token_hash)
+  WHERE token_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_review_payments_author_repo
+  ON review_payments(author_pubkey, repo_id);
+
+CREATE TABLE IF NOT EXISTS payment_subscriptions (
+  author_pubkey TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  source_patch_event_id TEXT NOT NULL UNIQUE,
+  source_token_hash TEXT NOT NULL UNIQUE,
+  paid_amount_sats INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (author_pubkey, repo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_payment_subscriptions_expires_at
+  ON payment_subscriptions(expires_at);
+
+CREATE TABLE IF NOT EXISTS free_review_usage (
+  author_pubkey TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  usage_day TEXT NOT NULL,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (author_pubkey, repo_id, usage_day)
+);
 `

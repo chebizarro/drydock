@@ -30,6 +30,7 @@ type RepoConfig struct {
 	Context      ContextConfig `yaml:"context"`
 	Status       StatusConfig  `yaml:"status"`
 	AutoFix      AutoFixConfig `yaml:"autofix"`
+	Payments     PaymentsConfig `yaml:"payments"`
 	Instructions string        `yaml:"instructions"`
 }
 
@@ -46,6 +47,17 @@ type ContextConfig struct {
 	TokenBudget  int      `yaml:"token_budget"`
 	ExcludePaths []string `yaml:"exclude_paths"`
 	IncludeDocs  *bool    `yaml:"include_docs"` // pointer to distinguish missing from false
+}
+
+// PaymentsConfig controls Cashu ecash payment gating for review access.
+// When enabled, reviews require either an active subscription, a Cashu token
+// attached to the patch event, or available free-tier quota.
+type PaymentsConfig struct {
+	Enabled               bool  `yaml:"enabled"`
+	PriceSats             int64 `yaml:"price_sats"`              // per-review price in sats
+	FreeReviewsPerDay     int   `yaml:"free_reviews_per_day"`    // free reviews per author per day
+	SubscriptionPriceSats int64 `yaml:"subscription_price_sats"` // subscription price in sats
+	SubscriptionDays      int   `yaml:"subscription_days"`       // subscription duration in days
 }
 
 // AutoFixConfig controls automatic fix-patch generation and publication.
@@ -89,6 +101,10 @@ func Default() RepoConfig {
 			Enabled:       false,
 			MinConfidence: 0.97,
 			MaxFindings:   3,
+		},
+		Payments: PaymentsConfig{
+			Enabled:           false,
+			FreeReviewsPerDay: 0,
 		},
 	}
 }
@@ -220,6 +236,22 @@ func Parse(data []byte) (RepoConfig, error) {
 		raw.AutoFix.MaxFindings = 3
 	}
 
+	// Validate payments config.
+	if raw.Payments.Enabled {
+		if raw.Payments.PriceSats <= 0 {
+			return Default(), fmt.Errorf(".drydock.yaml: payments.price_sats must be > 0 when payments enabled")
+		}
+		if raw.Payments.FreeReviewsPerDay < 0 {
+			raw.Payments.FreeReviewsPerDay = 0
+		}
+		// Subscription requires both fields or neither.
+		hasSubPrice := raw.Payments.SubscriptionPriceSats > 0
+		hasSubDays := raw.Payments.SubscriptionDays > 0
+		if hasSubPrice != hasSubDays {
+			return Default(), fmt.Errorf(".drydock.yaml: payments subscription requires both subscription_price_sats and subscription_days")
+		}
+	}
+
 	// Validate instructions length.
 	raw.Instructions = strings.TrimSpace(raw.Instructions)
 	if len(raw.Instructions) > maxInstructionBytes {
@@ -264,6 +296,19 @@ func (c RepoConfig) DocsEnabled() bool {
 		return true
 	}
 	return *c.Context.IncludeDocs
+}
+
+// ContainsPaymentsConfig returns true if the raw YAML data contains a top-level
+// "payments:" key. Used to implement fail-closed behavior when the payments
+// section is present but the config fails to parse.
+func ContainsPaymentsConfig(data []byte) bool {
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if bytes.HasPrefix(trimmed, []byte("payments:")) {
+			return true
+		}
+	}
+	return false
 }
 
 // PromptInstructions generates the repo-policy instruction text for the LLM.

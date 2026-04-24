@@ -383,6 +383,69 @@ func TestAutoFixConfigInvalidConfidence(t *testing.T) {
 	}
 }
 
+func TestPaymentsConfigDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.Payments.Enabled {
+		t.Error("payments should be disabled by default")
+	}
+}
+
+func TestPaymentsConfigValid(t *testing.T) {
+	yml := "version: 1\npayments:\n  enabled: true\n  price_sats: 100\n  free_reviews_per_day: 2\n"
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.Payments.Enabled {
+		t.Error("expected payments enabled")
+	}
+	if cfg.Payments.PriceSats != 100 {
+		t.Errorf("expected price_sats 100, got %d", cfg.Payments.PriceSats)
+	}
+	if cfg.Payments.FreeReviewsPerDay != 2 {
+		t.Errorf("expected free_reviews_per_day 2, got %d", cfg.Payments.FreeReviewsPerDay)
+	}
+}
+
+func TestPaymentsConfigWithSubscription(t *testing.T) {
+	yml := "version: 1\npayments:\n  enabled: true\n  price_sats: 100\n  subscription_price_sats: 2000\n  subscription_days: 30\n"
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Payments.SubscriptionPriceSats != 2000 {
+		t.Errorf("expected subscription_price_sats 2000, got %d", cfg.Payments.SubscriptionPriceSats)
+	}
+	if cfg.Payments.SubscriptionDays != 30 {
+		t.Errorf("expected subscription_days 30, got %d", cfg.Payments.SubscriptionDays)
+	}
+}
+
+func TestPaymentsConfigMissingPrice(t *testing.T) {
+	yml := "version: 1\npayments:\n  enabled: true\n"
+	_, err := Parse([]byte(yml))
+	if err == nil {
+		t.Fatal("expected error for missing price_sats")
+	}
+}
+
+func TestPaymentsConfigPartialSubscription(t *testing.T) {
+	yml := "version: 1\npayments:\n  enabled: true\n  price_sats: 100\n  subscription_price_sats: 2000\n"
+	_, err := Parse([]byte(yml))
+	if err == nil {
+		t.Fatal("expected error for partial subscription config")
+	}
+}
+
+func TestContainsPaymentsConfig(t *testing.T) {
+	if !ContainsPaymentsConfig([]byte("payments:\n  enabled: true")) {
+		t.Error("expected to detect payments section")
+	}
+	if ContainsPaymentsConfig([]byte("review:\n  severity_floor: high")) {
+		t.Error("should not detect payments in review-only config")
+	}
+}
+
 func TestMissingSeverityFloorDefaults(t *testing.T) {
 	yaml := `
 version: 1
