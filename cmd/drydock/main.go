@@ -57,6 +57,16 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// --- Configuration validation (fail fast) ---
+	logger.Info("validating configuration...")
+	validationResult := cfg.Validate(ctx)
+	validationResult.Log(logger)
+	if validationResult.HasErrors() {
+		logger.Error("configuration validation failed, exiting")
+		os.Exit(1)
+	}
+	logger.Info("configuration validation passed")
+
 	// --- Database ---
 	store, err := db.Open(ctx, cfg.DatabaseURL)
 	if err != nil {

@@ -1,10 +1,15 @@
 package config
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -128,4 +133,176 @@ func parseIntOrDefault(v string, fallback int) int {
 		return fallback
 	}
 	return result
+}
+
+// ValidationResult contains the outcome of configuration validation.
+type ValidationResult struct {
+	Errors   []string // Fatal errors that prevent startup
+	Warnings []string // Non-fatal issues that may cause degraded operation
+}
+
+// HasErrors returns true if there are any fatal validation errors.
+func (v ValidationResult) HasErrors() bool {
+	return len(v.Errors) > 0
+}
+
+// Log outputs all errors and warnings to the provided logger.
+func (v ValidationResult) Log(logger *slog.Logger) {
+	for _, err := range v.Errors {
+		logger.Error("configuration error", "message", err)
+	}
+	for _, warn := range v.Warnings {
+		logger.Warn("configuration warning", "message", warn)
+	}
+}
+
+// Validate checks the configuration for errors and warnings.
+// It performs connectivity checks where possible to fail fast.
+func (c *Config) Validate(ctx context.Context) ValidationResult {
+	result := ValidationResult{}
+
+	// --- Required: At least one relay ---
+	if len(c.Relays) == 0 && len(c.ReadRelays) == 0 {
+		result.Errors = append(result.Errors, "no relays configured: set DRYDOCK_RELAYS or DRYDOCK_READ_RELAYS")
+	}
+
+	// --- Validate relay URLs ---
+	allRelays := append(append([]string{}, c.Relays...), c.ReadRelays...)
+	allRelays = append(allRelays, c.WriteRelays...)
+	for _, relay := range allRelays {
+		if relay == "" {
+			continue
+		}
+		u, err := url.Parse(relay)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("invalid relay URL %q: %v", relay, err))
+			continue
+		}
+		if u.Scheme != "wss" && u.Scheme != "ws" {
+			result.Errors = append(result.Errors, fmt.Sprintf("relay URL must use ws:// or wss:// scheme: %q", relay))
+		}
+	}
+
+	// --- Signer configuration ---
+	hasSignerConfig := c.SignerBunkerURL != "" || c.SignerNsec != "" || c.SignerSocketPath != "" || c.SignerDBus
+	if !hasSignerConfig {
+		result.Warnings = append(result.Warnings, "no signer configured: review publishing will be disabled (set DRYDOCK_SIGNER_BUNKER_URL, DRYDOCK_SIGNER_NSEC, or enable DRYDOCK_SIGNER_DBUS)")
+	}
+
+	// --- Database connectivity ---
+	if err := c.validateDatabase(ctx); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("database validation failed: %v", err))
+	}
+
+	// --- LLM endpoint checks (warnings only, as they may come online later) ---
+	llmEndpoints := map[string]string{
+		"planner": c.PlannerBaseURL,
+		"70b":     c.LLM70BBaseURL,
+	}
+	for name, baseURL := range llmEndpoints {
+		if baseURL == "" {
+			continue
+		}
+		if err := c.checkLLMEndpoint(ctx, baseURL); err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("LLM endpoint %s (%s) not reachable: %v", name, baseURL, err))
+		}
+	}
+
+	// --- Optional service warnings ---
+	if c.QdrantURL != "" && c.EmbedBaseURL == "" {
+		result.Warnings = append(result.Warnings, "DRYDOCK_QDRANT_URL set but DRYDOCK_EMBED_BASE_URL not set: RAG features disabled")
+	}
+	if c.EmbedBaseURL != "" && c.QdrantURL == "" {
+		result.Warnings = append(result.Warnings, "DRYDOCK_EMBED_BASE_URL set but DRYDOCK_QDRANT_URL not set: RAG features disabled")
+	}
+
+	// --- Pipeline workers ---
+	if c.PipelineWorkers < 1 {
+		result.Errors = append(result.Errors, "DRYDOCK_PIPELINE_WORKERS must be at least 1")
+	}
+	if c.PipelineWorkers > 32 {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("DRYDOCK_PIPELINE_WORKERS=%d is very high; consider reducing for stability", c.PipelineWorkers))
+	}
+
+	// --- Health address ---
+	if c.HealthAddr != "" {
+		if _, err := url.Parse("http://" + c.HealthAddr); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("invalid DRYDOCK_HEALTH_ADDR %q: %v", c.HealthAddr, err))
+		}
+	}
+
+	return result
+}
+
+// validateDatabase checks that the database can be opened and is writable.
+func (c *Config) validateDatabase(ctx context.Context) error {
+	// Parse the DSN to ensure it's valid
+	if c.DatabaseURL == "" {
+		return fmt.Errorf("database URL is empty")
+	}
+
+	// Try to open and ping
+	db, err := sql.Open("sqlite3", c.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("failed to open: %w", err)
+	}
+	defer db.Close()
+
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(pingCtx); err != nil {
+		return fmt.Errorf("failed to ping: %w", err)
+	}
+
+	// Try a write operation
+	_, err = db.ExecContext(pingCtx, "CREATE TABLE IF NOT EXISTS _config_validation_test (id INTEGER); DROP TABLE IF EXISTS _config_validation_test;")
+	if err != nil {
+		return fmt.Errorf("database not writable: %w", err)
+	}
+
+	return nil
+}
+
+// checkLLMEndpoint verifies an LLM endpoint is reachable.
+func (c *Config) checkLLMEndpoint(ctx context.Context, baseURL string) error {
+	// Try to hit the models endpoint (common for OpenAI-compatible APIs)
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	
+	// Try /v1/models or just /models
+	endpoints := []string{
+		strings.TrimSuffix(baseURL, "/") + "/models",
+		strings.TrimSuffix(baseURL, "/v1") + "/v1/models",
+	}
+
+	var lastErr error
+	for _, endpoint := range endpoints {
+		req, err := http.NewRequestWithContext(checkCtx, "GET", endpoint, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		
+		if c.LLMAPIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.LLMAPIKey)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp.Body.Close()
+
+		// Any response (even 401/403) means the endpoint is reachable
+		if resp.StatusCode < 500 {
+			return nil
+		}
+		lastErr = fmt.Errorf("server error: %d", resp.StatusCode)
+	}
+
+	return lastErr
 }
