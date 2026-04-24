@@ -19,6 +19,7 @@ import (
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
 	"drydock/internal/securityscan"
+	"drydock/internal/tracing"
 
 	"fiatjaf.com/nostr"
 )
@@ -171,15 +172,28 @@ func (r *Runner) work(ctx context.Context, id int) {
 			metrics.ReviewsStarted.Inc()
 			metrics.WorkersActive.Inc()
 			done := metrics.Timer(metrics.ReviewDuration)
-			log.Info("processing review task", "patch_event_id", task.PatchEventID, "repo_id", task.RepoID)
-			if err := r.process(ctx, task); err != nil {
+
+			// Create trace context for this task
+			taskCtx := tracing.WithTraceData(ctx, tracing.TraceData{
+				TraceID: tracing.NewTraceID(),
+				EventID: task.PatchEventID,
+				RepoID:  task.RepoID,
+			})
+			taskLog := tracing.Logger(taskCtx, log)
+
+			taskLog.Info("processing review task")
+			if err := r.process(taskCtx, task); err != nil {
 				metrics.ReviewsFinished.With("failed").Inc()
-				log.Error("review pipeline failed", "patch_event_id", task.PatchEventID, "repo_id", task.RepoID, "error", err)
+				taskLog.Error("review pipeline failed",
+					"error", err,
+					"elapsed_ms", tracing.Elapsed(taskCtx).Milliseconds())
 				if markErr := r.store.MarkReviewFailed(ctx, task.PatchEventID, task.RepoID, err.Error()); markErr != nil {
-					log.Error("failed to mark review as failed", "error", markErr)
+					taskLog.Error("failed to mark review as failed", "error", markErr)
 				}
 			} else {
 				metrics.ReviewsFinished.With("published").Inc()
+				taskLog.Info("review pipeline completed",
+					"elapsed_ms", tracing.Elapsed(taskCtx).Milliseconds())
 			}
 			done()
 			metrics.WorkersActive.Dec()
@@ -188,14 +202,23 @@ func (r *Runner) work(ctx context.Context, id int) {
 }
 
 func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
+	log := tracing.Logger(ctx, r.logger)
+	timer := tracing.NewPipelineTimer(ctx, r.logger)
+	defer timer.Summary()
+
 	// 1. Prepare repo + apply patch series
-	prep, err := r.repoSvc.PreparePatchSeries(ctx, task.PatchEventID)
-	if err != nil {
+	var prep repo.PrepareResult
+	var prepErr error
+	timer.Time(tracing.StageRepoPrepare, func() error {
+		prep, prepErr = r.repoSvc.PreparePatchSeries(ctx, task.PatchEventID)
+		return prepErr
+	})
+	if prepErr != nil {
 		// Publish a review comment about the apply failure so the patch author gets feedback
 		if prep.FailureHint != "" && r.pubSvc != nil {
 			r.publishApplyFailure(ctx, task, prep.FailureHint)
 		}
-		return fmt.Errorf("prepare patch series: %w", err)
+		return fmt.Errorf("prepare patch series: %w", prepErr)
 	}
 	// Clean up the throwaway review branch when done (success or failure)
 	defer r.repoSvc.CleanupReviewBranch(ctx, prep.RepoPath, prep.Branch)
@@ -214,18 +237,22 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 
 	// 1c. Index project documentation (non-fatal; skip if repo config disables docs).
 	if r.docIngester != nil && repoCfg.DocsEnabled() {
-		if err := r.docIngester.IngestRepoDocs(ctx, prep.RepoPath, task.RepoID); err != nil {
-			r.logger.Warn("doc ingestion failed, continuing without",
-				"repo_id", task.RepoID, "error", err)
-		}
+		timer.Time(tracing.StageDocIngest, func() error {
+			if err := r.docIngester.IngestRepoDocs(ctx, prep.RepoPath, task.RepoID); err != nil {
+				log.Warn("doc ingestion failed, continuing without", "error", err)
+			}
+			return nil // non-fatal
+		})
 	}
 
 	// 1d. Index source code for semantic search (non-fatal; skip on error).
 	if r.codeIndexer != nil {
-		if err := r.codeIndexer.IndexRepo(ctx, prep.RepoPath, task.RepoID); err != nil {
-			r.logger.Warn("code indexing failed, continuing without",
-				"repo_id", task.RepoID, "error", err)
-		}
+		timer.Time(tracing.StageCodeIndex, func() error {
+			if err := r.codeIndexer.IndexRepo(ctx, prep.RepoPath, task.RepoID); err != nil {
+				log.Warn("code indexing failed, continuing without", "error", err)
+			}
+			return nil // non-fatal
+		})
 	}
 
 	// 2. Get patch event for context builder and meta-review
@@ -248,15 +275,19 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	// 4. Build context bundle (with repo-config overrides)
-	bundle, err := r.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
-		PatchEventContent:   patchDiffContent,
-		RepoPath:            prep.RepoPath,
-		RepoID:              task.RepoID,
-		TokenBudgetOverride: repoCfg.Context.TokenBudget,
-		ExcludePaths:        repoCfg.Context.ExcludePaths,
-		DisableDocs:         !repoCfg.DocsEnabled(),
-	})
-	if err != nil {
+	var bundle contextbuilder.ContextBundle
+	if err := timer.Time(tracing.StageContextBuild, func() error {
+		var buildErr error
+		bundle, buildErr = r.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
+			PatchEventContent:   patchDiffContent,
+			RepoPath:            prep.RepoPath,
+			RepoID:              task.RepoID,
+			TokenBudgetOverride: repoCfg.Context.TokenBudget,
+			ExcludePaths:        repoCfg.Context.ExcludePaths,
+			DisableDocs:         !repoCfg.DocsEnabled(),
+		})
+		return buildErr
+	}); err != nil {
 		return fmt.Errorf("build context: %w", err)
 	}
 
@@ -265,20 +296,24 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 
 	// 5b. Retrieve few-shot examples for reviewer prompt injection
 	var fewShot []string
-	if r.fewShotRetriever != nil {
-		fewShot, err = r.fewShotRetriever.RetrieveFewShots(ctx, FewShotQuery{
-			PatchDiff:  patchDiffContent,
-			Limit:      2,
-			Language:   DetectLanguage(changedFiles),
-			RepoID:     task.RepoID,
-		})
-	} else {
-		fewShot, err = r.store.GetRecentFewShots(ctx, 3)
-	}
-	if err != nil {
-		r.logger.Warn("failed to retrieve few-shot examples, continuing without", "error", err)
-		fewShot = nil
-	}
+	timer.Time(tracing.StageFewShotRetrieval, func() error {
+		var fewShotErr error
+		if r.fewShotRetriever != nil {
+			fewShot, fewShotErr = r.fewShotRetriever.RetrieveFewShots(ctx, FewShotQuery{
+				PatchDiff:  patchDiffContent,
+				Limit:      2,
+				Language:   DetectLanguage(changedFiles),
+				RepoID:     task.RepoID,
+			})
+		} else {
+			fewShot, fewShotErr = r.store.GetRecentFewShots(ctx, 3)
+		}
+		if fewShotErr != nil {
+			log.Warn("failed to retrieve few-shot examples, continuing without", "error", fewShotErr)
+			fewShot = nil
+		}
+		return nil // non-fatal
+	})
 
 	// 6. Run LLM review engine (with active prompt version override if available)
 	var promptOverride string
@@ -320,36 +355,43 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	var result reviewengine.RunOutput
-	if repoCfg.Ensemble.Enabled {
-		ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
-		result, err = r.engine.RunEnsemble(ctx, runInput, ensembleCfg)
-		if err != nil {
-			return fmt.Errorf("ensemble review engine: %w", err)
+	if err := timer.Time(tracing.StageLLMReview, func() error {
+		var reviewErr error
+		if repoCfg.Ensemble.Enabled {
+			ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
+			result, reviewErr = r.engine.RunEnsemble(ctx, runInput, ensembleCfg)
+			if reviewErr != nil {
+				return fmt.Errorf("ensemble review engine: %w", reviewErr)
+			}
+			log.Info("ensemble review completed",
+				"models", len(ensembleCfg.Models),
+				"findings", len(result.Review.Findings))
+		} else {
+			result, reviewErr = r.engine.Run(ctx, runInput)
+			if reviewErr != nil {
+				return fmt.Errorf("review engine: %w", reviewErr)
+			}
 		}
-		r.logger.Info("ensemble review completed",
-			"patch_event_id", task.PatchEventID,
-			"models", len(ensembleCfg.Models),
-			"findings", len(result.Review.Findings))
-	} else {
-		result, err = r.engine.Run(ctx, runInput)
-		if err != nil {
-			return fmt.Errorf("review engine: %w", err)
-		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// 6d. Run security scanner (deterministic SAST, parallel with LLM review is possible
 	// but kept sequential here for simplicity and determinism).
 	var scanFindings []securityscan.SecurityFinding
 	if r.secScanner != nil && len(changedFiles) > 0 {
-		scanResult := r.secScanner.ScanFiles(ctx, prep.RepoPath, changedFiles, patchDiffContent)
-		scanFindings = scanResult.Findings
-		if len(scanFindings) > 0 {
-			metrics.SecurityScanFindings.Add(int64(len(scanFindings)))
-			r.logger.Info("security scan complete",
-				"patch_event_id", task.PatchEventID,
-				"files_scanned", scanResult.FilesScanned,
-				"findings", len(scanFindings))
-		}
+		timer.Time(tracing.StageSecurityScan, func() error {
+			scanResult := r.secScanner.ScanFiles(ctx, prep.RepoPath, changedFiles, patchDiffContent)
+			scanFindings = scanResult.Findings
+			if len(scanFindings) > 0 {
+				metrics.SecurityScanFindings.Add(int64(len(scanFindings)))
+				log.Info("security scan complete",
+					"files_scanned", scanResult.FilesScanned,
+					"findings", len(scanFindings))
+			}
+			return nil
+		})
 	}
 
 	// 7. Compute context hash
@@ -378,66 +420,65 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	// 10. Publish review
-	reviewEventID, err := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
-		PatchEventID:         task.PatchEventID,
-		RepoID:               task.RepoID,
-		Summary:              filteredReview.Summary,
-		Findings:             filteredReview.Findings,
-		Model:                modelName(result.Route, r.engine),
-		ContextHash:          ctxHash,
-		Confidence:           confidence,
-		ContextLayersUsed:    bundle.LayersUsed,
-		ContextLayersDropped: bundle.LayersDropped,
-		ExcludedFiles:        bundle.ExcludedFiles,
-		Superseded:           superseded,
-		DetailSeverityFloor:  repoCfg.Review.DetailSeverityFloor,
-		Walkthrough:          result.Walkthrough,
-	})
-	if err != nil {
+	var reviewEventID string
+	if err := timer.Time(tracing.StagePublish, func() error {
+		var pubErr error
+		reviewEventID, pubErr = r.pubSvc.PublishReview(ctx, publisher.PublishInput{
+			PatchEventID:         task.PatchEventID,
+			RepoID:               task.RepoID,
+			Summary:              filteredReview.Summary,
+			Findings:             filteredReview.Findings,
+			Model:                modelName(result.Route, r.engine),
+			ContextHash:          ctxHash,
+			Confidence:           confidence,
+			ContextLayersUsed:    bundle.LayersUsed,
+			ContextLayersDropped: bundle.LayersDropped,
+			ExcludedFiles:        bundle.ExcludedFiles,
+			Superseded:           superseded,
+			DetailSeverityFloor:  repoCfg.Review.DetailSeverityFloor,
+			Walkthrough:          result.Walkthrough,
+		})
+		return pubErr
+	}); err != nil {
 		return fmt.Errorf("publish review: %w", err)
 	}
 
 	// 11. Log success (MarkReviewPublished is already called inside PublishReview)
-	r.logger.Info("review published",
-		"patch_event_id", task.PatchEventID,
-		"repo_id", task.RepoID,
+	log.Info("review published",
 		"review_event_id", reviewEventID,
 		"findings", len(filteredReview.Findings),
 	)
 
 	// 11b. Publish NIP-34 review status event (best-effort, non-fatal).
 	if r.pubSvc != nil {
-		statusResult, statusErr := r.pubSvc.PublishStatus(ctx, publisher.PublishStatusInput{
-			PatchEventID:  task.PatchEventID,
-			RepoID:        task.RepoID,
-			ReviewEventID: reviewEventID,
-			Summary:       filteredReview.Summary,
-			Findings:      filteredReview.Findings,
-			Model:         modelName(result.Route, r.engine),
-			Confidence:    confidence,
-			Superseded:    superseded,
-			Policy: publisher.StatusPolicy{
-				Enabled:           repoCfg.Status.Enabled,
-				OpenSeverityFloor: repoCfg.Status.OpenSeverityFloor,
-				MinConfidence:     repoCfg.Status.MinConfidence,
-			},
+		timer.Time(tracing.StageStatusPublish, func() error {
+			statusResult, statusErr := r.pubSvc.PublishStatus(ctx, publisher.PublishStatusInput{
+				PatchEventID:  task.PatchEventID,
+				RepoID:        task.RepoID,
+				ReviewEventID: reviewEventID,
+				Summary:       filteredReview.Summary,
+				Findings:      filteredReview.Findings,
+				Model:         modelName(result.Route, r.engine),
+				Confidence:    confidence,
+				Superseded:    superseded,
+				Policy: publisher.StatusPolicy{
+					Enabled:           repoCfg.Status.Enabled,
+					OpenSeverityFloor: repoCfg.Status.OpenSeverityFloor,
+					MinConfidence:     repoCfg.Status.MinConfidence,
+				},
+			})
+			if statusErr != nil {
+				log.Warn("NIP-34 status publish failed (non-fatal)", "error", statusErr)
+			} else if statusResult.Published {
+				log.Info("NIP-34 status event published",
+					"status_event_id", statusResult.EventID,
+					"kind", int(statusResult.Kind),
+					"reason", statusResult.Reason)
+			} else {
+				log.Debug("NIP-34 status skipped", "reason", statusResult.Reason)
+			}
+			return nil
 		})
-		if statusErr != nil {
-			r.logger.Warn("NIP-34 status publish failed (non-fatal)",
-				"patch_event_id", task.PatchEventID,
-				"repo_id", task.RepoID,
-				"error", statusErr)
-		} else if statusResult.Published {
-			r.logger.Info("NIP-34 status event published",
-				"patch_event_id", task.PatchEventID,
-				"status_event_id", statusResult.EventID,
-				"kind", int(statusResult.Kind),
-				"reason", statusResult.Reason)
-		} else {
-			r.logger.Debug("NIP-34 status skipped",
-				"patch_event_id", task.PatchEventID,
-				"reason", statusResult.Reason)
-		}
 	}
 
 	// 11c. Auto-fix patch generation (best-effort, non-fatal).
