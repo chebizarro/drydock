@@ -17,7 +17,7 @@
 //  3. Drydock processes the diff and publishes findings (kind 1652)
 //  4. IDE displays findings as diagnostics inline
 //  5. User clicks "apply fix" → IDE sends fix request (kind 1653)
-//  6. Drydock applies the fix and returns result (kind 1654)
+//  6. Drydock resolves the stored suggested fix and returns it (kind 1654)
 package idegateway
 
 import (
@@ -114,8 +114,8 @@ type FixRequest struct {
 type FixResponse struct {
 	RequestID string `json:"request_id"` // Reference to the FixRequest
 	SessionID string `json:"session_id"` // Reference to IDESession
-	Success   bool   `json:"success"`    // Whether the fix was applied
-	Diff      string `json:"diff,omitempty"` // The applied diff (if successful)
+	Success   bool   `json:"success"`    // Whether the fix was resolved and returned
+	Diff      string `json:"diff,omitempty"` // Suggested diff to apply (if successful)
 	Error     string `json:"error,omitempty"` // Error message (if failed)
 }
 

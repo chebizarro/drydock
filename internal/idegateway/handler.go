@@ -24,6 +24,9 @@ const (
 
 	// reviewTimeout is the max time for processing a review request.
 	reviewTimeout = 60 * time.Second
+
+	// fixTTL controls how long suggested fixes are retained server-side.
+	fixTTL = 15 * time.Minute
 )
 
 // Signer signs Nostr events for publishing responses.
@@ -57,6 +60,10 @@ type Handler struct {
 	// Track active sessions for routing responses
 	mu       sync.RWMutex
 	sessions map[string]*activeSession
+
+	// Track suggested fixes for later fix requests.
+	fixes  sync.Map // map[string]storedFix
+	fixTTL time.Duration
 }
 
 // activeSession tracks an IDE session.
@@ -64,6 +71,13 @@ type activeSession struct {
 	Session     IDESession
 	LastSeen    time.Time
 	SourceRelay string
+}
+
+type storedFix struct {
+	SessionID string
+	File      string
+	Diff      string
+	CreatedAt time.Time
 }
 
 // New creates a new IDE gateway handler.
@@ -96,6 +110,7 @@ func New(
 		ourPubKey:  ourPubKey,
 		sem:        make(chan struct{}, maxConcurrent),
 		sessions:   make(map[string]*activeSession),
+		fixTTL:     fixTTL,
 	}
 }
 
@@ -197,6 +212,7 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 	defer cancel()
 
 	start := time.Now()
+	h.cleanupExpiredFixes(start)
 
 	// Build context from the diff.
 	bundle, err := h.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
@@ -224,7 +240,13 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 	for i, f := range result.Review.Findings {
 		fixID := ""
 		if f.HasSuggestion() {
-			fixID = fmt.Sprintf("%s-%d", req.RequestID, i)
+			fixID = generateFixID(req.RequestID, f.File, f.Line, i)
+			h.storeFix(fixID, storedFix{
+				SessionID: req.SessionID,
+				File:      f.File,
+				Diff:      f.SuggestedDiff,
+				CreatedAt: start,
+			})
 		}
 		diagnostics = append(diagnostics, FindingToDiagnostic(f, fixID))
 	}
@@ -264,15 +286,31 @@ func (h *Handler) handleFixRequest(ctx context.Context, event nostr.Event, relay
 		return nil
 	}
 
-	// For now, we just echo back the fix that was stored in the diagnostic.
-	// In a full implementation, we'd store fixes server-side and apply them.
-	// The IDE can apply the fix locally using the SuggestedFix from the diagnostic.
+	now := time.Now()
+	h.cleanupExpiredFixes(now)
 
 	response := FixResponse{
 		RequestID: req.RequestID,
 		SessionID: req.SessionID,
-		Success:   true,
-		// The actual diff is in the original diagnostic response
+	}
+
+	fix, ok := h.lookupFix(req.FixID, now)
+	switch {
+	case req.FixID == "":
+		response.Success = false
+		response.Error = "missing fix_id"
+	case !ok:
+		response.Success = false
+		response.Error = "fix not found or expired"
+	case fix.SessionID != req.SessionID:
+		response.Success = false
+		response.Error = "fix does not belong to this session"
+	case req.File != "" && fix.File != "" && fix.File != req.File:
+		response.Success = false
+		response.Error = "fix does not match requested file"
+	default:
+		response.Success = true
+		response.Diff = fix.Diff
 	}
 
 	if err := h.publishFixResponse(ctx, event, response, relayURL); err != nil {
@@ -280,7 +318,7 @@ func (h *Handler) handleFixRequest(ctx context.Context, event nostr.Event, relay
 	}
 
 	metrics.IDEFixResponsesSent.Inc()
-	h.logger.Info("IDE fix response sent", "request_id", req.RequestID)
+	h.logger.Info("IDE fix response sent", "request_id", req.RequestID, "success", response.Success)
 
 	return nil
 }
@@ -392,9 +430,47 @@ func (h *Handler) CleanupStaleSessions(maxAge time.Duration) {
 	}
 }
 
+func (h *Handler) storeFix(fixID string, fix storedFix) {
+	h.fixes.Store(fixID, fix)
+}
+
+func (h *Handler) lookupFix(fixID string, now time.Time) (storedFix, bool) {
+	value, ok := h.fixes.Load(fixID)
+	if !ok {
+		return storedFix{}, false
+	}
+
+	fix, ok := value.(storedFix)
+	if !ok {
+		h.fixes.Delete(fixID)
+		return storedFix{}, false
+	}
+
+	if h.fixTTL > 0 && now.Sub(fix.CreatedAt) > h.fixTTL {
+		h.fixes.Delete(fixID)
+		return storedFix{}, false
+	}
+
+	return fix, true
+}
+
+func (h *Handler) cleanupExpiredFixes(now time.Time) {
+	if h.fixTTL <= 0 {
+		return
+	}
+
+	h.fixes.Range(func(key, value any) bool {
+		fix, ok := value.(storedFix)
+		if !ok || now.Sub(fix.CreatedAt) > h.fixTTL {
+			h.fixes.Delete(key)
+		}
+		return true
+	})
+}
+
 // generateFixID creates a deterministic fix ID from finding details.
-func generateFixID(requestID string, file string, line int) string {
-	key := fmt.Sprintf("%s:%s:%d", requestID, file, line)
+func generateFixID(requestID string, file string, line, index int) string {
+	key := fmt.Sprintf("%s:%s:%d:%d", requestID, file, line, index)
 	hash := sha256.Sum256([]byte(key))
 	return fmt.Sprintf("%x", hash[:8])
 }
