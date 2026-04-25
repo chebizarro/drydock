@@ -319,36 +319,221 @@ function convertSeverity(severity: number): vscode.DiagnosticSeverity {
     }
 }
 
+interface DiffHunk {
+    oldStart: number;
+    oldCount: number;
+    lines: string[];
+}
+
+function isUnifiedDiff(suggestedFix: string): boolean {
+    return suggestedFix.split(/\r?\n/).some(line => line.startsWith('@@'));
+}
+
+function parseUnifiedDiffHunks(suggestedFix: string): DiffHunk[] {
+    const lines = suggestedFix.split(/\r?\n/);
+    const hunks: DiffHunk[] = [];
+    const headerRegex = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/;
+
+    let index = 0;
+    while (index < lines.length) {
+        const line = lines[index];
+        const match = line.match(headerRegex);
+        if (!match) {
+            index += 1;
+            continue;
+        }
+
+        const oldStart = Number(match[1]);
+        const oldCount = match[2] ? Number(match[2]) : 1;
+
+        const hunkLines: string[] = [];
+        index += 1;
+
+        while (index < lines.length) {
+            const hunkLine = lines[index];
+            if (hunkLine.startsWith('@@')) {
+                break;
+            }
+
+            if (
+                hunkLine.startsWith(' ') ||
+                hunkLine.startsWith('+') ||
+                hunkLine.startsWith('-') ||
+                hunkLine.startsWith('\\ No newline at end of file')
+            ) {
+                hunkLines.push(hunkLine);
+            }
+
+            index += 1;
+        }
+
+        hunks.push({ oldStart, oldCount, lines: hunkLines });
+    }
+
+    if (hunks.length === 0) {
+        throw new Error('No diff hunks found in suggested fix');
+    }
+
+    return hunks;
+}
+
+function applyUnifiedDiffToText(originalText: string, hunks: DiffHunk[]): string {
+    const normalizedOriginal = originalText.replace(/\r\n/g, '\n');
+    const hasTrailingNewline = normalizedOriginal.endsWith('\n');
+    const originalLines = normalizedOriginal.split('\n');
+    if (hasTrailingNewline) {
+        originalLines.pop();
+    }
+
+    const output: string[] = [];
+    let cursor = 0;
+
+    for (const hunk of hunks) {
+        const hunkStart = Math.max(hunk.oldStart - 1, 0);
+        if (hunkStart < cursor) {
+            throw new Error('Overlapping or out-of-order diff hunks');
+        }
+
+        output.push(...originalLines.slice(cursor, hunkStart));
+
+        let localCursor = hunkStart;
+        let removedLines = 0;
+
+        for (const line of hunk.lines) {
+            if (line.startsWith('\\ No newline at end of file')) {
+                continue;
+            }
+
+            const marker = line[0];
+            const content = line.slice(1);
+
+            if (marker === ' ') {
+                if (originalLines[localCursor] !== content) {
+                    throw new Error('Diff context does not match current file content');
+                }
+                output.push(content);
+                localCursor += 1;
+                continue;
+            }
+
+            if (marker === '-') {
+                if (originalLines[localCursor] !== content) {
+                    throw new Error('Diff deletion does not match current file content');
+                }
+                localCursor += 1;
+                removedLines += 1;
+                continue;
+            }
+
+            if (marker === '+') {
+                output.push(content);
+                continue;
+            }
+
+            throw new Error(`Unsupported diff line marker: ${marker}`);
+        }
+
+        if (removedLines !== hunk.oldCount) {
+            // Keep processing even when oldCount metadata is approximate.
+        }
+
+        cursor = localCursor;
+    }
+
+    output.push(...originalLines.slice(cursor));
+
+    const result = output.join('\n');
+    return hasTrailingNewline ? `${result}\n` : result;
+}
+
+function getFullDocumentRange(document: vscode.TextDocument): vscode.Range {
+    if (document.lineCount === 0) {
+        return new vscode.Range(0, 0, 0, 0);
+    }
+
+    const lastLine = document.lineAt(document.lineCount - 1);
+    return new vscode.Range(0, 0, document.lineCount - 1, lastLine.range.end.character);
+}
+
+function normalizeReplacementText(suggestedFix: string): string {
+    const trimmed = suggestedFix.trim();
+    const fencedMatch = trimmed.match(/^```(?:\w+)?\n([\s\S]*?)\n```$/);
+    return fencedMatch ? fencedMatch[1] : suggestedFix;
+}
+
+function removeDiagnosticAtRange(uri: vscode.Uri, range: vscode.Range): void {
+    const diagnostics = [...(diagnosticCollection.get(uri) ?? [])];
+    const index = diagnostics.findIndex(diagnostic => diagnostic.range.isEqual(range));
+    if (index === -1) {
+        return;
+    }
+
+    diagnostics.splice(index, 1);
+    if (diagnostics.length > 0) {
+        diagnosticCollection.set(uri, diagnostics);
+    } else {
+        diagnosticCollection.delete(uri);
+    }
+}
+
 /**
  * Apply a suggested fix
  */
 async function applyFix() {
-    // In a full implementation, this would:
-    // 1. Get the fix ID from the current diagnostic
-    // 2. Look up the fix in pendingFixes
-    // 3. Apply the diff to the file
-    // 4. Send a fix request to Drydock to confirm
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        vscode.window.showErrorMessage('No workspace folder open');
+        return;
+    }
 
-    const fixes = Array.from(pendingFixes.values());
+    const fixes = Array.from(pendingFixes.entries());
     if (fixes.length === 0) {
         vscode.window.showInformationMessage('No fixes available');
         return;
     }
 
-    const items = fixes.map((fix, i) => ({
+    const items = fixes.map(([fixId, fix]) => ({
         label: `Fix in ${fix.file}`,
-        description: fix.suggestedFix.substring(0, 50) + '...',
-        index: i
+        description: fix.suggestedFix.substring(0, 80),
+        fixId,
+        fix
     }));
 
     const selected = await vscode.window.showQuickPick(items, {
         placeHolder: 'Select a fix to apply'
     });
 
-    if (selected) {
-        vscode.window.showInformationMessage(
-            `Would apply fix: ${selected.label}`
-        );
+    if (!selected) {
+        return;
+    }
+
+    const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, selected.fix.file);
+
+    try {
+        const document = await vscode.workspace.openTextDocument(fileUri);
+        const edit = new vscode.WorkspaceEdit();
+
+        if (isUnifiedDiff(selected.fix.suggestedFix)) {
+            const hunks = parseUnifiedDiffHunks(selected.fix.suggestedFix);
+            const updatedText = applyUnifiedDiffToText(document.getText(), hunks);
+            edit.replace(fileUri, getFullDocumentRange(document), updatedText);
+        } else {
+            const replacement = normalizeReplacementText(selected.fix.suggestedFix);
+            edit.replace(fileUri, selected.fix.range, replacement);
+        }
+
+        const applied = await vscode.workspace.applyEdit(edit);
+        if (!applied) {
+            throw new Error('VS Code rejected the workspace edit');
+        }
+
+        pendingFixes.delete(selected.fixId);
+        removeDiagnosticAtRange(fileUri, selected.fix.range);
+
+        vscode.window.showInformationMessage(`Applied fix in ${selected.fix.file}`);
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`Failed to apply fix: ${message}`);
     }
 }
 
