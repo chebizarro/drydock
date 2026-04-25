@@ -225,6 +225,18 @@ DRYDOCK_IDE_REVIEW_DEBOUNCE=2s
 | `drydock_ide_fix_requests_received_total` | Counter | Fix requests received |
 | `drydock_ide_fix_responses_sent_total` | Counter | Fix responses sent |
 
+## Integration Tests
+
+Integration suites are gated behind the `integration` build tag.
+
+```bash
+# Full pipeline integration tests
+go test -tags=integration ./internal/pipeline/...
+
+# IDE gateway review→fix integration tests
+go test -tags=integration ./internal/idegateway/...
+```
+
 ## Security
 
 1. **Encryption**: All IDE ↔ Server communication uses NIP-04/NIP-44 encryption
