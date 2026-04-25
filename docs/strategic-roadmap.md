@@ -76,10 +76,10 @@ Review published
 |---------|-----------|---------|-----|
 | Incremental review | Reviews only changed hunks | Reviews full diff | ⚠️ Minor |
 | **Inline code suggestions** | Diff-ready code blocks, one-click apply | Findings describe fixes but don't provide replacement code | ❌ Critical |
-| **Conversational threads** | Reply to comments, get follow-up analysis | One-shot reviews, ignores replies | ❌ Critical |
+| **Conversational threads** | Reply to comments, get follow-up analysis | ✅ Multi-turn (up to 3 replies), history-aware | ✅ Implemented |
 | **Review profiles** | Per-repo `.coderabbit.yaml` | Single global config | ❌ Critical |
 | Path filtering | Configurable per repo | Hardcoded exclusion list | ⚠️ Moderate |
-| **Auto-fix generation** | One-click apply of suggestions | Not available | ❌ High |
+| **Auto-fix generation** | One-click apply of suggestions | ✅ IDE extension applies fixes via workspace edits | ✅ Implemented |
 | **PR summary / walkthrough** | Auto-generated walkthrough | Summary is finding-focused | ⚠️ Moderate |
 | Sequence diagrams | Visual flow diagrams | Not available | Low priority |
 | Knowledge graph | Learns project patterns | Few-shot partial coverage | ⚠️ Partial |
@@ -127,8 +127,8 @@ Extend Finding schema with `suggested_diff` / `suggested_code` fields. Update re
 #### 1.3 Change Walkthrough / PR Summary
 Separate lightweight LLM call for change description. Walkthrough + file summaries prepended to review. Configurable via `.drydock.yaml`. **Effort: 1.5d**
 
-#### 1.4 Conversational Review Threads
-Subscribe to kind 1111 replies tagging Drydock's pubkey. New `internal/conversation` package. Look up original context, generate focused response, publish reply. Rate limit 3 turns/review. **Effort: 4d**
+#### 1.4 Conversational Review Threads ✅ IMPLEMENTED
+Subscribes to kind 1111 replies tagging Drydock's pubkey. `internal/conversation` package with context lookup, LLM-generated responses, and NIP-22 publishing. Rate limited to 3 turns/review. **Status: Complete**
 
 ### Phase 2: Depth & Intelligence (Weeks 4–6)
 
@@ -169,8 +169,8 @@ Run 2-3 models in parallel. Consensus-based confidence. Single-model findings fl
 #### 4.3 Review Marketplace
 Operators publish quality scores. Submitters choose reviewers. Payment + quality market. **Effort: 5d**
 
-#### 4.4 IDE Integration
-VS Code / Neovim extension subscribing to Drydock review events. Inline annotations. **Effort: 5d**
+#### 4.4 IDE Integration ✅ IMPLEMENTED
+VS Code extension with full Nostr relay integration, inline annotations, and one-click fix application. **Status: Complete**
 
 ---
 
