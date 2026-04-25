@@ -13,6 +13,23 @@
 import * as vscode from 'vscode';
 import { execSync } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
+import {
+    finalizeEvent,
+    getPublicKey,
+    nip19,
+    SimplePool,
+    type Event,
+    type EventTemplate,
+    type Filter,
+    type VerifiedEvent
+} from 'nostr-tools';
+
+const { useWebSocketImplementation } = require('nostr-tools/pool') as {
+    useWebSocketImplementation: (implementation: unknown) => void;
+};
+const NodeWebSocket = require('ws');
+
+useWebSocketImplementation(NodeWebSocket);
 
 // Nostr event kinds for IDE integration
 const KIND_IDE_SESSION = 31650;
@@ -26,6 +43,14 @@ let diagnosticCollection: vscode.DiagnosticCollection;
 
 // Session state
 let sessionId: string;
+let extensionVersion = '0.0.0';
+
+// Relay state
+let relayPool: SimplePool | undefined;
+let reviewResponseSubscription: { close: (reason?: string) => void | Promise<void> } | undefined;
+let activeRelayUrls: string[] = [];
+let activeSubscriptionKey: string | undefined;
+let latestReviewRequestId: string | undefined;
 
 // Store pending fixes by ID
 const pendingFixes: Map<string, PendingFix> = new Map();
@@ -61,8 +86,33 @@ interface ReviewResponse {
     review_time_ms: number;
 }
 
+interface IDESessionAnnouncement {
+    session_id: string;
+    workspace_path: string;
+    repo_id: string;
+    editor: string;
+    version: string;
+    languages: string[];
+}
+
+interface ReviewRequest {
+    session_id: string;
+    request_id: string;
+    diff: string;
+    changed_files: string[];
+    full_review: boolean;
+}
+
+interface DrydockConfig {
+    relays: string[];
+    privateKey: string;
+    drydockPubkey: string;
+}
+
 export function activate(context: vscode.ExtensionContext) {
     console.log('Drydock extension activated');
+
+    extensionVersion = String(context.extension.packageJSON.version ?? '0.0.0');
 
     // Create diagnostic collection
     diagnosticCollection = vscode.languages.createDiagnosticCollection('drydock');
@@ -75,17 +125,34 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('drydock.reviewChanges', reviewChanges),
         vscode.commands.registerCommand('drydock.applyFix', applyFix),
-        vscode.commands.registerCommand('drydock.clearDiagnostics', clearDiagnostics)
+        vscode.commands.registerCommand('drydock.clearDiagnostics', clearDiagnostics),
+        vscode.workspace.onDidChangeConfiguration(event => {
+            if (event.affectsConfiguration('drydock.relays') ||
+                event.affectsConfiguration('drydock.privateKey') ||
+                event.affectsConfiguration('drydock.drydockPubkey')) {
+                void refreshRelaySubscription({ announceSession: false, notifyOnFailure: true });
+            }
+        }),
+        new vscode.Disposable(() => {
+            void reviewResponseSubscription?.close('extension deactivated');
+            reviewResponseSubscription = undefined;
+            relayPool?.destroy();
+            relayPool = undefined;
+            activeRelayUrls = [];
+            activeSubscriptionKey = undefined;
+        })
     );
 
-    // TODO: Connect to Nostr relays and subscribe to responses
-    // This is a simplified implementation that shows the structure
-    // Full implementation would use nostr-tools for relay communication
+    void refreshRelaySubscription({ announceSession: false, notifyOnFailure: true });
 
     vscode.window.showInformationMessage('Drydock: Ready to review your code');
 }
 
 export function deactivate() {
+    void reviewResponseSubscription?.close('extension deactivated');
+    reviewResponseSubscription = undefined;
+    relayPool?.destroy();
+    relayPool = undefined;
     diagnosticCollection.dispose();
 }
 
@@ -120,39 +187,54 @@ async function reviewChanges() {
             encoding: 'utf-8'
         }).trim().split('\n').filter(f => f);
 
+        const config = getDrydockConfig();
+        const privateKey = parsePrivateKey(config.privateKey);
+        const drydockPubkey = tryParsePubkey(config.drydockPubkey);
+        if (!drydockPubkey) {
+            throw new Error('Configure drydock.drydockPubkey before requesting a review');
+        }
+
+        await refreshRelaySubscription({ announceSession: true, notifyOnFailure: true });
+
+        if (!relayPool || activeRelayUrls.length === 0) {
+            throw new Error('No Nostr relays configured');
+        }
+
         // Build review request
         const requestId = uuidv4();
-        const request = {
+        const request: ReviewRequest = {
             session_id: sessionId,
             request_id: requestId,
-            diff: diff,
+            diff,
             changed_files: changedFiles,
             full_review: true
         };
 
-        vscode.window.withProgress({
+        latestReviewRequestId = requestId;
+
+        await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: 'Drydock: Reviewing changes...',
             cancellable: false
         }, async () => {
-            // In full implementation, this would:
-            // 1. Sign the event with user's Nostr key
-            // 2. Publish to configured relays
-            // 3. Subscribe to response events
-            // 4. Process responses when received
-            
-            // For now, show a placeholder message
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            vscode.window.showInformationMessage(
-                `Drydock: Review request sent (${changedFiles.length} files). ` +
-                'Awaiting response from Nostr...'
-            );
+            const requestEvent = signEvent({
+                kind: KIND_IDE_REVIEW_REQUEST,
+                content: JSON.stringify(request),
+                tags: buildReviewRequestTags(config, requestId)
+            }, privateKey);
+
+            await publishEvent(requestEvent);
         });
+
+        vscode.window.showInformationMessage(
+            `Drydock: Review request published to ${activeRelayUrls.length} relay(s)`
+        );
 
         console.log('Review request:', JSON.stringify(request, null, 2));
 
     } catch (error) {
-        vscode.window.showErrorMessage(`Drydock: Failed to get diff: ${error}`);
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`Drydock: Failed to submit review request: ${message}`);
     }
 }
 
@@ -163,12 +245,22 @@ function handleReviewResponse(response: ReviewResponse) {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
     if (!workspaceFolder) return;
 
+    if (response.session_id !== sessionId) {
+        return;
+    }
+
+    if (!response.diagnostics.length && response.summary) {
+        vscode.window.showWarningMessage(`Drydock: ${response.summary}`);
+    }
+
     // Group diagnostics by file
     const diagnosticsByFile = new Map<string, vscode.Diagnostic[]>();
 
+    pendingFixes.clear();
+
     for (const diag of response.diagnostics) {
         const filePath = vscode.Uri.joinPath(workspaceFolder.uri, diag.file);
-        
+
         const range = new vscode.Range(
             diag.range.start_line,
             diag.range.start_column,
@@ -187,7 +279,7 @@ function handleReviewResponse(response: ReviewResponse) {
         if (diag.has_fix && diag.fix_id && diag.suggested_fix) {
             pendingFixes.set(diag.fix_id, {
                 file: diag.file,
-                range: range,
+                range,
                 suggestedFix: diag.suggested_fix
             });
         }
@@ -208,8 +300,9 @@ function handleReviewResponse(response: ReviewResponse) {
     // Show summary
     const count = response.diagnostics.length;
     const timeMs = response.review_time_ms;
+    const summarySuffix = response.summary ? ` — ${response.summary}` : '';
     vscode.window.showInformationMessage(
-        `Drydock: Found ${count} issue(s) in ${timeMs}ms`
+        `Drydock: Found ${count} issue(s) in ${timeMs}ms${summarySuffix}`
     );
 }
 
@@ -235,7 +328,7 @@ async function applyFix() {
     // 2. Look up the fix in pendingFixes
     // 3. Apply the diff to the file
     // 4. Send a fix request to Drydock to confirm
-    
+
     const fixes = Array.from(pendingFixes.values());
     if (fixes.length === 0) {
         vscode.window.showInformationMessage('No fixes available');
@@ -266,4 +359,255 @@ function clearDiagnostics() {
     diagnosticCollection.clear();
     pendingFixes.clear();
     vscode.window.showInformationMessage('Drydock: Diagnostics cleared');
+}
+
+async function refreshRelaySubscription(options: { announceSession: boolean; notifyOnFailure: boolean }) {
+    try {
+        const config = getDrydockConfig();
+        const relayUrls = normalizeRelayUrls(config.relays);
+
+        if (relayUrls.length === 0) {
+            await reviewResponseSubscription?.close('relay configuration empty');
+            reviewResponseSubscription = undefined;
+            activeRelayUrls = [];
+            activeSubscriptionKey = undefined;
+            relayPool?.destroy();
+            relayPool = undefined;
+            return;
+        }
+
+        relayPool ??= new SimplePool({ enablePing: true, enableReconnect: true });
+
+        const subscriptionKey = JSON.stringify({
+            relays: relayUrls,
+            privateKey: config.privateKey,
+            drydockPubkey: config.drydockPubkey,
+            sessionId
+        });
+
+        if (activeSubscriptionKey !== subscriptionKey || !reviewResponseSubscription) {
+            await reviewResponseSubscription?.close('refresh relay subscription');
+
+            const filter: Filter = {
+                kinds: [KIND_IDE_REVIEW_RESPONSE],
+                since: Math.floor(Date.now() / 1000)
+            };
+
+            const authorPubkey = tryParsePubkey(config.drydockPubkey);
+            if (authorPubkey) {
+                filter.authors = [authorPubkey];
+            }
+
+            const clientPubkey = tryGetPublicKey(config.privateKey);
+            if (clientPubkey) {
+                filter['#p'] = [clientPubkey];
+            }
+
+            reviewResponseSubscription = relayPool.subscribe(relayUrls, filter, {
+                onevent: (event: Event) => {
+                    try {
+                        handleIncomingReviewEvent(event);
+                    } catch (error) {
+                        console.error('Failed to process Drydock review response', error);
+                    }
+                },
+                onclose: (reasons: string[]) => {
+                    console.warn('Drydock review subscription closed', reasons);
+                    reviewResponseSubscription = undefined;
+                    activeSubscriptionKey = undefined;
+                }
+            });
+
+            activeRelayUrls = relayUrls;
+            activeSubscriptionKey = subscriptionKey;
+        }
+
+        if (options.announceSession) {
+            await publishSessionAnnouncement(config);
+        }
+    } catch (error) {
+        console.error('Failed to initialize Drydock relay subscription', error);
+        if (options.notifyOnFailure) {
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showWarningMessage(`Drydock: Relay setup failed: ${message}`);
+        }
+        throw error;
+    }
+}
+
+function handleIncomingReviewEvent(event: Event) {
+    if (event.kind !== KIND_IDE_REVIEW_RESPONSE) {
+        return;
+    }
+
+    const expectedAuthor = tryParsePubkey(getDrydockConfig().drydockPubkey);
+    if (expectedAuthor && event.pubkey !== expectedAuthor) {
+        return;
+    }
+
+    const response = JSON.parse(event.content) as ReviewResponse;
+    if (response.session_id !== sessionId) {
+        return;
+    }
+
+    if (latestReviewRequestId && response.request_id !== latestReviewRequestId) {
+        return;
+    }
+
+    handleReviewResponse(response);
+}
+
+async function publishSessionAnnouncement(config: DrydockConfig) {
+    if (!relayPool || activeRelayUrls.length === 0) {
+        return;
+    }
+
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        return;
+    }
+
+    if (!config.privateKey.trim()) {
+        return;
+    }
+
+    const privateKey = parsePrivateKey(config.privateKey);
+    const announcement: IDESessionAnnouncement = {
+        session_id: sessionId,
+        workspace_path: workspaceFolder.uri.fsPath,
+        repo_id: '',
+        editor: 'vscode',
+        version: extensionVersion,
+        languages: getWorkspaceLanguages()
+    };
+
+    const sessionEvent = signEvent({
+        kind: KIND_IDE_SESSION,
+        content: JSON.stringify(announcement),
+        tags: [
+            ['d', sessionId]
+        ]
+    }, privateKey);
+
+    await publishEvent(sessionEvent);
+}
+
+async function publishEvent(event: VerifiedEvent) {
+    if (!relayPool || activeRelayUrls.length === 0) {
+        throw new Error('No active relay connections');
+    }
+
+    const publishResults = await Promise.allSettled(relayPool.publish(activeRelayUrls, event));
+    const publishOutcomes = publishResults.map(result => {
+        if (result.status === 'fulfilled') {
+            const message = String(result.value);
+            return message.startsWith('connection failure: ')
+                ? { ok: false, message }
+                : { ok: true, message };
+        }
+
+        return { ok: false, message: String(result.reason) };
+    });
+
+    if (publishOutcomes.some(result => result.ok)) {
+        return;
+    }
+
+    const reasons = publishOutcomes.map(result => result.message).join('; ');
+    throw new Error(`Publish failed on all relays: ${reasons || 'unknown error'}`);
+}
+
+function signEvent(template: Omit<EventTemplate, 'created_at'>, privateKey: Uint8Array): VerifiedEvent {
+    return finalizeEvent({
+        ...template,
+        created_at: Math.floor(Date.now() / 1000)
+    }, privateKey);
+}
+
+function getDrydockConfig(): DrydockConfig {
+    const config = vscode.workspace.getConfiguration('drydock');
+    return {
+        relays: config.get<string[]>('relays', []),
+        privateKey: config.get<string>('privateKey', '').trim(),
+        drydockPubkey: config.get<string>('drydockPubkey', '').trim()
+    };
+}
+
+function normalizeRelayUrls(relays: string[]): string[] {
+    return Array.from(new Set(
+        relays
+            .map(relay => relay.trim())
+            .filter(relay => relay.length > 0)
+    ));
+}
+
+function parsePrivateKey(value: string): Uint8Array {
+    const trimmed = value.trim();
+    if (!trimmed) {
+        throw new Error('Configure drydock.privateKey before requesting a review');
+    }
+
+    if (trimmed.startsWith('nsec1')) {
+        const decoded = nip19.decode(trimmed);
+        if (decoded.type !== 'nsec') {
+            throw new Error('drydock.privateKey must be an nsec or 64-character hex key');
+        }
+        return decoded.data;
+    }
+
+    if (!/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+        throw new Error('drydock.privateKey must be an nsec or 64-character hex key');
+    }
+
+    return Uint8Array.from(Buffer.from(trimmed, 'hex'));
+}
+
+function tryGetPublicKey(privateKey: string): string | undefined {
+    try {
+        return getPublicKey(parsePrivateKey(privateKey));
+    } catch {
+        return undefined;
+    }
+}
+
+function tryParsePubkey(value: string): string | undefined {
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+        return trimmed.toLowerCase();
+    }
+
+    if (trimmed.startsWith('npub1')) {
+        const decoded = nip19.decode(trimmed);
+        if (decoded.type === 'npub') {
+            return decoded.data;
+        }
+    }
+
+    throw new Error('drydock.drydockPubkey must be an npub or 64-character hex public key');
+}
+
+function buildReviewRequestTags(config: DrydockConfig, requestId: string): string[][] {
+    const tags: string[][] = [
+        ['session', sessionId],
+        ['request', requestId]
+    ];
+
+    const drydockPubkey = tryParsePubkey(config.drydockPubkey);
+    if (drydockPubkey) {
+        tags.push(['p', drydockPubkey]);
+    }
+
+    return tags;
+}
+
+function getWorkspaceLanguages(): string[] {
+    return Array.from(new Set(
+        vscode.workspace.textDocuments
+            .map(document => document.languageId)
+            .filter(languageId => languageId && languageId !== 'Log')
+    ));
 }
