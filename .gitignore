@@ -32,3 +32,4 @@ tmp/
 
 # Node (if any tooling uses it)
 node_modules/
+extensions/vscode-drydock/out/
