@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"drydock/internal/llmutil"
 	"drydock/internal/metrics"
 )
 
@@ -37,9 +38,9 @@ func DefaultEnsembleConfig() EnsembleConfig {
 
 // modelResult holds the output from a single model in the ensemble.
 type modelResult struct {
-	Route    ModelRoute
-	Review   ReviewerOutput
-	Err      error
+	Route  ModelRoute
+	Review ReviewerOutput
+	Err    error
 }
 
 // RunEnsemble runs the review engine with multiple models in parallel and
@@ -57,7 +58,7 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("planner completion: %w", err)
 	}
-	planner, err := ParsePlannerOutput(extractJSON(plannerRaw))
+	planner, err := ParsePlannerOutput(llmutil.ExtractJSON(plannerRaw))
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("planner output invalid: %w", err)
 	}
@@ -103,7 +104,7 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 				results <- modelResult{Route: r, Err: fmt.Errorf("reviewer %s: %w", r, err)}
 				return
 			}
-			review, err := ParseReviewerOutput(extractJSON(reviewerRaw))
+			review, err := ParseReviewerOutput(llmutil.ExtractJSON(reviewerRaw))
 			if err != nil {
 				results <- modelResult{Route: r, Err: fmt.Errorf("reviewer %s parse: %w", r, err)}
 				return
@@ -178,7 +179,7 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 		if wtErr != nil {
 			e.logger.Warn("walkthrough generation failed, continuing without", "error", wtErr)
 		} else {
-			parsed, parseErr := ParseWalkthroughOutput(extractJSON(wtRaw))
+			parsed, parseErr := ParseWalkthroughOutput(llmutil.ExtractJSON(wtRaw))
 			if parseErr != nil {
 				e.logger.Warn("walkthrough parse failed, continuing without", "error", parseErr)
 			} else {
@@ -212,7 +213,8 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 // findingKey generates a deduplication key for a finding.
 // Findings are considered the same if they target the same file, line, and category.
 func findingKey(f Finding) string {
-	return fmt.Sprintf("%s:%d:%s", strings.ToLower(f.File), f.Line, strings.ToLower(f.Category))
+	normalizedLine := (f.Line / 5) * 5
+	return fmt.Sprintf("%s:%d:%s", strings.ToLower(f.File), normalizedLine, strings.ToLower(f.Category))
 }
 
 // mergedFinding tracks a finding across multiple models.

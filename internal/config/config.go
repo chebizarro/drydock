@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,9 +32,15 @@ type Config struct {
 	LLM70BModel     string
 	Coder14BBaseURL string
 	Coder14BModel   string
-	LLMAPIKey       string
+	LLMAPIKey          string
+	PlannerAPIKey      string
+	Coder32BAPIKey     string
+	LLM70BAPIKey       string
+	Coder14BAPIKey     string
+	MetaAPIKey         string
 	SignerBunkerURL    string
 	SignerNsec         string
+	SignerNsecFile     string
 	SignerSocketPath   string
 	SignerDBus         bool
 	QdrantURL       string
@@ -51,6 +58,17 @@ type Config struct {
 }
 
 func FromEnv() Config {
+	signerNsec := envOrDefault("DRYDOCK_SIGNER_NSEC", "")
+	signerNsecFile := envOrDefault("DRYDOCK_SIGNER_NSEC_FILE", "")
+	if signerNsecFile != "" {
+		nsecFromFile, err := os.ReadFile(signerNsecFile)
+		if err != nil {
+			slog.Warn("failed to read signer nsec file", "path", signerNsecFile, "error", err)
+		} else {
+			signerNsec = strings.TrimSpace(string(nsecFromFile))
+		}
+	}
+
 	return Config{
 		DatabaseURL:         envOrDefault("DRYDOCK_DATABASE_URL", "file:drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)"),
 		RepoCacheDir:        envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
@@ -75,10 +93,16 @@ func FromEnv() Config {
 		Coder14BBaseURL:     envOrDefault("DRYDOCK_CODER14B_BASE_URL", "http://127.0.0.1:11434/v1"),
 		Coder14BModel:       envOrDefault("DRYDOCK_CODER14B_MODEL", "qwen2.5-coder-14b-instruct-q4_k_m"),
 		LLMAPIKey:           envOrDefault("DRYDOCK_LLM_API_KEY", ""),
+		PlannerAPIKey:       envOrDefault("DRYDOCK_PLANNER_API_KEY", ""),
+		Coder32BAPIKey:      envOrDefault("DRYDOCK_CODER32B_API_KEY", ""),
+		LLM70BAPIKey:        envOrDefault("DRYDOCK_LLM70B_API_KEY", ""),
+		Coder14BAPIKey:      envOrDefault("DRYDOCK_CODER14B_API_KEY", ""),
+		MetaAPIKey:          envOrDefault("DRYDOCK_META_API_KEY", ""),
 		SignerBunkerURL:     envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
-		SignerNsec:          envOrDefault("DRYDOCK_SIGNER_NSEC", ""),
+		SignerNsec:          signerNsec,
+		SignerNsecFile:      signerNsecFile,
 		SignerSocketPath:    envOrDefault("DRYDOCK_SIGNER_SOCKET_PATH", ""),
-		SignerDBus:          envOrDefault("DRYDOCK_SIGNER_DBUS", "") == "true",
+		SignerDBus:          parseBoolOrDefault(envOrDefault("DRYDOCK_SIGNER_DBUS", ""), false),
 		QdrantURL:           envOrDefault("DRYDOCK_QDRANT_URL", ""),
 		QdrantAPIKey:        envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
 		EmbedBaseURL:        envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
@@ -107,14 +131,18 @@ func splitCSV(v string) []string {
 }
 
 func parseLogLevel(v string) slog.Level {
-	switch strings.ToLower(strings.TrimSpace(v)) {
+	normalized := strings.ToLower(strings.TrimSpace(v))
+	switch normalized {
 	case "debug":
 		return slog.LevelDebug
 	case "warn", "warning":
 		return slog.LevelWarn
 	case "error":
 		return slog.LevelError
+	case "", "info":
+		return slog.LevelInfo
 	default:
+		slog.Warn("invalid log level, defaulting to info", "value", v)
 		return slog.LevelInfo
 	}
 }
@@ -133,6 +161,18 @@ func parseIntOrDefault(v string, fallback int) int {
 		return fallback
 	}
 	return result
+}
+
+func parseBoolOrDefault(v string, fallback bool) bool {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(trimmed)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 // ValidationResult contains the outcome of configuration validation.
@@ -184,7 +224,7 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 
 	// --- Signer configuration ---
-	hasSignerConfig := c.SignerBunkerURL != "" || c.SignerNsec != "" || c.SignerSocketPath != "" || c.SignerDBus
+	hasSignerConfig := c.SignerBunkerURL != "" || c.SignerNsec != "" || c.SignerNsecFile != "" || c.SignerSocketPath != "" || c.SignerDBus
 	if !hasSignerConfig {
 		result.Warnings = append(result.Warnings, "no signer configured: review publishing will be disabled (set DRYDOCK_SIGNER_BUNKER_URL, DRYDOCK_SIGNER_NSEC, or enable DRYDOCK_SIGNER_DBUS)")
 	}
@@ -195,15 +235,22 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 
 	// --- LLM endpoint checks (warnings only, as they may come online later) ---
-	llmEndpoints := map[string]string{
-		"planner": c.PlannerBaseURL,
-		"70b":     c.LLM70BBaseURL,
+	llmEndpoints := map[string]struct {
+		baseURL string
+		apiKey  string
+	}{
+		"planner":  {baseURL: c.PlannerBaseURL, apiKey: c.effectiveLLMAPIKey(c.PlannerAPIKey)},
+		"coder32b": {baseURL: c.Coder32BBaseURL, apiKey: c.effectiveLLMAPIKey(c.Coder32BAPIKey)},
+		"70b":      {baseURL: c.LLM70BBaseURL, apiKey: c.effectiveLLMAPIKey(c.LLM70BAPIKey)},
+		"coder14b": {baseURL: c.Coder14BBaseURL, apiKey: c.effectiveLLMAPIKey(c.Coder14BAPIKey)},
+		"meta":     {baseURL: c.MetaBaseURL, apiKey: c.effectiveLLMAPIKey(c.MetaAPIKey)},
 	}
-	for name, baseURL := range llmEndpoints {
+	for name, endpoint := range llmEndpoints {
+		baseURL := endpoint.baseURL
 		if baseURL == "" {
 			continue
 		}
-		if err := c.checkLLMEndpoint(ctx, baseURL); err != nil {
+		if err := c.checkLLMEndpoint(ctx, baseURL, endpoint.apiKey); err != nil {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("LLM endpoint %s (%s) not reachable: %v", name, baseURL, err))
 		}
 	}
@@ -264,8 +311,15 @@ func (c *Config) validateDatabase(ctx context.Context) error {
 	return nil
 }
 
+func (c *Config) effectiveLLMAPIKey(override string) string {
+	if strings.TrimSpace(override) != "" {
+		return override
+	}
+	return c.LLMAPIKey
+}
+
 // checkLLMEndpoint verifies an LLM endpoint is reachable.
-func (c *Config) checkLLMEndpoint(ctx context.Context, baseURL string) error {
+func (c *Config) checkLLMEndpoint(ctx context.Context, baseURL, apiKey string) error {
 	// Try to hit the models endpoint (common for OpenAI-compatible APIs)
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -286,8 +340,8 @@ func (c *Config) checkLLMEndpoint(ctx context.Context, baseURL string) error {
 			continue
 		}
 		
-		if c.LLMAPIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+c.LLMAPIKey)
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
 
 		resp, err := client.Do(req)

@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -53,6 +54,7 @@ type ParsedToken struct {
 	Unit       string
 	AmountSats int64
 	Raw        string
+	Proofs     json.RawMessage
 }
 
 // MeltQuote represents a mint's quote for melting tokens to pay an invoice.

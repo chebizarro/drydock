@@ -39,7 +39,7 @@ func (c *CashuMintClient) ParseToken(raw string) (ParsedToken, error) {
 
 	// Decode base64url payload after prefix
 	payload := raw[6:] // strip "cashuA"
-	
+
 	// Add padding if needed
 	switch len(payload) % 4 {
 	case 2:
@@ -60,13 +60,8 @@ func (c *CashuMintClient) ParseToken(raw string) (ParsedToken, error) {
 	// Parse JSON structure
 	var tokenData struct {
 		Token []struct {
-			Mint   string `json:"mint"`
-			Proofs []struct {
-				Amount int64  `json:"amount"`
-				ID     string `json:"id"`
-				Secret string `json:"secret"`
-				C      string `json:"C"`
-			} `json:"proofs"`
+			Mint   string          `json:"mint"`
+			Proofs json.RawMessage `json:"proofs"`
 		} `json:"token"`
 		Unit string `json:"unit"`
 		Memo string `json:"memo,omitempty"`
@@ -88,9 +83,16 @@ func (c *CashuMintClient) ParseToken(raw string) (ParsedToken, error) {
 		return ParsedToken{}, errors.New("token missing mint URL")
 	}
 
+	var proofs []struct {
+		Amount int64 `json:"amount"`
+	}
+	if err := json.Unmarshal(entry.Proofs, &proofs); err != nil {
+		return ParsedToken{}, fmt.Errorf("parse token proofs: %w", err)
+	}
+
 	// Sum proof amounts
 	var total int64
-	for _, proof := range entry.Proofs {
+	for _, proof := range proofs {
 		total += proof.Amount
 	}
 
@@ -104,6 +106,7 @@ func (c *CashuMintClient) ParseToken(raw string) (ParsedToken, error) {
 		Unit:       unit,
 		AmountSats: total,
 		Raw:        raw,
+		Proofs:     append(json.RawMessage(nil), entry.Proofs...),
 	}, nil
 }
 
@@ -159,31 +162,11 @@ func (c *CashuMintClient) MeltToken(ctx context.Context, mintURL string, quote M
 	mintURL = strings.TrimRight(mintURL, "/")
 	url := mintURL + "/v1/melt/bolt11"
 
-	// Re-parse token to get proofs
-	payload := token.Raw[6:]
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-	decoded, _ := base64.URLEncoding.DecodeString(payload)
-	if decoded == nil {
-		decoded, _ = base64.StdEncoding.DecodeString(payload)
-	}
-
-	var tokenData struct {
-		Token []struct {
-			Proofs json.RawMessage `json:"proofs"`
-		} `json:"token"`
-	}
-	json.Unmarshal(decoded, &tokenData)
-
-	if len(tokenData.Token) == 0 {
+	if len(token.Proofs) == 0 {
 		return errors.New("no proofs in token")
 	}
 
-	reqBody := fmt.Sprintf(`{"quote":"%s","inputs":%s}`, quote.ID, string(tokenData.Token[0].Proofs))
+	reqBody := fmt.Sprintf(`{"quote":"%s","inputs":%s}`, quote.ID, string(token.Proofs))
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(reqBody))
 	if err != nil {

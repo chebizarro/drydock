@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+
+	"drydock/internal/llmutil"
 )
 
 type ModelEndpoint struct {
@@ -14,12 +16,12 @@ type ModelEndpoint struct {
 }
 
 type Config struct {
-	Planner       ModelEndpoint
-	Coder32B      ModelEndpoint
-	LLM70B        ModelEndpoint
-	Coder14B      ModelEndpoint
-	PlannerTemp   float64
-	ReviewerTemp  float64
+	Planner      ModelEndpoint
+	Coder32B     ModelEndpoint
+	LLM70B       ModelEndpoint
+	Coder14B     ModelEndpoint
+	PlannerTemp  float64
+	ReviewerTemp float64
 }
 
 type RunInput struct {
@@ -71,7 +73,7 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("planner completion: %w", err)
 	}
-	planner, err := ParsePlannerOutput(extractJSON(plannerRaw))
+	planner, err := ParsePlannerOutput(llmutil.ExtractJSON(plannerRaw))
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("planner output invalid: %w", err)
 	}
@@ -100,7 +102,7 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("reviewer completion: %w", err)
 	}
-	review, err := ParseReviewerOutput(extractJSON(reviewerRaw))
+	review, err := ParseReviewerOutput(llmutil.ExtractJSON(reviewerRaw))
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("reviewer output invalid: %w", err)
 	}
@@ -121,7 +123,7 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 			e.logger.Warn("walkthrough generation failed, continuing without",
 				"error", wtErr)
 		} else {
-			parsed, parseErr := ParseWalkthroughOutput(extractJSON(wtRaw))
+			parsed, parseErr := ParseWalkthroughOutput(llmutil.ExtractJSON(wtRaw))
 			if parseErr != nil {
 				e.logger.Warn("walkthrough parse failed, continuing without",
 					"error", parseErr)
@@ -153,14 +155,3 @@ func (e *Engine) routeEndpoint(route ModelRoute) (ModelEndpoint, error) {
 		return ModelEndpoint{}, fmt.Errorf("unsupported model route %q", route)
 	}
 }
-
-func extractJSON(raw string) string {
-	raw = strings.TrimSpace(raw)
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start >= 0 && end > start {
-		return raw[start : end+1]
-	}
-	return raw
-}
-

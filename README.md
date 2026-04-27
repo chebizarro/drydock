@@ -1,5 +1,7 @@
 # Drydock
 
+![drydock logo](docs/assets/logo.png)
+
 Automated code review for [NIP-34](https://github.com/nostr-protocol/nips/blob/master/34.md) Nostr repositories. Drydock listens for patch and pull request events on Nostr relays, reviews them with local LLMs, and publishes structured review comments back to the protocol.
 
 ## How It Works

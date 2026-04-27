@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -13,6 +13,7 @@ import (
 
 	"drydock/internal/db"
 	"drydock/internal/embedding"
+	"drydock/internal/llmutil"
 	"drydock/internal/reviewengine"
 	"drydock/internal/symbols"
 	"drydock/internal/vectorstore"
@@ -23,7 +24,7 @@ const (
 	WhyMissedInsufficientContext = "insufficient_context"
 	WhyMissedModelLimitation     = "model_limitation"
 	WhyMissedPromptGap           = "prompt_gap"
-	
+
 	ActionFlagContextBuilder    = "flag-context-builder-pattern"
 	ActionFlagModelRouting      = "flag-model-routing-review"
 	ActionQueuePromptRefinement = "queue-prompt-refinement"
@@ -34,21 +35,21 @@ type LLMClient interface {
 }
 
 type Config struct {
-	Endpoint            reviewengine.ModelEndpoint
-	RandomSampleRate    float64
-	MinReuseJaccard     float64
-	FewShotCap          int
-	MaxConcurrent       int64
+	Endpoint         reviewengine.ModelEndpoint
+	RandomSampleRate float64
+	MinReuseJaccard  float64
+	FewShotCap       int
+	MaxConcurrent    int64
 }
 
 type Input struct {
-	PatchEventID   string
-	RepoID         string
-	PatchDiff      string
-	ContextBundle  string
-	ContextHash    string
-	ChangedFiles   []string
-	LocalReview    reviewengine.ReviewerOutput
+	PatchEventID  string
+	RepoID        string
+	PatchDiff     string
+	ContextBundle string
+	ContextHash   string
+	ChangedFiles  []string
+	LocalReview   reviewengine.ReviewerOutput
 }
 
 type Result struct {
@@ -111,7 +112,7 @@ func (s *Service) RunAsync(ctx context.Context, in Input) {
 			return
 		}
 		defer s.sem.Release(1)
-		
+
 		if _, err := s.Run(ctx, in); err != nil {
 			s.logger.Error("meta-review async run failed", "patch_event_id", in.PatchEventID, "repo_id", in.RepoID, "error", err)
 		}
@@ -133,7 +134,7 @@ func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
 
 	var parsed MetaReviewOutput
 	if reuse != nil {
-		parsed, err = ParseMetaReviewOutput(extractJSON(reuse.ResponseJSON))
+		parsed, err = ParseMetaReviewOutput(llmutil.ExtractJSON(reuse.ResponseJSON))
 		if err != nil {
 			return Result{}, err
 		}
@@ -158,7 +159,7 @@ func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("meta-review completion failed: %w", err)
 	}
-	parsed, err = ParseMetaReviewOutput(extractJSON(raw))
+	parsed, err = ParseMetaReviewOutput(llmutil.ExtractJSON(raw))
 	if err != nil {
 		return Result{}, err
 	}
@@ -242,8 +243,8 @@ func (s *Service) queuePromptGaps(ctx context.Context, in Input, out MetaReviewO
 func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOutput) error {
 	if out.SuggestedFewShot {
 		payload := map[string]any{
-			"patch_diff": in.PatchDiff,
-			"meta_review": out,
+			"patch_diff":   in.PatchDiff,
+			"meta_review":  out,
 			"local_review": in.LocalReview,
 		}
 		buf, _ := json.Marshal(payload)
@@ -283,7 +284,7 @@ func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOut
 	}
 	if len(out.FalsePositives) > 0 {
 		payload := map[string]any{
-			"kind": "negative-pattern",
+			"kind":            "negative-pattern",
 			"false_positives": out.FalsePositives,
 		}
 		buf, _ := json.Marshal(payload)
@@ -347,16 +348,6 @@ func dedupe(items []string) []string {
 	return out
 }
 
-func extractJSON(raw string) string {
-	raw = strings.TrimSpace(raw)
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start >= 0 && end > start {
-		return raw[start : end+1]
-	}
-	return raw
-}
-
 // detectPrimaryLanguage returns the most common programming language
 // among the changed files, using the symbols package's extension mapping
 // for consistency with code indexing. First-seen language wins on ties.
@@ -400,4 +391,3 @@ func extractFindingCategories(findings []reviewengine.Finding) []string {
 	}
 	return cats
 }
-

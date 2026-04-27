@@ -40,6 +40,14 @@ func TestParseToken_ValidToken(t *testing.T) {
 	if parsed.AmountSats != 96 {
 		t.Errorf("expected amount=96, got %d", parsed.AmountSats)
 	}
+
+	var proofs []map[string]any
+	if err := json.Unmarshal(parsed.Proofs, &proofs); err != nil {
+		t.Fatalf("failed to parse stored proofs: %v", err)
+	}
+	if len(proofs) != 2 {
+		t.Errorf("expected 2 proofs, got %d", len(proofs))
+	}
 }
 
 func TestParseToken_InvalidPrefix(t *testing.T) {

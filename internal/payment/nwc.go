@@ -272,10 +272,16 @@ func (p *NWCInvoiceProvider) sendRequest(ctx context.Context, method string, par
 		Since:   nostr.Timestamp(time.Now().Add(-5 * time.Second).Unix()),
 	}
 
-	// Subscribe to responses using the pool
-	stream := p.pool.SubscribeMany(ctx, []string{p.conn.RelayURL}, filter, nostr.SubscriptionOptions{
-		Label: "nwc-response",
-	})
+	// Subscribe to responses and ensure cleanup.
+	relay, err := p.pool.EnsureRelay(p.conn.RelayURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to relay %s: %w", p.conn.RelayURL, err)
+	}
+	sub, err := relay.Subscribe(ctx, filter, nostr.SubscriptionOptions{Label: "nwc-response"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to subscribe for response: %w", err)
+	}
+	defer sub.Unsub()
 
 	// Publish request to relays
 	for res := range p.pool.PublishMany(ctx, []string{p.conn.RelayURL}, evt) {
@@ -290,18 +296,18 @@ func (p *NWCInvoiceProvider) sendRequest(ctx context.Context, method string, par
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case ie, ok := <-stream:
+		case responseEvt, ok := <-sub.Events:
 			if !ok {
 				return nil, errors.New("subscription closed")
 			}
 
 			// Check if response is for our request
-			if !hasTag(ie.Event.Tags, "e", evt.ID.Hex()) {
+			if !hasTag(responseEvt.Tags, "e", evt.ID.Hex()) {
 				continue
 			}
 
 			// Decrypt response using keyer
-			decrypted, err := p.keyer.Decrypt(ctx, ie.Event.Content, p.conn.WalletPubkey)
+			decrypted, err := p.keyer.Decrypt(ctx, responseEvt.Content, p.conn.WalletPubkey)
 			if err != nil {
 				return nil, fmt.Errorf("failed to decrypt response: %w", err)
 			}
