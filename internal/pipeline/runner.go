@@ -60,6 +60,7 @@ type Runner struct {
 	queue            <-chan db.ReviewTask
 	workers          int
 	logger           *slog.Logger
+	activityHook     func()
 }
 
 type Config struct {
@@ -105,6 +106,14 @@ func WithCodeIndexer(ci CodeIndexer) func(*Runner) {
 func WithSecurityScanner(scanner *securityscan.Scanner) func(*Runner) {
 	return func(r *Runner) {
 		r.secScanner = scanner
+	}
+}
+
+// WithActivityHeartbeat sets a callback that is invoked by workers whenever
+// they begin and complete processing a task.
+func WithActivityHeartbeat(hook func()) func(*Runner) {
+	return func(r *Runner) {
+		r.activityHook = hook
 	}
 }
 
@@ -168,6 +177,9 @@ func (r *Runner) work(ctx context.Context, id int) {
 			if !ok {
 				return
 			}
+			if r.activityHook != nil {
+				r.activityHook()
+			}
 			metrics.ReviewQueueDepth.Dec()
 			metrics.ReviewsStarted.Inc()
 			metrics.WorkersActive.Inc()
@@ -197,6 +209,9 @@ func (r *Runner) work(ctx context.Context, id int) {
 			}
 			done()
 			metrics.WorkersActive.Dec()
+			if r.activityHook != nil {
+				r.activityHook()
+			}
 		}
 	}
 }
@@ -300,10 +315,10 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		var fewShotErr error
 		if r.fewShotRetriever != nil {
 			fewShot, fewShotErr = r.fewShotRetriever.RetrieveFewShots(ctx, FewShotQuery{
-				PatchDiff:  patchDiffContent,
-				Limit:      2,
-				Language:   DetectLanguage(changedFiles),
-				RepoID:     task.RepoID,
+				PatchDiff: patchDiffContent,
+				Limit:     2,
+				Language:  DetectLanguage(changedFiles),
+				RepoID:    task.RepoID,
 			})
 		} else {
 			fewShot, fewShotErr = r.store.GetRecentFewShots(ctx, 3)

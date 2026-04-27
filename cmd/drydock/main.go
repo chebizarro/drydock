@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"drydock/internal/circuitbreaker"
 	"drydock/internal/codeindex"
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
@@ -192,12 +193,20 @@ func main() {
 		writeRelays = cfg.Relays
 	}
 
+	// --- Health check server ---
+	healthAddr := cfg.HealthAddr
+	healthSrv := health.New(store, logger)
+
 	// --- Conversation handler ---
 	var convHandler *conversation.Handler
 	if signer != nil {
-		convClient := reviewengine.NewRetryingClient(
-			reviewengine.NewOpenAICompatClient(),
-			reviewengine.RetryConfig{MaxAttempts: 2},
+		convClient := reviewengine.NewCircuitBreakingClient(
+			reviewengine.NewRetryingClient(
+				reviewengine.NewOpenAICompatClient(),
+				reviewengine.RetryConfig{MaxAttempts: 2},
+				logger,
+			),
+			circuitbreaker.DefaultConfig(),
 			logger,
 		)
 		relayPub := publisher.NewNostrRelayPublisher(pool, logger)
@@ -292,10 +301,14 @@ func main() {
 	// --- Context builder ---
 	ctxBuilder := contextbuilder.NewWithOptions(contextbuilder.NewBuilderOptions(builderOpts...))
 
-	// --- Review engine (with retry for transient LLM failures) ---
-	llmClient := reviewengine.NewRetryingClient(
-		reviewengine.NewOpenAICompatClient(),
-		reviewengine.RetryConfig{MaxAttempts: 3},
+	// --- Review engine (with retry + circuit breaker for transient LLM failures) ---
+	llmClient := reviewengine.NewCircuitBreakingClient(
+		reviewengine.NewRetryingClient(
+			reviewengine.NewOpenAICompatClient(),
+			reviewengine.RetryConfig{MaxAttempts: 3},
+			logger,
+		),
+		circuitbreaker.DefaultConfig(),
 		logger,
 	)
 	engine := reviewengine.New(reviewengine.Config{
@@ -319,10 +332,14 @@ func main() {
 		}, store, signer, relayPub, logger)
 	}
 
-	// --- Meta-review (with retry) ---
-	metaClient := reviewengine.NewRetryingClient(
-		reviewengine.NewOpenAICompatClient(),
-		reviewengine.RetryConfig{MaxAttempts: 3},
+	// --- Meta-review (with retry + circuit breaker) ---
+	metaClient := reviewengine.NewCircuitBreakingClient(
+		reviewengine.NewRetryingClient(
+			reviewengine.NewOpenAICompatClient(),
+			reviewengine.RetryConfig{MaxAttempts: 3},
+			logger,
+		),
+		circuitbreaker.DefaultConfig(),
 		logger,
 	)
 	var metaOpts []func(*metareview.Service)
@@ -350,6 +367,7 @@ func main() {
 		var pipelineOpts []func(*pipeline.Runner)
 		pipelineOpts = append(pipelineOpts, pipeline.WithPromptRefiner(prSvc))
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityScanner(secScanner))
+		pipelineOpts = append(pipelineOpts, pipeline.WithActivityHeartbeat(healthSrv.RecordActivity))
 		if codeIndexer != nil {
 			pipelineOpts = append(pipelineOpts, pipeline.WithCodeIndexer(codeIndexer))
 		}
@@ -373,10 +391,6 @@ func main() {
 	} else {
 		logger.Warn("pipeline runner disabled (no signer configured)")
 	}
-
-	// --- Health check server ---
-	healthAddr := cfg.HealthAddr
-	healthSrv := health.New(store, logger)
 
 	// --- Analytics dashboard ---
 	dash := dashboard.New(store, logger)
@@ -612,4 +626,3 @@ func socketSignerAvailable() bool {
 	_, err = os.Stat(home + "/.local/share/nostr/signer.sock")
 	return err == nil
 }
-

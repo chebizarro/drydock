@@ -18,20 +18,24 @@ type Checker interface {
 
 // Server provides /healthz and /readyz HTTP endpoints.
 type Server struct {
-	mux    *http.ServeMux
-	srv    *http.Server
-	logger *slog.Logger
-	db     Checker
-	ready  atomic.Bool
+	mux              *http.ServeMux
+	srv              *http.Server
+	logger           *slog.Logger
+	db               Checker
+	ready            atomic.Bool
+	lastActivityUnix atomic.Int64
+	heartbeatTimeout time.Duration
 }
 
 // New creates a health check server.
 func New(db Checker, logger *slog.Logger) *Server {
 	s := &Server{
-		mux:    http.NewServeMux(),
-		logger: logger,
-		db:     db,
+		mux:              http.NewServeMux(),
+		logger:           logger,
+		db:               db,
+		heartbeatTimeout: 60 * time.Second,
 	}
+	s.RecordActivity()
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.mux.HandleFunc("/readyz", s.handleReadyz)
 	s.mux.Handle("/metrics", metrics.Handler())
@@ -44,6 +48,11 @@ func (s *Server) Mux() *http.ServeMux { return s.mux }
 // SetReady marks the service as ready to receive traffic.
 func (s *Server) SetReady(ready bool) {
 	s.ready.Store(ready)
+}
+
+// RecordActivity updates the service heartbeat timestamp.
+func (s *Server) RecordActivity() {
+	s.lastActivityUnix.Store(time.Now().UnixNano())
 }
 
 // ListenAndServe starts the health check server on the given address.
@@ -75,6 +84,14 @@ type healthResponse struct {
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+
+	lastActivity := time.Unix(0, s.lastActivityUnix.Load())
+	if time.Since(lastActivity) > s.heartbeatTimeout {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(healthResponse{Status: "unhealthy", Error: "heartbeat stale"})
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(healthResponse{Status: "ok"})
 }

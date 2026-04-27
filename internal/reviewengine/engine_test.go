@@ -2,11 +2,14 @@ package reviewengine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
+
+	"drydock/internal/circuitbreaker"
 )
 
 type fakeLLM struct {
@@ -385,3 +388,54 @@ func TestRetryingClientExhaustsAttempts(t *testing.T) {
 	}
 }
 
+func TestCircuitBreakingClientOpensAndFailsFastPerEndpoint(t *testing.T) {
+	inner := &failingLLM{
+		errors: []error{
+			&LLMHTTPError{StatusCode: 500, Status: "500", Body: "err1"},
+			&LLMHTTPError{StatusCode: 500, Status: "500", Body: "err2"},
+		},
+	}
+	cb := NewCircuitBreakingClient(inner, circuitbreaker.Config{
+		FailureThreshold:    2,
+		SuccessThreshold:    1,
+		Timeout:             time.Hour,
+		MaxHalfOpenRequests: 1,
+	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	req := ChatRequest{BaseURL: "http://llm-a", Model: "model-a"}
+	_, _ = cb.ChatCompletion(context.Background(), req)
+	_, _ = cb.ChatCompletion(context.Background(), req)
+
+	_, err := cb.ChatCompletion(context.Background(), req)
+	if !errors.Is(err, circuitbreaker.ErrCircuitOpen) {
+		t.Fatalf("expected circuit open error, got: %v", err)
+	}
+	if inner.calls != 2 {
+		t.Fatalf("expected no inner call once circuit opens, got %d calls", inner.calls)
+	}
+}
+
+func TestCircuitBreakingClientUsesSeparateBreakerPerModelEndpoint(t *testing.T) {
+	inner := &failingLLM{
+		errors: []error{&LLMHTTPError{StatusCode: 500, Status: "500", Body: "err1"}},
+	}
+	cb := NewCircuitBreakingClient(inner, circuitbreaker.Config{
+		FailureThreshold:    1,
+		SuccessThreshold:    1,
+		Timeout:             time.Hour,
+		MaxHalfOpenRequests: 1,
+	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	// Open breaker for endpoint/model A.
+	_, _ = cb.ChatCompletion(context.Background(), ChatRequest{BaseURL: "http://llm-a", Model: "model-a"})
+	_, err := cb.ChatCompletion(context.Background(), ChatRequest{BaseURL: "http://llm-a", Model: "model-a"})
+	if !errors.Is(err, circuitbreaker.ErrCircuitOpen) {
+		t.Fatalf("expected circuit open for model-a, got: %v", err)
+	}
+
+	// Different model endpoint should still call through.
+	_, err = cb.ChatCompletion(context.Background(), ChatRequest{BaseURL: "http://llm-b", Model: "model-b"})
+	if err != nil {
+		t.Fatalf("expected model-b call to proceed, got: %v", err)
+	}
+}

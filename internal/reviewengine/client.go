@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
 	"net/http"
+	"sync"
 	"time"
 
+	"drydock/internal/circuitbreaker"
 	"drydock/internal/metrics"
 )
 
@@ -134,6 +137,57 @@ type RetryingClient struct {
 	Inner  LLMClient
 	Config RetryConfig
 	Logger *slog.Logger
+}
+
+// CircuitBreakingClient wraps an LLMClient with per-endpoint/model circuit breakers.
+type CircuitBreakingClient struct {
+	Inner         LLMClient
+	Logger        *slog.Logger
+	breakerConfig circuitbreaker.Config
+
+	mu       sync.Mutex
+	breakers map[string]*circuitbreaker.Breaker
+}
+
+func NewCircuitBreakingClient(inner LLMClient, cfg circuitbreaker.Config, logger *slog.Logger) *CircuitBreakingClient {
+	return &CircuitBreakingClient{
+		Inner:         inner,
+		Logger:        logger,
+		breakerConfig: cfg,
+		breakers:      make(map[string]*circuitbreaker.Breaker),
+	}
+}
+
+func (c *CircuitBreakingClient) ChatCompletion(ctx context.Context, req ChatRequest) (string, error) {
+	breaker := c.getBreaker(req)
+	var result string
+	err := breaker.Execute(ctx, func(ctx context.Context) error {
+		var callErr error
+		result, callErr = c.Inner.ChatCompletion(ctx, req)
+		return callErr
+	})
+	if err != nil {
+		if errors.Is(err, circuitbreaker.ErrCircuitOpen) && c.Logger != nil {
+			c.Logger.Warn("llm circuit breaker open",
+				"base_url", req.BaseURL,
+				"model", req.Model,
+			)
+		}
+		return "", err
+	}
+	return result, nil
+}
+
+func (c *CircuitBreakingClient) getBreaker(req ChatRequest) *circuitbreaker.Breaker {
+	key := req.BaseURL + "|" + req.Model
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if b, ok := c.breakers[key]; ok {
+		return b
+	}
+	b := circuitbreaker.New(c.breakerConfig)
+	c.breakers[key] = b
+	return b
 }
 
 func NewRetryingClient(inner LLMClient, cfg RetryConfig, logger *slog.Logger) *RetryingClient {

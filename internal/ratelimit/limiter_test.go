@@ -188,11 +188,35 @@ func TestResult_ResetAt(t *testing.T) {
 	}, store)
 
 	result, _ := limiter.Allow(ctx, "user1")
-	
+
 	// ResetAt should be approximately 1 hour from now
 	expectedReset := time.Now().Add(time.Hour)
 	diff := result.ResetAt.Sub(expectedReset)
 	if diff < -time.Second || diff > time.Second {
 		t.Errorf("ResetAt = %v, expected around %v", result.ResetAt, expectedReset)
+	}
+}
+
+func TestLimiter_EvictExpiredCache(t *testing.T) {
+	limiter := New(Config{
+		Window:      time.Minute,
+		MaxRequests: 10,
+		KeyPrefix:   "test:",
+	}, NewMemoryStore())
+
+	limiter.mu.Lock()
+	limiter.cache["expired"] = &cacheEntry{count: 1, expiresAt: time.Now().Add(-time.Second)}
+	limiter.cache["active"] = &cacheEntry{count: 1, expiresAt: time.Now().Add(time.Minute)}
+	limiter.mu.Unlock()
+
+	limiter.evictExpiredCache()
+
+	limiter.mu.RLock()
+	defer limiter.mu.RUnlock()
+	if _, ok := limiter.cache["expired"]; ok {
+		t.Fatal("expected expired cache entry to be evicted")
+	}
+	if _, ok := limiter.cache["active"]; !ok {
+		t.Fatal("expected active cache entry to remain")
 	}
 }

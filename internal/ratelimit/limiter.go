@@ -70,6 +70,8 @@ type Result struct {
 // Check checks if a request is allowed for the given key.
 // Returns whether the request is allowed and remaining quota.
 func (l *Limiter) Check(ctx context.Context, key string) (Result, error) {
+	l.evictExpiredCache()
+
 	fullKey := l.cfg.KeyPrefix + key
 	now := time.Now()
 	windowStart := now.Add(-l.cfg.Window).Unix()
@@ -155,6 +157,17 @@ func (l *Limiter) incrementCache(key string) {
 	defer l.mu.Unlock()
 	if entry, ok := l.cache[key]; ok {
 		entry.count++
+	}
+}
+
+func (l *Limiter) evictExpiredCache() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	for key, entry := range l.cache {
+		if entry.expiresAt.Before(now) {
+			delete(l.cache, key)
+		}
 	}
 }
 
