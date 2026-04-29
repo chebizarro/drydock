@@ -818,6 +818,46 @@ func (s *Store) SetReviewEventID(ctx context.Context, patchEventID, repoID, revi
 	return nil
 }
 
+// ClearReviewEventID removes a provisional review event ID that was set before
+// publishing but for which the actual relay publish failed. This allows the
+// next retry to generate and publish a new event rather than incorrectly
+// assuming the prior event was already published.
+func (s *Store) ClearReviewEventID(ctx context.Context, patchEventID, repoID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE review_log SET review_event_id=NULL WHERE patch_event_id=? AND repo_id=? AND status != 'published'`,
+		patchEventID, repoID,
+	)
+	if err != nil {
+		return fmt.Errorf("clear review event id: %w", err)
+	}
+	return nil
+}
+
+// GetReviewEventIDAndStatus returns the review_event_id and status for a review
+// log entry. Used for idempotency checks that need to verify both that an event
+// was signed AND successfully published. Returns empty strings if not found.
+func (s *Store) GetReviewEventIDAndStatus(ctx context.Context, patchEventID, repoID string) (eventID, status string, err error) {
+	var reviewEventID sql.NullString
+	var reviewStatus sql.NullString
+	err = s.db.QueryRowContext(ctx,
+		`SELECT review_event_id, status FROM review_log WHERE patch_event_id=? AND repo_id=?`,
+		patchEventID, repoID,
+	).Scan(&reviewEventID, &reviewStatus)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", nil
+		}
+		return "", "", fmt.Errorf("get review event id and status: %w", err)
+	}
+	if reviewEventID.Valid {
+		eventID = reviewEventID.String
+	}
+	if reviewStatus.Valid {
+		status = reviewStatus.String
+	}
+	return eventID, status, nil
+}
+
 func (s *Store) CountReviewLog(ctx context.Context) (int64, error) {
 	var n int64
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_log`).Scan(&n); err != nil {

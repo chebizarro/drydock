@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite" // Register sqlite driver for validation
 )
 
 type Config struct {
@@ -289,7 +291,7 @@ func (c *Config) validateDatabase(ctx context.Context) error {
 	}
 
 	// Try to open and ping
-	db, err := sql.Open("sqlite3", c.DatabaseURL)
+	db, err := sql.Open("sqlite", c.DatabaseURL)
 	if err != nil {
 		return fmt.Errorf("failed to open: %w", err)
 	}

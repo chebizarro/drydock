@@ -206,7 +206,10 @@ func (s *Store) TryAuthorizeFreeReview(ctx context.Context, patchEventID, repoID
 		return false, err
 	}
 
-	return tx.Commit() == nil, nil
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // AuthorizeReviewFromSubscription creates an authorized payment record

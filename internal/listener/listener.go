@@ -99,8 +99,11 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.store != nil {
 		if hwm, err := s.store.GetListenerHighWaterMark(ctx); err == nil && hwm > 0 {
 			// Use high-water-mark with a small overlap to handle clock skew.
+			// Choose the MORE RECENT timestamp (larger unix timestamp) to avoid
+			// re-processing events we've already seen, while still respecting
+			// the lookback window for initial startup.
 			hwmWithOverlap := hwm - 30
-			if hwmWithOverlap < since {
+			if hwmWithOverlap > since {
 				since = hwmWithOverlap
 			}
 			s.logger.Info("using persisted high-water-mark for lookback",

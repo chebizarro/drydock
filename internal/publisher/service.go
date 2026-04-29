@@ -83,21 +83,31 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	}
 
 	// Idempotency check: if a prior run already published a review event for
-	// this patch/repo but crashed before marking it published in the DB,
-	// skip re-publishing and just mark it published now.
-	if priorEventID, err := s.store.GetReviewEventID(ctx, in.PatchEventID, in.RepoID); err == nil && priorEventID != "" {
-		s.logger.Info("review already published by prior run, marking published",
+	// this patch/repo, skip re-publishing. We must check BOTH that an event ID
+	// exists AND that the status is 'published'. If there's an event ID but
+	// status is not 'published', it means we crashed after signing but before
+	// relay publish completed - we should clear the stale ID and retry.
+	if priorEventID, status, err := s.store.GetReviewEventIDAndStatus(ctx, in.PatchEventID, in.RepoID); err == nil && priorEventID != "" {
+		if status == "published" {
+			s.logger.Info("review already published by prior run",
+				"patch_event_id", in.PatchEventID,
+				"repo_id", in.RepoID,
+				"review_event_id", priorEventID,
+			)
+			return priorEventID, nil
+		}
+		// Event ID exists but status is not 'published' - prior publish attempt
+		// failed after signing. Clear the stale ID so we can retry properly.
+		s.logger.Info("clearing stale review event ID from failed prior publish",
 			"patch_event_id", in.PatchEventID,
 			"repo_id", in.RepoID,
-			"review_event_id", priorEventID,
+			"stale_event_id", priorEventID,
+			"status", status,
 		)
-		if err := s.store.MarkReviewPublished(ctx, in.PatchEventID, in.RepoID, priorEventID); err != nil {
-			// If it's already published, that's fine.
-			if !errors.Is(err, db.ErrReviewNotFound) {
-				return priorEventID, nil
-			}
+		if err := s.store.ClearReviewEventID(ctx, in.PatchEventID, in.RepoID); err != nil {
+			s.logger.Warn("failed to clear stale review event ID (continuing)",
+				"patch_event_id", in.PatchEventID, "error", err)
 		}
-		return priorEventID, nil
 	}
 
 	patchRec, err := s.store.GetPatchEvent(ctx, in.PatchEventID)
@@ -153,6 +163,12 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	metrics.PublishAttempts.Inc()
 	if err := s.publish.Publish(ctx, relays, summaryEvent); err != nil {
 		metrics.PublishFailures.Inc()
+		// Clear the provisional event ID so the next retry can generate a fresh event.
+		// This prevents the idempotency check from incorrectly thinking we already published.
+		if clearErr := s.store.ClearReviewEventID(ctx, in.PatchEventID, in.RepoID); clearErr != nil {
+			s.logger.Warn("failed to clear review event ID after publish failure",
+				"patch_event_id", in.PatchEventID, "error", clearErr)
+		}
 		return "", fmt.Errorf("publish summary review event: %w", err)
 	}
 	if err := s.store.InsertReviewEvent(ctx, summaryEvent, in.PatchEventID, in.RepoID); err != nil {
