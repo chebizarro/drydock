@@ -33,3 +33,7 @@ tmp/
 # Node (if any tooling uses it)
 node_modules/
 extensions/vscode-drydock/out/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key

@@ -1,6 +1,7 @@
 {
   "database": "dolt",
-  "jsonl_export": "issues.jsonl",
   "backend": "dolt",
-  "dolt_database": "beads_drydock"
+  "dolt_mode": "embedded",
+  "dolt_database": "beads_drydock",
+  "project_id": "1ed9d6ee-e49c-4ab5-9251-0805285870db"
 }
