@@ -25,14 +25,13 @@ func DefaultProviders(opts ...BuilderOptions) []Provider {
 		opt = opts[0]
 	}
 
-	extractor := symbols.New()
 	srch := newSearcher()
 
 	providers := []Provider{
 		patchDiffProvider{},
 		fileContextProvider{},
 		changeImpactProvider{search: srch},
-		symbolsCallsitesProvider{lspClient: opt.lspClient, extractor: extractor, search: srch},
+		symbolsCallsitesProvider{lspClient: opt.lspClient, search: srch},
 		testsProvider{search: srch},
 		importsExportsProvider{},
 		commitHistoryProvider{},
@@ -118,7 +117,6 @@ func (fileContextProvider) Build(_ context.Context, in BuildInput) (string, erro
 
 type symbolsCallsitesProvider struct {
 	lspClient *lspbridge.Client   // optional LSP bridge for type-aware analysis
-	extractor  *symbols.Extractor // tree-sitter symbol extractor
 	search    *searcher           // ripgrep with git grep fallback
 }
 
@@ -129,9 +127,13 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 		return "", nil
 	}
 
+	// Create per-call extractor (not shared — tree-sitter parser is mutable).
+	extractor := symbols.New()
+	defer extractor.Close()
+
 	// Try tree-sitter extraction first for accurate, AST-based symbol detection.
 	// Falls back to regex for unsupported languages or when tree-sitter is unavailable.
-	syms := p.extractWithTreeSitter(in)
+	syms := p.extractWithTreeSitter(in, extractor)
 	if len(syms) == 0 {
 		syms = extractChangedSymbols(in.PatchEventContent)
 	}
@@ -175,8 +177,8 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 
 // extractWithTreeSitter parses changed files from the diff using tree-sitter
 // and returns symbol names that overlap with changed line ranges.
-func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput) []string {
-	if p.extractor == nil {
+func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput, extractor *symbols.Extractor) []string {
+	if extractor == nil {
 		return nil
 	}
 
@@ -205,7 +207,7 @@ func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput) []string 
 		}
 
 		changedLines := extractChangedLineNumbers(f)
-		result, err := p.extractor.ExtractChanged(lang, source, changedLines)
+		result, err := extractor.ExtractChanged(lang, source, changedLines)
 		if err != nil {
 			continue
 		}
