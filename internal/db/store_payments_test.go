@@ -244,6 +244,63 @@ func TestAuthorizeReviewFromSubscription(t *testing.T) {
 	}
 }
 
+func TestMarkReviewPaymentTokenSpent(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	// Create pending payment
+	err := store.UpsertPendingReviewPayment(ctx, ReviewPaymentRecord{
+		PatchEventID:     "patch-1",
+		RepoID:           "repo-1",
+		AuthorPubkey:     "author-1",
+		RequestedMode:    "review",
+		TokenHash:        "hash123",
+		MintURL:          "https://mint.example.com",
+		InvoiceID:        "inv-1",
+		InvoiceRequest:   "lnbc...",
+		InvoiceExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("UpsertPendingReviewPayment: %v", err)
+	}
+
+	// Mark token as spent
+	if err := store.MarkReviewPaymentTokenSpent(ctx, "patch-1"); err != nil {
+		t.Fatalf("MarkReviewPaymentTokenSpent: %v", err)
+	}
+
+	// Verify status is token_spent
+	got, err := store.GetReviewPayment(ctx, "patch-1")
+	if err != nil {
+		t.Fatalf("GetReviewPayment: %v", err)
+	}
+	if got.Status != "token_spent" {
+		t.Errorf("expected status 'token_spent', got %q", got.Status)
+	}
+
+	// Token should be considered used to prevent double-spending
+	used, err := store.IsTokenHashUsed(ctx, "hash123")
+	if err != nil {
+		t.Fatalf("IsTokenHashUsed: %v", err)
+	}
+	if !used {
+		t.Error("expected token_spent hash to be considered used")
+	}
+
+	// Should be able to complete authorization from token_spent state
+	if err := store.MarkReviewPaymentAuthorized(ctx, "patch-1", "cashu_review"); err != nil {
+		t.Fatalf("MarkReviewPaymentAuthorized from token_spent: %v", err)
+	}
+
+	got, _ = store.GetReviewPayment(ctx, "patch-1")
+	if got.Status != "authorized" {
+		t.Errorf("expected status 'authorized', got %q", got.Status)
+	}
+	if got.AccessKind != "cashu_review" {
+		t.Errorf("expected access_kind 'cashu_review', got %q", got.AccessKind)
+	}
+}
+
 func TestIsTokenHashUsed(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)

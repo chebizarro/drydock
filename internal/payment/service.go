@@ -279,7 +279,13 @@ func (s *Service) processTokenPayment(
 		return deny("token_spent")
 	}
 
-	// Finalize authorization.
+	// Mark token as spent immediately to create recoverable state.
+	// If subsequent steps fail, reconciliation can complete authorization.
+	if err := s.store.MarkReviewPaymentTokenSpent(ctx, patchEventID); err != nil {
+		return AuthorizeResult{}, fmt.Errorf("mark token spent: %w", err)
+	}
+
+	// Finalize authorization in steps that can be retried.
 	accessKind := "cashu_review"
 	if mode == "subscription" {
 		accessKind = "cashu_subscription"

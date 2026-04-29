@@ -218,7 +218,7 @@ CREATE TABLE IF NOT EXISTS review_payments (
   patch_event_id TEXT PRIMARY KEY,
   repo_id TEXT NOT NULL,
   author_pubkey TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('pending', 'authorized')),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'token_spent', 'authorized')),
   access_kind TEXT NOT NULL DEFAULT ''
     CHECK (access_kind IN ('', 'free_tier', 'subscription', 'cashu_review', 'cashu_subscription')),
   requested_mode TEXT NOT NULL DEFAULT 'review'

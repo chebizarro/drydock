@@ -11,7 +11,7 @@ type ReviewPaymentRecord struct {
 	PatchEventID     string
 	RepoID           string
 	AuthorPubkey     string
-	Status           string // pending, authorized
+	Status           string // pending, token_spent, authorized
 	AccessKind       string // free_tier, subscription, cashu_review, cashu_subscription
 	RequestedMode    string // review, subscription
 	TokenHash        string
@@ -87,13 +87,26 @@ func (s *Store) DeletePendingReviewPayment(ctx context.Context, patchEventID str
 	return err
 }
 
+// MarkReviewPaymentTokenSpent marks that a payment token has been melted but authorization is not yet complete.
+// This creates a recoverable state if subsequent authorization steps fail.
+func (s *Store) MarkReviewPaymentTokenSpent(ctx context.Context, patchEventID string) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_payments
+		SET status = 'token_spent', updated_at = ?
+		WHERE patch_event_id = ? AND status = 'pending'
+	`, now, patchEventID)
+	return err
+}
+
 // MarkReviewPaymentAuthorized marks a review payment as authorized.
+// Accepts payments in 'pending' or 'token_spent' status for recovery scenarios.
 func (s *Store) MarkReviewPaymentAuthorized(ctx context.Context, patchEventID, accessKind string) error {
 	now := time.Now().Unix()
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE review_payments
 		SET status = 'authorized', access_kind = ?, updated_at = ?
-		WHERE patch_event_id = ?
+		WHERE patch_event_id = ? AND status IN ('pending', 'token_spent')
 	`, accessKind, now, patchEventID)
 	return err
 }
@@ -228,10 +241,11 @@ func (s *Store) AuthorizeReviewFromSubscription(ctx context.Context, patchEventI
 }
 
 // IsTokenHashUsed checks if a token hash has already been used for payment.
+// Considers both 'token_spent' and 'authorized' status to prevent double-spending during recovery.
 func (s *Store) IsTokenHashUsed(ctx context.Context, tokenHash string) (bool, error) {
 	var exists int
 	err := s.db.QueryRowContext(ctx, `
-		SELECT 1 FROM review_payments WHERE token_hash = ? AND status = 'authorized'
+		SELECT 1 FROM review_payments WHERE token_hash = ? AND status IN ('token_spent', 'authorized')
 		UNION ALL
 		SELECT 1 FROM payment_subscriptions WHERE source_token_hash = ?
 		LIMIT 1

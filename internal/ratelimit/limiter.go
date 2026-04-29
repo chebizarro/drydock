@@ -16,6 +16,11 @@ type Store interface {
 	GetRateLimitCount(ctx context.Context, key string, windowStart int64) (int, error)
 	// IncrementRateLimit records an event for a key at the current time.
 	IncrementRateLimit(ctx context.Context, key string, timestamp int64) error
+	// CheckAndIncrementRateLimit atomically checks the count and increments if under limit.
+	// Returns (count_before_increment, incremented, error).
+	// If count < maxRequests, it increments and returns (count, true, nil).
+	// If count >= maxRequests, it does not increment and returns (count, false, nil).
+	CheckAndIncrementRateLimit(ctx context.Context, key string, windowStart int64, timestamp int64, maxRequests int) (int, bool, error)
 	// CleanupOldRateLimits removes entries older than the given timestamp.
 	CleanupOldRateLimits(ctx context.Context, olderThan int64) (int64, error)
 }
@@ -110,26 +115,39 @@ func (l *Limiter) Check(ctx context.Context, key string) (Result, error) {
 // Allow checks and increments the counter if allowed.
 // This is the typical use case - check and consume in one call.
 func (l *Limiter) Allow(ctx context.Context, key string) (Result, error) {
-	result, err := l.Check(ctx, key)
-	if err != nil {
-		return result, err
-	}
+	l.evictExpiredCache()
 
-	if !result.Allowed {
-		return result, nil
-	}
-
-	// Increment the counter
 	fullKey := l.cfg.KeyPrefix + key
-	if err := l.store.IncrementRateLimit(ctx, fullKey, time.Now().Unix()); err != nil {
-		return result, fmt.Errorf("increment rate limit: %w", err)
+	now := time.Now()
+	windowStart := now.Add(-l.cfg.Window).Unix()
+	timestamp := now.Unix()
+
+	// Atomically check and increment
+	count, incremented, err := l.store.CheckAndIncrementRateLimit(ctx, fullKey, windowStart, timestamp, l.cfg.MaxRequests)
+	if err != nil {
+		return Result{}, fmt.Errorf("check and increment rate limit: %w", err)
 	}
 
-	// Update result and cache
-	result.Remaining--
-	l.incrementCache(fullKey)
+	resetAt := now.Add(l.cfg.Window)
 
-	return result, nil
+	if incremented {
+		// Request was allowed and counter was incremented
+		remaining := l.cfg.MaxRequests - count - 1
+		l.setCache(fullKey, count+1, resetAt)
+		return Result{
+			Allowed:   true,
+			Remaining: max(0, remaining),
+			ResetAt:   resetAt,
+		}, nil
+	}
+
+	// Request was denied - limit exceeded
+	l.setCache(fullKey, count, resetAt)
+	return Result{
+		Allowed:   false,
+		Remaining: 0,
+		ResetAt:   resetAt,
+	}, nil
 }
 
 // Cleanup removes old rate limit entries from the database.
@@ -244,6 +262,32 @@ func (m *MemoryStore) IncrementRateLimit(ctx context.Context, key string, timest
 	return nil
 }
 
+func (m *MemoryStore) CheckAndIncrementRateLimit(ctx context.Context, key string, windowStart int64, timestamp int64, maxRequests int) (int, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Count current requests in window
+	timestamps, ok := m.entries[key]
+	count := 0
+	if ok {
+		for _, ts := range timestamps {
+			if ts >= windowStart {
+				count++
+			}
+		}
+	}
+
+	// Check if under limit
+	if count < maxRequests {
+		// Increment
+		m.entries[key] = append(m.entries[key], timestamp)
+		return count, true, nil
+	}
+
+	// Over limit, do not increment
+	return count, false, nil
+}
+
 func (m *MemoryStore) CleanupOldRateLimits(ctx context.Context, olderThan int64) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -294,6 +338,47 @@ func (s *SQLStore) IncrementRateLimit(ctx context.Context, key string, timestamp
 		INSERT INTO rate_limits (key, timestamp) VALUES (?, ?)
 	`, key, timestamp)
 	return err
+}
+
+func (s *SQLStore) CheckAndIncrementRateLimit(ctx context.Context, key string, windowStart int64, timestamp int64, maxRequests int) (int, bool, error) {
+	// Begin transaction for atomic check-and-increment
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback() // Rollback if we don't commit
+
+	// Count current requests in window
+	var count int
+	err = tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM rate_limits
+		WHERE key = ? AND timestamp >= ?
+	`, key, windowStart).Scan(&count)
+	if err != nil {
+		return 0, false, fmt.Errorf("count rate limits: %w", err)
+	}
+
+	// Check if under limit
+	if count < maxRequests {
+		// Insert new entry
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO rate_limits (key, timestamp) VALUES (?, ?)
+		`, key, timestamp)
+		if err != nil {
+			return 0, false, fmt.Errorf("insert rate limit: %w", err)
+		}
+
+		// Commit transaction
+		if err = tx.Commit(); err != nil {
+			return 0, false, fmt.Errorf("commit transaction: %w", err)
+		}
+
+		return count, true, nil
+	}
+
+	// Over limit - rollback (no insert)
+	tx.Rollback()
+	return count, false, nil
 }
 
 func (s *SQLStore) CleanupOldRateLimits(ctx context.Context, olderThan int64) (int64, error) {

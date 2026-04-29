@@ -2,6 +2,8 @@ package ratelimit
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -218,5 +220,67 @@ func TestLimiter_EvictExpiredCache(t *testing.T) {
 	}
 	if _, ok := limiter.cache["active"]; !ok {
 		t.Fatal("expected active cache entry to remain")
+	}
+}
+
+// TestLimiter_ConcurrentAllow tests that concurrent calls to Allow()
+// properly enforce the rate limit without allowing excess requests.
+func TestLimiter_ConcurrentAllow(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	maxRequests := 10
+	limiter := New(Config{
+		Window:      time.Minute,
+		MaxRequests: maxRequests,
+		KeyPrefix:   "test:",
+	}, store)
+
+	key := "concurrent_user"
+	concurrency := 50 // Many more than the limit
+
+	var allowedCount atomic.Int32
+	var deniedCount atomic.Int32
+	var wg sync.WaitGroup
+
+	// Spawn many concurrent requests
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := limiter.Allow(ctx, key)
+			if err != nil {
+				t.Errorf("Allow failed: %v", err)
+				return
+			}
+			if result.Allowed {
+				allowedCount.Add(1)
+			} else {
+				deniedCount.Add(1)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	allowed := int(allowedCount.Load())
+	denied := int(deniedCount.Load())
+
+	// Verify exactly maxRequests were allowed
+	if allowed != maxRequests {
+		t.Errorf("allowed = %d, want exactly %d (denied = %d)", allowed, maxRequests, denied)
+	}
+
+	// Verify remaining were denied
+	if denied != concurrency-maxRequests {
+		t.Errorf("denied = %d, want %d", denied, concurrency-maxRequests)
+	}
+
+	// Double-check with store count
+	count, err := store.GetRateLimitCount(ctx, "test:"+key, time.Now().Add(-time.Minute).Unix())
+	if err != nil {
+		t.Fatalf("GetRateLimitCount failed: %v", err)
+	}
+	if count != maxRequests {
+		t.Errorf("store count = %d, want exactly %d", count, maxRequests)
 	}
 }
