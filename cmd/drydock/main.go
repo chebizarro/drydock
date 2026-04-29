@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"drydock/internal/circuitbreaker"
+	"drydock/internal/codechat"
 	"drydock/internal/codeindex"
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
@@ -20,6 +21,7 @@ import (
 	"drydock/internal/driftguard"
 	"drydock/internal/embedding"
 	"drydock/internal/health"
+	"drydock/internal/idegateway"
 	"drydock/internal/ingest"
 	"drydock/internal/listener"
 	"drydock/internal/lspbridge"
@@ -27,6 +29,7 @@ import (
 	"drydock/internal/metareview"
 	"drydock/internal/metrics"
 	"drydock/internal/nipingest"
+	"drydock/internal/payment"
 	"drydock/internal/pipeline"
 	"drydock/internal/promptrefine"
 	"drydock/internal/publisher"
@@ -192,6 +195,7 @@ func main() {
 	if len(writeRelays) == 0 {
 		writeRelays = cfg.Relays
 	}
+	relayPub := publisher.NewNostrRelayPublisher(pool, logger)
 
 	// --- Health check server ---
 	healthAddr := cfg.HealthAddr
@@ -209,9 +213,8 @@ func main() {
 			circuitbreaker.DefaultConfig(),
 			logger,
 		)
-		relayPub := publisher.NewNostrRelayPublisher(pool, logger)
 		convHandler = conversation.New(conversation.Config{
-			Endpoint:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.PlannerModel},
+			Endpoint:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel},
 			Temperature:   0.3,
 			DefaultRelays: writeRelays,
 			ResponseTTL:   30 * 24 * time.Hour,
@@ -233,18 +236,30 @@ func main() {
 			logger.Warn("failed to resolve signer pubkey for autofix loop suppression", "error", err)
 		}
 	}
-	processor := ingest.NewProcessor(store, logger, processorOpts...)
-	svc := listener.New(listener.Config{
-		Relays:          readRelays,
-		LookbackMinutes: cfg.ListenerLookbackMin,
-	}, processor, logger, listener.WithPool(pool), listener.WithStore(store))
-
 	// --- Repo service ---
 	repoManager := repo.NewManager(cfg.RepoCacheDir, logger,
 		repo.WithMaxRepoCount(cfg.RepoCacheMaxCount),
 		repo.WithMaxCacheSizeMB(cfg.RepoCacheMaxSizeMB),
 	)
 	repoSvc := repo.NewService(store, repoManager, logger)
+
+	// --- Payment service (used when a repo enables payments in .drydock.yaml) ---
+	var invoiceProvider payment.InvoiceProvider
+	if cfg.PaymentNWCURI != "" {
+		var err error
+		invoiceProvider, err = payment.NewNWCInvoiceProvider(payment.NWCConfig{URI: cfg.PaymentNWCURI})
+		if err != nil {
+			logger.Error("failed to configure NWC payment provider", "error", err)
+			os.Exit(1)
+		}
+	} else if len(cfg.PaymentTrustedMints) > 0 {
+		logger.Warn("trusted Cashu mints configured but NWC connection is missing; Cashu token payments cannot be authorized")
+	}
+	mintClient := payment.NewCashuMintClient(10 * time.Second)
+	paymentSvc := payment.New(payment.Config{
+		TrustedMints: cfg.PaymentTrustedMints,
+	}, store, invoiceProvider, mintClient, logger)
+	logger.Info("payment service configured", "nwc_configured", invoiceProvider != nil, "trusted_mints", len(cfg.PaymentTrustedMints))
 
 	// --- Optional service clients ---
 	var builderOpts []func(*contextbuilder.BuilderOptions)
@@ -258,7 +273,7 @@ func main() {
 		embedClient = embedding.NewClient(cfg.EmbedBaseURL, cfg.EmbedAPIKey, cfg.EmbedModel)
 
 		// Ensure collections exist (non-fatal).
-		vectorDim := 768 // default for nomic-embed
+		vectorDim := cfg.EmbedDimension
 		for _, col := range []string{vectorstore.CollectionNIPSpecs, vectorstore.CollectionProjectDocs, vectorstore.CollectionFewShot, vectorstore.CollectionCodeChunks} {
 			if err := qdrantClient.EnsureCollection(ctx, col, vectorDim); err != nil {
 				logger.Warn("failed to ensure Qdrant collection", "collection", col, "error", err)
@@ -272,9 +287,9 @@ func main() {
 		if codeProvider != nil {
 			builderOpts = append(builderOpts, contextbuilder.WithExtraProviders(codeProvider))
 		}
-		codeIndexer = codeindex.New(qdrantClient, embedClient, logger)
+		codeIndexer = codeindex.New(qdrantClient, embedClient, logger, vectorDim)
 
-		logger.Info("Qdrant + embedding configured", "qdrant", cfg.QdrantURL, "embed_model", cfg.EmbedModel)
+		logger.Info("Qdrant + embedding configured", "qdrant", cfg.QdrantURL, "embed_model", cfg.EmbedModel, "embed_dimension", vectorDim)
 	} else if cfg.QdrantURL != "" || cfg.EmbedBaseURL != "" {
 		logger.Warn("both DRYDOCK_QDRANT_URL and DRYDOCK_EMBED_BASE_URL must be set for RAG features")
 	}
@@ -312,10 +327,10 @@ func main() {
 		logger,
 	)
 	engine := reviewengine.New(reviewengine.Config{
-		Planner:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.PlannerModel},
-		Coder32B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.Coder32BModel},
-		LLM70B:       reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.LLM70BModel},
-		Coder14B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.Coder14BModel},
+		Planner:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel},
+		Coder32B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey), Model: cfg.Coder32BModel},
+		LLM70B:       reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.LLM70BAPIKey), Model: cfg.LLM70BModel},
+		Coder14B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder14BAPIKey), Model: cfg.Coder14BModel},
 		PlannerTemp:  0.1,
 		ReviewerTemp: 0.2,
 	}, llmClient, logger)
@@ -323,7 +338,6 @@ func main() {
 	// --- Publisher ---
 	var pubSvc *publisher.Service
 	if signer != nil {
-		relayPub := publisher.NewNostrRelayPublisher(pool, logger)
 		pubSvc = publisher.New(publisher.Config{
 			DefaultRelays:       writeRelays,
 			DetailSeverityFloor: "high",
@@ -347,7 +361,7 @@ func main() {
 		metaOpts = append(metaOpts, metareview.WithQdrant(qdrantClient, embedClient))
 	}
 	metaSvc := metareview.New(metareview.Config{
-		Endpoint:         reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.MetaModel},
+		Endpoint:         reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.MetaAPIKey), Model: cfg.MetaModel},
 		RandomSampleRate: 0.15,
 		MinReuseJaccard:  0.85,
 		FewShotCap:       500,
@@ -357,9 +371,46 @@ func main() {
 	// --- Prompt refinement (reuses the meta-review LLM endpoint) ---
 	prSvc := promptrefine.New(promptrefine.Config{
 		Threshold:          promptrefine.DefaultThreshold,
-		Endpoint:           reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.MetaModel},
+		Endpoint:           reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.MetaAPIKey), Model: cfg.MetaModel},
 		EvalScoreTolerance: 0.05,
 	}, store, metaClient, logger)
+
+	// --- Event handlers registered before subscribing ---
+	if signer != nil && qdrantClient != nil && embedClient != nil {
+		if keyer, ok := signer.(codechat.Keyer); ok {
+			codeChatHandler := codechat.New(codechat.Config{
+				Endpoint:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel},
+				Temperature:   0.4,
+				DefaultRelays: writeRelays,
+			}, store, qdrantClient, embedClient, llmClient, keyer, relayPub, logger)
+			processorOpts = append(processorOpts, ingest.WithCodeChat(codeChatHandler))
+			logger.Info("codechat handler registered")
+		} else {
+			logger.Warn("codechat handler disabled", "requires", "signer with encryption/decryption support")
+		}
+	} else {
+		logger.Warn("codechat handler disabled", "requires", "signer and Qdrant+embedding")
+	}
+
+	if signer != nil {
+		ideHandler := idegateway.New(idegateway.Config{DefaultRelays: writeRelays}, store, ctxBuilder, engine, signer, relayPub, logger)
+		processorOpts = append(processorOpts, ingest.WithIDEGateway(ideHandler))
+		logger.Info("IDE gateway handler registered")
+
+		marketRegistry := marketplace.NewRegistry(store, logger)
+		marketRouter := marketplace.NewRouter(marketplace.RouterConfig{DefaultRelays: writeRelays}, marketRegistry, store, signer, relayPub, logger)
+		marketHandler := marketplace.NewHandler(marketRegistry, marketRouter, store, logger)
+		processorOpts = append(processorOpts, ingest.WithMarketplace(marketHandler))
+		logger.Info("marketplace handler registered")
+	} else {
+		logger.Warn("IDE gateway and marketplace handlers disabled", "requires", "signer")
+	}
+
+	processor := ingest.NewProcessor(store, logger, processorOpts...)
+	svc := listener.New(listener.Config{
+		Relays:          readRelays,
+		LookbackMinutes: cfg.ListenerLookbackMin,
+	}, processor, logger, listener.WithPool(pool), listener.WithStore(store))
 
 	// --- Pipeline runner ---
 	var pipelineRunner *pipeline.Runner
@@ -368,6 +419,9 @@ func main() {
 		pipelineOpts = append(pipelineOpts, pipeline.WithPromptRefiner(prSvc))
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityScanner(secScanner))
 		pipelineOpts = append(pipelineOpts, pipeline.WithActivityHeartbeat(healthSrv.RecordActivity))
+		if paymentSvc != nil {
+			pipelineOpts = append(pipelineOpts, pipeline.WithPaymentAuthorizer(paymentSvc))
+		}
 		if codeIndexer != nil {
 			pipelineOpts = append(pipelineOpts, pipeline.WithCodeIndexer(codeIndexer))
 		}
@@ -608,7 +662,8 @@ func runNIPIngest(cfg config.Config, logger *slog.Logger) {
 
 	ingester := nipingest.NewIngester(qdrantClient, embedClient, logger)
 	n, err := ingester.Run(ctx, nipingest.Config{
-		NIPsDir: cfg.NIPsDir,
+		NIPsDir:   cfg.NIPsDir,
+		VectorDim: cfg.EmbedDimension,
 	})
 	if err != nil {
 		logger.Error("NIP ingest failed", "error", err)

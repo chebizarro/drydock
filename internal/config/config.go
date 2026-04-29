@@ -26,37 +26,40 @@ type Config struct {
 	LogLevel            slog.Level
 	ListenerLookbackMin int
 
-	PlannerBaseURL  string
-	PlannerModel    string
-	Coder32BBaseURL string
-	Coder32BModel   string
-	LLM70BBaseURL   string
-	LLM70BModel     string
-	Coder14BBaseURL string
-	Coder14BModel   string
-	LLMAPIKey          string
-	PlannerAPIKey      string
-	Coder32BAPIKey     string
-	LLM70BAPIKey       string
-	Coder14BAPIKey     string
-	MetaAPIKey         string
-	SignerBunkerURL    string
-	SignerNsec         string
-	SignerNsecFile     string
-	SignerSocketPath   string
-	SignerDBus         bool
-	QdrantURL       string
-	QdrantAPIKey    string
-	EmbedBaseURL    string
-	EmbedModel      string
-	EmbedAPIKey     string
-	LSPBridgeURL    string
-	MetaBaseURL     string
-	MetaModel       string
-	EvalDatasetPath string
-	NIPsDir         string
-	HealthAddr      string
-	PipelineWorkers int
+	PlannerBaseURL      string
+	PlannerModel        string
+	Coder32BBaseURL     string
+	Coder32BModel       string
+	LLM70BBaseURL       string
+	LLM70BModel         string
+	Coder14BBaseURL     string
+	Coder14BModel       string
+	LLMAPIKey           string
+	PlannerAPIKey       string
+	Coder32BAPIKey      string
+	LLM70BAPIKey        string
+	Coder14BAPIKey      string
+	MetaAPIKey          string
+	SignerBunkerURL     string
+	SignerNsec          string
+	SignerNsecFile      string
+	SignerSocketPath    string
+	SignerDBus          bool
+	QdrantURL           string
+	QdrantAPIKey        string
+	EmbedBaseURL        string
+	EmbedModel          string
+	EmbedAPIKey         string
+	EmbedDimension      int
+	PaymentNWCURI       string
+	PaymentTrustedMints []string
+	LSPBridgeURL        string
+	MetaBaseURL         string
+	MetaModel           string
+	EvalDatasetPath     string
+	NIPsDir             string
+	HealthAddr          string
+	PipelineWorkers     int
 }
 
 func FromEnv() Config {
@@ -72,18 +75,18 @@ func FromEnv() Config {
 	}
 
 	return Config{
-		DatabaseURL:         envOrDefault("DRYDOCK_DATABASE_URL", "file:drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)"),
-		RepoCacheDir:        envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
-		RepoCacheMaxCount:   parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_COUNT", "50"), 50),
-		RepoCacheMaxSizeMB:  parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_SIZE_MB", "10240"), 10240),
+		DatabaseURL:        envOrDefault("DRYDOCK_DATABASE_URL", "file:drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)"),
+		RepoCacheDir:       envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
+		RepoCacheMaxCount:  parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_COUNT", "50"), 50),
+		RepoCacheMaxSizeMB: parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_SIZE_MB", "10240"), 10240),
 		Relays: splitCSV(
 			envOrDefault(
 				"DRYDOCK_RELAYS",
 				"wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net",
 			),
 		),
-		ReadRelays:  splitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
-		WriteRelays: splitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
+		ReadRelays:          splitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
+		WriteRelays:         splitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
 		LogLevel:            parseLogLevel(envOrDefault("DRYDOCK_LOG_LEVEL", "info")),
 		ListenerLookbackMin: parseIntOrDefault(envOrDefault("DRYDOCK_LISTENER_LOOKBACK_MIN", "5"), 5),
 		PlannerBaseURL:      envOrDefault("DRYDOCK_PLANNER_BASE_URL", "http://127.0.0.1:11434/v1"),
@@ -110,6 +113,9 @@ func FromEnv() Config {
 		EmbedBaseURL:        envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
 		EmbedModel:          envOrDefault("DRYDOCK_EMBED_MODEL", "nomic-embed-text"),
 		EmbedAPIKey:         envOrDefault("DRYDOCK_EMBED_API_KEY", ""),
+		EmbedDimension:      parseIntOrDefault(envOrDefault("DRYDOCK_EMBED_DIMENSION", "768"), 768),
+		PaymentNWCURI:       envOrDefault("DRYDOCK_NWC_CONNECTION_STRING", ""),
+		PaymentTrustedMints: paymentTrustedMints(),
 		LSPBridgeURL:        envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
 		MetaBaseURL:         envOrDefault("DRYDOCK_META_BASE_URL", "http://127.0.0.1:11436/v1"),
 		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", "llama-3.3-70b-instruct-q4_k_m"),
@@ -130,6 +136,13 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+func paymentTrustedMints() []string {
+	if mints := splitCSV(envOrDefault("DRYDOCK_CASHU_TRUSTED_MINTS", "")); len(mints) > 0 {
+		return mints
+	}
+	return splitCSV(envOrDefault("DRYDOCK_CASHU_MINT_URL", ""))
 }
 
 func parseLogLevel(v string) slog.Level {
@@ -241,11 +254,11 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 		baseURL string
 		apiKey  string
 	}{
-		"planner":  {baseURL: c.PlannerBaseURL, apiKey: c.effectiveLLMAPIKey(c.PlannerAPIKey)},
-		"coder32b": {baseURL: c.Coder32BBaseURL, apiKey: c.effectiveLLMAPIKey(c.Coder32BAPIKey)},
-		"70b":      {baseURL: c.LLM70BBaseURL, apiKey: c.effectiveLLMAPIKey(c.LLM70BAPIKey)},
-		"coder14b": {baseURL: c.Coder14BBaseURL, apiKey: c.effectiveLLMAPIKey(c.Coder14BAPIKey)},
-		"meta":     {baseURL: c.MetaBaseURL, apiKey: c.effectiveLLMAPIKey(c.MetaAPIKey)},
+		"planner":  {baseURL: c.PlannerBaseURL, apiKey: c.EffectiveLLMAPIKey(c.PlannerAPIKey)},
+		"coder32b": {baseURL: c.Coder32BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.Coder32BAPIKey)},
+		"70b":      {baseURL: c.LLM70BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.LLM70BAPIKey)},
+		"coder14b": {baseURL: c.Coder14BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.Coder14BAPIKey)},
+		"meta":     {baseURL: c.MetaBaseURL, apiKey: c.EffectiveLLMAPIKey(c.MetaAPIKey)},
 	}
 	for name, endpoint := range llmEndpoints {
 		baseURL := endpoint.baseURL
@@ -263,6 +276,15 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 	if c.EmbedBaseURL != "" && c.QdrantURL == "" {
 		result.Warnings = append(result.Warnings, "DRYDOCK_EMBED_BASE_URL set but DRYDOCK_QDRANT_URL not set: RAG features disabled")
+	}
+	if c.EmbedDimension <= 0 {
+		result.Errors = append(result.Errors, "DRYDOCK_EMBED_DIMENSION must be at least 1")
+	}
+	if c.PaymentNWCURI != "" && len(c.PaymentTrustedMints) == 0 {
+		result.Warnings = append(result.Warnings, "DRYDOCK_NWC_CONNECTION_STRING set but no trusted Cashu mints configured (set DRYDOCK_CASHU_TRUSTED_MINTS or DRYDOCK_CASHU_MINT_URL)")
+	}
+	if c.PaymentNWCURI == "" && len(c.PaymentTrustedMints) > 0 {
+		result.Warnings = append(result.Warnings, "trusted Cashu mints configured but DRYDOCK_NWC_CONNECTION_STRING is empty: paid reviews cannot be authorized")
 	}
 
 	// --- Pipeline workers ---
@@ -313,7 +335,9 @@ func (c *Config) validateDatabase(ctx context.Context) error {
 	return nil
 }
 
-func (c *Config) effectiveLLMAPIKey(override string) string {
+// EffectiveLLMAPIKey returns an endpoint-specific API key when configured,
+// falling back to the global DRYDOCK_LLM_API_KEY.
+func (c *Config) EffectiveLLMAPIKey(override string) string {
 	if strings.TrimSpace(override) != "" {
 		return override
 	}
@@ -327,7 +351,7 @@ func (c *Config) checkLLMEndpoint(ctx context.Context, baseURL, apiKey string) e
 	defer cancel()
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	
+
 	// Try /v1/models or just /models
 	endpoints := []string{
 		strings.TrimSuffix(baseURL, "/") + "/models",
@@ -341,7 +365,7 @@ func (c *Config) checkLLMEndpoint(ctx context.Context, baseURL, apiKey string) e
 			lastErr = err
 			continue
 		}
-		
+
 		if apiKey != "" {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}

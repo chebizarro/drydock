@@ -192,6 +192,10 @@ func (s *Service) processTokenPayment(
 		return AuthorizeResult{Allowed: false, Reason: reason}, nil
 	}
 
+	if s.invoice == nil || s.mint == nil {
+		return deny("payment_service_not_configured")
+	}
+
 	// Parse the token.
 	parsed, err := s.mint.ParseToken(token)
 	if err != nil {

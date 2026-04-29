@@ -13,6 +13,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/metareview"
 	"drydock/internal/metrics"
+	"drydock/internal/payment"
 	"drydock/internal/promptrefine"
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
@@ -45,6 +46,11 @@ type CodeIndexer interface {
 	IndexRepo(ctx context.Context, repoPath, repoID string) error
 }
 
+// PaymentAuthorizer gates reviews according to the repository payment policy.
+type PaymentAuthorizer interface {
+	AuthorizePatch(ctx context.Context, patchEvent nostr.Event, repoID string, policy repoconfig.PaymentsConfig) (payment.AuthorizeResult, error)
+}
+
 type Runner struct {
 	store            *db.Store
 	repoSvc          *repo.Service
@@ -57,6 +63,7 @@ type Runner struct {
 	docIngester      DocIngester
 	codeIndexer      CodeIndexer
 	secScanner       *securityscan.Scanner
+	paymentAuth      PaymentAuthorizer
 	queue            <-chan db.ReviewTask
 	workers          int
 	logger           *slog.Logger
@@ -106,6 +113,13 @@ func WithCodeIndexer(ci CodeIndexer) func(*Runner) {
 func WithSecurityScanner(scanner *securityscan.Scanner) func(*Runner) {
 	return func(r *Runner) {
 		r.secScanner = scanner
+	}
+}
+
+// WithPaymentAuthorizer enables per-repository payment gating before expensive review work.
+func WithPaymentAuthorizer(auth PaymentAuthorizer) func(*Runner) {
+	return func(r *Runner) {
+		r.paymentAuth = auth
 	}
 }
 
@@ -246,11 +260,42 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		if cfgErr != nil {
 			r.logger.Warn("failed to parse .drydock.yaml, using defaults",
 				"patch_event_id", task.PatchEventID, "repo_id", task.RepoID, "error", cfgErr)
+			if repoconfig.ContainsPaymentsConfig(prep.BaseRepoConfig) {
+				return fmt.Errorf("payment_blocked:invalid_repo_payment_policy")
+			}
 			repoCfg = repoconfig.Default()
 		}
 	}
 
-	// 1c. Index project documentation (non-fatal; skip if repo config disables docs).
+	// 1c. Get patch event for payment authorization, context builder, and meta-review.
+	patchRec, err := r.store.GetPatchEvent(ctx, task.PatchEventID)
+	if err != nil {
+		return fmt.Errorf("get patch event: %w", err)
+	}
+	var patchEvent nostr.Event
+	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
+		return fmt.Errorf("decode patch event: %w", err)
+	}
+
+	// 1d. Authorize payment-gated repositories before documentation/code indexing, context building, or LLM calls.
+	if repoCfg.Payments.Enabled {
+		if r.paymentAuth == nil {
+			return fmt.Errorf("payment_blocked:payment_service_not_configured")
+		}
+		auth, err := r.paymentAuth.AuthorizePatch(ctx, patchEvent, task.RepoID, repoCfg.Payments)
+		if err != nil {
+			return fmt.Errorf("authorize payment: %w", err)
+		}
+		if !auth.Allowed {
+			return fmt.Errorf("payment_blocked:%s", auth.Reason)
+		}
+		log.Info("review payment authorized",
+			"patch_event_id", task.PatchEventID,
+			"repo_id", task.RepoID,
+			"access_kind", auth.AccessKind)
+	}
+
+	// 1e. Index project documentation (non-fatal; skip if repo config disables docs).
 	if r.docIngester != nil && repoCfg.DocsEnabled() {
 		timer.Time(tracing.StageDocIngest, func() error {
 			if err := r.docIngester.IngestRepoDocs(ctx, prep.RepoPath, task.RepoID); err != nil {
@@ -260,7 +305,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		})
 	}
 
-	// 1d. Index source code for semantic search (non-fatal; skip on error).
+	// 1f. Index source code for semantic search (non-fatal; skip on error).
 	if r.codeIndexer != nil {
 		timer.Time(tracing.StageCodeIndex, func() error {
 			if err := r.codeIndexer.IndexRepo(ctx, prep.RepoPath, task.RepoID); err != nil {
@@ -270,18 +315,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		})
 	}
 
-	// 2. Get patch event for context builder and meta-review
-	patchRec, err := r.store.GetPatchEvent(ctx, task.PatchEventID)
-	if err != nil {
-		return fmt.Errorf("get patch event: %w", err)
-	}
-
-	// 3. Extract actual diff content from the raw event.
+	// 2. Extract actual diff content from the raw event.
 	// The context builder expects unified diff content, not the JSON envelope.
-	var patchEvent nostr.Event
-	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
-		return fmt.Errorf("decode patch event for context: %w", err)
-	}
 	patchDiffContent := patchEvent.Content
 
 	// 3b. Validate that the patch diff is non-empty to avoid wasting an LLM call.

@@ -26,11 +26,11 @@ import (
 )
 
 const (
-	stateFileName  = "drydock-codeindex-state.json"
-	maxFileBytes   = 64 * 1024
-	maxChunkBytes  = 8 * 1024
-	upsertBatch    = 50
-	contextLines   = 2 // lines of context before/after each symbol
+	stateFileName = "drydock-codeindex-state.json"
+	maxFileBytes  = 64 * 1024
+	maxChunkBytes = 8 * 1024
+	upsertBatch   = 50
+	contextLines  = 2 // lines of context before/after each symbol
 )
 
 // indexState tracks the last indexed commit per repo.
@@ -42,22 +42,28 @@ type indexState struct {
 // Indexer manages semantic code indexing into Qdrant.
 // It is safe for concurrent use; per-repo serialisation is enforced internally.
 type Indexer struct {
-	qdrant   *vectorstore.Client
-	embedder *embedding.Client
-	logger   *slog.Logger
+	qdrant    *vectorstore.Client
+	embedder  *embedding.Client
+	logger    *slog.Logger
+	vectorDim int
 
 	repoLocks sync.Map // keyed by repoID → *sync.Mutex
 }
 
 // New creates a code indexer.
-func New(qdrant *vectorstore.Client, embedder *embedding.Client, logger *slog.Logger) *Indexer {
+func New(qdrant *vectorstore.Client, embedder *embedding.Client, logger *slog.Logger, vectorDims ...int) *Indexer {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	vectorDim := 768
+	if len(vectorDims) > 0 && vectorDims[0] > 0 {
+		vectorDim = vectorDims[0]
+	}
 	return &Indexer{
-		qdrant:   qdrant,
-		embedder: embedder,
-		logger:   logger,
+		qdrant:    qdrant,
+		embedder:  embedder,
+		logger:    logger,
+		vectorDim: vectorDim,
 	}
 }
 
@@ -80,7 +86,7 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 	defer mu.Unlock()
 
 	// Ensure collection exists.
-	if err := idx.qdrant.EnsureCollection(ctx, vectorstore.CollectionCodeChunks, 768); err != nil {
+	if err := idx.qdrant.EnsureCollection(ctx, vectorstore.CollectionCodeChunks, idx.vectorDim); err != nil {
 		return fmt.Errorf("ensure code_chunks collection: %w", err)
 	}
 

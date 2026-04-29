@@ -87,7 +87,7 @@ type AutoFixConfig struct {
 type StatusConfig struct {
 	Enabled           bool    `yaml:"enabled"`
 	OpenSeverityFloor string  `yaml:"open_severity_floor"` // findings at or above this trigger a 1630 status
-	MinConfidence     float64 `yaml:"min_confidence"`       // minimum review confidence to publish status
+	MinConfidence     float64 `yaml:"min_confidence"`      // minimum review confidence to publish status
 }
 
 // Default returns a RepoConfig with sensible defaults.
@@ -342,8 +342,16 @@ func (c RepoConfig) DocsEnabled() bool {
 // section is present but the config fails to parse.
 func ContainsPaymentsConfig(data []byte) bool {
 	for _, line := range bytes.Split(data, []byte("\n")) {
-		trimmed := bytes.TrimSpace(line)
-		if bytes.HasPrefix(trimmed, []byte("payments:")) {
+		trimmed := strings.TrimSpace(string(line))
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		key, _, ok := strings.Cut(trimmed, ":")
+		if !ok {
+			continue
+		}
+		key = strings.Trim(strings.TrimSpace(key), `"'`)
+		if key == "payments" {
 			return true
 		}
 	}
