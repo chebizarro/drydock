@@ -60,12 +60,12 @@ func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecor
 	if err != nil {
 		return PrepareResult{}, err
 	}
-	repoPath, err := s.manager.EnsureRepo(ctx, rec.RepoID, cloneURLs)
+	repoPath, err := s.manager.EnsureCanonicalRepo(ctx, rec.RepoID, cloneURLs)
 	if err != nil {
 		return PrepareResult{}, err
 	}
 
-	// Read .drydock.yaml from the base ref BEFORE applying patches.
+	// Read .drydock.yaml from the canonical base ref BEFORE applying patches.
 	baseConfig, cfgErr := s.manager.ReadFileAtDefaultRef(ctx, repoPath, ".drydock.yaml")
 	if cfgErr != nil {
 		s.logger.Warn("failed to read .drydock.yaml from base ref",
@@ -116,8 +116,9 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 	var baseConfig []byte
 	canonicalURLs, canonErr := s.store.GetRepositoryCloneURLs(ctx, rec.RepoID)
 	if canonErr == nil && len(canonicalURLs) > 0 {
-		// Ensure the canonical repo is available (may be a different path than the PR clone).
-		canonPath, ensureErr := s.manager.EnsureRepo(ctx, rec.RepoID, canonicalURLs)
+		// Ensure the canonical repo is available in a cache entry that is
+		// distinct from any PR/fork clone for this repo ID.
+		canonPath, ensureErr := s.manager.EnsureCanonicalRepo(ctx, rec.RepoID, canonicalURLs)
 		if ensureErr == nil {
 			baseConfig, _ = s.manager.ReadFileAtDefaultRef(ctx, canonPath, ".drydock.yaml")
 		} else {

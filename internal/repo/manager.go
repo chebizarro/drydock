@@ -2,6 +2,8 @@ package repo
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,7 +24,7 @@ type Manager struct {
 	baseDir      string
 	logger       *slog.Logger
 	repoLocks    sync.Map
-	maxCount     int // 0 = unlimited
+	maxCount     int   // 0 = unlimited
 	maxSizeBytes int64 // 0 = unlimited
 }
 
@@ -58,10 +60,19 @@ const (
 )
 
 func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []string) (string, error) {
+	return m.ensureRepoAtPath(ctx, m.repoPath(repoID), repoID, cloneURLs)
+}
+
+// EnsureCanonicalRepo ensures a clone of the canonical repository under a
+// cache entry that cannot be shared with PR/fork clones for the same repo ID.
+func (m *Manager) EnsureCanonicalRepo(ctx context.Context, repoID string, cloneURLs []string) (string, error) {
+	return m.ensureRepoAtPath(ctx, m.canonicalRepoPath(repoID), repoID, cloneURLs)
+}
+
+func (m *Manager) ensureRepoAtPath(ctx context.Context, repoPath, repoID string, cloneURLs []string) (string, error) {
 	if len(cloneURLs) == 0 {
 		return "", fmt.Errorf("no clone urls for repository %s", repoID)
 	}
-	repoPath := m.repoPath(repoID)
 
 	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
 		fetchCtx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
@@ -288,8 +299,16 @@ func (m *Manager) runGit(ctx context.Context, repoPath string, args ...string) (
 }
 
 func (m *Manager) repoPath(repoID string) string {
-	safe := strings.NewReplacer("/", "_", "\\", "_", ":", "__", " ", "_").Replace(repoID)
-	return filepath.Join(m.baseDir, safe)
+	return filepath.Join(m.baseDir, safeRepoPathComponent(repoID))
+}
+
+func (m *Manager) canonicalRepoPath(repoID string) string {
+	sum := sha256.Sum256([]byte("canonical\x00" + repoID))
+	return filepath.Join(m.baseDir, safeRepoPathComponent(repoID)+"__canonical_"+hex.EncodeToString(sum[:])[:12])
+}
+
+func safeRepoPathComponent(repoID string) string {
+	return strings.NewReplacer("/", "_", "\\", "_", ":", "__", " ", "_").Replace(repoID)
 }
 
 func (m *Manager) getRepoLock(repoPath string) *sync.Mutex {
