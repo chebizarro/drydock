@@ -34,10 +34,10 @@ useWebSocketImplementation(NodeWebSocket);
 // Nostr event kinds for IDE integration
 const KIND_IDE_SESSION = 30078;
 const IDE_SESSION_SCHEMA = 'drydock.ide-session.v1';
-const KIND_IDE_REVIEW_REQUEST = 1651;
-const KIND_IDE_REVIEW_RESPONSE = 1652;
-const KIND_IDE_FIX_REQUEST = 1653;
-const KIND_IDE_FIX_RESPONSE = 1654;
+const KIND_CONTEXTVM = 25910;
+const JSONRPC_VERSION = '2.0';
+const METHOD_REVIEW_REQUEST = 'review/request';
+const METHOD_APPLY_FIX = 'review/apply-fix';
 
 // Diagnostic collection for displaying findings
 let diagnosticCollection: vscode.DiagnosticCollection;
@@ -55,11 +55,12 @@ let latestReviewRequestId: string | undefined;
 
 // Store pending fixes by ID
 const pendingFixes: Map<string, PendingFix> = new Map();
+const pendingFixRequests: Map<string, { fixId: string; file: string; range: vscode.Range }> = new Map();
 
 interface PendingFix {
     file: string;
     range: vscode.Range;
-    suggestedFix: string;
+    suggestedFix?: string;
 }
 
 interface Diagnostic {
@@ -102,6 +103,39 @@ interface ReviewRequest {
     diff: string;
     changed_files: string[];
     full_review: boolean;
+}
+
+interface FixRequest {
+    session_id: string;
+    request_id: string;
+    fix_id: string;
+    file: string;
+}
+
+interface FixResponse {
+    request_id?: string;
+    session_id?: string;
+    fix_id: string;
+    success: boolean;
+    patch?: string;
+}
+
+interface JSONRPCRequest<T> {
+    jsonrpc: '2.0';
+    id: string;
+    method: string;
+    params: T;
+}
+
+interface JSONRPCResponse<T> {
+    jsonrpc: string;
+    id: string;
+    result?: T;
+    error?: {
+        code: number;
+        message: string;
+        data?: unknown;
+    };
 }
 
 interface DrydockConfig {
@@ -218,10 +252,11 @@ async function reviewChanges() {
             title: 'Drydock: Reviewing changes...',
             cancellable: false
         }, async () => {
+            const rpcRequest = buildJSONRPCRequest(requestId, METHOD_REVIEW_REQUEST, request);
             const requestEvent = signEvent({
-                kind: KIND_IDE_REVIEW_REQUEST,
-                content: JSON.stringify(request),
-                tags: buildReviewRequestTags(config, requestId)
+                kind: KIND_CONTEXTVM,
+                content: JSON.stringify(rpcRequest),
+                tags: buildContextVMRequestTags(config, requestId, METHOD_REVIEW_REQUEST)
             }, privateKey);
 
             await publishEvent(requestEvent);
@@ -258,6 +293,7 @@ function handleReviewResponse(response: ReviewResponse) {
     const diagnosticsByFile = new Map<string, vscode.Diagnostic[]>();
 
     pendingFixes.clear();
+    pendingFixRequests.clear();
 
     for (const diag of response.diagnostics) {
         const filePath = vscode.Uri.joinPath(workspaceFolder.uri, diag.file);
@@ -277,7 +313,7 @@ function handleReviewResponse(response: ReviewResponse) {
         }
 
         // Store fix information if available
-        if (diag.has_fix && diag.fix_id && diag.suggested_fix) {
+        if (diag.has_fix && diag.fix_id) {
             pendingFixes.set(diag.fix_id, {
                 file: diag.file,
                 range,
@@ -495,7 +531,7 @@ async function applyFix() {
 
     const items = fixes.map(([fixId, fix]) => ({
         label: `Fix in ${fix.file}`,
-        description: fix.suggestedFix.substring(0, 80),
+        description: fix.suggestedFix ? fix.suggestedFix.substring(0, 80) : fixId,
         fixId,
         fix
     }));
@@ -508,34 +544,73 @@ async function applyFix() {
         return;
     }
 
-    const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, selected.fix.file);
-
     try {
-        const document = await vscode.workspace.openTextDocument(fileUri);
-        const edit = new vscode.WorkspaceEdit();
-
-        if (isUnifiedDiff(selected.fix.suggestedFix)) {
-            const hunks = parseUnifiedDiffHunks(selected.fix.suggestedFix);
-            const updatedText = applyUnifiedDiffToText(document.getText(), hunks);
-            edit.replace(fileUri, getFullDocumentRange(document), updatedText);
-        } else {
-            const replacement = normalizeReplacementText(selected.fix.suggestedFix);
-            edit.replace(fileUri, selected.fix.range, replacement);
+        const config = getDrydockConfig();
+        const privateKey = parsePrivateKey(config.privateKey);
+        const drydockPubkey = tryParsePubkey(config.drydockPubkey);
+        if (!drydockPubkey) {
+            throw new Error('Configure drydock.drydockPubkey before requesting a fix');
         }
 
-        const applied = await vscode.workspace.applyEdit(edit);
-        if (!applied) {
-            throw new Error('VS Code rejected the workspace edit');
+        await refreshRelaySubscription({ announceSession: true, notifyOnFailure: true });
+
+        if (!relayPool || activeRelayUrls.length === 0) {
+            throw new Error('No Nostr relays configured');
         }
 
-        pendingFixes.delete(selected.fixId);
-        removeDiagnosticAtRange(fileUri, selected.fix.range);
+        const requestId = uuidv4();
+        const request: FixRequest = {
+            session_id: sessionId,
+            request_id: requestId,
+            fix_id: selected.fixId,
+            file: selected.fix.file
+        };
+        const rpcRequest = buildJSONRPCRequest(requestId, METHOD_APPLY_FIX, request);
+        const requestEvent = signEvent({
+            kind: KIND_CONTEXTVM,
+            content: JSON.stringify(rpcRequest),
+            tags: buildContextVMRequestTags(config, requestId, METHOD_APPLY_FIX)
+        }, privateKey);
 
-        vscode.window.showInformationMessage(`Applied fix in ${selected.fix.file}`);
+        pendingFixRequests.set(requestId, {
+            fixId: selected.fixId,
+            file: selected.fix.file,
+            range: selected.fix.range
+        });
+        await publishEvent(requestEvent);
+        vscode.window.showInformationMessage('Drydock: Fix request published');
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        vscode.window.showErrorMessage(`Failed to apply fix: ${message}`);
+        vscode.window.showErrorMessage(`Failed to request fix: ${message}`);
     }
+}
+
+async function applySuggestedFix(file: string, range: vscode.Range, suggestedFix: string) {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        vscode.window.showErrorMessage('No workspace folder open');
+        return;
+    }
+
+    const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, file);
+    const document = await vscode.workspace.openTextDocument(fileUri);
+    const edit = new vscode.WorkspaceEdit();
+
+    if (isUnifiedDiff(suggestedFix)) {
+        const hunks = parseUnifiedDiffHunks(suggestedFix);
+        const updatedText = applyUnifiedDiffToText(document.getText(), hunks);
+        edit.replace(fileUri, getFullDocumentRange(document), updatedText);
+    } else {
+        const replacement = normalizeReplacementText(suggestedFix);
+        edit.replace(fileUri, range, replacement);
+    }
+
+    const applied = await vscode.workspace.applyEdit(edit);
+    if (!applied) {
+        throw new Error('VS Code rejected the workspace edit');
+    }
+
+    removeDiagnosticAtRange(fileUri, range);
 }
 
 /**
@@ -544,6 +619,7 @@ async function applyFix() {
 function clearDiagnostics() {
     diagnosticCollection.clear();
     pendingFixes.clear();
+    pendingFixRequests.clear();
     vscode.window.showInformationMessage('Drydock: Diagnostics cleared');
 }
 
@@ -575,7 +651,7 @@ async function refreshRelaySubscription(options: { announceSession: boolean; not
             await reviewResponseSubscription?.close('refresh relay subscription');
 
             const filter: Filter = {
-                kinds: [KIND_IDE_REVIEW_RESPONSE],
+                kinds: [KIND_CONTEXTVM],
                 since: Math.floor(Date.now() / 1000)
             };
 
@@ -622,7 +698,7 @@ async function refreshRelaySubscription(options: { announceSession: boolean; not
 }
 
 function handleIncomingReviewEvent(event: Event) {
-    if (event.kind !== KIND_IDE_REVIEW_RESPONSE) {
+    if (event.kind !== KIND_CONTEXTVM) {
         return;
     }
 
@@ -631,16 +707,80 @@ function handleIncomingReviewEvent(event: Event) {
         return;
     }
 
-    const response = JSON.parse(event.content) as ReviewResponse;
-    if (response.session_id !== sessionId) {
+    const response = JSON.parse(event.content) as JSONRPCResponse<ReviewResponse | FixResponse>;
+    if (response.jsonrpc !== JSONRPC_VERSION) {
         return;
     }
 
-    if (latestReviewRequestId && response.request_id !== latestReviewRequestId) {
+    if (response.error) {
+        if (response.id === latestReviewRequestId || pendingFixRequests.has(response.id)) {
+            vscode.window.showWarningMessage(`Drydock: ${response.error.message}`);
+            pendingFixRequests.delete(response.id);
+        }
         return;
     }
 
-    handleReviewResponse(response);
+    if (!response.result) {
+        return;
+    }
+
+    if (isReviewResponse(response.result)) {
+        if (response.result.session_id !== sessionId) {
+            return;
+        }
+
+        if (latestReviewRequestId && response.id !== latestReviewRequestId && response.result.request_id !== latestReviewRequestId) {
+            return;
+        }
+
+        handleReviewResponse(response.result);
+        return;
+    }
+
+    if (isFixResponse(response.result)) {
+        void handleFixResponse(response.id, response.result);
+    }
+}
+
+function isReviewResponse(result: ReviewResponse | FixResponse): result is ReviewResponse {
+    return 'diagnostics' in result && Array.isArray(result.diagnostics);
+}
+
+function isFixResponse(result: ReviewResponse | FixResponse): result is FixResponse {
+    return 'fix_id' in result && 'success' in result;
+}
+
+async function handleFixResponse(responseId: string, response: FixResponse) {
+    if (response.session_id && response.session_id !== sessionId) {
+        return;
+    }
+
+    const pending = pendingFixRequests.get(responseId);
+    if (!pending) {
+        return;
+    }
+    pendingFixRequests.delete(responseId);
+
+    if (!response.success) {
+        vscode.window.showWarningMessage('Drydock: Fix was not available');
+        return;
+    }
+
+    const fix = pendingFixes.get(response.fix_id) ?? pendingFixes.get(pending.fixId);
+    const patch = response.patch ?? fix?.suggestedFix;
+    if (!patch) {
+        vscode.window.showWarningMessage('Drydock: Fix response did not include a patch');
+        return;
+    }
+
+    try {
+        await applySuggestedFix(pending.file, pending.range, patch);
+        pendingFixes.delete(pending.fixId);
+        vscode.window.showInformationMessage(`Applied fix in ${pending.file}`);
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`Failed to apply fix: ${message}`);
+    }
 }
 
 async function publishSessionAnnouncement(config: DrydockConfig) {
@@ -779,10 +919,20 @@ function tryParsePubkey(value: string): string | undefined {
     throw new Error('drydock.drydockPubkey must be an npub or 64-character hex public key');
 }
 
-function buildReviewRequestTags(config: DrydockConfig, requestId: string): string[][] {
+function buildJSONRPCRequest<T>(id: string, method: string, params: T): JSONRPCRequest<T> {
+    return {
+        jsonrpc: JSONRPC_VERSION,
+        id,
+        method,
+        params
+    };
+}
+
+function buildContextVMRequestTags(config: DrydockConfig, requestId: string, method: string): string[][] {
     const tags: string[][] = [
         ['session', sessionId],
-        ['request', requestId]
+        ['request', requestId],
+        ['method', method]
     ];
 
     const drydockPubkey = tryParsePubkey(config.drydockPubkey);

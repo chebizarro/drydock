@@ -31,15 +31,20 @@ AI-powered code review via Nostr — review uncommitted changes, see inline diag
 
 ## Protocol
 
-This extension communicates with Drydock using custom Nostr event kinds:
+This extension communicates with Drydock using Nostr-native event kinds:
 
 | Kind | Description |
 |------|-------------|
-| 31650 | IDE workspace session announcement |
-| 1651 | Review request (uncommitted diff) |
-| 1652 | Review response (diagnostics) |
-| 1653 | Fix apply request |
-| 1654 | Fix apply response |
+| 30078 | IDE workspace session announcement (NIP-78 app data, `d=drydock:ide-session:<session-id>`) |
+| 25910 | ContextVM JSON-RPC review requests, fix requests, and responses |
+
+Review and fix requests are kind 25910 events whose content is a JSON-RPC 2.0 request:
+
+```json
+{"jsonrpc":"2.0","id":"<uuid>","method":"review/request","params":{"session_id":"<session-id>","request_id":"<uuid>","diff":"<unified diff>","changed_files":["path/to/file"],"full_review":true}}
+```
+
+Fix requests use method `review/apply-fix` with `session_id`, `request_id`, `fix_id`, and `file` params. Drydock responses are also kind 25910 ContextVM events containing a JSON-RPC `result` or `error`.
 
 ## Development
 
