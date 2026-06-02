@@ -4,20 +4,17 @@
 //
 // # Nostr Event Kinds
 //
-//   - kind 31650: IDE workspace session (addressable, a=<session-id>)
-//   - kind 1651:  Review request from IDE (includes diff of uncommitted changes)
-//   - kind 1652:  Review findings response (diagnostics for the IDE)
-//   - kind 1653:  Fix apply request (apply a suggested fix)
-//   - kind 1654:  Fix apply result (success/failure)
+//   - kind 30078: IDE workspace session (NIP-78 app data, d=drydock:ide-session:<session-id>)
+//   - kind 25910: ContextVM JSON-RPC review requests, fix intents, and responses
 //
 // # Workflow
 //
-//  1. IDE connects and announces a workspace session (kind 31650)
-//  2. IDE sends a review request with uncommitted diff (kind 1651)
-//  3. Drydock processes the diff and publishes findings (kind 1652)
+//  1. IDE connects and announces a workspace session (kind 30078)
+//  2. IDE sends a ContextVM review/request intent with uncommitted diff (kind 25910)
+//  3. Drydock processes the diff and publishes findings as a ContextVM response (kind 25910)
 //  4. IDE displays findings as diagnostics inline
-//  5. User clicks "apply fix" → IDE sends fix request (kind 1653)
-//  6. Drydock resolves the stored suggested fix and returns it (kind 1654)
+//  5. User clicks "apply fix" → IDE sends review/apply-fix ContextVM request (kind 25910)
+//  6. Drydock resolves the stored suggested fix and returns a ContextVM response (kind 25910)
 package idegateway
 
 import (
@@ -28,15 +25,23 @@ import (
 
 // Event kinds for IDE integration.
 const (
-	KindIDESession        = 31650 // Addressable workspace session
-	KindIDEReviewRequest  = 1651  // Review request from IDE
-	KindIDEReviewResponse = 1652  // Review findings for IDE
-	KindIDEFixRequest     = 1653  // Apply fix request
-	KindIDEFixResponse    = 1654  // Apply fix result
+	KindIDESession = 30078 // NIP-78 app-specific workspace session
+	KindContextVM  = 25910 // ContextVM point-to-point IDE messages
 )
 
+const (
+	SchemaIDESession    = "drydock.ide-session.v1"
+	MethodReviewRequest = "review/request"
+	MethodApplyFix      = "review/apply-fix"
+)
+
+// BuildSessionDTag builds the NIP-78 d-tag for an IDE session.
+func BuildSessionDTag(sessionID string) string {
+	return "drydock:ide-session:" + sessionID
+}
+
 // IDESession represents an IDE workspace session announcement.
-// Published as kind 31650 with "d" tag for session ID.
+// Published as kind 30078 with "d" tag drydock:ide-session:<session-id>.
 type IDESession struct {
 	SessionID     string   `json:"session_id"`     // Unique session identifier
 	WorkspacePath string   `json:"workspace_path"` // Absolute path to workspace root
@@ -47,35 +52,50 @@ type IDESession struct {
 }
 
 // ReviewRequest represents an IDE request to review uncommitted changes.
-// Published as kind 1651 with reference to the session.
+// Sent as ContextVM JSON-RPC params for MethodReviewRequest.
 type ReviewRequest struct {
-	SessionID    string   `json:"session_id"`     // Reference to IDESession
-	RequestID    string   `json:"request_id"`     // Unique request identifier
-	Diff         string   `json:"diff"`           // Unified diff of uncommitted changes
-	ChangedFiles []string `json:"changed_files"`  // List of changed file paths
-	FullReview   bool     `json:"full_review"`    // Request full review vs quick diagnostics
+	SessionID    string   `json:"session_id"`    // Reference to IDESession
+	RequestID    string   `json:"request_id"`    // Unique request identifier
+	Diff         string   `json:"diff"`          // Unified diff of uncommitted changes
+	ChangedFiles []string `json:"changed_files"` // List of changed file paths
+	FullReview   bool     `json:"full_review"`   // Request full review vs quick diagnostics
 }
 
 // ReviewResponse contains findings for the IDE to display.
-// Published as kind 1652 as a reply to the review request.
+// Sent as the JSON-RPC result inside a ContextVM response (kind 25910)
+// with an "e" tag referencing the review request event.
 type ReviewResponse struct {
-	RequestID    string       `json:"request_id"`   // Reference to the ReviewRequest
-	SessionID    string       `json:"session_id"`   // Reference to IDESession
-	Diagnostics  []Diagnostic `json:"diagnostics"`  // Findings formatted as LSP diagnostics
-	Summary      string       `json:"summary"`      // Brief summary of the review
+	RequestID    string       `json:"request_id"`     // Reference to the ReviewRequest
+	SessionID    string       `json:"session_id"`     // Reference to IDESession
+	Diagnostics  []Diagnostic `json:"diagnostics"`    // Findings formatted as LSP diagnostics
+	Summary      string       `json:"summary"`        // Brief summary of the review
 	ReviewTimeMs int64        `json:"review_time_ms"` // Time taken to process
+}
+
+// JSONRPCResponse is the JSON-RPC 2.0 envelope used in ContextVM responses.
+type JSONRPCResponse struct {
+	JSONRPC string      `json:"jsonrpc"`
+	ID      string      `json:"id"`
+	Result  interface{} `json:"result,omitempty"`
+	Error   *RPCError   `json:"error,omitempty"`
+}
+
+// RPCError represents a JSON-RPC error.
+type RPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 }
 
 // Diagnostic represents a single finding in LSP-compatible format.
 // This maps directly to the LSP DiagnosticSeverity and structure.
 type Diagnostic struct {
-	File     string           `json:"file"`     // Relative path to the file
-	Range    DiagnosticRange  `json:"range"`    // Line/character range
-	Severity DiagnosticSeverity `json:"severity"` // 1=Error, 2=Warning, 3=Info, 4=Hint
-	Message  string           `json:"message"`  // Description of the issue
-	Source   string           `json:"source"`   // "drydock" or the model name
-	Code     string           `json:"code,omitempty"` // Category code (e.g., "security")
-	
+	File     string             `json:"file"`           // Relative path to the file
+	Range    DiagnosticRange    `json:"range"`          // Line/character range
+	Severity DiagnosticSeverity `json:"severity"`       // 1=Error, 2=Warning, 3=Info, 4=Hint
+	Message  string             `json:"message"`        // Description of the issue
+	Source   string             `json:"source"`         // "drydock" or the model name
+	Code     string             `json:"code,omitempty"` // Category code (e.g., "security")
+
 	// Fix information (if available)
 	HasFix       bool   `json:"has_fix,omitempty"`
 	SuggestedFix string `json:"suggested_fix,omitempty"` // Diff or replacement text
@@ -101,7 +121,7 @@ const (
 )
 
 // FixRequest represents an IDE request to apply a suggested fix.
-// Published as kind 1653 with reference to the original finding.
+// Sent as ContextVM JSON-RPC params for MethodApplyFix.
 type FixRequest struct {
 	SessionID string `json:"session_id"` // Reference to IDESession
 	RequestID string `json:"request_id"` // Unique request identifier
@@ -110,13 +130,13 @@ type FixRequest struct {
 }
 
 // FixResponse contains the result of applying a fix.
-// Published as kind 1654 as a reply to the fix request.
+// Published as the JSON-RPC result inside a ContextVM response (kind 25910).
 type FixResponse struct {
-	RequestID string `json:"request_id"` // Reference to the FixRequest
-	SessionID string `json:"session_id"` // Reference to IDESession
-	Success   bool   `json:"success"`    // Whether the fix was resolved and returned
-	Diff      string `json:"diff,omitempty"` // Suggested diff to apply (if successful)
-	Error     string `json:"error,omitempty"` // Error message (if failed)
+	RequestID string `json:"request_id,omitempty"` // Reference to the FixRequest
+	SessionID string `json:"session_id,omitempty"` // Reference to IDESession
+	FixID     string `json:"fix_id"`               // Reference to the diagnostic fix
+	Success   bool   `json:"success"`              // Whether the fix was resolved and returned
+	Patch     string `json:"patch,omitempty"`      // Suggested patch to apply (if successful)
 }
 
 // ParseReviewRequest parses a ReviewRequest from event content.

@@ -15,6 +15,7 @@ import (
 	"drydock/internal/codeindex"
 	"drydock/internal/config"
 	"drydock/internal/contextbuilder"
+	"drydock/internal/contextvm"
 	"drydock/internal/conversation"
 	"drydock/internal/dashboard"
 	"drydock/internal/db"
@@ -196,6 +197,15 @@ func main() {
 		writeRelays = cfg.Relays
 	}
 	relayPub := publisher.NewNostrRelayPublisher(pool, logger)
+
+	// --- ContextVM transport (MCP-over-Nostr JSON-RPC foundation) ---
+	contextVMTransport := contextvm.NewTransport(pool, signer, readRelays, writeRelays, logger)
+	contextVMRouter := contextvm.NewRouter()
+	logger.Info("contextvm transport initialized",
+		"kind", int(contextvm.KindContextVM),
+		"gift_wrap_kind", int(contextvm.KindGiftWrap),
+		"enabled", contextVMTransport != nil && contextVMRouter != nil && signer != nil,
+	)
 
 	// --- Health check server ---
 	healthAddr := cfg.HealthAddr
@@ -395,11 +405,20 @@ func main() {
 	if signer != nil {
 		ideHandler := idegateway.New(idegateway.Config{DefaultRelays: writeRelays}, store, ctxBuilder, engine, signer, relayPub, logger)
 		processorOpts = append(processorOpts, ingest.WithIDEGateway(ideHandler))
+		if err := contextvm.RegisterIDEMethods(contextVMRouter, ideHandler); err != nil {
+			logger.Error("failed to register IDE ContextVM handlers", "error", err)
+			os.Exit(1)
+		}
+		processorOpts = append(processorOpts, ingest.WithContextVM(contextVMRouter, contextVMTransport))
 		logger.Info("IDE gateway handler registered")
 
 		marketRegistry := marketplace.NewRegistry(store, logger)
-		marketRouter := marketplace.NewRouter(marketplace.RouterConfig{DefaultRelays: writeRelays}, marketRegistry, store, signer, relayPub, logger)
+		marketRouter := marketplace.NewRouter(marketplace.RouterConfig{DefaultRelays: writeRelays}, marketRegistry, store, signer, relayPub, contextVMTransport, logger)
 		marketHandler := marketplace.NewHandler(marketRegistry, marketRouter, store, logger)
+		if err := contextvm.RegisterMarketplaceMethods(contextVMRouter, marketHandler); err != nil {
+			logger.Error("failed to register marketplace contextvm methods", "error", err)
+			os.Exit(1)
+		}
 		processorOpts = append(processorOpts, ingest.WithMarketplace(marketHandler))
 		logger.Info("marketplace handler registered")
 	} else {

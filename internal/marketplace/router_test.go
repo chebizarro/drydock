@@ -12,6 +12,11 @@ import (
 	"fiatjaf.com/nostr"
 )
 
+const (
+	reviewer1Pubkey = "1111111111111111111111111111111111111111111111111111111111111111"
+	reviewer2Pubkey = "2222222222222222222222222222222222222222222222222222222222222222"
+)
+
 // mockSigner is a test signer that records signed events.
 type mockSigner struct {
 	pubkey nostr.PubKey
@@ -40,6 +45,22 @@ func (m *mockPublisher) Publish(ctx context.Context, relays []string, event nost
 	return nil
 }
 
+type mockContextVMTransport struct {
+	calls []contextVMCall
+}
+
+type contextVMCall struct {
+	id         string
+	method     string
+	params     any
+	recipients []nostr.PubKey
+}
+
+func (m *mockContextVMTransport) SendWithID(ctx context.Context, id, method string, params any, recipients ...nostr.PubKey) (string, error) {
+	m.calls = append(m.calls, contextVMCall{id: id, method: method, params: params, recipients: append([]nostr.PubKey(nil), recipients...)})
+	return id, nil
+}
+
 func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
@@ -48,6 +69,7 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	registry := NewRegistry(store, logger)
 	signer := &mockSigner{pubkey: nostr.PubKey{}}
 	publisher := &mockPublisher{}
+	contextVMTransport := &mockContextVMTransport{}
 
 	router := NewRouter(
 		RouterConfig{
@@ -59,17 +81,18 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 		store,
 		signer,
 		publisher,
+		contextVMTransport,
 		logger,
 	)
 
 	// Register two reviewers
 	reviewer1 := ReviewerProfile{
-		Pubkey:       "reviewer1",
+		Pubkey:       reviewer1Pubkey,
 		Languages:    []string{"go"},
 		Availability: AvailabilityAvailable,
 	}
 	reviewer2 := ReviewerProfile{
-		Pubkey:       "reviewer2",
+		Pubkey:       reviewer2Pubkey,
 		Languages:    []string{"go"},
 		Availability: AvailabilityAvailable,
 	}
@@ -80,7 +103,7 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	assignment := db.ReviewAssignment{
 		PatchEventID:      "patch123",
 		RepoID:            "repo1",
-		ReviewerPubkey:    "reviewer1",
+		ReviewerPubkey:    reviewer1Pubkey,
 		RequesterPubkey:   "author1",
 		Status:            "pending",
 		Priority:          2,
@@ -95,13 +118,13 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	// Simulate reviewer1 rejecting
 	rejection := ReviewRejection{
 		AssignmentID:   "assign-r1",
-		ReviewerPubkey: "reviewer1",
+		ReviewerPubkey: reviewer1Pubkey,
 		Reason:         "too busy",
 	}
 	rejectionJSON, _ := json.Marshal(rejection)
 
 	rejectionEvent := nostr.Event{
-		Kind:      nostr.Kind(KindReviewRejection),
+		Kind:      nostr.Kind(25910),
 		Content:   string(rejectionJSON),
 		PubKey:    nostr.PubKey{}, // Will be overwritten
 		CreatedAt: nostr.Now(),
@@ -113,19 +136,21 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 		t.Fatalf("HandleRejection failed: %v", err)
 	}
 
-	// Check that a new assignment was published
-	if len(publisher.published) == 0 {
-		t.Error("expected a reassignment to be published")
+	// Check that a new assignment was published via ContextVM
+	if len(contextVMTransport.calls) == 0 {
+		t.Fatal("expected a reassignment to be published")
 	}
 
 	// Verify the new assignment is to reviewer2 (not reviewer1)
-	if len(publisher.published) > 0 {
-		var newAssignment ReviewAssignment
-		json.Unmarshal([]byte(publisher.published[0].Content), &newAssignment)
-		
-		if newAssignment.ReviewerPubkey == "reviewer1" {
-			t.Error("reassignment should not be to the rejecting reviewer")
-		}
+	newAssignment := contextVMTransport.calls[0].params.(ReviewAssignment)
+	if newAssignment.ReviewerPubkey == reviewer1Pubkey {
+		t.Error("reassignment should not be to the rejecting reviewer")
+	}
+	if contextVMTransport.calls[0].method != MethodAssign {
+		t.Errorf("method = %s, want %s", contextVMTransport.calls[0].method, MethodAssign)
+	}
+	if contextVMTransport.calls[0].id != newAssignment.AssignmentID {
+		t.Errorf("id = %s, want %s", contextVMTransport.calls[0].id, newAssignment.AssignmentID)
 	}
 }
 
@@ -137,6 +162,7 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	registry := NewRegistry(store, logger)
 	signer := &mockSigner{pubkey: nostr.PubKey{}}
 	publisher := &mockPublisher{}
+	contextVMTransport := &mockContextVMTransport{}
 
 	router := NewRouter(
 		RouterConfig{
@@ -148,12 +174,13 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 		store,
 		signer,
 		publisher,
+		contextVMTransport,
 		logger,
 	)
 
 	// Register only one reviewer
 	reviewer1 := ReviewerProfile{
-		Pubkey:       "reviewer1",
+		Pubkey:       reviewer1Pubkey,
 		Languages:    []string{"go"},
 		Availability: AvailabilityAvailable,
 	}
@@ -163,7 +190,7 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	assignment := db.ReviewAssignment{
 		PatchEventID:      "patch456",
 		RepoID:            "repo1",
-		ReviewerPubkey:    "reviewer1",
+		ReviewerPubkey:    reviewer1Pubkey,
 		RequesterPubkey:   "author1",
 		Status:            "pending",
 		Priority:          2,
@@ -180,7 +207,7 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	rejectionJSON, _ := json.Marshal(rejection)
 
 	rejectionEvent := nostr.Event{
-		Kind:      nostr.Kind(KindReviewRejection),
+		Kind:      nostr.Kind(25910),
 		Content:   string(rejectionJSON),
 		CreatedAt: nostr.Now(),
 	}
@@ -192,8 +219,8 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	}
 
 	// No new assignment should be published (no alternatives)
-	if len(publisher.published) != 0 {
-		t.Errorf("expected no reassignment, but got %d published", len(publisher.published))
+	if len(contextVMTransport.calls) != 0 {
+		t.Errorf("expected no reassignment, but got %d published", len(contextVMTransport.calls))
 	}
 }
 
@@ -225,7 +252,7 @@ func TestRouter_DetectLanguages(t *testing.T) {
 				tc.files, len(langs), len(tc.expected))
 			continue
 		}
-		
+
 		langSet := make(map[string]bool)
 		for _, l := range langs {
 			langSet[l] = true

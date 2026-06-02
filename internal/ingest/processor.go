@@ -2,10 +2,12 @@ package ingest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 
+	"drydock/internal/contextvm"
 	"drydock/internal/db"
 	"drydock/internal/metrics"
 
@@ -34,6 +36,11 @@ type MarketplaceHandler interface {
 	HandleEvent(ctx context.Context, event nostr.Event, relayURL string) error
 }
 
+// ContextVMResponder publishes ContextVM JSON-RPC responses.
+type ContextVMResponder interface {
+	SendResponseToEvent(ctx context.Context, requestEventID, id string, result any, rpcErr *contextvm.Error, recipients ...nostr.PubKey) error
+}
+
 type Processor struct {
 	store              *db.Store
 	logger             *slog.Logger
@@ -42,6 +49,8 @@ type Processor struct {
 	codeChat           CodeChatHandler
 	ideGateway         IDEGatewayHandler
 	marketplace        MarketplaceHandler
+	contextVMRouter    *contextvm.Router
+	contextVMResponder ContextVMResponder
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
 }
 
@@ -79,6 +88,14 @@ func WithIDEGateway(h IDEGatewayHandler) func(*Processor) {
 func WithMarketplace(h MarketplaceHandler) func(*Processor) {
 	return func(p *Processor) {
 		p.marketplace = h
+	}
+}
+
+// WithContextVM sets the ContextVM router and responder for kind 25910 events.
+func WithContextVM(router *contextvm.Router, responder ContextVMResponder) func(*Processor) {
+	return func(p *Processor) {
+		p.contextVMRouter = router
+		p.contextVMResponder = responder
 	}
 }
 
@@ -212,7 +229,9 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			}()
 		}
 		return nil
-	case 31650, 1651, 1653: // IDE integration events
+	case contextvm.KindContextVM:
+		return p.handleContextVM(ctx, event, relayURL)
+	case 30078: // IDE integration events
 		// Route to IDE gateway handler.
 		if p.ideGateway != nil {
 			go func() {
@@ -226,7 +245,7 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			}()
 		}
 		return nil
-	case 30620, 1660, 1661, 1662, 1663: // Marketplace events
+	case 31990, 7000: // Marketplace events
 		// Route to marketplace handler.
 		if p.marketplace != nil {
 			go func() {
@@ -243,6 +262,36 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 	default:
 		return nil
 	}
+}
+
+func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, relayURL string) error {
+	if p.contextVMRouter == nil {
+		return nil
+	}
+
+	var msg contextvm.Message
+	if err := json.Unmarshal([]byte(event.Content), &msg); err != nil {
+		p.logger.Warn("invalid ContextVM message", "event_id", event.ID.Hex(), "error", err)
+		return nil
+	}
+	// Responses do not carry a method and should not be dispatched to method handlers.
+	if msg.Method == "" {
+		return nil
+	}
+
+	resp, err := p.contextVMRouter.Handle(ctx, contextvm.Request{
+		Event:  event,
+		Relay:  relayURL,
+		Sender: event.PubKey,
+		Msg:    msg,
+	})
+	if err != nil {
+		return err
+	}
+	if p.contextVMResponder == nil || resp.ID == "" {
+		return nil
+	}
+	return p.contextVMResponder.SendResponseToEvent(ctx, event.ID.Hex(), resp.ID, resp.Result, resp.Error, event.PubKey)
 }
 
 // hasAutofixTag checks if an event carries the drydock-autofix tag.

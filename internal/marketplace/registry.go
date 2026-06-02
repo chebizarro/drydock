@@ -11,6 +11,8 @@ import (
 
 	"drydock/internal/db"
 	"drydock/internal/metrics"
+
+	"fiatjaf.com/nostr"
 )
 
 // Registry tracks registered reviewers and their profiles.
@@ -30,6 +32,17 @@ type cachedReviewer struct {
 }
 
 const cacheExpiry = 5 * time.Minute
+
+// ReviewerProfileQueryFilter scopes Nostr queries to Drydock reviewer NIP-89 app handlers.
+func ReviewerProfileQueryFilter() nostr.Filter {
+	return nostr.Filter{
+		Kinds: []nostr.Kind{nostr.Kind(KindReviewerProfile)},
+		Tags: nostr.TagMap{
+			"d": []string{ReviewerProfileDTag},
+			"k": []string{ReviewerProfileHandledKind},
+		},
+	}
+}
 
 // NewRegistry creates a reviewer registry.
 func NewRegistry(store *db.Store, logger *slog.Logger) *Registry {
@@ -396,12 +409,21 @@ func (r *Registry) RecordFeedback(ctx context.Context, feedback ReviewFeedback) 
 		return fmt.Errorf("invalid rating: %d", feedback.Rating)
 	}
 
+	assignment, err := r.store.GetAssignmentByCompletionEventID(ctx, feedback.ReviewEventID)
+	if err != nil {
+		return fmt.Errorf("find assignment by review event: %w", err)
+	}
+	if feedback.ReviewerPubkey == "" {
+		feedback.ReviewerPubkey = assignment.ReviewerPubkey
+	}
+
 	dbFeedback := db.ReviewFeedback{
-		AssignmentID:   0, // Should be looked up
+		AssignmentID:   assignment.ID,
 		ReviewerPubkey: feedback.ReviewerPubkey,
-		RaterPubkey:    "", // Filled by caller
+		RaterPubkey:    feedback.RaterPubkey,
 		Rating:         feedback.Rating,
 		Comment:        feedback.Comment,
+		EventID:        feedback.EventID,
 	}
 	if err := r.store.RecordFeedback(ctx, dbFeedback); err != nil {
 		return err
@@ -440,7 +462,7 @@ func (r *Registry) recalculateReputation(ctx context.Context, pubkey string) err
 	// - 40% average rating (normalized to 0-1)
 	// - 20% volume bonus (diminishing returns)
 	volumeBonus := 1.0 - (1.0 / (1.0 + float64(stats.CompletedReviews)/10.0))
-	
+
 	overallScore := (acceptanceRate*0.4 + (avgRating/5.0)*0.4 + volumeBonus*0.2)
 
 	// Save reputation

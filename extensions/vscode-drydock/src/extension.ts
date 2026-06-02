@@ -32,7 +32,8 @@ const NodeWebSocket = require('ws');
 useWebSocketImplementation(NodeWebSocket);
 
 // Nostr event kinds for IDE integration
-const KIND_IDE_SESSION = 31650;
+const KIND_IDE_SESSION = 30078;
+const IDE_SESSION_SCHEMA = 'drydock.ide-session.v1';
 const KIND_IDE_REVIEW_REQUEST = 1651;
 const KIND_IDE_REVIEW_RESPONSE = 1652;
 const KIND_IDE_FIX_REQUEST = 1653;
@@ -670,7 +671,10 @@ async function publishSessionAnnouncement(config: DrydockConfig) {
         kind: KIND_IDE_SESSION,
         content: JSON.stringify(announcement),
         tags: [
-            ['d', sessionId]
+            ['d', `drydock:ide-session:${sessionId}`],
+            ['type', 'ide-session'],
+            ['schema', IDE_SESSION_SCHEMA],
+            ['client', `vscode-drydock/${extensionVersion}`]
         ]
     }, privateKey);
 

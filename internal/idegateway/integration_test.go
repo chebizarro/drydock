@@ -1,6 +1,3 @@
-//go:build integration
-// +build integration
-
 package idegateway
 
 import (
@@ -11,6 +8,7 @@ import (
 	"testing"
 
 	"drydock/internal/contextbuilder"
+	"drydock/internal/contextvm"
 	"drydock/internal/reviewengine"
 
 	"fiatjaf.com/nostr"
@@ -37,7 +35,7 @@ func (p *integRelayPublisher) Publish(_ context.Context, _ []string, event nostr
 	return nil
 }
 
-func TestIntegrationIDEGatewayReviewToFixFlow(t *testing.T) {
+func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
@@ -69,32 +67,39 @@ func TestIntegrationIDEGatewayReviewToFixFlow(t *testing.T) {
 	sessionEvent := nostr.Event{
 		Kind:    nostr.Kind(KindIDESession),
 		Content: `{"workspace_path":"/tmp/repo","editor":"vscode","version":"1.0.0"}`,
-		Tags:    nostr.Tags{{"d", "sess-1"}},
+		Tags: nostr.Tags{
+			{"d", BuildSessionDTag("sess-1")},
+			{"type", "ide-session"},
+			{"schema", SchemaIDESession},
+			{"client", "vscode-drydock/1.0.0"},
+		},
 	}
 	if err := handler.HandleEvent(ctx, sessionEvent, "wss://relay.test"); err != nil {
 		t.Fatalf("handle session: %v", err)
 	}
 
-	reviewEvent := nostr.Event{
-		Kind: nostr.Kind(KindIDEReviewRequest),
-		Content: `{
-			"session_id":"sess-1",
-			"request_id":"req-1",
-			"diff":"diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+func x() int { return 0 }\n",
-			"changed_files":["main.go"]
-		}`,
-	}
-	if err := handler.HandleEvent(ctx, reviewEvent, "wss://relay.test"); err != nil {
-		t.Fatalf("handle review request: %v", err)
+	reviewParams := json.RawMessage(`{
+		"session_id":"sess-1",
+		"request_id":"req-1",
+		"diff":"diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+func x() int { return 0 }\n",
+		"changed_files":["main.go"]
+	}`)
+	reviewResult, rpcErr := handler.HandleReviewRequest(ctx, contextvm.Request{
+		Relay: "wss://relay.test",
+		Msg: contextvm.Message{
+			JSONRPC: "2.0",
+			ID:      "req-1",
+			Method:  MethodReviewRequest,
+			Params:  reviewParams,
+		},
+	})
+	if rpcErr != nil {
+		t.Fatalf("handle review request: %v", rpcErr.Message)
 	}
 
-	if len(pub.events) != 1 {
-		t.Fatalf("published events after review = %d, want 1", len(pub.events))
-	}
-
-	var reviewResp ReviewResponse
-	if err := json.Unmarshal([]byte(pub.events[0].Content), &reviewResp); err != nil {
-		t.Fatalf("unmarshal review response: %v", err)
+	reviewResp, ok := reviewResult.(ReviewResponse)
+	if !ok {
+		t.Fatalf("review result = %T, want ReviewResponse", reviewResult)
 	}
 	if len(reviewResp.Diagnostics) != 1 {
 		t.Fatalf("diagnostics = %d, want 1", len(reviewResp.Diagnostics))
@@ -108,35 +113,36 @@ func TestIntegrationIDEGatewayReviewToFixFlow(t *testing.T) {
 		t.Fatal("expected suggested_fix in review response")
 	}
 
-	fixEvent := nostr.Event{
-		Kind: nostr.Kind(KindIDEFixRequest),
-		Content: `{
-			"session_id":"sess-1",
-			"request_id":"fix-req-1",
-			"fix_id":"` + diag.FixID + `",
-			"file":"main.go"
-		}`,
-	}
-	if err := handler.HandleEvent(ctx, fixEvent, "wss://relay.test"); err != nil {
-		t.Fatalf("handle fix request: %v", err)
+	fixParams := json.RawMessage(`{
+		"session_id":"sess-1",
+		"request_id":"fix-req-1",
+		"fix_id":"` + diag.FixID + `",
+		"file":"main.go"
+	}`)
+	fixResult, rpcErr := handler.HandleApplyFixRequest(ctx, contextvm.Request{
+		Relay: "wss://relay.test",
+		Msg: contextvm.Message{
+			JSONRPC: "2.0",
+			ID:      "fix-req-1",
+			Method:  MethodApplyFix,
+			Params:  fixParams,
+		},
+	})
+	if rpcErr != nil {
+		t.Fatalf("handle fix request: %v", rpcErr.Message)
 	}
 
-	if len(pub.events) != 2 {
-		t.Fatalf("published events after fix = %d, want 2", len(pub.events))
-	}
-
-	var fixResp FixResponse
-	if err := json.Unmarshal([]byte(pub.events[1].Content), &fixResp); err != nil {
-		t.Fatalf("unmarshal fix response: %v", err)
+	fixResp, ok := fixResult.(FixResponse)
+	if !ok {
+		t.Fatalf("fix result = %T, want FixResponse", fixResult)
 	}
 	if !fixResp.Success {
-		t.Fatalf("fix response not successful: %s", fixResp.Error)
+		t.Fatal("fix response not successful")
 	}
-	if fixResp.Diff == "" {
-		t.Fatal("expected diff in fix response")
+	if fixResp.Patch == "" {
+		t.Fatal("expected patch in fix response")
 	}
-	if fixResp.Diff != diag.SuggestedFix {
-		t.Fatalf("fix diff mismatch: got %q want %q", fixResp.Diff, diag.SuggestedFix)
+	if fixResp.Patch != diag.SuggestedFix {
+		t.Fatalf("fix patch mismatch: got %q want %q", fixResp.Patch, diag.SuggestedFix)
 	}
 }
-

@@ -17,13 +17,13 @@ Drydock provides real-time code review diagnostics directly in your IDE through 
 │  │                            │                    │             │  │
 │  │  ┌─────────────────────────┴────────────────────┴──────────┐ │  │
 │  │  │              Drydock IDE Extension                       │ │  │
-│  │  │  • Session management (kind 31650)                       │ │  │
-│  │  │  • Review requests (kind 1651)                           │ │  │
-│  │  │  • Fix applications (kind 1653)                          │ │  │
+│  │  │  • Session state (kind 30078 / NIP-78)                  │ │  │
+│  │  │  • Review RPC (kind 25910 / ContextVM)                  │ │  │
+│  │  │  • Fix RPC (kind 25910 / ContextVM)                     │ │  │
 │  │  └────────────────────────┬────────────────────────────────┘ │  │
 │  └───────────────────────────┼────────────────────────────────────┘  │
 └──────────────────────────────┼──────────────────────────────────────┘
-                               │ Nostr (encrypted)
+                               │ Nostr + NIP-59 encryption
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        Drydock Server                                │
@@ -38,76 +38,94 @@ Drydock provides real-time code review diagnostics directly in your IDE through 
 
 | Kind | Name | Direction | Description |
 |------|------|-----------|-------------|
-| 31650 | IDE Session | IDE → Server | Establishes workspace session (replaceable) |
-| 1651 | Review Request | IDE → Server | Request review for file/selection |
-| 1652 | Review Response | Server → IDE | Diagnostics from review |
-| 1653 | Fix Request | IDE → Server | Request auto-fix for a diagnostic |
-| 1654 | Fix Response | Server → IDE | Generated fix patch |
+| 30078 | IDE Session | IDE → Relay | NIP-78 application data for replaceable workspace session state |
+| 25910 | ContextVM JSON-RPC | IDE ↔ Server | Review requests/responses and fix requests/responses |
+| 1059 | NIP-59 Gift Wrap | IDE ↔ Server | Encrypted envelope for private session, review, and fix payloads |
+
+Deprecated mappings: `31650` is replaced by `30078`; `1651`, `1652`, `1653`, and `1654` are replaced by ContextVM JSON-RPC messages on kind `25910`.
 
 ## Protocol Flow
 
 ### 1. Session Establishment
 
-When the IDE extension activates:
+When the IDE extension activates, it publishes replaceable NIP-78 application data:
 
 ```json
 {
-  "kind": 31650,
+  "kind": 30078,
   "content": {
     "workspace": "/path/to/project",
     "repo_url": "github.com/user/project",
     "capabilities": ["review", "fix", "explain"]
   },
   "tags": [
-    ["d", "session-uuid"],
-    ["client", "vscode-drydock/1.0.0"]
+    ["d", "drydock:ide-session:session-uuid"],
+    ["client", "vscode-drydock/1.0.0"],
+    ["t", "drydock"],
+    ["t", "ide-session"]
   ]
 }
 ```
 
+If the session data contains private repository information, publish it inside a NIP-59 gift-wrap addressed to Drydock.
+
 ### 2. Review Request
 
-When the user saves a file or triggers manual review:
+When the user saves a file or triggers manual review, the IDE sends a ContextVM JSON-RPC request on kind `25910`:
 
 ```json
 {
-  "kind": 1651,
+  "kind": 25910,
   "content": {
-    "file": "src/auth.go",
-    "content": "package auth\n\nfunc Login(user, pass string) {...}",
-    "selection": {"start": 10, "end": 25},
-    "trigger": "save"
+    "jsonrpc": "2.0",
+    "id": "review-01HZX...",
+    "method": "review/request",
+    "params": {
+      "session_id": "session-uuid",
+      "file": "src/auth.go",
+      "content": "package auth\n\nfunc Login(user, pass string) {...}",
+      "selection": {"start": 10, "end": 25},
+      "trigger": "save"
+    }
   },
   "tags": [
-    ["e", "<session-event-id>"],
-    ["p", "<drydock-pubkey>"]
+    ["p", "<drydock-pubkey>"],
+    ["a", "30078:<ide-pubkey>:drydock:ide-session:session-uuid"],
+    ["t", "drydock"],
+    ["method", "review/request"]
   ]
 }
 ```
 
 ### 3. Review Response
 
-Drydock responds with diagnostics:
+Drydock responds on kind `25910` with the same JSON-RPC `id`:
 
 ```json
 {
-  "kind": 1652,
+  "kind": 25910,
   "content": {
-    "diagnostics": [
-      {
-        "file": "src/auth.go",
-        "range": {"start": {"line": 15, "character": 4}, "end": {"line": 15, "character": 20}},
-        "severity": 1,
-        "message": "Password compared in constant time to prevent timing attacks",
-        "source": "drydock",
-        "has_fix": true,
-        "fix_id": "fix-timing-attack-001"
-      }
-    ]
+    "jsonrpc": "2.0",
+    "id": "review-01HZX...",
+    "result": {
+      "diagnostics": [
+        {
+          "file": "src/auth.go",
+          "range": {"start": {"line": 15, "character": 4}, "end": {"line": 15, "character": 20}},
+          "severity": 1,
+          "message": "Password compared in constant time to prevent timing attacks",
+          "source": "drydock",
+          "has_fix": true,
+          "fix_id": "fix-timing-attack-001"
+        }
+      ]
+    }
   },
   "tags": [
+    ["p", "<user-pubkey>"],
     ["e", "<request-event-id>"],
-    ["p", "<user-pubkey>"]
+    ["t", "drydock"],
+    ["method", "review/request"]
   ]
 }
 ```
@@ -117,20 +135,45 @@ Drydock responds with diagnostics:
 User clicks "Quick Fix" in the IDE:
 
 ```json
-// Request (kind 1653)
 {
+  "kind": 25910,
   "content": {
-    "fix_id": "fix-timing-attack-001",
-    "file": "src/auth.go"
-  }
+    "jsonrpc": "2.0",
+    "id": "fix-01HZY...",
+    "method": "review/apply-fix",
+    "params": {
+      "session_id": "session-uuid",
+      "fix_id": "fix-timing-attack-001",
+      "file": "src/auth.go"
+    }
+  },
+  "tags": [
+    ["p", "<drydock-pubkey>"],
+    ["t", "drydock"],
+    ["method", "review/apply-fix"]
+  ]
 }
+```
 
-// Response (kind 1654)
+Drydock replies:
+
+```json
 {
+  "kind": 25910,
   "content": {
-    "fix_id": "fix-timing-attack-001",
-    "patch": "--- a/src/auth.go\n+++ b/src/auth.go\n@@ -15 +15 @@\n-  if password == storedHash {\n+  if subtle.ConstantTimeCompare([]byte(password), []byte(storedHash)) == 1 {"
-  }
+    "jsonrpc": "2.0",
+    "id": "fix-01HZY...",
+    "result": {
+      "fix_id": "fix-timing-attack-001",
+      "patch": "--- a/src/auth.go\n+++ b/src/auth.go\n@@ -15 +15 @@\n-  if password == storedHash {\n+  if subtle.ConstantTimeCompare([]byte(password), []byte(storedHash)) == 1 {"
+    }
+  },
+  "tags": [
+    ["p", "<user-pubkey>"],
+    ["e", "<fix-request-event-id>"],
+    ["t", "drydock"],
+    ["method", "review/apply-fix"]
+  ]
 }
 ```
 
@@ -239,10 +282,10 @@ go test -tags=integration ./internal/idegateway/...
 
 ## Security
 
-1. **Encryption**: All IDE ↔ Server communication uses NIP-04/NIP-44 encryption
-2. **Session Isolation**: Each user's sessions are separate and authenticated
-3. **Code Privacy**: Source code is transmitted encrypted, processed locally
-4. **No Cloud**: All LLM inference runs on your infrastructure
+1. **Encryption**: Private IDE ↔ Server payloads use NIP-59 gift-wrap; the inner event carries the kind `25910` ContextVM request or response.
+2. **Session Isolation**: Each user's sessions are separate and authenticated by Nostr signatures.
+3. **Code Privacy**: Source code is transmitted encrypted, processed locally.
+4. **No Cloud**: All LLM inference runs on your infrastructure.
 
 ## Troubleshooting
 

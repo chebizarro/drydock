@@ -22,15 +22,11 @@ var subscribedKinds = []nostr.Kind{
 	1630, 1631, 1632, 1633,
 	1985,
 	nostr.KindEncryptedDirectMessage, // NIP-04 DMs (kind 4)
-	14,                                // NIP-17 sealed DMs
-	31650,                             // IDE workspace session
-	1651,                              // IDE review request
-	1653,                              // IDE fix request
-	30620,                             // Reviewer profile (replaceable)
-	1660,                              // Review assignment
-	1661,                              // Assignment acceptance
-	1662,                              // Assignment rejection
-	1663,                              // Review feedback
+	14,                               // NIP-17 sealed DMs
+	30078,                            // IDE workspace session (NIP-78 app data)
+	25910,                            // ContextVM IDE intents/responses
+	31990,                            // Reviewer profile (NIP-89 app handler)
+	7000,                             // NIP-90 review feedback
 }
 
 func SubscribedKinds() []nostr.Kind {

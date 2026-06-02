@@ -26,23 +26,29 @@ type RelayPublisher interface {
 	Publish(ctx context.Context, relays []string, event nostr.Event) error
 }
 
+// ContextVMTransport publishes ContextVM intents to Nostr relays.
+type ContextVMTransport interface {
+	SendWithID(ctx context.Context, id, method string, params any, recipients ...nostr.PubKey) (string, error)
+}
+
 // RouterConfig holds router configuration.
 type RouterConfig struct {
-	DefaultRelays      []string
+	DefaultRelays        []string
 	MaxReviewersPerPatch int           // Max reviewers to assign per patch
-	AssignmentTimeout  time.Duration // How long to wait for acceptance
-	DefaultDeadline    time.Duration // Default review deadline
-	MinReputation      float64       // Minimum reputation to be assigned
+	AssignmentTimeout    time.Duration // How long to wait for acceptance
+	DefaultDeadline      time.Duration // Default review deadline
+	MinReputation        float64       // Minimum reputation to be assigned
 }
 
 // Router assigns patches to appropriate community reviewers.
 type Router struct {
-	cfg       RouterConfig
-	registry  *Registry
-	store     *db.Store
-	signer    Signer
-	publisher RelayPublisher
-	logger    *slog.Logger
+	cfg                RouterConfig
+	registry           *Registry
+	store              *db.Store
+	signer             Signer
+	publisher          RelayPublisher
+	contextVMTransport ContextVMTransport
+	logger             *slog.Logger
 }
 
 // NewRouter creates a patch router.
@@ -52,6 +58,7 @@ func NewRouter(
 	store *db.Store,
 	signer Signer,
 	publisher RelayPublisher,
+	contextVMTransport ContextVMTransport,
 	logger *slog.Logger,
 ) *Router {
 	if cfg.MaxReviewersPerPatch <= 0 {
@@ -68,12 +75,13 @@ func NewRouter(
 	}
 
 	return &Router{
-		cfg:       cfg,
-		registry:  registry,
-		store:     store,
-		signer:    signer,
-		publisher: publisher,
-		logger:    logger,
+		cfg:                cfg,
+		registry:           registry,
+		store:              store,
+		signer:             signer,
+		publisher:          publisher,
+		contextVMTransport: contextVMTransport,
+		logger:             logger,
 	}
 }
 
@@ -89,10 +97,10 @@ type PatchInfo struct {
 
 // RoutingResult contains the result of routing a patch.
 type RoutingResult struct {
-	Assignments    []ReviewAssignment
-	MatchedCount   int
-	AssignedCount  int
-	NoMatchReason  string
+	Assignments   []ReviewAssignment
+	MatchedCount  int
+	AssignedCount int
+	NoMatchReason string
 }
 
 // RoutePatch finds appropriate reviewers and assigns the patch to them.
@@ -264,32 +272,18 @@ func extToLanguage(ext string) string {
 	}
 }
 
-// publishAssignment publishes a review assignment event.
+// publishAssignment publishes a review assignment ContextVM intent.
 func (r *Router) publishAssignment(ctx context.Context, assignment ReviewAssignment) error {
-	content, err := json.Marshal(assignment)
+	if r.contextVMTransport == nil {
+		return fmt.Errorf("contextvm transport not configured")
+	}
+	reviewerPubkey, err := nostr.PubKeyFromHex(assignment.ReviewerPubkey)
 	if err != nil {
-		return fmt.Errorf("marshal assignment: %w", err)
+		return fmt.Errorf("parse reviewer pubkey: %w", err)
 	}
 
-	event := nostr.Event{
-		Kind:      nostr.Kind(KindReviewAssignment),
-		CreatedAt: nostr.Now(),
-		Content:   string(content),
-		Tags: nostr.Tags{
-			{"p", assignment.ReviewerPubkey},           // Tag the reviewer
-			{"e", assignment.PatchEventID},             // Reference the patch
-			{"a", "30617:" + assignment.RepoID},        // Reference the repo
-			{"assignment", assignment.AssignmentID},    // Assignment ID
-			{"expiration", fmt.Sprintf("%d", assignment.Deadline)},
-		},
-	}
-
-	if err := r.signer.SignEvent(ctx, &event); err != nil {
-		return fmt.Errorf("sign assignment: %w", err)
-	}
-
-	if err := r.publisher.Publish(ctx, r.cfg.DefaultRelays, event); err != nil {
-		return fmt.Errorf("publish assignment: %w", err)
+	if _, err := r.contextVMTransport.SendWithID(ctx, assignment.AssignmentID, MethodAssign, assignment, reviewerPubkey); err != nil {
+		return fmt.Errorf("publish assignment intent: %w", err)
 	}
 
 	return nil
@@ -457,12 +451,10 @@ func (r *Router) attemptReassignment(ctx context.Context, originalAssignmentID s
 
 // HandleFeedback processes feedback on a completed review.
 func (r *Router) HandleFeedback(ctx context.Context, event nostr.Event) error {
-	var feedback ReviewFeedback
-	if err := json.Unmarshal([]byte(event.Content), &feedback); err != nil {
+	feedback, err := ParseReviewFeedbackEvent(event)
+	if err != nil {
 		return fmt.Errorf("parse feedback: %w", err)
 	}
-
-	feedback.CreatedAt = int64(event.CreatedAt)
 
 	if err := r.registry.RecordFeedback(ctx, feedback); err != nil {
 		return fmt.Errorf("record feedback: %w", err)
