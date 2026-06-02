@@ -2,6 +2,8 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+For Nostr protocol guidance, follow [AGENTS.md](AGENTS.md). Drydock has migrated to Nostr-native events: IDE session state uses kind `30078`, ContextVM commands use kind `25910`, reviewer profiles use kind `31990`, marketplace feedback uses kind `7000`, and private payloads should use NIP-59 gift-wrap (`1059`). Deprecated project-specific kinds include `31650` and `1651`-`1654`.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
