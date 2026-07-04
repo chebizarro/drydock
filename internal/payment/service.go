@@ -283,8 +283,34 @@ func (s *Service) processTokenPayment(
 		return deny("token_spent")
 	}
 
-	// Mark token as spent immediately to create recoverable state.
-	// If subsequent steps fail, reconciliation can complete authorization.
+	// Verify our wallet reports the invoice settled before granting access.
+	// A successful melt alone is not sufficient: a mint/client false-positive must
+	// never authorize paid access without wallet-confirmed funds.
+	settlement, err := s.invoice.LookupInvoice(ctx, invoice.ID)
+	if err != nil {
+		// Melt succeeded, so persist a recoverable spent-token state for the
+		// reconciliation loop rather than allowing this token to be reused.
+		if markErr := s.store.MarkReviewPaymentTokenSpent(ctx, patchEventID); markErr != nil {
+			return AuthorizeResult{}, fmt.Errorf("mark token spent after settlement lookup failure: %w", markErr)
+		}
+		return AuthorizeResult{}, fmt.Errorf("lookup invoice settlement: %w", err)
+	}
+	if !settlement.Settled {
+		// Keep the melted token recoverable for later reconciliation, but do not
+		// authorize until NWC reports Settled=true.
+		if err := s.store.MarkReviewPaymentTokenSpent(ctx, patchEventID); err != nil {
+			return AuthorizeResult{}, fmt.Errorf("mark token spent for unsettled invoice: %w", err)
+		}
+		s.logger.Warn("cashu token melted but invoice not settled; authorization withheld",
+			"patch_event_id", patchEventID,
+			"author", authorPubkey,
+			"invoice_id", invoice.ID,
+			"expired", settlement.Expired)
+		return deny("invoice_not_settled")
+	}
+
+	// Mark token as spent after wallet-confirmed settlement, then finalize authorization.
+	// If subsequent authorization steps fail, reconciliation can complete authorization.
 	if err := s.store.MarkReviewPaymentTokenSpent(ctx, patchEventID); err != nil {
 		return AuthorizeResult{}, fmt.Errorf("mark token spent: %w", err)
 	}

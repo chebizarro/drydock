@@ -15,12 +15,13 @@ import (
 
 // fakeInvoiceProvider is a test double for InvoiceProvider.
 type fakeInvoiceProvider struct {
-	invoices map[string]InvoiceStatus
+	invoices      map[string]InvoiceStatus
+	createdStatus InvoiceStatus
 }
 
 func (f *fakeInvoiceProvider) CreateInvoice(ctx context.Context, sats int64, memo string, expiry time.Duration) (Invoice, error) {
 	id := "inv_" + memo
-	f.invoices[id] = InvoiceStatus{Settled: false, Expired: false}
+	f.invoices[id] = f.createdStatus
 	return Invoice{ID: id, Request: "lnbc" + memo}, nil
 }
 
@@ -189,6 +190,97 @@ func TestAuthorizePatch_IdempotentAuthorization(t *testing.T) {
 	result2, _ := svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
 	if !result2.Allowed {
 		t.Error("second authorization should still succeed (idempotent)")
+	}
+}
+
+func TestAuthorizePatch_CashuMeltRequiresSettledInvoice(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+
+	token := "cashuAunsettled"
+	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
+		MintURL:    "https://mint.example.com",
+		Unit:       "sat",
+		AmountSats: 110,
+		Raw:        token,
+	}
+
+	event := nostr.Event{
+		ID:     mustParseID("3333333333333333333333333333333333333333333333333333333333333333"),
+		PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		Tags:   nostr.Tags{{"cashu", token}},
+	}
+	policy := repoconfig.PaymentsConfig{
+		Enabled:   true,
+		PriceSats: 100,
+	}
+
+	result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Allowed {
+		t.Fatal("expected unsettled invoice lookup to deny access")
+	}
+	if result.Reason != "invoice_not_settled" {
+		t.Fatalf("expected reason invoice_not_settled, got %q", result.Reason)
+	}
+
+	rec, err := store.GetReviewPayment(context.Background(), event.ID.Hex())
+	if err != nil {
+		t.Fatalf("GetReviewPayment: %v", err)
+	}
+	if rec.Status != "token_spent" {
+		t.Fatalf("expected recoverable token_spent state, got %q", rec.Status)
+	}
+	if rec.AccessKind != "" {
+		t.Fatalf("expected no access kind for unsettled payment, got %q", rec.AccessKind)
+	}
+}
+
+func TestAuthorizePatch_CashuMeltAuthorizesWhenInvoiceSettled(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+
+	svc.invoice.(*fakeInvoiceProvider).createdStatus = InvoiceStatus{Settled: true}
+	token := "cashuAsettled"
+	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
+		MintURL:    "https://mint.example.com",
+		Unit:       "sat",
+		AmountSats: 110,
+		Raw:        token,
+	}
+
+	event := nostr.Event{
+		ID:     mustParseID("4444444444444444444444444444444444444444444444444444444444444444"),
+		PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		Tags:   nostr.Tags{{"cashu", token}},
+	}
+	policy := repoconfig.PaymentsConfig{
+		Enabled:   true,
+		PriceSats: 100,
+	}
+
+	result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Allowed {
+		t.Fatalf("expected settled invoice to authorize access, reason=%q", result.Reason)
+	}
+	if result.AccessKind != "cashu_review" {
+		t.Fatalf("expected cashu_review access, got %q", result.AccessKind)
+	}
+
+	rec, err := store.GetReviewPayment(context.Background(), event.ID.Hex())
+	if err != nil {
+		t.Fatalf("GetReviewPayment: %v", err)
+	}
+	if rec.Status != "authorized" {
+		t.Fatalf("expected authorized payment, got %q", rec.Status)
+	}
+	if rec.AccessKind != "cashu_review" {
+		t.Fatalf("expected cashu_review record, got %q", rec.AccessKind)
 	}
 }
 
