@@ -56,27 +56,34 @@ func TestIntegrationIDEGatewayReviewToFixFlow(t *testing.T) {
 	}, llm, logger)
 
 	pub := &integRelayPublisher{}
+	gatewaySK := nostr.Generate()
+	ideSK := nostr.Generate()
 	handler := New(
 		Config{DefaultRelays: []string{"wss://relay.test"}},
 		nil,
 		contextbuilder.NewDefault(),
 		engine,
-		integSigner{sk: nostr.Generate()},
+		integSigner{sk: gatewaySK},
 		pub,
 		logger,
 	)
 
+	idePubKey := nostr.GetPublicKey(ideSK)
+
 	sessionEvent := nostr.Event{
 		Kind:    nostr.Kind(KindIDESession),
+		PubKey:  idePubKey,
 		Content: `{"workspace_path":"/tmp/repo","editor":"vscode","version":"1.0.0"}`,
-		Tags:    nostr.Tags{{"d", "sess-1"}},
+		Tags:    nostr.Tags{{"d", "sess-1"}, {"p", handler.ourPubKey}},
 	}
 	if err := handler.HandleEvent(ctx, sessionEvent, "wss://relay.test"); err != nil {
 		t.Fatalf("handle session: %v", err)
 	}
 
 	reviewEvent := nostr.Event{
-		Kind: nostr.Kind(KindIDEReviewRequest),
+		Kind:   nostr.Kind(KindIDEReviewRequest),
+		PubKey: idePubKey,
+		Tags:   nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "req-1"}},
 		Content: `{
 			"session_id":"sess-1",
 			"request_id":"req-1",
@@ -109,7 +116,9 @@ func TestIntegrationIDEGatewayReviewToFixFlow(t *testing.T) {
 	}
 
 	fixEvent := nostr.Event{
-		Kind: nostr.Kind(KindIDEFixRequest),
+		Kind:   nostr.Kind(KindIDEFixRequest),
+		PubKey: idePubKey,
+		Tags:   nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "fix-req-1"}},
 		Content: `{
 			"session_id":"sess-1",
 			"request_id":"fix-req-1",
@@ -139,4 +148,3 @@ func TestIntegrationIDEGatewayReviewToFixFlow(t *testing.T) {
 		t.Fatalf("fix diff mismatch: got %q want %q", fixResp.Diff, diag.SuggestedFix)
 	}
 }
-

@@ -61,7 +61,8 @@ type Handler struct {
 	mu       sync.RWMutex
 	sessions map[string]*activeSession
 
-	// Track suggested fixes for later fix requests.
+	// Fallback suggested-fix storage for tests that construct a handler without a DB store.
+	// Production handlers persist fixes through db.Store.
 	fixes  sync.Map // map[string]storedFix
 	fixTTL time.Duration
 }
@@ -71,13 +72,15 @@ type activeSession struct {
 	Session     IDESession
 	LastSeen    time.Time
 	SourceRelay string
+	PubKey      string
 }
 
 type storedFix struct {
-	SessionID string
-	File      string
-	Diff      string
-	CreatedAt time.Time
+	SessionID    string
+	AuthorPubKey string
+	File         string
+	Diff         string
+	CreatedAt    time.Time
 }
 
 // New creates a new IDE gateway handler.
@@ -154,12 +157,23 @@ func (h *Handler) handleSession(ctx context.Context, event nostr.Event, relayURL
 		h.logger.Warn("IDE session missing session ID", "event_id", event.ID.Hex())
 		return nil
 	}
+	if !h.isAddressedToGateway(event) {
+		h.logger.Warn("rejecting IDE session not addressed to this gateway", "event_id", event.ID.Hex(), "session_id", session.SessionID)
+		return nil
+	}
 
+	sender := event.PubKey.Hex()
 	h.mu.Lock()
+	if existing, ok := h.sessions[session.SessionID]; ok && existing.PubKey != "" && !strings.EqualFold(existing.PubKey, sender) {
+		h.mu.Unlock()
+		h.logger.Warn("rejecting IDE session update from unauthorized sender", "event_id", event.ID.Hex(), "session_id", session.SessionID)
+		return nil
+	}
 	h.sessions[session.SessionID] = &activeSession{
 		Session:     session,
 		LastSeen:    time.Now(),
 		SourceRelay: relayURL,
+		PubKey:      sender,
 	}
 	h.mu.Unlock()
 
@@ -191,28 +205,36 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 		return nil
 	}
 
+	if req.SessionID == "" || req.RequestID == "" {
+		h.logger.Warn("review request missing session_id or request_id", "event_id", event.ID.Hex())
+		return nil
+	}
+	if !h.validateRequestEnvelope(event, req.SessionID, req.RequestID) {
+		return nil
+	}
 	if req.Diff == "" {
 		h.logger.Debug("empty diff in review request", "event_id", event.ID.Hex())
 		return nil
 	}
 
-	// Look up the session.
-	h.mu.RLock()
+	// Look up the session and verify the request author owns it.
+	h.mu.Lock()
 	session, ok := h.sessions[req.SessionID]
-	h.mu.RUnlock()
-
-	repoPath := ""
-	if ok {
-		repoPath = session.Session.WorkspacePath
-		session.LastSeen = time.Now()
+	if !ok || session.PubKey == "" || !strings.EqualFold(session.PubKey, event.PubKey.Hex()) {
+		h.mu.Unlock()
+		h.logger.Warn("rejecting review request from unauthorized session sender", "event_id", event.ID.Hex(), "session_id", req.SessionID)
+		return nil
 	}
+	session.LastSeen = time.Now()
+	repoPath := session.Session.WorkspacePath
+	h.mu.Unlock()
 
 	// Process the review.
 	ctx, cancel := context.WithTimeout(ctx, reviewTimeout)
 	defer cancel()
 
 	start := time.Now()
-	h.cleanupExpiredFixes(start)
+	h.cleanupExpiredFixes(ctx, start)
 
 	// Build context from the diff.
 	bundle, err := h.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
@@ -226,8 +248,8 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 
 	// Run the review engine.
 	result, err := h.engine.Run(ctx, reviewengine.RunInput{
-		ContextBundle: bundle.Content,
-		ChangedFiles:  req.ChangedFiles,
+		ContextBundle:   bundle.Content,
+		ChangedFiles:    req.ChangedFiles,
 		SkipWalkthrough: true, // IDEs don't need walkthrough
 	})
 	if err != nil {
@@ -241,11 +263,12 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 		fixID := ""
 		if f.HasSuggestion() {
 			fixID = generateFixID(req.RequestID, f.File, f.Line, i)
-			h.storeFix(fixID, storedFix{
-				SessionID: req.SessionID,
-				File:      f.File,
-				Diff:      f.SuggestedDiff,
-				CreatedAt: start,
+			h.storeFix(ctx, fixID, storedFix{
+				SessionID:    req.SessionID,
+				AuthorPubKey: event.PubKey.Hex(),
+				File:         f.File,
+				Diff:         f.SuggestedDiff,
+				CreatedAt:    start,
 			})
 		}
 		diagnostics = append(diagnostics, FindingToDiagnostic(f, fixID))
@@ -286,15 +309,27 @@ func (h *Handler) handleFixRequest(ctx context.Context, event nostr.Event, relay
 		return nil
 	}
 
+	if req.SessionID == "" || req.RequestID == "" {
+		h.logger.Warn("fix request missing session_id or request_id", "event_id", event.ID.Hex())
+		return nil
+	}
+	if !h.validateRequestEnvelope(event, req.SessionID, req.RequestID) {
+		return nil
+	}
+
 	now := time.Now()
-	h.cleanupExpiredFixes(now)
+	h.cleanupExpiredFixes(ctx, now)
 
 	response := FixResponse{
 		RequestID: req.RequestID,
 		SessionID: req.SessionID,
 	}
 
-	fix, ok := h.lookupFix(req.FixID, now)
+	fix, ok := h.lookupFix(ctx, req.FixID, req.SessionID, now)
+	if ok && fix.AuthorPubKey != "" && !strings.EqualFold(fix.AuthorPubKey, event.PubKey.Hex()) {
+		h.logger.Warn("rejecting fix request from unauthorized sender", "event_id", event.ID.Hex(), "session_id", req.SessionID)
+		return nil
+	}
 	switch {
 	case req.FixID == "":
 		response.Success = false
@@ -335,9 +370,9 @@ func (h *Handler) publishReviewResponse(ctx context.Context, reqEvent nostr.Even
 		CreatedAt: nostr.Now(),
 		Content:   string(content),
 		Tags: nostr.Tags{
-			{"e", reqEvent.ID.Hex()},         // Reference the request
-			{"p", reqEvent.PubKey.Hex()},     // Tag the requester
-			{"session", resp.SessionID},      // Session reference
+			{"e", reqEvent.ID.Hex()},     // Reference the request
+			{"p", reqEvent.PubKey.Hex()}, // Tag the requester
+			{"session", resp.SessionID},  // Session reference
 		},
 	}
 
@@ -430,11 +465,47 @@ func (h *Handler) CleanupStaleSessions(maxAge time.Duration) {
 	}
 }
 
-func (h *Handler) storeFix(fixID string, fix storedFix) {
+func (h *Handler) storeFix(ctx context.Context, fixID string, fix storedFix) {
+	if h.store != nil {
+		if err := h.store.UpsertIDEGatewayFix(ctx, db.IDEGatewayFix{
+			FixID:        fixID,
+			SessionID:    fix.SessionID,
+			AuthorPubKey: fix.AuthorPubKey,
+			File:         fix.File,
+			Diff:         fix.Diff,
+			CreatedAt:    fix.CreatedAt.Unix(),
+		}); err != nil {
+			h.logger.Warn("failed to persist IDE suggested fix", "fix_id", fixID, "session_id", fix.SessionID, "error", err)
+		}
+		return
+	}
+
 	h.fixes.Store(fixID, fix)
 }
 
-func (h *Handler) lookupFix(fixID string, now time.Time) (storedFix, bool) {
+func (h *Handler) lookupFix(ctx context.Context, fixID, sessionID string, now time.Time) (storedFix, bool) {
+	if h.store != nil {
+		rec, ok, err := h.store.GetIDEGatewayFix(ctx, fixID, sessionID)
+		if err != nil {
+			h.logger.Warn("failed to load IDE suggested fix", "fix_id", fixID, "session_id", sessionID, "error", err)
+			return storedFix{}, false
+		}
+		if !ok {
+			return storedFix{}, false
+		}
+		createdAt := time.Unix(rec.CreatedAt, 0)
+		if h.fixTTL > 0 && now.Sub(createdAt) > h.fixTTL {
+			return storedFix{}, false
+		}
+		return storedFix{
+			SessionID:    rec.SessionID,
+			AuthorPubKey: rec.AuthorPubKey,
+			File:         rec.File,
+			Diff:         rec.Diff,
+			CreatedAt:    createdAt,
+		}, true
+	}
+
 	value, ok := h.fixes.Load(fixID)
 	if !ok {
 		return storedFix{}, false
@@ -450,12 +521,22 @@ func (h *Handler) lookupFix(fixID string, now time.Time) (storedFix, bool) {
 		h.fixes.Delete(fixID)
 		return storedFix{}, false
 	}
+	if fix.SessionID != sessionID {
+		return storedFix{}, false
+	}
 
 	return fix, true
 }
 
-func (h *Handler) cleanupExpiredFixes(now time.Time) {
+func (h *Handler) cleanupExpiredFixes(ctx context.Context, now time.Time) {
 	if h.fixTTL <= 0 {
+		return
+	}
+
+	if h.store != nil {
+		if err := h.store.DeleteExpiredIDEGatewayFixes(ctx, now.Add(-h.fixTTL).Unix()); err != nil {
+			h.logger.Warn("failed to delete expired IDE suggested fixes", "error", err)
+		}
 		return
 	}
 
@@ -466,6 +547,41 @@ func (h *Handler) cleanupExpiredFixes(now time.Time) {
 		}
 		return true
 	})
+}
+
+func (h *Handler) validateRequestEnvelope(event nostr.Event, sessionID, requestID string) bool {
+	if !h.isAddressedToGateway(event) {
+		h.logger.Warn("rejecting IDE request not addressed to this gateway", "event_id", event.ID.Hex(), "session_id", sessionID, "request_id", requestID)
+		return false
+	}
+	if !hasTagValue(event.Tags, "session", sessionID) {
+		h.logger.Warn("rejecting IDE request missing matching session tag", "event_id", event.ID.Hex(), "session_id", sessionID, "request_id", requestID)
+		return false
+	}
+	if !hasTagValue(event.Tags, "request", requestID) {
+		h.logger.Warn("rejecting IDE request missing matching request tag", "event_id", event.ID.Hex(), "session_id", sessionID, "request_id", requestID)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) isAddressedToGateway(event nostr.Event) bool {
+	if h.ourPubKey == "" {
+		return false
+	}
+	return hasTagValue(event.Tags, "p", h.ourPubKey)
+}
+
+func hasTagValue(tags nostr.Tags, name, value string) bool {
+	for _, tag := range tags {
+		if len(tag) < 2 || tag[0] != name {
+			continue
+		}
+		if strings.EqualFold(tag[1], value) {
+			return true
+		}
+	}
+	return false
 }
 
 // generateFixID creates a deterministic fix ID from finding details.
