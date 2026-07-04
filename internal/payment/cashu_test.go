@@ -1,8 +1,12 @@
 package payment
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -47,6 +51,78 @@ func TestParseToken_ValidToken(t *testing.T) {
 	}
 	if len(proofs) != 2 {
 		t.Errorf("expected 2 proofs, got %d", len(proofs))
+	}
+}
+
+func TestCreateMeltQuote_MarshalsRequestBody(t *testing.T) {
+	var body []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/melt/quote/bolt11" {
+			t.Fatalf("expected quote path, got %q", r.URL.Path)
+		}
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"quote":"quote-1","amount":10,"fee_reserve":1}`))
+	}))
+	defer server.Close()
+
+	client := NewCashuMintClient(0)
+	invoice := "lnbc\"special"
+	if _, err := client.CreateMeltQuote(context.Background(), server.URL, invoice); err != nil {
+		t.Fatalf("CreateMeltQuote: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("request body is not valid JSON: %v; body=%s", err, body)
+	}
+	if got["request"] != invoice {
+		t.Errorf("expected request %q, got %q", invoice, got["request"])
+	}
+	if got["unit"] != "sat" {
+		t.Errorf("expected unit sat, got %q", got["unit"])
+	}
+}
+
+func TestMeltToken_MarshalsRequestBody(t *testing.T) {
+	var body []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/melt/bolt11" {
+			t.Fatalf("expected melt path, got %q", r.URL.Path)
+		}
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"paid":true}`))
+	}))
+	defer server.Close()
+
+	client := NewCashuMintClient(0)
+	quoteID := "quote\"special"
+	proofs := json.RawMessage(`[{"amount":10,"id":"abc","secret":"s","C":"c"}]`)
+	if err := client.MeltToken(context.Background(), server.URL, MeltQuote{ID: quoteID}, ParsedToken{Proofs: proofs}); err != nil {
+		t.Fatalf("MeltToken: %v", err)
+	}
+
+	var got struct {
+		Quote  string           `json:"quote"`
+		Inputs []map[string]any `json:"inputs"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("request body is not valid JSON: %v; body=%s", err, body)
+	}
+	if got.Quote != quoteID {
+		t.Errorf("expected quote %q, got %q", quoteID, got.Quote)
+	}
+	if len(got.Inputs) != 1 || got.Inputs[0]["id"] != "abc" {
+		t.Errorf("unexpected inputs: %#v", got.Inputs)
 	}
 }
 

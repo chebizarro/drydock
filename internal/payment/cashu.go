@@ -17,6 +17,16 @@ type CashuMintClient struct {
 	timeout    time.Duration
 }
 
+type createMeltQuoteRequest struct {
+	Request string `json:"request"`
+	Unit    string `json:"unit"`
+}
+
+type meltTokenRequest struct {
+	Quote  string          `json:"quote"`
+	Inputs json.RawMessage `json:"inputs"`
+}
+
 // NewCashuMintClient creates a new Cashu mint client.
 func NewCashuMintClient(timeout time.Duration) *CashuMintClient {
 	if timeout == 0 {
@@ -119,9 +129,15 @@ func (c *CashuMintClient) CreateMeltQuote(ctx context.Context, mintURL, bolt11 s
 	mintURL = strings.TrimRight(mintURL, "/")
 	url := mintURL + "/v1/melt/quote/bolt11"
 
-	reqBody := fmt.Sprintf(`{"request":"%s","unit":"sat"}`, bolt11)
+	reqBody, err := json.Marshal(createMeltQuoteRequest{
+		Request: bolt11,
+		Unit:    "sat",
+	})
+	if err != nil {
+		return MeltQuote{}, fmt.Errorf("marshal quote request: %w", err)
+	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(reqBody)))
 	if err != nil {
 		return MeltQuote{}, fmt.Errorf("create request: %w", err)
 	}
@@ -166,9 +182,15 @@ func (c *CashuMintClient) MeltToken(ctx context.Context, mintURL string, quote M
 		return errors.New("no proofs in token")
 	}
 
-	reqBody := fmt.Sprintf(`{"quote":"%s","inputs":%s}`, quote.ID, string(token.Proofs))
+	reqBody, err := json.Marshal(meltTokenRequest{
+		Quote:  quote.ID,
+		Inputs: token.Proofs,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal melt request: %w", err)
+	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(reqBody)))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}

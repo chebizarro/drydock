@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 )
 
@@ -91,24 +92,44 @@ func (s *Store) DeletePendingReviewPayment(ctx context.Context, patchEventID str
 // This creates a recoverable state if subsequent authorization steps fail.
 func (s *Store) MarkReviewPaymentTokenSpent(ctx context.Context, patchEventID string) error {
 	now := time.Now().Unix()
-	_, err := s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 		UPDATE review_payments
 		SET status = 'token_spent', updated_at = ?
 		WHERE patch_event_id = ? AND status = 'pending'
 	`, now, patchEventID)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check token-spent update rows affected: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("mark review payment token spent: expected 1 row updated for patch %q, got %d", patchEventID, rows)
+	}
+	return nil
 }
 
 // MarkReviewPaymentAuthorized marks a review payment as authorized.
 // Accepts payments in 'pending' or 'token_spent' status for recovery scenarios.
 func (s *Store) MarkReviewPaymentAuthorized(ctx context.Context, patchEventID, accessKind string) error {
 	now := time.Now().Unix()
-	_, err := s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 		UPDATE review_payments
 		SET status = 'authorized', access_kind = ?, updated_at = ?
 		WHERE patch_event_id = ? AND status IN ('pending', 'token_spent')
 	`, accessKind, now, patchEventID)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check authorized update rows affected: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("mark review payment authorized: expected 1 row updated for patch %q, got %d", patchEventID, rows)
+	}
+	return nil
 }
 
 // GetActiveSubscription returns an active subscription for the author+repo if one exists.

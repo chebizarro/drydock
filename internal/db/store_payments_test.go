@@ -55,6 +55,15 @@ func TestGetReviewPayment_NotFound(t *testing.T) {
 	}
 }
 
+func TestMarkReviewPaymentAuthorized_NotFoundReturnsError(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	if err := store.MarkReviewPaymentAuthorized(ctx, "missing-patch", "cashu_review"); err == nil {
+		t.Fatal("expected error for nonexistent payment")
+	}
+}
+
 func TestMarkReviewPaymentAuthorized(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
@@ -241,6 +250,15 @@ func TestAuthorizeReviewFromSubscription(t *testing.T) {
 	}
 	if accessKind != "subscription" {
 		t.Errorf("expected access_kind 'subscription', got %q", accessKind)
+	}
+}
+
+func TestMarkReviewPaymentTokenSpent_NotFoundReturnsError(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	if err := store.MarkReviewPaymentTokenSpent(ctx, "missing-patch"); err == nil {
+		t.Fatal("expected error for nonexistent payment")
 	}
 }
 
