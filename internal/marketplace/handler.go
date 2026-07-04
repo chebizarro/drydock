@@ -3,7 +3,10 @@ package marketplace
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 
 	"drydock/internal/db"
@@ -104,11 +107,13 @@ func (h *Handler) handleAssignment(ctx context.Context, event nostr.Event) error
 	// Assignment events are created by the router, not ingested externally.
 	// This handler is for assignments created by other nodes in the network.
 	var assignment struct {
+		AssignmentID   string `json:"assignment_id"`
 		PatchEventID   string `json:"patch_event_id"`
 		RepoID         string `json:"repo_id"`
 		ReviewerPubkey string `json:"reviewer_pubkey"`
 		Priority       int    `json:"priority"`
 		PriceSats      int64  `json:"price_sats"`
+		Deadline       int64  `json:"deadline"`
 		ExpiresAt      int64  `json:"expires_at"`
 	}
 
@@ -119,18 +124,30 @@ func (h *Handler) handleAssignment(ctx context.Context, event nostr.Event) error
 		)
 		return nil
 	}
+	assignmentEventID := assignment.AssignmentID
+	if assignmentEventID == "" {
+		assignmentEventID = event.ID.Hex()
+	}
+	expiresAt := assignment.ExpiresAt
+	if expiresAt == 0 {
+		expiresAt = assignment.Deadline
+	}
+	requesterPubkey, err := h.authorizeAssignmentIntent(ctx, event.PubKey.Hex(), assignment.PatchEventID, assignment.RepoID, assignment.PriceSats)
+	if err != nil {
+		return err
+	}
 
 	// Store the assignment
-	err := h.store.CreateAssignment(ctx, db.ReviewAssignment{
+	err = h.store.CreateAssignment(ctx, db.ReviewAssignment{
 		PatchEventID:      assignment.PatchEventID,
 		RepoID:            assignment.RepoID,
 		ReviewerPubkey:    assignment.ReviewerPubkey,
-		RequesterPubkey:   event.PubKey.Hex(),
+		RequesterPubkey:   requesterPubkey,
 		Status:            "pending",
 		Priority:          assignment.Priority,
 		PriceSats:         assignment.PriceSats,
-		AssignmentEventID: event.ID.Hex(),
-		ExpiresAt:         assignment.ExpiresAt,
+		AssignmentEventID: assignmentEventID,
+		ExpiresAt:         expiresAt,
 	})
 	if err != nil {
 		h.logger.Error("failed to store assignment",
@@ -149,6 +166,49 @@ func (h *Handler) handleAssignment(ctx context.Context, event nostr.Event) error
 	)
 
 	return nil
+}
+
+func (h *Handler) authorizeAssignmentIntent(ctx context.Context, senderPubkey, patchEventID, repoID string, priceSats int64) (string, error) {
+	if h.router == nil {
+		return "", fmt.Errorf("marketplace assignment intent rejected: router authority is not configured")
+	}
+	authorityPubkey, err := h.router.AuthorityPubkey(ctx)
+	if err != nil {
+		return "", err
+	}
+	if senderPubkey != authorityPubkey {
+		return "", fmt.Errorf("unauthorized assignment intent: sender %s is not router authority %s", senderPubkey, authorityPubkey)
+	}
+
+	if h.store == nil {
+		return "", fmt.Errorf("marketplace assignment intent rejected: store is not configured")
+	}
+	if payment, err := h.store.GetReviewPayment(ctx, patchEventID); err == nil {
+		if payment.Status != "authorized" {
+			return "", fmt.Errorf("assignment intent rejected: payment for patch %s is %s, not authorized", patchEventID, payment.Status)
+		}
+		if repoID != "" && payment.RepoID != "" && payment.RepoID != repoID {
+			return "", fmt.Errorf("assignment intent rejected: payment repo %s does not match assignment repo %s", payment.RepoID, repoID)
+		}
+		if payment.AuthorPubkey == "" {
+			return "", fmt.Errorf("assignment intent rejected: authorized payment has no author pubkey")
+		}
+		return payment.AuthorPubkey, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("check assignment payment authorization: %w", err)
+	}
+
+	if priceSats > 0 {
+		return "", fmt.Errorf("assignment intent rejected: paid assignment for patch %s has no authorized payment record", patchEventID)
+	}
+	patchAuthor, err := h.store.GetPatchAuthorPubKey(ctx, patchEventID)
+	if err != nil {
+		return "", fmt.Errorf("assignment intent rejected: patch author is not known: %w", err)
+	}
+	if patchAuthor == "" {
+		return "", fmt.Errorf("assignment intent rejected: patch author is empty")
+	}
+	return patchAuthor, nil
 }
 
 // handleAcceptance processes an assignment acceptance event.
@@ -180,11 +240,7 @@ func (h *Handler) handleFeedback(ctx context.Context, event nostr.Event) error {
 		}
 	}
 
-	var feedback struct {
-		AssignmentID int    `json:"assignment_id"`
-		Rating       int    `json:"rating"`
-		Comment      string `json:"comment"`
-	}
+	var feedback ReviewFeedback
 
 	if err := json.Unmarshal([]byte(event.Content), &feedback); err != nil {
 		h.logger.Warn("failed to parse feedback event",
@@ -193,26 +249,12 @@ func (h *Handler) handleFeedback(ctx context.Context, event nostr.Event) error {
 		)
 		return nil
 	}
+	feedback.RaterPubkey = event.PubKey.Hex()
+	feedback.CreatedAt = int64(event.CreatedAt)
+	feedback.EventID = event.ID.Hex()
 
-	// Get the assignment to find the reviewer
-	assignment, err := h.store.GetAssignmentByID(ctx, feedback.AssignmentID)
-	if err != nil {
-		h.logger.Warn("feedback references unknown assignment",
-			"assignment_id", feedback.AssignmentID,
-			"event_id", event.ID.Hex(),
-		)
-		return nil
-	}
-
-	// Store the feedback
-	err = h.store.RecordFeedback(ctx, db.ReviewFeedback{
-		AssignmentID:   feedback.AssignmentID,
-		ReviewerPubkey: assignment.ReviewerPubkey,
-		RaterPubkey:    event.PubKey.Hex(),
-		Rating:         feedback.Rating,
-		Comment:        feedback.Comment,
-		EventID:        event.ID.Hex(),
-	})
+	// Store authorized, non-duplicate feedback.
+	err := h.registry.RecordFeedback(ctx, feedback)
 	if err != nil {
 		h.logger.Error("failed to store feedback",
 			"event_id", event.ID.Hex(),
@@ -223,17 +265,10 @@ func (h *Handler) handleFeedback(ctx context.Context, event nostr.Event) error {
 
 	metrics.MarketplaceFeedbackReceived.Inc()
 
-	// Recalculate reviewer's reputation
-	if err := h.registry.RecalculateReputation(ctx, assignment.ReviewerPubkey); err != nil {
-		h.logger.Error("failed to recalculate reputation",
-			"reviewer", assignment.ReviewerPubkey,
-			"error", err,
-		)
-	}
-
 	h.logger.Info("recorded review feedback",
 		"event_id", event.ID.Hex(),
-		"reviewer", assignment.ReviewerPubkey,
+		"assignment_id", feedback.AssignmentID,
+		"review_event_id", feedback.ReviewEventID,
 		"rating", feedback.Rating,
 	)
 

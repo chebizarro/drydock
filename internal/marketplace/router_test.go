@@ -63,13 +63,16 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	)
 
 	// Register two reviewers
+	reviewer1SK := nostr.Generate()
+	reviewer1Pubkey := nostr.GetPublicKey(reviewer1SK).Hex()
+	reviewer2Pubkey := testPubKey().Hex()
 	reviewer1 := ReviewerProfile{
-		Pubkey:       "reviewer1",
+		Pubkey:       reviewer1Pubkey,
 		Languages:    []string{"go"},
 		Availability: AvailabilityAvailable,
 	}
 	reviewer2 := ReviewerProfile{
-		Pubkey:       "reviewer2",
+		Pubkey:       reviewer2Pubkey,
 		Languages:    []string{"go"},
 		Availability: AvailabilityAvailable,
 	}
@@ -80,7 +83,7 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	assignment := db.ReviewAssignment{
 		PatchEventID:      "patch123",
 		RepoID:            "repo1",
-		ReviewerPubkey:    "reviewer1",
+		ReviewerPubkey:    reviewer1Pubkey,
 		RequesterPubkey:   "author1",
 		Status:            "pending",
 		Priority:          2,
@@ -93,19 +96,10 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	}
 
 	// Simulate reviewer1 rejecting
-	rejection := ReviewRejection{
-		AssignmentID:   "assign-r1",
-		ReviewerPubkey: "reviewer1",
-		Reason:         "too busy",
-	}
-	rejectionJSON, _ := json.Marshal(rejection)
-
-	rejectionEvent := nostr.Event{
-		Kind:      nostr.Kind(KindReviewRejection),
-		Content:   string(rejectionJSON),
-		PubKey:    nostr.PubKey{}, // Will be overwritten
-		CreatedAt: nostr.Now(),
-	}
+	rejectionEvent := signedMarketplaceEvent(t, reviewer1SK, KindReviewRejection, ReviewRejection{
+		AssignmentID: "assign-r1",
+		Reason:       "too busy",
+	})
 
 	// Handle the rejection
 	err := router.HandleRejection(ctx, rejectionEvent)
@@ -122,8 +116,8 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	if len(publisher.published) > 0 {
 		var newAssignment ReviewAssignment
 		json.Unmarshal([]byte(publisher.published[0].Content), &newAssignment)
-		
-		if newAssignment.ReviewerPubkey == "reviewer1" {
+
+		if newAssignment.ReviewerPubkey == reviewer1Pubkey {
 			t.Error("reassignment should not be to the rejecting reviewer")
 		}
 	}
@@ -152,8 +146,10 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	)
 
 	// Register only one reviewer
+	reviewer1SK := nostr.Generate()
+	reviewer1Pubkey := nostr.GetPublicKey(reviewer1SK).Hex()
 	reviewer1 := ReviewerProfile{
-		Pubkey:       "reviewer1",
+		Pubkey:       reviewer1Pubkey,
 		Languages:    []string{"go"},
 		Availability: AvailabilityAvailable,
 	}
@@ -163,7 +159,7 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	assignment := db.ReviewAssignment{
 		PatchEventID:      "patch456",
 		RepoID:            "repo1",
-		ReviewerPubkey:    "reviewer1",
+		ReviewerPubkey:    reviewer1Pubkey,
 		RequesterPubkey:   "author1",
 		Status:            "pending",
 		Priority:          2,
@@ -173,17 +169,10 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	store.CreateAssignment(ctx, assignment)
 
 	// Simulate rejection
-	rejection := ReviewRejection{
+	rejectionEvent := signedMarketplaceEvent(t, reviewer1SK, KindReviewRejection, ReviewRejection{
 		AssignmentID: "assign-only",
 		Reason:       "no time",
-	}
-	rejectionJSON, _ := json.Marshal(rejection)
-
-	rejectionEvent := nostr.Event{
-		Kind:      nostr.Kind(KindReviewRejection),
-		Content:   string(rejectionJSON),
-		CreatedAt: nostr.Now(),
-	}
+	})
 
 	// Handle the rejection - should not error, but no reassignment
 	err := router.HandleRejection(ctx, rejectionEvent)
@@ -225,7 +214,7 @@ func TestRouter_DetectLanguages(t *testing.T) {
 				tc.files, len(langs), len(tc.expected))
 			continue
 		}
-		
+
 		langSet := make(map[string]bool)
 		for _, l := range langs {
 			langSet[l] = true

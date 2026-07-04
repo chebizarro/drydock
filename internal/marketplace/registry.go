@@ -2,6 +2,8 @@ package marketplace
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -372,22 +374,39 @@ func (r *Registry) RecordAssignment(ctx context.Context, assignment ReviewAssign
 
 // RecordAcceptance records that a reviewer accepted an assignment.
 func (r *Registry) RecordAcceptance(ctx context.Context, acceptance ReviewAcceptance) error {
-	// Find assignment by ID
 	assignment, err := r.store.GetAssignmentByEventID(ctx, acceptance.AssignmentID)
 	if err != nil {
 		return fmt.Errorf("find assignment: %w", err)
 	}
-	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "accepted", "")
+	if err := validatePendingAssignmentTransition(assignment, acceptance.ReviewerPubkey); err != nil {
+		return err
+	}
+	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "accepted", acceptance.EventID)
 }
 
 // RecordRejection records that a reviewer rejected an assignment.
 func (r *Registry) RecordRejection(ctx context.Context, rejection ReviewRejection) error {
-	// Find assignment by ID
 	assignment, err := r.store.GetAssignmentByEventID(ctx, rejection.AssignmentID)
 	if err != nil {
 		return fmt.Errorf("find assignment: %w", err)
 	}
-	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "rejected", "")
+	if err := validatePendingAssignmentTransition(assignment, rejection.ReviewerPubkey); err != nil {
+		return err
+	}
+	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "rejected", rejection.EventID)
+}
+
+func validatePendingAssignmentTransition(assignment *db.ReviewAssignment, senderPubkey string) error {
+	if assignment.ReviewerPubkey != senderPubkey {
+		return fmt.Errorf("unauthorized reviewer: sender %s is not assigned reviewer %s", senderPubkey, assignment.ReviewerPubkey)
+	}
+	if assignment.Status != "pending" {
+		return fmt.Errorf("assignment %s is not pending: status=%s", assignment.AssignmentEventID, assignment.Status)
+	}
+	if assignment.ExpiresAt > 0 && assignment.ExpiresAt <= time.Now().Unix() {
+		return fmt.Errorf("assignment %s is expired", assignment.AssignmentEventID)
+	}
+	return nil
 }
 
 // RecordFeedback records feedback on a review and updates reputation.
@@ -395,20 +414,96 @@ func (r *Registry) RecordFeedback(ctx context.Context, feedback ReviewFeedback) 
 	if !IsValidRating(feedback.Rating) {
 		return fmt.Errorf("invalid rating: %d", feedback.Rating)
 	}
+	if feedback.RaterPubkey == "" {
+		return fmt.Errorf("feedback rater pubkey is required")
+	}
+
+	assignment, err := r.feedbackAssignment(ctx, feedback)
+	if err != nil {
+		return err
+	}
+	if assignment.Status != "completed" {
+		return fmt.Errorf("assignment %s is not completed: status=%s", assignment.AssignmentEventID, assignment.Status)
+	}
+	if assignment.ReviewerPubkey != feedback.ReviewerPubkey && feedback.ReviewerPubkey != "" {
+		return fmt.Errorf("feedback reviewer %s does not match assignment reviewer %s", feedback.ReviewerPubkey, assignment.ReviewerPubkey)
+	}
+	if err := r.authorizeFeedbackRater(ctx, assignment, feedback.RaterPubkey); err != nil {
+		return err
+	}
+	if err := r.ensureFeedbackNotDuplicate(ctx, assignment.ID, feedback.RaterPubkey); err != nil {
+		return err
+	}
 
 	dbFeedback := db.ReviewFeedback{
-		AssignmentID:   0, // Should be looked up
-		ReviewerPubkey: feedback.ReviewerPubkey,
-		RaterPubkey:    "", // Filled by caller
+		AssignmentID:   assignment.ID,
+		ReviewerPubkey: assignment.ReviewerPubkey,
+		RaterPubkey:    feedback.RaterPubkey,
 		Rating:         feedback.Rating,
 		Comment:        feedback.Comment,
+		EventID:        feedback.EventID,
 	}
 	if err := r.store.RecordFeedback(ctx, dbFeedback); err != nil {
 		return err
 	}
 
-	// Recalculate reputation
-	return r.recalculateReputation(ctx, feedback.ReviewerPubkey)
+	return r.recalculateReputation(ctx, assignment.ReviewerPubkey)
+}
+
+func (r *Registry) feedbackAssignment(ctx context.Context, feedback ReviewFeedback) (*db.ReviewAssignment, error) {
+	if feedback.AssignmentID > 0 {
+		assignment, err := r.store.GetAssignmentByID(ctx, feedback.AssignmentID)
+		if err != nil {
+			return nil, fmt.Errorf("find feedback assignment: %w", err)
+		}
+		return assignment, nil
+	}
+	if feedback.ReviewEventID == "" {
+		return nil, fmt.Errorf("feedback assignment_id or review_event_id is required")
+	}
+
+	var assignmentID int
+	err := r.store.DB().QueryRowContext(ctx, `
+		SELECT id FROM review_assignments WHERE completion_event_id = ?
+	`, feedback.ReviewEventID).Scan(&assignmentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("feedback references unknown completed review: %s", feedback.ReviewEventID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find assignment by review event: %w", err)
+	}
+	assignment, err := r.store.GetAssignmentByID(ctx, assignmentID)
+	if err != nil {
+		return nil, fmt.Errorf("find feedback assignment: %w", err)
+	}
+	return assignment, nil
+}
+
+func (r *Registry) authorizeFeedbackRater(ctx context.Context, assignment *db.ReviewAssignment, raterPubkey string) error {
+	if raterPubkey == assignment.RequesterPubkey && raterPubkey != "" {
+		return nil
+	}
+	patchAuthor, err := r.store.GetPatchAuthorPubKey(ctx, assignment.PatchEventID)
+	if err == nil && patchAuthor == raterPubkey {
+		return nil
+	}
+	if err != nil && assignment.RequesterPubkey == "" {
+		return fmt.Errorf("resolve assignment requester: %w", err)
+	}
+	return fmt.Errorf("unauthorized feedback rater: sender %s is not requester/patch author", raterPubkey)
+}
+
+func (r *Registry) ensureFeedbackNotDuplicate(ctx context.Context, assignmentID int, raterPubkey string) error {
+	var count int
+	if err := r.store.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM review_feedback WHERE assignment_id = ? AND rater_pubkey = ?
+	`, assignmentID, raterPubkey).Scan(&count); err != nil {
+		return fmt.Errorf("check duplicate feedback: %w", err)
+	}
+	if count > 0 {
+		return fmt.Errorf("duplicate feedback for assignment %d from rater %s", assignmentID, raterPubkey)
+	}
+	return nil
 }
 
 // RecalculateReputation triggers reputation recalculation for a reviewer.
@@ -440,7 +535,7 @@ func (r *Registry) recalculateReputation(ctx context.Context, pubkey string) err
 	// - 40% average rating (normalized to 0-1)
 	// - 20% volume bonus (diminishing returns)
 	volumeBonus := 1.0 - (1.0 / (1.0 + float64(stats.CompletedReviews)/10.0))
-	
+
 	overallScore := (acceptanceRate*0.4 + (avgRating/5.0)*0.4 + volumeBonus*0.2)
 
 	// Save reputation

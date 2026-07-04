@@ -28,11 +28,11 @@ type RelayPublisher interface {
 
 // RouterConfig holds router configuration.
 type RouterConfig struct {
-	DefaultRelays      []string
+	DefaultRelays        []string
 	MaxReviewersPerPatch int           // Max reviewers to assign per patch
-	AssignmentTimeout  time.Duration // How long to wait for acceptance
-	DefaultDeadline    time.Duration // Default review deadline
-	MinReputation      float64       // Minimum reputation to be assigned
+	AssignmentTimeout    time.Duration // How long to wait for acceptance
+	DefaultDeadline      time.Duration // Default review deadline
+	MinReputation        float64       // Minimum reputation to be assigned
 }
 
 // Router assigns patches to appropriate community reviewers.
@@ -77,6 +77,18 @@ func NewRouter(
 	}
 }
 
+// AuthorityPubkey returns the configured Drydock service/router authority pubkey.
+func (r *Router) AuthorityPubkey(ctx context.Context) (string, error) {
+	if r == nil || r.signer == nil {
+		return "", fmt.Errorf("marketplace router authority signer is not configured")
+	}
+	pubkey, err := r.signer.GetPublicKey(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolve marketplace router authority pubkey: %w", err)
+	}
+	return pubkey.Hex(), nil
+}
+
 // PatchInfo contains information about a patch to be routed.
 type PatchInfo struct {
 	PatchEventID string
@@ -89,10 +101,10 @@ type PatchInfo struct {
 
 // RoutingResult contains the result of routing a patch.
 type RoutingResult struct {
-	Assignments    []ReviewAssignment
-	MatchedCount   int
-	AssignedCount  int
-	NoMatchReason  string
+	Assignments   []ReviewAssignment
+	MatchedCount  int
+	AssignedCount int
+	NoMatchReason string
 }
 
 // RoutePatch finds appropriate reviewers and assigns the patch to them.
@@ -276,10 +288,10 @@ func (r *Router) publishAssignment(ctx context.Context, assignment ReviewAssignm
 		CreatedAt: nostr.Now(),
 		Content:   string(content),
 		Tags: nostr.Tags{
-			{"p", assignment.ReviewerPubkey},           // Tag the reviewer
-			{"e", assignment.PatchEventID},             // Reference the patch
-			{"a", "30617:" + assignment.RepoID},        // Reference the repo
-			{"assignment", assignment.AssignmentID},    // Assignment ID
+			{"p", assignment.ReviewerPubkey},        // Tag the reviewer
+			{"e", assignment.PatchEventID},          // Reference the patch
+			{"a", "30617:" + assignment.RepoID},     // Reference the repo
+			{"assignment", assignment.AssignmentID}, // Assignment ID
 			{"expiration", fmt.Sprintf("%d", assignment.Deadline)},
 		},
 	}
@@ -318,6 +330,7 @@ func (r *Router) HandleAcceptance(ctx context.Context, event nostr.Event) error 
 
 	acceptance.ReviewerPubkey = event.PubKey.Hex()
 	acceptance.CreatedAt = int64(event.CreatedAt)
+	acceptance.EventID = event.ID.Hex()
 
 	if err := r.registry.RecordAcceptance(ctx, acceptance); err != nil {
 		return fmt.Errorf("record acceptance: %w", err)
@@ -341,6 +354,7 @@ func (r *Router) HandleRejection(ctx context.Context, event nostr.Event) error {
 
 	rejection.ReviewerPubkey = event.PubKey.Hex()
 	rejection.CreatedAt = int64(event.CreatedAt)
+	rejection.EventID = event.ID.Hex()
 
 	if err := r.registry.RecordRejection(ctx, rejection); err != nil {
 		return fmt.Errorf("record rejection: %w", err)
@@ -462,7 +476,9 @@ func (r *Router) HandleFeedback(ctx context.Context, event nostr.Event) error {
 		return fmt.Errorf("parse feedback: %w", err)
 	}
 
+	feedback.RaterPubkey = event.PubKey.Hex()
 	feedback.CreatedAt = int64(event.CreatedAt)
+	feedback.EventID = event.ID.Hex()
 
 	if err := r.registry.RecordFeedback(ctx, feedback); err != nil {
 		return fmt.Errorf("record feedback: %w", err)
