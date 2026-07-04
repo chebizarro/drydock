@@ -13,13 +13,13 @@ AI-powered code review via Nostr — review uncommitted changes, see inline diag
 
 - VS Code 1.80.0 or later
 - Git repository
-- Nostr private key (for authentication)
-- Access to Nostr relays
+- Nostr private key (stored with VS Code SecretStorage via the command below)
+- Access to trusted/private Nostr relays
 
 ## Configuration
 
-- `drydock.relays`: Nostr relays to connect to (default: `["wss://relay.damus.io", "wss://nos.lol"]`)
-- `drydock.privateKey`: Your Nostr private key (nsec or hex)
+- `drydock.relays`: Trusted/private Nostr relays to connect to (default: `[]`; publishing source diffs to likely-public relays requires confirmation)
+- Private key: run **Drydock: Store Nostr Private Key** to store your nsec/hex key in VS Code SecretStorage
 - `drydock.drydockPubkey`: Drydock service public key
 - `drydock.autoReview`: Automatically review on save (default: false)
 
@@ -28,6 +28,7 @@ AI-powered code review via Nostr — review uncommitted changes, see inline diag
 - **Drydock: Review Uncommitted Changes** - Review your current uncommitted changes
 - **Drydock: Apply Suggested Fix** - Apply a fix from the diagnostics
 - **Drydock: Clear Diagnostics** - Clear all Drydock diagnostics
+- **Drydock: Store Nostr Private Key** - Store or clear your Nostr private key securely
 
 ## Protocol
 

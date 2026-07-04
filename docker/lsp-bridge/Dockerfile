@@ -52,9 +52,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/clangd-14 /usr/bin/clangd \
     && rm -rf /var/lib/apt/lists/*
 
-# rust-analyzer (optional — large download, uncomment if needed)
-# RUN curl -L https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-x86_64-unknown-linux-gnu.gz \
-#     | gunzip > /usr/local/bin/rust-analyzer && chmod +x /usr/local/bin/rust-analyzer
+# rust-analyzer (Rust)
+RUN curl -L https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-x86_64-unknown-linux-gnu.gz \
+    | gunzip > /usr/local/bin/rust-analyzer && chmod +x /usr/local/bin/rust-analyzer
 
 WORKDIR /app
 

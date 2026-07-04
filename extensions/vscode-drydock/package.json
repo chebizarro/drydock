@@ -32,6 +32,10 @@
       {
         "command": "drydock.clearDiagnostics",
         "title": "Drydock: Clear Diagnostics"
+      },
+      {
+        "command": "drydock.setPrivateKey",
+        "title": "Drydock: Store Nostr Private Key"
       }
     ],
     "configuration": {
@@ -39,16 +43,8 @@
       "properties": {
         "drydock.relays": {
           "type": "array",
-          "default": [
-            "wss://relay.damus.io",
-            "wss://nos.lol"
-          ],
-          "description": "Nostr relays to connect to"
-        },
-        "drydock.privateKey": {
-          "type": "string",
-          "default": "",
-          "description": "Nostr private key (nsec or hex) for authentication"
+          "default": [],
+          "description": "Nostr relays to connect to. Configure private/trusted relays; review requests include source diffs and public relays require confirmation."
         },
         "drydock.drydockPubkey": {
           "type": "string",

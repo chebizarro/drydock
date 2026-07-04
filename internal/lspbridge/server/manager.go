@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,22 +43,44 @@ type managedProcess struct {
 
 // Manager manages language server processes.
 type Manager struct {
-	mu        sync.Mutex
-	processes map[processKey]*managedProcess
-	logger    *slog.Logger
-	cancel    context.CancelFunc
+	mu             sync.Mutex
+	processes      map[processKey]*managedProcess
+	logger         *slog.Logger
+	cancel         context.CancelFunc
+	commandConfigs map[string]lspbridge.LSPCommandConfig
+}
+
+type ManagerOption func(*managerOptions)
+
+type managerOptions struct {
+	commandConfigs map[string]lspbridge.LSPCommandConfig
+}
+
+// WithLSPCommandConfig overrides or disables the language server command for a language.
+func WithLSPCommandConfig(lang string, cfg lspbridge.LSPCommandConfig) ManagerOption {
+	return func(opts *managerOptions) {
+		if opts.commandConfigs == nil {
+			opts.commandConfigs = make(map[string]lspbridge.LSPCommandConfig)
+		}
+		opts.commandConfigs[lang] = normalizeCommandConfig(cfg)
+	}
 }
 
 // NewManager creates a process manager and starts the idle reaper.
-func NewManager(logger *slog.Logger) *Manager {
+func NewManager(logger *slog.Logger, opts ...ManagerOption) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	options := managerOptions{commandConfigs: configuredLSPCommandConfigs()}
+	for _, opt := range opts {
+		opt(&options)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		processes: make(map[processKey]*managedProcess),
-		logger:    logger,
-		cancel:    cancel,
+		processes:      make(map[processKey]*managedProcess),
+		logger:         logger,
+		cancel:         cancel,
+		commandConfigs: options.commandConfigs,
 	}
 	go m.reapLoop(ctx)
 	return m
@@ -76,17 +99,18 @@ func (m *Manager) GetOrStart(ctx context.Context, lang, repoPath string) (*lspCo
 	m.mu.Unlock()
 
 	// Start new process.
-	cmdName := lspbridge.LSPCommand(lang)
-	if cmdName == "" {
-		return nil, fmt.Errorf("unsupported language: %s", lang)
+	commandConfig, err := m.commandConfig(lang)
+	if err != nil {
+		return nil, err
 	}
+	cmdName := commandConfig.Command
 
 	// Check if the command exists.
 	if _, err := exec.LookPath(cmdName); err != nil {
 		return nil, fmt.Errorf("language server %q not found: %w", cmdName, err)
 	}
 
-	args := lspArgs(lang)
+	args := append([]string(nil), commandConfig.Args...)
 	cmd := exec.CommandContext(ctx, cmdName, args...)
 	cmd.Dir = repoPath
 	cmd.Stderr = os.Stderr // forward LSP server errors for debugging
@@ -254,20 +278,94 @@ func workspaceSymbol(ctx context.Context, conn *lspConn, query string) ([]json.R
 	return symbols, nil
 }
 
-// lspArgs returns additional command-line arguments for specific language servers.
-func lspArgs(lang string) []string {
-	switch lang {
-	case lspbridge.LangGo:
-		return []string{"serve"}
-	case lspbridge.LangTypeScript, lspbridge.LangJavaScript:
-		return []string{"--stdio"}
-	case lspbridge.LangPython:
-		return nil // pylsp uses stdio by default
-	case lspbridge.LangRust:
-		return nil // rust-analyzer uses stdio by default
-	case lspbridge.LangC, lspbridge.LangCPP:
-		return nil // clangd uses stdio by default
+func (m *Manager) commandConfig(lang string) (lspbridge.LSPCommandConfig, error) {
+	cfg := lspbridge.DefaultLSPCommandConfig(lang)
+	if cfg.Command == "" {
+		return lspbridge.LSPCommandConfig{}, fmt.Errorf("unsupported language: %s", lang)
+	}
+	if override, ok := m.commandConfigs[lang]; ok {
+		if override.Disabled {
+			return lspbridge.LSPCommandConfig{}, fmt.Errorf("language server disabled for language: %s", lang)
+		}
+		if override.Command != "" {
+			cfg.Command = override.Command
+		}
+		if override.Args != nil {
+			cfg.Args = append([]string(nil), override.Args...)
+		}
+	}
+	cfg = normalizeCommandConfig(cfg)
+	if cfg.Disabled {
+		return lspbridge.LSPCommandConfig{}, fmt.Errorf("language server disabled for language: %s", lang)
+	}
+	if cfg.Command == "" {
+		return lspbridge.LSPCommandConfig{}, fmt.Errorf("unsupported language: %s", lang)
+	}
+	return cfg, nil
+}
+
+func configuredLSPCommandConfigs() map[string]lspbridge.LSPCommandConfig {
+	configs := make(map[string]lspbridge.LSPCommandConfig)
+	disabled := make(map[string]struct{})
+	for _, lang := range splitConfigList(os.Getenv("DRYDOCK_LSP_DISABLED_LANGUAGES")) {
+		disabled[lang] = struct{}{}
+	}
+	for _, lang := range lspbridge.SupportedLanguages() {
+		envKey := languageEnvKey(lang)
+		cfg := lspbridge.LSPCommandConfig{}
+		if _, ok := disabled[lang]; ok || truthy(os.Getenv("DRYDOCK_LSP_"+envKey+"_DISABLED")) {
+			cfg.Disabled = true
+		}
+		if command := strings.TrimSpace(os.Getenv("DRYDOCK_LSP_" + envKey + "_COMMAND")); command != "" {
+			cfg.Command = command
+		}
+		if argsEnv, ok := os.LookupEnv("DRYDOCK_LSP_" + envKey + "_ARGS"); ok {
+			cfg.Args = splitArgs(argsEnv)
+		}
+		if cfg.Disabled || cfg.Command != "" || cfg.Args != nil {
+			configs[lang] = normalizeCommandConfig(cfg)
+		}
+	}
+	return configs
+}
+
+func normalizeCommandConfig(cfg lspbridge.LSPCommandConfig) lspbridge.LSPCommandConfig {
+	cfg.Command = strings.TrimSpace(cfg.Command)
+	if cfg.Args != nil {
+		args := make([]string, 0, len(cfg.Args))
+		for _, arg := range cfg.Args {
+			if trimmed := strings.TrimSpace(arg); trimmed != "" {
+				args = append(args, trimmed)
+			}
+		}
+		cfg.Args = args
+	}
+	return cfg
+}
+
+func splitArgs(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return []string{}
+	}
+	var args []string
+	for _, part := range strings.Split(value, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			args = append(args, trimmed)
+		}
+	}
+	return args
+}
+
+func languageEnvKey(lang string) string {
+	replacer := strings.NewReplacer("-", "_", ".", "_")
+	return strings.ToUpper(replacer.Replace(lang))
+}
+
+func truthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "t", "true", "y", "yes", "on":
+		return true
 	default:
-		return nil
+		return false
 	}
 }

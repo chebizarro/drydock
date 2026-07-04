@@ -134,7 +134,7 @@ func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
 
 	var parsed MetaReviewOutput
 	if reuse != nil {
-		parsed, err = ParseMetaReviewOutput(llmutil.ExtractJSON(reuse.ResponseJSON))
+		parsed, err = ParseMetaReviewOutputForFindings(llmutil.ExtractJSON(reuse.ResponseJSON), len(in.LocalReview.Findings))
 		if err != nil {
 			return Result{}, err
 		}
@@ -159,7 +159,7 @@ func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("meta-review completion failed: %w", err)
 	}
-	parsed, err = ParseMetaReviewOutput(llmutil.ExtractJSON(raw))
+	parsed, err = ParseMetaReviewOutputForFindings(llmutil.ExtractJSON(raw), len(in.LocalReview.Findings))
 	if err != nil {
 		return Result{}, err
 	}

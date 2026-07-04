@@ -32,6 +32,20 @@ func TestLangFromExt(t *testing.T) {
 	}
 }
 
+func TestDefaultLSPCommandConfig(t *testing.T) {
+	goCfg := DefaultLSPCommandConfig(LangGo)
+	if goCfg.Command != "gopls" || len(goCfg.Args) != 1 || goCfg.Args[0] != "serve" {
+		t.Fatalf("unexpected Go LSP config: %+v", goCfg)
+	}
+	tsCfg := DefaultLSPCommandConfig(LangTypeScript)
+	if tsCfg.Command != "typescript-language-server" || len(tsCfg.Args) != 1 || tsCfg.Args[0] != "--stdio" {
+		t.Fatalf("unexpected TypeScript LSP config: %+v", tsCfg)
+	}
+	if cfg := DefaultLSPCommandConfig("unknown"); cfg.Command != "" || cfg.Args != nil || cfg.Disabled {
+		t.Fatalf("unknown language should have zero config, got %+v", cfg)
+	}
+}
+
 func TestLSPCommand(t *testing.T) {
 	tests := []struct {
 		lang string

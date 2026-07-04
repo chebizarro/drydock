@@ -114,7 +114,8 @@ func (r *QdrantFewShotRetriever) RetrieveFewShots(ctx context.Context, query Few
 
 	// Fetch more results than needed to allow for post-filtering and re-ranking.
 	fetchLimit := query.Limit + searchOverfetch
-	results, err := r.qdrant.Search(ctx, vectorstore.CollectionFewShot, vec, fetchLimit, nil)
+	filter := buildFewShotFilter(query)
+	results, err := r.qdrant.Search(ctx, vectorstore.CollectionFewShot, vec, fetchLimit, filter)
 	if err != nil {
 		r.logger.Warn("Qdrant few-shot search failed, falling back to recency", "error", err)
 		return r.fallback(ctx, query.Limit)
@@ -188,9 +189,33 @@ func (r *QdrantFewShotRetriever) RetrieveFewShots(ctx context.Context, query Few
 	r.logger.Info("retrieved weighted few-shot examples from Qdrant",
 		"count", len(shots),
 		"top_score", fmt.Sprintf("%.3f", topScore),
+		"repo_filter", query.RepoID,
 		"language_filter", query.Language,
 	)
 	return shots, nil
+}
+
+func buildFewShotFilter(query FewShotQuery) map[string]any {
+	var must []map[string]any
+	if repoID := strings.TrimSpace(query.RepoID); repoID != "" {
+		must = append(must, qdrantMatchValue("repo_id", repoID))
+	}
+	if language := strings.TrimSpace(query.Language); language != "" {
+		must = append(must, qdrantMatchValue("language", language))
+	}
+	if len(must) == 0 {
+		return nil
+	}
+	return map[string]any{"must": must}
+}
+
+func qdrantMatchValue(key string, value string) map[string]any {
+	return map[string]any{
+		"key": key,
+		"match": map[string]any{
+			"value": value,
+		},
+	}
 }
 
 func (r *QdrantFewShotRetriever) fallback(ctx context.Context, limit int) ([]string, error) {
@@ -304,5 +329,3 @@ func DetectLanguage(changedFiles []string) string {
 	}
 	return best
 }
-
-

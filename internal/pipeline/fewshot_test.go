@@ -107,6 +107,77 @@ func TestQdrantRetrieverSuccess(t *testing.T) {
 	}
 }
 
+func TestQdrantRetrieverPassesRepoAndLanguageFilter(t *testing.T) {
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{"embedding": []float32{0.1, 0.2, 0.3}, "index": 0},
+			},
+		})
+	}))
+	defer embedSrv.Close()
+
+	filterSeen := make(chan map[string]any, 1)
+	qdrantSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode qdrant request: %v", err)
+		}
+		if filter, ok := body["filter"].(map[string]any); ok {
+			filterSeen <- filter
+		} else {
+			filterSeen <- nil
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": []map[string]any{
+				{
+					"id": "hit1", "score": 0.95,
+					"payload": map[string]any{
+						"content":  `{"patch":"same repo"}`,
+						"repo_id":  "repo-a",
+						"language": "go",
+						"quality":  0.9,
+					},
+				},
+			},
+		})
+	}))
+	defer qdrantSrv.Close()
+
+	ctx := context.Background()
+	store := mustStoreForFewShot(t, ctx)
+	embedClient := embedding.NewClient(embedSrv.URL, "", "test-model")
+	qdrantClient := vectorstore.NewClient(qdrantSrv.URL, "")
+	retriever := NewQdrantRetriever(qdrantClient, embedClient, store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	_, err := retriever.RetrieveFewShots(ctx, FewShotQuery{
+		PatchDiff: "diff --git a/main.go b/main.go",
+		Limit:     1,
+		Language:  "go",
+		RepoID:    "repo-a",
+	})
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+
+	var filter map[string]any
+	select {
+	case filter = <-filterSeen:
+	default:
+		t.Fatal("qdrant search was not called")
+	}
+	must, ok := filter["must"].([]any)
+	if !ok || len(must) != 2 {
+		t.Fatalf("expected repo and language must filters, got %#v", filter)
+	}
+	if !filterHasMatch(must, "repo_id", "repo-a") {
+		t.Fatalf("expected repo_id filter in %#v", must)
+	}
+	if !filterHasMatch(must, "language", "go") {
+		t.Fatalf("expected language filter in %#v", must)
+	}
+}
+
 func TestQdrantRetrieverLanguageBoost(t *testing.T) {
 	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
@@ -403,6 +474,20 @@ func TestExtractMetaEmpty(t *testing.T) {
 	if meta.Language != "" || meta.RepoID != "" || meta.Quality != 0 {
 		t.Errorf("empty payload should yield zero meta, got: %+v", meta)
 	}
+}
+
+func filterHasMatch(must []any, key, value string) bool {
+	for _, clause := range must {
+		clauseMap, ok := clause.(map[string]any)
+		if !ok || clauseMap["key"] != key {
+			continue
+		}
+		match, ok := clauseMap["match"].(map[string]any)
+		if ok && match["value"] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func containsSubstring(s, substr string) bool {

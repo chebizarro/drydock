@@ -100,21 +100,39 @@ func LangFromExt(ext string) string {
 	}
 }
 
+// LSPCommandConfig describes how to start a language server.
+type LSPCommandConfig struct {
+	Command  string   `json:"command"`
+	Args     []string `json:"args,omitempty"`
+	Disabled bool     `json:"disabled,omitempty"`
+}
+
+// SupportedLanguages returns the language identifiers supported by the bridge.
+func SupportedLanguages() []string {
+	return []string{LangGo, LangPython, LangTypeScript, LangJavaScript, LangRust, LangC, LangCPP}
+}
+
+// DefaultLSPCommandConfig returns the default command and args for a language.
+// A zero-value config means the language is not supported.
+func DefaultLSPCommandConfig(lang string) LSPCommandConfig {
+	switch lang {
+	case LangGo:
+		return LSPCommandConfig{Command: "gopls", Args: []string{"serve"}}
+	case LangPython:
+		return LSPCommandConfig{Command: "pylsp"}
+	case LangTypeScript, LangJavaScript:
+		return LSPCommandConfig{Command: "typescript-language-server", Args: []string{"--stdio"}}
+	case LangRust:
+		return LSPCommandConfig{Command: "rust-analyzer"}
+	case LangC, LangCPP:
+		return LSPCommandConfig{Command: "clangd"}
+	default:
+		return LSPCommandConfig{}
+	}
+}
+
 // LSPCommand returns the command to start the language server for a language.
 // Returns empty string if the language is not supported.
 func LSPCommand(lang string) string {
-	switch lang {
-	case LangGo:
-		return "gopls"
-	case LangPython:
-		return "pylsp"
-	case LangTypeScript, LangJavaScript:
-		return "typescript-language-server"
-	case LangRust:
-		return "rust-analyzer"
-	case LangC, LangCPP:
-		return "clangd"
-	default:
-		return ""
-	}
+	return DefaultLSPCommandConfig(lang).Command
 }
