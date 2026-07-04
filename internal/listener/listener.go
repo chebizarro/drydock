@@ -33,9 +33,8 @@ var subscribedKinds = []nostr.Kind{
 	nostr.KindEncryptedDirectMessage, // NIP-04 DMs (kind 4)
 	14,                               // NIP-17 sealed DMs
 	1059,                             // NIP-59 gift wraps for private ContextVM payloads
-	31650,                            // IDE workspace session
-	1651,                             // IDE review request
-	1653,                             // IDE fix request
+	30078,                            // IDE workspace session state
+	25910,                            // ContextVM IDE commands/responses
 	30620,                            // Reviewer profile (replaceable)
 	1660,                             // Review assignment
 	1661,                             // Assignment acceptance

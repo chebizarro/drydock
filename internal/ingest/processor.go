@@ -214,7 +214,7 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			}()
 		}
 		return nil
-	case 31650, 1651, 1653: // IDE integration events
+	case 30078, 25910: // IDE session state and ContextVM IDE commands
 		// Route to IDE gateway handler.
 		if p.ideGateway != nil {
 			go func() {

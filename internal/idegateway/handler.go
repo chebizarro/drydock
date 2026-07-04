@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"drydock/internal/contextbuilder"
+	"drydock/internal/contextvm"
 	"drydock/internal/db"
 	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
@@ -126,19 +127,54 @@ func (h *Handler) HandleEvent(ctx context.Context, event nostr.Event, relayURL s
 	switch int(event.Kind) {
 	case KindIDESession:
 		return h.handleSession(ctx, event, relayURL)
-	case KindIDEReviewRequest:
-		return h.handleReviewRequest(ctx, event, relayURL)
-	case KindIDEFixRequest:
-		return h.handleFixRequest(ctx, event, relayURL)
+	case KindIDECommand:
+		return h.handleContextVMCommand(ctx, event, relayURL)
 	default:
 		return nil
 	}
 }
 
-// IsIDEEvent checks if an event is an IDE integration event.
+// HandledKinds returns the Nostr kinds accepted by the IDE gateway.
+func HandledKinds() []nostr.Kind {
+	return []nostr.Kind{nostr.Kind(KindIDESession), nostr.Kind(KindIDECommand)}
+}
+
+// IsHandled checks if a Nostr kind is accepted by the IDE gateway.
+func IsHandled(kind nostr.Kind) bool {
+	for _, handled := range HandledKinds() {
+		if kind == handled {
+			return true
+		}
+	}
+	return false
+}
+
+// IsIDEEvent checks if an event kind is handled by IDE integration.
 func IsIDEEvent(kind nostr.Kind) bool {
-	k := int(kind)
-	return k == KindIDESession || k == KindIDEReviewRequest || k == KindIDEFixRequest
+	return IsHandled(kind)
+}
+
+func (h *Handler) handleContextVMCommand(ctx context.Context, event nostr.Event, relayURL string) error {
+	msg, err := contextvm.ParseMessage(event.Content)
+	if err != nil {
+		h.logger.Warn("invalid ContextVM IDE command", "event_id", event.ID.Hex(), "error", err)
+		return nil
+	}
+	if msg.ID == "" || msg.Method == "" {
+		h.logger.Warn("ContextVM IDE command missing id or method", "event_id", event.ID.Hex(), "method", msg.Method)
+		return nil
+	}
+
+	paramsEvent := event
+	paramsEvent.Content = string(msg.Params)
+	switch msg.Method {
+	case MethodIDEReview:
+		return h.handleReviewRequest(ctx, paramsEvent, relayURL, msg.ID)
+	case MethodIDEApplyFix:
+		return h.handleFixRequest(ctx, paramsEvent, relayURL, msg.ID)
+	default:
+		return nil
+	}
 }
 
 // handleSession registers or updates an IDE workspace session.
@@ -192,7 +228,7 @@ func (h *Handler) handleSession(ctx context.Context, event nostr.Event, relayURL
 }
 
 // handleReviewRequest processes an IDE review request.
-func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, relayURL string) error {
+func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, relayURL string, contextVMID string) error {
 	metrics.IDEReviewRequestsReceived.Inc()
 
 	// Acquire semaphore slot.
@@ -209,6 +245,11 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 		return nil
 	}
 
+	if req.RequestID != "" && req.RequestID != contextVMID {
+		h.logger.Warn("review request_id does not match ContextVM id", "event_id", event.ID.Hex(), "request_id", req.RequestID, "contextvm_id", contextVMID)
+		return nil
+	}
+	req.RequestID = contextVMID
 	if req.SessionID == "" || req.RequestID == "" {
 		h.logger.Warn("review request missing session_id or request_id", "event_id", event.ID.Hex())
 		return nil
@@ -304,7 +345,7 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 }
 
 // handleFixRequest processes an IDE fix application request.
-func (h *Handler) handleFixRequest(ctx context.Context, event nostr.Event, relayURL string) error {
+func (h *Handler) handleFixRequest(ctx context.Context, event nostr.Event, relayURL string, contextVMID string) error {
 	metrics.IDEFixRequestsReceived.Inc()
 
 	req, err := ParseFixRequest(event.Content)
@@ -313,6 +354,11 @@ func (h *Handler) handleFixRequest(ctx context.Context, event nostr.Event, relay
 		return nil
 	}
 
+	if req.RequestID != "" && req.RequestID != contextVMID {
+		h.logger.Warn("fix request_id does not match ContextVM id", "event_id", event.ID.Hex(), "request_id", req.RequestID, "contextvm_id", contextVMID)
+		return nil
+	}
+	req.RequestID = contextVMID
 	if req.SessionID == "" || req.RequestID == "" {
 		h.logger.Warn("fix request missing session_id or request_id", "event_id", event.ID.Hex())
 		return nil
@@ -362,9 +408,9 @@ func (h *Handler) handleFixRequest(ctx context.Context, event nostr.Event, relay
 	return nil
 }
 
-// publishReviewResponse publishes a review response event.
+// publishReviewResponse publishes a ContextVM review response event.
 func (h *Handler) publishReviewResponse(ctx context.Context, reqEvent nostr.Event, resp ReviewResponse, relayURL string) error {
-	content, err := json.Marshal(resp)
+	content, err := contextvm.MarshalResult(resp.RequestID, resp)
 	if err != nil {
 		return fmt.Errorf("marshal response: %w", err)
 	}
@@ -372,11 +418,14 @@ func (h *Handler) publishReviewResponse(ctx context.Context, reqEvent nostr.Even
 	responseEvent := nostr.Event{
 		Kind:      nostr.Kind(KindIDEReviewResponse),
 		CreatedAt: nostr.Now(),
-		Content:   string(content),
+		Content:   content,
 		Tags: nostr.Tags{
-			{"e", reqEvent.ID.Hex()},     // Reference the request
+			{"e", reqEvent.ID.Hex()},     // Reference the request event
 			{"p", reqEvent.PubKey.Hex()}, // Tag the requester
 			{"session", resp.SessionID},  // Session reference
+			{"request", resp.RequestID},  // ContextVM request correlation
+			{"method", MethodIDEReview},
+			{"t", "drydock-ide"},
 		},
 	}
 
@@ -403,9 +452,9 @@ func (h *Handler) publishErrorResponse(ctx context.Context, reqEvent nostr.Event
 	return h.publishReviewResponse(ctx, reqEvent, resp, relayURL)
 }
 
-// publishFixResponse publishes a fix response event.
+// publishFixResponse publishes a ContextVM fix response event.
 func (h *Handler) publishFixResponse(ctx context.Context, reqEvent nostr.Event, resp FixResponse, relayURL string) error {
-	content, err := json.Marshal(resp)
+	content, err := contextvm.MarshalResult(resp.RequestID, resp)
 	if err != nil {
 		return fmt.Errorf("marshal response: %w", err)
 	}
@@ -413,11 +462,14 @@ func (h *Handler) publishFixResponse(ctx context.Context, reqEvent nostr.Event, 
 	responseEvent := nostr.Event{
 		Kind:      nostr.Kind(KindIDEFixResponse),
 		CreatedAt: nostr.Now(),
-		Content:   string(content),
+		Content:   content,
 		Tags: nostr.Tags{
 			{"e", reqEvent.ID.Hex()},
 			{"p", reqEvent.PubKey.Hex()},
 			{"session", resp.SessionID},
+			{"request", resp.RequestID},
+			{"method", MethodIDEApplyFix},
+			{"t", "drydock-ide"},
 		},
 	}
 

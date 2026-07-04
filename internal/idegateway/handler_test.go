@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"drydock/internal/contextvm"
 	"drydock/internal/db"
 
 	"fiatjaf.com/nostr"
@@ -56,6 +57,22 @@ func zeroPubKeyHex() string {
 	return pk.Hex()
 }
 
+func unwrapContextVMResult[T any](t *testing.T, content string) T {
+	t.Helper()
+	msg, err := contextvm.ParseMessage(content)
+	if err != nil {
+		t.Fatalf("parse ContextVM response: %v", err)
+	}
+	if msg.Error != nil {
+		t.Fatalf("ContextVM response error: %+v", msg.Error)
+	}
+	var result T
+	if err := json.Unmarshal(msg.Result, &result); err != nil {
+		t.Fatalf("unmarshal ContextVM result: %v", err)
+	}
+	return result
+}
+
 func fixRequestEvent(t *testing.T, h *Handler, sessionID, requestID, fixID, file string) nostr.Event {
 	t.Helper()
 	content, err := json.Marshal(FixRequest{
@@ -77,6 +94,24 @@ func fixRequestEvent(t *testing.T, h *Handler, sessionID, requestID, fixID, file
 	}
 }
 
+func signedContextVMEvent(t *testing.T, sk nostr.SecretKey, method, id string, params any, tags nostr.Tags) nostr.Event {
+	t.Helper()
+	content, err := contextvm.MarshalRequest(id, method, params)
+	if err != nil {
+		t.Fatalf("marshal ContextVM request: %v", err)
+	}
+	event := nostr.Event{
+		Kind:      nostr.Kind(KindIDECommand),
+		CreatedAt: nostr.Now(),
+		Content:   content,
+		Tags:      tags,
+	}
+	if err := event.Sign(sk); err != nil {
+		t.Fatalf("sign ContextVM event: %v", err)
+	}
+	return event
+}
+
 func TestHandleFixRequestReturnsStoredFix(t *testing.T) {
 	ctx := context.Background()
 	pub := &mockPublisher{}
@@ -91,7 +126,7 @@ func TestHandleFixRequestReturnsStoredFix(t *testing.T) {
 
 	event := fixRequestEvent(t, h, "sess-1", "req-1", "fix-1", "main.go")
 
-	if err := h.handleFixRequest(ctx, event, ""); err != nil {
+	if err := h.handleFixRequest(ctx, event, "", "req-1"); err != nil {
 		t.Fatalf("handleFixRequest failed: %v", err)
 	}
 
@@ -99,16 +134,65 @@ func TestHandleFixRequestReturnsStoredFix(t *testing.T) {
 		t.Fatalf("published events = %d, want 1", len(pub.events))
 	}
 
-	var resp FixResponse
-	if err := json.Unmarshal([]byte(pub.events[0].Content), &resp); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
-	}
-
+	resp := unwrapContextVMResult[FixResponse](t, pub.events[0].Content)
 	if !resp.Success {
 		t.Fatalf("Success = false, want true (error: %q)", resp.Error)
 	}
 	if resp.Diff == "" {
 		t.Fatal("Diff is empty, want stored diff")
+	}
+}
+
+func TestHandleEventDispatchesContextVMFixRequest(t *testing.T) {
+	ctx := context.Background()
+	pub := &mockPublisher{}
+	h := newTestHandler(pub)
+	clientSK := nostr.Generate()
+	clientPubKey := nostr.GetPublicKey(clientSK)
+
+	h.storeFix(ctx, "fix-1", storedFix{
+		SessionID:    "sess-1",
+		AuthorPubKey: clientPubKey.Hex(),
+		File:         "main.go",
+		Diff:         "@@ -1 +1 @@\n-old\n+new",
+		CreatedAt:    time.Now(),
+	})
+
+	event := signedContextVMEvent(t, clientSK, MethodIDEApplyFix, "req-1", FixRequest{
+		SessionID: "sess-1",
+		FixID:     "fix-1",
+		File:      "main.go",
+	}, nostr.Tags{{"p", h.ourPubKey}, {"session", "sess-1"}, {"request", "req-1"}, {"t", "drydock-ide"}})
+
+	if err := h.HandleEvent(ctx, event, ""); err != nil {
+		t.Fatalf("HandleEvent failed: %v", err)
+	}
+	if len(pub.events) != 1 {
+		t.Fatalf("published events = %d, want 1", len(pub.events))
+	}
+	if pub.events[0].Kind != nostr.Kind(KindIDECommand) {
+		t.Fatalf("response kind = %d, want %d", pub.events[0].Kind, KindIDECommand)
+	}
+	assertTagValue(t, pub.events[0].Tags, "method", MethodIDEApplyFix)
+	assertTagValue(t, pub.events[0].Tags, "request", "req-1")
+	resp := unwrapContextVMResult[FixResponse](t, pub.events[0].Content)
+	if !resp.Success || resp.Diff == "" {
+		t.Fatalf("unexpected fix response: %+v", resp)
+	}
+}
+
+func TestHandleEventIgnoresUnknownContextVMMethod(t *testing.T) {
+	ctx := context.Background()
+	pub := &mockPublisher{}
+	h := newTestHandler(pub)
+	clientSK := nostr.Generate()
+
+	event := signedContextVMEvent(t, clientSK, "ide/unknown", "req-1", map[string]string{"session_id": "sess-1"}, nostr.Tags{{"p", h.ourPubKey}})
+	if err := h.HandleEvent(ctx, event, ""); err != nil {
+		t.Fatalf("HandleEvent failed: %v", err)
+	}
+	if len(pub.events) != 0 {
+		t.Fatalf("published events = %d, want 0", len(pub.events))
 	}
 }
 
@@ -140,7 +224,7 @@ func TestHandleFixRequestRejectsUnaddressedRecipient(t *testing.T) {
 			event := fixRequestEvent(t, h, "sess-1", "req-1", "fix-1", "main.go")
 			event.Tags = tc.tags
 
-			if err := h.handleFixRequest(ctx, event, ""); err != nil {
+			if err := h.handleFixRequest(ctx, event, "", "req-1"); err != nil {
 				t.Fatalf("handleFixRequest failed: %v", err)
 			}
 			if len(pub.events) != 0 {
@@ -168,7 +252,7 @@ func TestHandleFixRequestRejectsUnauthorizedSender(t *testing.T) {
 	event := fixRequestEvent(t, h, "sess-1", "req-1", "fix-1", "main.go")
 	event.PubKey = nostr.GetPublicKey(otherSK)
 
-	if err := h.handleFixRequest(ctx, event, ""); err != nil {
+	if err := h.handleFixRequest(ctx, event, "", "req-1"); err != nil {
 		t.Fatalf("handleFixRequest failed: %v", err)
 	}
 	if len(pub.events) != 0 {
@@ -183,7 +267,7 @@ func TestHandleFixRequestMissingFix(t *testing.T) {
 
 	event := fixRequestEvent(t, h, "sess-1", "req-1", "missing", "main.go")
 
-	if err := h.handleFixRequest(ctx, event, ""); err != nil {
+	if err := h.handleFixRequest(ctx, event, "", "req-1"); err != nil {
 		t.Fatalf("handleFixRequest failed: %v", err)
 	}
 
@@ -191,11 +275,7 @@ func TestHandleFixRequestMissingFix(t *testing.T) {
 		t.Fatalf("published events = %d, want 1", len(pub.events))
 	}
 
-	var resp FixResponse
-	if err := json.Unmarshal([]byte(pub.events[0].Content), &resp); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
-	}
-
+	resp := unwrapContextVMResult[FixResponse](t, pub.events[0].Content)
 	if resp.Success {
 		t.Fatal("Success = true, want false")
 	}
@@ -245,17 +325,14 @@ func TestStoredFixSurvivesNewHandlerInstance(t *testing.T) {
 	event := fixRequestEvent(t, h2, "sess-1", "req-1", "fix-durable", "main.go")
 	event.PubKey = ownerPubKey
 
-	if err := h2.handleFixRequest(ctx, event, ""); err != nil {
+	if err := h2.handleFixRequest(ctx, event, "", "req-1"); err != nil {
 		t.Fatalf("handleFixRequest failed: %v", err)
 	}
 	if len(pub.events) != 1 {
 		t.Fatalf("published events = %d, want 1", len(pub.events))
 	}
 
-	var resp FixResponse
-	if err := json.Unmarshal([]byte(pub.events[0].Content), &resp); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
-	}
+	resp := unwrapContextVMResult[FixResponse](t, pub.events[0].Content)
 	if !resp.Success {
 		t.Fatalf("Success = false, want true (error: %q)", resp.Error)
 	}

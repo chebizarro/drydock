@@ -35,9 +35,8 @@ func TestSubscribedKindsSet(t *testing.T) {
 		4:     true, // NIP-04 DMs
 		14:    true, // NIP-17 sealed DMs
 		1059:  true, // NIP-59 gift wraps
-		31650: true, // IDE workspace session
-		1651:  true, // IDE review request
-		1653:  true, // IDE fix request
+		30078: true, // IDE workspace session state
+		25910: true, // ContextVM IDE commands/responses
 		30620: true, // Marketplace: reviewer profile
 		1660:  true, // Marketplace: review assignment
 		1661:  true, // Marketplace: assignment acceptance

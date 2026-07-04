@@ -32,12 +32,12 @@ const NodeWebSocket = require('ws');
 
 useWebSocketImplementation(NodeWebSocket);
 
-// Nostr event kinds for IDE integration
-const KIND_IDE_SESSION = 31650;
-const KIND_IDE_REVIEW_REQUEST = 1651;
-const KIND_IDE_REVIEW_RESPONSE = 1652;
-const KIND_IDE_FIX_REQUEST = 1653;
-const KIND_IDE_FIX_RESPONSE = 1654;
+// Nostr event kinds and ContextVM methods for IDE integration
+const KIND_IDE_SESSION = 30078;
+const KIND_CONTEXTVM = 25910;
+const METHOD_IDE_REVIEW = 'ide/review';
+const METHOD_IDE_APPLY_FIX = 'ide/applyFix';
+const IDE_CONTEXT_TAG = 'drydock-ide';
 
 const PRIVATE_KEY_SECRET_KEY = 'drydock.privateKey';
 const PUBLIC_DIFF_WARNING_ACTION = 'Publish Diff';
@@ -61,11 +61,15 @@ let autoReviewInFlight = false;
 
 // Store pending fixes by ID
 const pendingFixes: Map<string, PendingFix> = new Map();
+const pendingFixResponses: Map<string, {
+    resolve: (response: FixResponse) => void;
+    reject: (error: Error) => void;
+}> = new Map();
 
 interface PendingFix {
     file: string;
     range: vscode.Range;
-    suggestedFix: string;
+    suggestedFix?: string;
 }
 
 interface Diagnostic {
@@ -93,8 +97,41 @@ interface ReviewResponse {
     review_time_ms: number;
 }
 
+interface FixRequest {
+    session_id: string;
+    fix_id: string;
+    file: string;
+}
+
+interface FixResponse {
+    request_id: string;
+    session_id: string;
+    success: boolean;
+    diff?: string;
+    error?: string;
+}
+
+interface ContextVMRequest<T> {
+    jsonrpc: '2.0';
+    id: string;
+    method: string;
+    params: T;
+}
+
+interface ContextVMResponse<T> {
+    jsonrpc?: string;
+    id: string;
+    result?: T;
+    error?: {
+        code: number;
+        message: string;
+        data?: unknown;
+    };
+}
+
 interface IDESessionAnnouncement {
     session_id: string;
+    workspace_path: string;
     repo_id: string;
     repo_ref: string;
     editor: string;
@@ -152,6 +189,7 @@ export function activate(context: vscode.ExtensionContext) {
             activeRelayUrls = [];
             activeSubscriptionKey = undefined;
             activeDrydockPubkey = undefined;
+            rejectPendingFixResponses(new Error('Extension deactivated'));
         })
     );
 
@@ -170,6 +208,7 @@ export function deactivate() {
     activeRelayUrls = [];
     activeSubscriptionKey = undefined;
     activeDrydockPubkey = undefined;
+    rejectPendingFixResponses(new Error('Extension deactivated'));
     diagnosticCollection.dispose();
 }
 
@@ -239,9 +278,9 @@ async function reviewChanges() {
             cancellable: false
         }, async () => {
             const requestEvent = signEvent({
-                kind: KIND_IDE_REVIEW_REQUEST,
-                content: JSON.stringify(request),
-                tags: buildReviewRequestTags(config, requestId)
+                kind: KIND_CONTEXTVM,
+                content: JSON.stringify(buildContextVMRequest(requestId, METHOD_IDE_REVIEW, request)),
+                tags: buildContextVMRequestTags(config, requestId, METHOD_IDE_REVIEW)
             }, privateKey);
 
             await publishEvent(requestEvent);
@@ -296,8 +335,10 @@ function handleReviewResponse(response: ReviewResponse) {
             diagnostic.code = diag.code;
         }
 
-        // Store fix information if available
-        if (diag.has_fix && diag.fix_id && diag.suggested_fix) {
+        // Store fix information if available. The suggested fix may be present in
+        // the review response, but apply still retrieves the authoritative fix via
+        // the ContextVM ide/applyFix method.
+        if (diag.has_fix && diag.fix_id) {
             pendingFixes.set(diag.fix_id, {
                 file: diag.file,
                 range,
@@ -515,7 +556,7 @@ async function applyFix() {
 
     const items = fixes.map(([fixId, fix]) => ({
         label: `Fix in ${fix.file}`,
-        description: fix.suggestedFix.substring(0, 80),
+        description: (fix.suggestedFix ?? 'Retrieve fix from Drydock').substring(0, 80),
         fixId,
         fix
     }));
@@ -531,15 +572,26 @@ async function applyFix() {
     const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, selected.fix.file);
 
     try {
+        const fixResponse = await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: 'Drydock: Retrieving fix...',
+            cancellable: false
+        }, () => requestFix(selected.fixId, selected.fix.file));
+
+        const suggestedFix = fixResponse.diff || selected.fix.suggestedFix;
+        if (!suggestedFix) {
+            throw new Error(fixResponse.error || 'Drydock returned an empty fix');
+        }
+
         const document = await vscode.workspace.openTextDocument(fileUri);
         const edit = new vscode.WorkspaceEdit();
 
-        if (isUnifiedDiff(selected.fix.suggestedFix)) {
-            const hunks = parseUnifiedDiffHunks(selected.fix.suggestedFix);
+        if (isUnifiedDiff(suggestedFix)) {
+            const hunks = parseUnifiedDiffHunks(suggestedFix);
             const updatedText = applyUnifiedDiffToText(document.getText(), hunks);
             edit.replace(fileUri, getFullDocumentRange(document), updatedText);
         } else {
-            const replacement = normalizeReplacementText(selected.fix.suggestedFix);
+            const replacement = normalizeReplacementText(suggestedFix);
             edit.replace(fileUri, selected.fix.range, replacement);
         }
 
@@ -558,6 +610,45 @@ async function applyFix() {
     }
 }
 
+async function requestFix(fixId: string, file: string): Promise<FixResponse> {
+    const config = await getDrydockConfig();
+    const privateKey = parsePrivateKey(config.privateKey);
+    const drydockPubkey = tryParsePubkey(config.drydockPubkey);
+    if (!drydockPubkey) {
+        throw new Error('Configure drydock.drydockPubkey before requesting a fix');
+    }
+
+    await refreshRelaySubscription({ announceSession: false, notifyOnFailure: true });
+    if (!relayPool || activeRelayUrls.length === 0) {
+        throw new Error('No Nostr relays configured');
+    }
+
+    const requestId = uuidv4();
+    const request: FixRequest = {
+        session_id: sessionId,
+        fix_id: fixId,
+        file
+    };
+
+    const responsePromise = new Promise<FixResponse>((resolve, reject) => {
+        pendingFixResponses.set(requestId, { resolve, reject });
+    });
+
+    try {
+        const requestEvent = signEvent({
+            kind: KIND_CONTEXTVM,
+            content: JSON.stringify(buildContextVMRequest(requestId, METHOD_IDE_APPLY_FIX, request)),
+            tags: buildContextVMRequestTags(config, requestId, METHOD_IDE_APPLY_FIX)
+        }, privateKey);
+        await publishEvent(requestEvent);
+    } catch (error) {
+        pendingFixResponses.delete(requestId);
+        throw error;
+    }
+
+    return responsePromise;
+}
+
 /**
  * Clear all diagnostics
  */
@@ -565,6 +656,13 @@ function clearDiagnostics() {
     diagnosticCollection.clear();
     pendingFixes.clear();
     vscode.window.showInformationMessage('Drydock: Diagnostics cleared');
+}
+
+function rejectPendingFixResponses(error: Error): void {
+    for (const pending of pendingFixResponses.values()) {
+        pending.reject(error);
+    }
+    pendingFixResponses.clear();
 }
 
 async function refreshRelaySubscription(options: { announceSession: boolean; notifyOnFailure: boolean }) {
@@ -600,7 +698,7 @@ async function refreshRelaySubscription(options: { announceSession: boolean; not
             await reviewResponseSubscription?.close('refresh relay subscription');
 
             const filter: Filter = {
-                kinds: [KIND_IDE_REVIEW_RESPONSE],
+                kinds: [KIND_CONTEXTVM],
                 since: Math.floor(Date.now() / 1000)
             };
 
@@ -611,19 +709,21 @@ async function refreshRelaySubscription(options: { announceSession: boolean; not
             if (clientPubkey) {
                 filter['#p'] = [clientPubkey];
             }
+            filter['#t'] = [IDE_CONTEXT_TAG];
 
             reviewResponseSubscription = relayPool.subscribe(relayUrls, filter, {
                 onevent: (event: Event) => {
                     try {
-                        handleIncomingReviewEvent(event);
+                        handleIncomingContextVMEvent(event);
                     } catch (error) {
-                        console.error('Failed to process Drydock review response', error);
+                        console.error('Failed to process Drydock ContextVM response', error);
                     }
                 },
                 onclose: (reasons: string[]) => {
                     console.warn('Drydock review subscription closed', reasons);
                     reviewResponseSubscription = undefined;
                     activeSubscriptionKey = undefined;
+                    rejectPendingFixResponses(new Error(`Drydock relay subscription closed: ${reasons.join('; ')}`));
                 }
             });
 
@@ -644,8 +744,8 @@ async function refreshRelaySubscription(options: { announceSession: boolean; not
     }
 }
 
-function handleIncomingReviewEvent(event: Event) {
-    if (event.kind !== KIND_IDE_REVIEW_RESPONSE) {
+function handleIncomingContextVMEvent(event: Event) {
+    if (event.kind !== KIND_CONTEXTVM) {
         return;
     }
 
@@ -654,12 +754,45 @@ function handleIncomingReviewEvent(event: Event) {
         return;
     }
 
-    const response = JSON.parse(event.content) as ReviewResponse;
-    if (response.session_id !== sessionId) {
+    const envelope = JSON.parse(event.content) as ContextVMResponse<unknown>;
+    if (!envelope.id) {
         return;
     }
 
-    if (latestReviewRequestId && response.request_id !== latestReviewRequestId) {
+    const pendingFix = pendingFixResponses.get(envelope.id);
+    if (pendingFix) {
+        pendingFixResponses.delete(envelope.id);
+        if (envelope.error) {
+            pendingFix.reject(new Error(envelope.error.message));
+            return;
+        }
+        const response = envelope.result as FixResponse | undefined;
+        if (!response) {
+            pendingFix.reject(new Error('Drydock returned an empty fix response'));
+            return;
+        }
+        if (response.session_id !== sessionId) {
+            pendingFix.reject(new Error('Drydock fix response was for a different session'));
+            return;
+        }
+        if (!response.success) {
+            pendingFix.reject(new Error(response.error || 'Drydock could not resolve the fix'));
+            return;
+        }
+        pendingFix.resolve(response);
+        return;
+    }
+
+    if (latestReviewRequestId && envelope.id !== latestReviewRequestId) {
+        return;
+    }
+    if (envelope.error) {
+        vscode.window.showWarningMessage(`Drydock: ${envelope.error.message}`);
+        return;
+    }
+
+    const response = envelope.result as ReviewResponse | undefined;
+    if (!response || response.session_id !== sessionId || !Array.isArray(response.diagnostics)) {
         return;
     }
 
@@ -681,9 +814,15 @@ async function publishSessionAnnouncement(config: DrydockConfig) {
     }
 
     const privateKey = parsePrivateKey(config.privateKey);
+    const drydockPubkey = tryParsePubkey(config.drydockPubkey);
+    if (!drydockPubkey) {
+        return;
+    }
+
     const repoIdentity = getRepoIdentity(workspaceFolder);
     const announcement: IDESessionAnnouncement = {
         session_id: sessionId,
+        workspace_path: workspaceFolder.uri.fsPath,
         repo_id: repoIdentity.repoID,
         repo_ref: repoIdentity.repoRef,
         editor: 'vscode',
@@ -696,8 +835,10 @@ async function publishSessionAnnouncement(config: DrydockConfig) {
         content: JSON.stringify(announcement),
         tags: [
             ['d', sessionId],
+            ['p', drydockPubkey],
             ['repo', repoIdentity.repoID],
-            ['r', repoIdentity.repoRef]
+            ['r', repoIdentity.repoRef],
+            ['t', IDE_CONTEXT_TAG]
         ]
     }, privateKey);
 
@@ -943,10 +1084,21 @@ function tryParsePubkey(value: string): string | undefined {
     throw new Error('drydock.drydockPubkey must be an npub or 64-character hex public key');
 }
 
-function buildReviewRequestTags(config: DrydockConfig, requestId: string): string[][] {
+function buildContextVMRequest<T>(id: string, method: string, params: T): ContextVMRequest<T> {
+    return {
+        jsonrpc: '2.0',
+        id,
+        method,
+        params
+    };
+}
+
+function buildContextVMRequestTags(config: DrydockConfig, requestId: string, method: string): string[][] {
     const tags: string[][] = [
         ['session', sessionId],
-        ['request', requestId]
+        ['request', requestId],
+        ['method', method],
+        ['t', IDE_CONTEXT_TAG]
     ];
 
     const drydockPubkey = tryParsePubkey(config.drydockPubkey);

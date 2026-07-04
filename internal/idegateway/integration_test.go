@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"drydock/internal/contextbuilder"
+	"drydock/internal/contextvm"
 	"drydock/internal/db"
 	"drydock/internal/reviewengine"
 	"drydock/internal/testutil"
@@ -110,16 +111,19 @@ func TestIntegrationIDEGatewaySignedHandleEventReviewToFixFlow(t *testing.T) {
 		t.Fatalf("handle session: %v", err)
 	}
 
+	reviewContent, err := contextvm.MarshalRequest("req-1", MethodIDEReview, ReviewRequest{
+		SessionID:    "sess-1",
+		Diff:         "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+func x() int { return 0 }\n",
+		ChangedFiles: []string{"main.go"},
+	})
+	if err != nil {
+		t.Fatalf("marshal review request: %v", err)
+	}
 	reviewEvent := nostr.Event{
 		Kind:      nostr.Kind(KindIDEReviewRequest),
 		CreatedAt: nostr.Now(),
-		Tags:      nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "req-1"}},
-		Content: `{
-			"session_id":"sess-1",
-			"request_id":"req-1",
-			"diff":"diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+func x() int { return 0 }\n",
-			"changed_files":["main.go"]
-		}`,
+		Tags:      nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "req-1"}, {"method", MethodIDEReview}, {"t", "drydock-ide"}},
+		Content:   reviewContent,
 	}
 	if err := reviewEvent.Sign(ideSK); err != nil {
 		t.Fatalf("sign review event: %v", err)
@@ -153,9 +157,16 @@ func TestIntegrationIDEGatewaySignedHandleEventReviewToFixFlow(t *testing.T) {
 	assertTagValue(t, reviewEnvelope.Tags, "p", idePubKey.Hex())
 	assertTagValue(t, reviewEnvelope.Tags, "session", "sess-1")
 
+	reviewMsg, err := contextvm.ParseMessage(pub.events[0].Content)
+	if err != nil {
+		t.Fatalf("parse review ContextVM response: %v", err)
+	}
+	if reviewMsg.ID != "req-1" {
+		t.Fatalf("review response id = %q, want req-1", reviewMsg.ID)
+	}
 	var reviewResp ReviewResponse
-	if err := json.Unmarshal([]byte(pub.events[0].Content), &reviewResp); err != nil {
-		t.Fatalf("unmarshal review response: %v", err)
+	if err := json.Unmarshal(reviewMsg.Result, &reviewResp); err != nil {
+		t.Fatalf("unmarshal review response result: %v", err)
 	}
 	if len(reviewResp.Diagnostics) != 1 {
 		t.Fatalf("diagnostics = %d, want 1", len(reviewResp.Diagnostics))
@@ -179,16 +190,19 @@ func TestIntegrationIDEGatewaySignedHandleEventReviewToFixFlow(t *testing.T) {
 		t.Fatalf("unexpected stored fix: %+v; diagnostic fix=%q", stored, diag.SuggestedFix)
 	}
 
+	fixContent, err := contextvm.MarshalRequest("fix-req-1", MethodIDEApplyFix, FixRequest{
+		SessionID: "sess-1",
+		FixID:     diag.FixID,
+		File:      "main.go",
+	})
+	if err != nil {
+		t.Fatalf("marshal fix request: %v", err)
+	}
 	fixEvent := nostr.Event{
 		Kind:      nostr.Kind(KindIDEFixRequest),
 		CreatedAt: nostr.Now(),
-		Tags:      nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "fix-req-1"}},
-		Content: `{
-			"session_id":"sess-1",
-			"request_id":"fix-req-1",
-			"fix_id":"` + diag.FixID + `",
-			"file":"main.go"
-		}`,
+		Tags:      nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "fix-req-1"}, {"method", MethodIDEApplyFix}, {"t", "drydock-ide"}},
+		Content:   fixContent,
 	}
 	if err := fixEvent.Sign(ideSK); err != nil {
 		t.Fatalf("sign fix event: %v", err)
@@ -212,9 +226,16 @@ func TestIntegrationIDEGatewaySignedHandleEventReviewToFixFlow(t *testing.T) {
 	assertTagValue(t, fixEnvelope.Tags, "p", idePubKey.Hex())
 	assertTagValue(t, fixEnvelope.Tags, "session", "sess-1")
 
+	fixMsg, err := contextvm.ParseMessage(pub.events[1].Content)
+	if err != nil {
+		t.Fatalf("parse fix ContextVM response: %v", err)
+	}
+	if fixMsg.ID != "fix-req-1" {
+		t.Fatalf("fix response id = %q, want fix-req-1", fixMsg.ID)
+	}
 	var fixResp FixResponse
-	if err := json.Unmarshal([]byte(pub.events[1].Content), &fixResp); err != nil {
-		t.Fatalf("unmarshal fix response: %v", err)
+	if err := json.Unmarshal(fixMsg.Result, &fixResp); err != nil {
+		t.Fatalf("unmarshal fix response result: %v", err)
 	}
 	if !fixResp.Success {
 		t.Fatalf("fix response not successful: %s", fixResp.Error)

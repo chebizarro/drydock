@@ -1,135 +1,171 @@
 # IDE Integration
 
-Drydock provides real-time code review diagnostics directly in your IDE through a Nostr-native protocol. Developers get instant feedback as they edit, with actionable inline diagnostics and one-click fixes.
+Drydock provides code review diagnostics directly in the IDE through Nostr-native events. IDEs publish workspace session state and send review/fix commands as ContextVM JSON-RPC messages.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           Developer IDE                              │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                    VS Code / Neovim                           │  │
-│  │  ┌─────────────┐  ┌─────────────────┐  ┌──────────────────┐  │  │
-│  │  │  Editor     │  │  Diagnostics    │  │  Code Actions    │  │  │
-│  │  │  (source)   │  │  (squiggles)    │  │  (quick fixes)   │  │  │
-│  │  └─────────────┘  └─────────────────┘  └──────────────────┘  │  │
-│  │                            ▲                    ▲             │  │
-│  │                            │                    │             │  │
-│  │  ┌─────────────────────────┴────────────────────┴──────────┐ │  │
-│  │  │              Drydock IDE Extension                       │ │  │
-│  │  │  • Session management (kind 31650)                       │ │  │
-│  │  │  • Review requests (kind 1651)                           │ │  │
-│  │  │  • Fix applications (kind 1653)                          │ │  │
-│  │  └────────────────────────┬────────────────────────────────┘ │  │
-│  └───────────────────────────┼────────────────────────────────────┘  │
-└──────────────────────────────┼──────────────────────────────────────┘
-                               │ Nostr (encrypted)
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Drydock Server                                │
-│  ┌────────────────┐  ┌────────────────┐  ┌─────────────────────┐   │
-│  │  IDE Gateway   │  │  Review Engine │  │  Auto-Fix Generator │   │
-│  │  (handler.go)  │──▶│  (LLM review)  │──▶│  (patch creation)  │   │
-│  └────────────────┘  └────────────────┘  └─────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
+Developer IDE
+  └─ Drydock IDE Extension
+       • Session state: kind 30078 addressable event
+       • Review command: kind 25910 ContextVM JSON-RPC method ide/review
+       • Fix command: kind 25910 ContextVM JSON-RPC method ide/applyFix
+            │
+            ▼
+        Nostr relays
+            │
+            ▼
+Drydock Server
+  └─ IDE Gateway → Context Builder → Review Engine → Suggested-fix store
 ```
 
 ## Nostr Event Kinds
 
 | Kind | Name | Direction | Description |
 |------|------|-----------|-------------|
-| 31650 | IDE Session | IDE → Server | Establishes workspace session (replaceable) |
-| 1651 | Review Request | IDE → Server | Request review for file/selection |
-| 1652 | Review Response | Server → IDE | Diagnostics from review |
-| 1653 | Fix Request | IDE → Server | Request auto-fix for a diagnostic |
-| 1654 | Fix Response | Server → IDE | Generated fix patch |
+| 30078 | IDE Session State | IDE → Server | Addressable workspace session state with `d=<session-id>` |
+| 25910 | ContextVM Command | IDE ↔ Server | JSON-RPC request/response for IDE review and fix methods |
+| 1059 | NIP-59 Gift Wrap | IDE ↔ Server | Optional encrypted wrapper for private ContextVM payloads |
+
+Deprecated IDE-specific kinds `31650` and `1651`–`1654` are historical only and must not be used by live integrations.
+
+## ContextVM Methods
+
+| Method | Direction | Params | Result |
+|--------|-----------|--------|--------|
+| `ide/review` | IDE → Server | `ReviewRequest` | `ReviewResponse` diagnostics |
+| `ide/applyFix` | IDE → Server | `FixRequest` | `FixResponse` with suggested diff |
+
+Responses are kind `25910` JSON-RPC response envelopes and are correlated to requests by the JSON-RPC `id`. Events also carry `p`, `session`, `request`, `method`, and `t=drydock-ide` tags for routing and filtering.
 
 ## Protocol Flow
 
 ### 1. Session Establishment
 
-When the IDE extension activates:
+The IDE announces session state as an addressable kind `30078` event:
 
 ```json
 {
-  "kind": 31650,
+  "kind": 30078,
   "content": {
-    "workspace": "/path/to/project",
-    "repo_url": "github.com/user/project",
-    "capabilities": ["review", "fix", "explain"]
+    "session_id": "session-uuid",
+    "workspace_path": "/path/to/project",
+    "repo_id": "<repo-id>",
+    "repo_ref": "repo:<repo-id>",
+    "editor": "vscode",
+    "version": "1.0.0",
+    "languages": ["go", "typescript"]
   },
   "tags": [
     ["d", "session-uuid"],
-    ["client", "vscode-drydock/1.0.0"]
+    ["p", "<drydock-pubkey>"],
+    ["t", "drydock-ide"]
   ]
 }
 ```
 
 ### 2. Review Request
 
-When the user saves a file or triggers manual review:
+When the user triggers review, the IDE publishes a kind `25910` ContextVM JSON-RPC request:
 
 ```json
 {
-  "kind": 1651,
+  "kind": 25910,
   "content": {
-    "file": "src/auth.go",
-    "content": "package auth\n\nfunc Login(user, pass string) {...}",
-    "selection": {"start": 10, "end": 25},
-    "trigger": "save"
+    "jsonrpc": "2.0",
+    "id": "review-request-uuid",
+    "method": "ide/review",
+    "params": {
+      "session_id": "session-uuid",
+      "diff": "diff --git ...",
+      "changed_files": ["src/auth.go"],
+      "full_review": true
+    }
   },
   "tags": [
-    ["e", "<session-event-id>"],
-    ["p", "<drydock-pubkey>"]
+    ["p", "<drydock-pubkey>"],
+    ["session", "session-uuid"],
+    ["request", "review-request-uuid"],
+    ["method", "ide/review"],
+    ["t", "drydock-ide"]
   ]
 }
 ```
 
 ### 3. Review Response
 
-Drydock responds with diagnostics:
+Drydock responds with a kind `25910` JSON-RPC result using the same `id`:
 
 ```json
 {
-  "kind": 1652,
+  "kind": 25910,
   "content": {
-    "diagnostics": [
-      {
-        "file": "src/auth.go",
-        "range": {"start": {"line": 15, "character": 4}, "end": {"line": 15, "character": 20}},
-        "severity": 1,
-        "message": "Password compared in constant time to prevent timing attacks",
-        "source": "drydock",
-        "has_fix": true,
-        "fix_id": "fix-timing-attack-001"
-      }
-    ]
+    "jsonrpc": "2.0",
+    "id": "review-request-uuid",
+    "result": {
+      "request_id": "review-request-uuid",
+      "session_id": "session-uuid",
+      "diagnostics": [
+        {
+          "file": "src/auth.go",
+          "range": {"start_line": 15, "start_column": 4, "end_line": 15, "end_column": 20},
+          "severity": 1,
+          "message": "Password comparison should avoid timing leaks",
+          "source": "drydock",
+          "has_fix": true,
+          "fix_id": "fix-timing-attack-001",
+          "suggested_fix": "@@ ..."
+        }
+      ],
+      "summary": "Found one issue.",
+      "review_time_ms": 1234
+    }
   },
   "tags": [
     ["e", "<request-event-id>"],
-    ["p", "<user-pubkey>"]
+    ["p", "<ide-pubkey>"],
+    ["session", "session-uuid"],
+    ["request", "review-request-uuid"],
+    ["method", "ide/review"],
+    ["t", "drydock-ide"]
   ]
 }
 ```
 
 ### 4. Fix Request & Response
 
-User clicks "Quick Fix" in the IDE:
+When the user applies a fix, the IDE asks Drydock to retrieve the stored suggested fix:
 
 ```json
-// Request (kind 1653)
 {
+  "kind": 25910,
   "content": {
-    "fix_id": "fix-timing-attack-001",
-    "file": "src/auth.go"
+    "jsonrpc": "2.0",
+    "id": "fix-request-uuid",
+    "method": "ide/applyFix",
+    "params": {
+      "session_id": "session-uuid",
+      "fix_id": "fix-timing-attack-001",
+      "file": "src/auth.go"
+    }
   }
 }
+```
 
-// Response (kind 1654)
+Drydock responds:
+
+```json
 {
+  "kind": 25910,
   "content": {
-    "fix_id": "fix-timing-attack-001",
-    "patch": "--- a/src/auth.go\n+++ b/src/auth.go\n@@ -15 +15 @@\n-  if password == storedHash {\n+  if subtle.ConstantTimeCompare([]byte(password), []byte(storedHash)) == 1 {"
+    "jsonrpc": "2.0",
+    "id": "fix-request-uuid",
+    "result": {
+      "request_id": "fix-request-uuid",
+      "session_id": "session-uuid",
+      "success": true,
+      "diff": "@@ ..."
+    }
   }
 }
 ```
@@ -148,71 +184,21 @@ User clicks "Quick Fix" in the IDE:
 ### Installation
 
 ```bash
-# From VS Code marketplace
-code --install-extension drydock.vscode-drydock
-
-# Or build from source
 cd extensions/vscode-drydock
-npm install && npm run package
-code --install-extension drydock-*.vsix
+npm install && npm run compile
 ```
 
 ### Extension Settings
 
 ```json
 {
-  "drydock.enabled": true,
-  "drydock.serverPubkey": "npub1drydock...",
-  "drydock.relays": ["wss://relay.damus.io", "wss://nos.lol"],
-  "drydock.reviewOnSave": true,
-  "drydock.reviewDelay": 500,
-  "drydock.showInlineHints": true
+  "drydock.relays": ["wss://relay.example"],
+  "drydock.drydockPubkey": "npub1drydock...",
+  "drydock.autoReview": false
 }
 ```
 
-### Features
-
-- **Real-time Diagnostics**: Squiggly underlines appear as you type
-- **Hover Information**: Hover over issues to see full explanations
-- **Quick Fixes**: Click the lightbulb or use `Cmd+.` to apply fixes
-- **Problems Panel**: All diagnostics appear in VS Code's Problems panel
-- **Status Bar**: Shows connection status and active session
-
-## Neovim Integration
-
-For Neovim users, integrate via the LSP client:
-
-```lua
--- In your Neovim config
-require('lspconfig').drydock.setup({
-  cmd = {'drydock-lsp-bridge'},
-  filetypes = {'go', 'python', 'typescript', 'rust'},
-  settings = {
-    drydock = {
-      serverPubkey = 'npub1drydock...',
-      relays = {'wss://relay.damus.io'}
-    }
-  }
-})
-```
-
-## Server Configuration
-
-### Environment Variables
-
-```bash
-# Enable IDE gateway
-DRYDOCK_IDE_ENABLED=true
-
-# Session timeout (inactive sessions are cleaned up)
-DRYDOCK_IDE_SESSION_TIMEOUT=30m
-
-# Maximum concurrent sessions per user
-DRYDOCK_IDE_MAX_SESSIONS_PER_USER=3
-
-# Review debounce (avoid overwhelming with rapid saves)
-DRYDOCK_IDE_REVIEW_DEBOUNCE=2s
-```
+The private key is stored in VS Code SecretStorage via **Drydock: Store Nostr Private Key**.
 
 ## Metrics
 
@@ -225,39 +211,22 @@ DRYDOCK_IDE_REVIEW_DEBOUNCE=2s
 | `drydock_ide_fix_requests_received_total` | Counter | Fix requests received |
 | `drydock_ide_fix_responses_sent_total` | Counter | Fix responses sent |
 
-## Integration Tests
+## Security and Privacy
 
-Integration suites are gated behind the `integration` build tag.
-
-```bash
-# Full pipeline integration tests
-go test -tags=integration ./internal/pipeline/...
-
-# IDE gateway review→fix integration tests
-go test -tags=integration ./internal/idegateway/...
-```
-
-## Security
-
-1. **Encryption**: All IDE ↔ Server communication uses NIP-04/NIP-44 encryption
-2. **Session Isolation**: Each user's sessions are separate and authenticated
-3. **Code Privacy**: Source code is transmitted encrypted, processed locally
-4. **No Cloud**: All LLM inference runs on your infrastructure
+- Events are signed and verified before gateway processing.
+- Session and command events must be addressed to the Drydock gateway with a matching `p` tag.
+- Review requests contain uncommitted diffs. The current VS Code extension publishes kind `25910` payloads directly and warns before using likely-public relays. NIP-59 gift-wrap support exists on the server/listener path (`1059` → inner `25910`) and should be used by clients that support encrypting private ContextVM payloads.
+- Fixes are stored server-side with session/author checks and expire after a short TTL.
 
 ## Troubleshooting
 
 ### No diagnostics appearing
-1. Check extension is enabled: `drydock.enabled: true`
-2. Verify relay connectivity in output panel
-3. Ensure Drydock server has IDE gateway enabled
-4. Check file type is supported
-
-### Slow diagnostics
-1. Increase `drydock.reviewDelay` setting
-2. Check server-side LLM latency
-3. Consider disabling `reviewOnSave` for large files
+1. Verify `drydock.drydockPubkey` is configured.
+2. Verify trusted relay connectivity.
+3. Confirm the session state event is published as kind `30078` and commands as kind `25910`.
+4. Check Drydock logs for signature, session, or recipient validation failures.
 
 ### Connection issues
-1. Verify relays are reachable
-2. Check server pubkey is correct
-3. Look for errors in extension output channel
+1. Verify relays are reachable.
+2. Check server pubkey is correct.
+3. Look for errors in the extension host console.

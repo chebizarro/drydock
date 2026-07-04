@@ -32,15 +32,14 @@ AI-powered code review via Nostr — review uncommitted changes, see inline diag
 
 ## Protocol
 
-This extension communicates with Drydock using custom Nostr event kinds:
+This extension communicates with Drydock using Nostr-native IDE events:
 
 | Kind | Description |
 |------|-------------|
-| 31650 | IDE workspace session announcement |
-| 1651 | Review request (uncommitted diff) |
-| 1652 | Review response (diagnostics) |
-| 1653 | Fix apply request |
-| 1654 | Fix apply response |
+| 30078 | IDE workspace session state (`d=<session-id>`) |
+| 25910 | ContextVM JSON-RPC `ide/review` and `ide/applyFix` requests/responses |
+
+Review requests include uncommitted diffs. Use trusted/private relays; likely-public relays require confirmation before publishing.
 
 ## Development
 
