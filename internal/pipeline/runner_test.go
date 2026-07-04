@@ -3,9 +3,11 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +51,14 @@ type mockMetaService struct {
 
 func (m *mockMetaService) RunAsync(ctx context.Context, in metareview.Input) {
 	m.calls++
+}
+
+type mockCodeIndexer struct {
+	err error
+}
+
+func (m mockCodeIndexer) IndexRepo(ctx context.Context, repoPath, repoID string) error {
+	return m.err
 }
 
 // --- Test helpers ---
@@ -188,6 +198,24 @@ func TestProcessEndToEndWithMocks(t *testing.T) {
 	_ = mockMeta
 	_ = engine
 	_ = json.Marshal // used in process
+}
+
+func TestIndexSourceCodePropagatesConfiguredIndexerFailure(t *testing.T) {
+	runner := &Runner{codeIndexer: mockCodeIndexer{err: errors.New("embedding failed")}}
+	err := runner.indexSourceCode(context.Background(), "/repo", "repo-id", testLogger())
+	if err == nil {
+		t.Fatal("expected code indexing error")
+	}
+	if !strings.Contains(err.Error(), "code indexing") || !strings.Contains(err.Error(), "embedding failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestIndexSourceCodeNoIndexerIsNoop(t *testing.T) {
+	runner := &Runner{}
+	if err := runner.indexSourceCode(context.Background(), "/repo", "repo-id", testLogger()); err != nil {
+		t.Fatalf("nil code indexer should be no-op: %v", err)
+	}
 }
 
 func TestRunnerShutdownDrainsWorkers(t *testing.T) {

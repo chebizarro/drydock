@@ -305,14 +305,12 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		})
 	}
 
-	// 1f. Index source code for semantic search (non-fatal; skip on error).
-	if r.codeIndexer != nil {
-		timer.Time(tracing.StageCodeIndex, func() error {
-			if err := r.codeIndexer.IndexRepo(ctx, prep.RepoPath, task.RepoID); err != nil {
-				log.Warn("code indexing failed, continuing without", "error", err)
-			}
-			return nil // non-fatal
-		})
+	// 1f. Index source code for semantic search. When configured, this is required:
+	// silently reviewing without related-code context hides total index failures.
+	if err := timer.Time(tracing.StageCodeIndex, func() error {
+		return r.indexSourceCode(ctx, prep.RepoPath, task.RepoID, log)
+	}); err != nil {
+		return err
 	}
 
 	// 2. Extract actual diff content from the raw event.
@@ -555,6 +553,19 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		})
 	}
 
+	return nil
+}
+
+func (r *Runner) indexSourceCode(ctx context.Context, repoPath, repoID string, log *slog.Logger) error {
+	if r.codeIndexer == nil {
+		return nil
+	}
+	if err := r.codeIndexer.IndexRepo(ctx, repoPath, repoID); err != nil {
+		if log != nil {
+			log.Error("code indexing failed", "error", err)
+		}
+		return fmt.Errorf("code indexing: %w", err)
+	}
 	return nil
 }
 

@@ -96,6 +96,12 @@ func fakeEmbedServer() *httptest.Server {
 	}))
 }
 
+func failingEmbedServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "embedding unavailable", http.StatusInternalServerError)
+	}))
+}
+
 // fakeQdrantServer returns an httptest server that simulates Qdrant.
 // It tracks upserted points and supports search/count/scroll/delete.
 type fakeQdrant struct {
@@ -379,6 +385,45 @@ func Goodbye() string {
 	}
 }
 
+func TestIndexRepoAllEmbeddingFailuresReturnErrorAndDoNotAdvanceState(t *testing.T) {
+	goSource := `package main
+
+func Hello() string {
+	return "hello"
+}
+
+func Goodbye() string {
+	return "goodbye"
+}
+`
+	repoPath := initTestRepo(t, map[string]string{
+		"main.go": goSource,
+	})
+
+	fq := newFakeQdrant()
+	defer fq.server.Close()
+	embedSrv := failingEmbedServer()
+	defer embedSrv.Close()
+
+	qdrant := vectorstore.NewClient(fq.server.URL, "")
+	embed := embedding.NewClient(embedSrv.URL, "", "test-model")
+	indexer := New(qdrant, embed, testLogger())
+
+	err := indexer.IndexRepo(context.Background(), repoPath, "test-repo")
+	if err == nil {
+		t.Fatal("expected indexing error when every embedding fails")
+	}
+	if !strings.Contains(err.Error(), "code index incomplete") {
+		t.Fatalf("expected incomplete index error, got: %v", err)
+	}
+	if got := len(fq.points[vectorstore.CollectionCodeChunks]); got != 0 {
+		t.Fatalf("expected no upserted points, got %d", got)
+	}
+	if state := readState(repoPath); state.Commit != "" {
+		t.Fatalf("state advanced despite total embedding failure: %+v", state)
+	}
+}
+
 func TestIndexRepoIncrementalSkipsUnchanged(t *testing.T) {
 	repoPath := initTestRepo(t, map[string]string{
 		"main.go": "package main\n\nfunc Hello() {}\n",
@@ -499,9 +544,9 @@ func TestIndexRepoDeletedFileCleanup(t *testing.T) {
 
 func TestIndexRepoSkipsUnsupportedLanguages(t *testing.T) {
 	repoPath := initTestRepo(t, map[string]string{
-		"data.csv":  "a,b,c\n1,2,3\n",
+		"data.csv":   "a,b,c\n1,2,3\n",
 		"config.yml": "key: value\n",
-		"main.go":   "package main\n\nfunc Hello() {}\n",
+		"main.go":    "package main\n\nfunc Hello() {}\n",
 	})
 
 	fq := newFakeQdrant()
@@ -623,6 +668,40 @@ func TestReadStateMissingFile(t *testing.T) {
 	got := readState(dir)
 	if got.Commit != "" {
 		t.Errorf("expected empty state for missing file, got: %+v", got)
+	}
+}
+
+func TestWriteStateFileAtomicReplacesCompleteJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	if err := writeStateFileAtomic(path, []byte(`{"commit":"old","updated_at":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStateFileAtomic(path, []byte(`{"commit":"new","updated_at":2}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got indexState
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("state file is not valid json after atomic replace: %v", err)
+	}
+	if got.Commit != "new" || got.UpdatedAt != 2 {
+		t.Fatalf("unexpected state after atomic replace: %+v", got)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("temporary state file was not cleaned up: %s", entry.Name())
+		}
 	}
 }
 
@@ -943,5 +1022,3 @@ func TestPayloadInt(t *testing.T) {
 		})
 	}
 }
-
-

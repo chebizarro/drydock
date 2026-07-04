@@ -1,6 +1,12 @@
 package db
 
 const schemaSQL = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS ingested_events (
   event_id TEXT PRIMARY KEY,
   kind INTEGER NOT NULL,

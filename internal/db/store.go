@@ -83,35 +83,107 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
+type schemaMigration struct {
+	version int
+	name    string
+	apply   func(context.Context, *sql.Tx) error
+}
+
+var schemaMigrations = []schemaMigration{
+	{
+		version: 1,
+		name:    "review_log_status_event_columns",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			for _, col := range []struct {
+				table, name, ddl string
+			}{
+				{"review_log", "status_event_id", "ALTER TABLE review_log ADD COLUMN status_event_id TEXT"},
+				{"review_log", "status_event_kind", "ALTER TABLE review_log ADD COLUMN status_event_kind INTEGER NOT NULL DEFAULT 0"},
+				{"review_log", "status_published_at", "ALTER TABLE review_log ADD COLUMN status_published_at INTEGER NOT NULL DEFAULT 0"},
+			} {
+				exists, err := hasColumn(ctx, tx, col.table, col.name)
+				if err != nil {
+					return fmt.Errorf("check %s.%s: %w", col.table, col.name, err)
+				}
+				if exists {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+					return fmt.Errorf("add %s.%s: %w", col.table, col.name, err)
+				}
+			}
+			return nil
+		},
+	},
+}
+
 func (s *Store) Migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, schemaSQL)
 	if err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	if err := s.applySchemaMigrations(ctx); err != nil {
+		return err
+	}
+	return nil
+}
 
-	// Idempotent column migrations for existing databases.
-	for _, col := range []struct {
-		table, name, ddl string
-	}{
-		{"review_log", "status_event_id", "ALTER TABLE review_log ADD COLUMN status_event_id TEXT"},
-		{"review_log", "status_event_kind", "ALTER TABLE review_log ADD COLUMN status_event_kind INTEGER NOT NULL DEFAULT 0"},
-		{"review_log", "status_published_at", "ALTER TABLE review_log ADD COLUMN status_published_at INTEGER NOT NULL DEFAULT 0"},
-	} {
-		if !s.hasColumn(ctx, col.table, col.name) {
-			if _, err := s.db.ExecContext(ctx, col.ddl); err != nil {
-				return fmt.Errorf("migrate %s.%s: %w", col.table, col.name, err)
-			}
+func (s *Store) applySchemaMigrations(ctx context.Context) error {
+	for _, migration := range schemaMigrations {
+		if err := s.applySchemaMigration(ctx, migration); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
+func (s *Store) applySchemaMigration(ctx context.Context, migration schemaMigration) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin schema migration %d: %w", migration.version, err)
+	}
+	defer tx.Rollback()
+
+	var applied int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=?`, migration.version).Scan(&applied); err != nil {
+		return fmt.Errorf("check schema migration %d: %w", migration.version, err)
+	}
+	if applied > 0 {
+		return tx.Commit()
+	}
+
+	if err := migration.apply(ctx, tx); err != nil {
+		return fmt.Errorf("apply schema migration %d %s: %w", migration.version, migration.name, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)`,
+		migration.version, migration.name, time.Now().Unix(),
+	); err != nil {
+		return fmt.Errorf("record schema migration %d: %w", migration.version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit schema migration %d: %w", migration.version, err)
+	}
 	return nil
 }
 
 // hasColumn checks whether a table has a specific column.
-func (s *Store) hasColumn(ctx context.Context, table, column string) bool {
-	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	return hasColumn(ctx, s.db, table, column)
+}
+
+type columnQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func hasColumn(ctx context.Context, q columnQuerier, table, column string) (bool, error) {
+	quotedTable, err := quoteSQLiteIdent(table)
 	if err != nil {
-		return false
+		return false, err
+	}
+	rows, err := q.QueryContext(ctx, "PRAGMA table_info("+quotedTable+")")
+	if err != nil {
+		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -121,13 +193,30 @@ func (s *Store) hasColumn(ctx context.Context, table, column string) bool {
 		var dfltValue *string
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk); err != nil {
-			continue
+			return false, err
 		}
 		if name == column {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func quoteSQLiteIdent(ident string) (string, error) {
+	if ident == "" {
+		return "", fmt.Errorf("empty sqlite identifier")
+	}
+	for i := 0; i < len(ident); i++ {
+		c := ident[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			continue
+		}
+		return "", fmt.Errorf("invalid sqlite identifier %q", ident)
+	}
+	return `"` + ident + `"`, nil
 }
 
 // InsertIngestedEvent inserts a raw event idempotently.

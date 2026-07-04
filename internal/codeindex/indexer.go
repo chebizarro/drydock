@@ -39,6 +39,12 @@ type indexState struct {
 	UpdatedAt int64  `json:"updated_at"`
 }
 
+type fileIndexResult struct {
+	intendedChunks int
+	upserted       int
+	embedErrors    int
+}
+
 // Indexer manages semantic code indexing into Qdrant.
 // It is safe for concurrent use; per-repo serialisation is enforced internally.
 type Indexer struct {
@@ -85,6 +91,10 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 	mu.Lock()
 	defer mu.Unlock()
 
+	if len(symbols.SupportedLanguages()) == 0 {
+		return fmt.Errorf("codeindex: symbol extraction unavailable; rebuild with CGO_ENABLED=1 for tree-sitter support")
+	}
+
 	// Ensure collection exists.
 	if err := idx.qdrant.EnsureCollection(ctx, vectorstore.CollectionCodeChunks, idx.vectorDim); err != nil {
 		return fmt.Errorf("ensure code_chunks collection: %w", err)
@@ -97,7 +107,7 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 	}
 
 	// Read prior state.
-	state := readState(repoPath)
+	state := readState(repoPath, idx.logger)
 
 	// Check Qdrant/state divergence: if state says current but collection is
 	// empty, force a full rebuild.
@@ -123,7 +133,9 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 	extractor := symbols.New()
 	defer extractor.Close()
 
+	var totalIntended int
 	var totalUpserted int
+	var totalEmbedErrors int
 	var hadErrors bool
 
 	// Determine whether to do a full rebuild or incremental update.
@@ -164,12 +176,15 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 							"old_path", change.oldPath, "error", err)
 						hadErrors = true
 					}
-					n, err := idx.indexFile(ctx, extractor, repoPath, repoID, currentCommit, change.newPath)
+					res, err := idx.indexFile(ctx, extractor, repoPath, repoID, currentCommit, change.newPath)
+					totalIntended += res.intendedChunks
+					totalUpserted += res.upserted
+					totalEmbedErrors += res.embedErrors
 					if err != nil {
-						idx.logger.Warn("skip renamed file", "file", change.newPath, "error", err)
+						idx.logger.Warn("failed to index renamed file", "file", change.newPath, "error", err)
 						hadErrors = true
-					} else {
-						totalUpserted += n
+					} else if res.embedErrors > 0 {
+						hadErrors = true
 					}
 
 				case change.status == "A" || change.status == "M" ||
@@ -181,12 +196,15 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 							hadErrors = true
 						}
 					}
-					n, err := idx.indexFile(ctx, extractor, repoPath, repoID, currentCommit, change.effectivePath())
+					res, err := idx.indexFile(ctx, extractor, repoPath, repoID, currentCommit, change.effectivePath())
+					totalIntended += res.intendedChunks
+					totalUpserted += res.upserted
+					totalEmbedErrors += res.embedErrors
 					if err != nil {
-						idx.logger.Warn("skip file", "file", change.effectivePath(), "error", err)
+						idx.logger.Warn("failed to index file", "file", change.effectivePath(), "error", err)
 						hadErrors = true
-					} else {
-						totalUpserted += n
+					} else if res.embedErrors > 0 {
+						hadErrors = true
 					}
 
 				default:
@@ -218,14 +236,19 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 			default:
 			}
 
-			n, err := idx.indexFile(ctx, extractor, repoPath, repoID, currentCommit, filePath)
+			res, err := idx.indexFile(ctx, extractor, repoPath, repoID, currentCommit, filePath)
+			totalIntended += res.intendedChunks
+			totalUpserted += res.upserted
+			totalEmbedErrors += res.embedErrors
 			if err != nil {
-				idx.logger.Warn("skip file during index",
+				idx.logger.Warn("failed to index file during full build",
 					"file", filePath, "error", err)
 				hadErrors = true
 				continue
 			}
-			totalUpserted += n
+			if res.embedErrors > 0 {
+				hadErrors = true
+			}
 		}
 	}
 
@@ -233,71 +256,79 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 	// Partial indexes leave the state unchanged so the next run retries.
 	if hadErrors {
 		idx.logger.Warn("code index completed with errors, state not advanced",
-			"repo_id", repoID, "chunks_upserted", totalUpserted)
-	} else {
-		if err := writeState(repoPath, indexState{
-			Commit:    currentCommit,
-			UpdatedAt: time.Now().Unix(),
-		}); err != nil {
-			idx.logger.Warn("failed to write index state", "repo_id", repoID, "error", err)
-		}
+			"repo_id", repoID,
+			"chunks_intended", totalIntended,
+			"chunks_upserted", totalUpserted,
+			"embed_errors", totalEmbedErrors)
+		return fmt.Errorf("code index incomplete: intended_chunks=%d upserted_chunks=%d embed_errors=%d", totalIntended, totalUpserted, totalEmbedErrors)
+	}
+	if totalIntended > 0 && totalUpserted == 0 {
+		return fmt.Errorf("code index produced no upserted chunks from %d intended chunks", totalIntended)
+	}
+	if err := writeState(repoPath, indexState{
+		Commit:    currentCommit,
+		UpdatedAt: time.Now().Unix(),
+	}); err != nil {
+		return fmt.Errorf("write code index state: %w", err)
 	}
 
 	idx.logger.Info("code index complete",
 		"repo_id", repoID, "commit", currentCommit[:min(8, len(currentCommit))],
+		"chunks_intended", totalIntended,
 		"chunks_upserted", totalUpserted)
 	return nil
 }
 
 // indexFile reads a single file from the canonical ref, extracts symbols,
-// embeds each chunk, and upserts to Qdrant. Returns the number of points
-// upserted. Returns a non-nil error only for file-level issues that the
-// caller should log and skip.
+// embeds each intended chunk, and upserts successful embeddings to Qdrant.
+// It returns per-file counts alongside any extraction, embedding, or upsert error.
 func (idx *Indexer) indexFile(
 	ctx context.Context,
 	extractor *symbols.Extractor,
 	repoPath, repoID, commit, filePath string,
-) (int, error) {
+) (fileIndexResult, error) {
 	// Check language support.
 	ext := filepath.Ext(filePath)
 	lang := symbols.LangFromExt(ext)
 	if lang == "" {
-		return 0, nil // unsupported language, silently skip
+		return fileIndexResult{}, nil // unsupported language, silently skip
 	}
 
 	// Read file from canonical ref.
 	source, err := gitShowFile(ctx, repoPath, commit, filePath)
 	if err != nil {
-		return 0, fmt.Errorf("git show %s: %w", filePath, err)
+		return fileIndexResult{}, fmt.Errorf("git show %s: %w", filePath, err)
 	}
 
 	// Skip large or binary files.
 	if len(source) > maxFileBytes {
-		return 0, nil
+		return fileIndexResult{}, nil
 	}
 	if !isProbablyText(source) {
-		return 0, nil
+		return fileIndexResult{}, nil
 	}
 
 	// Extract symbols.
 	syms, err := extractor.Extract(lang, source)
 	if err != nil {
-		return 0, fmt.Errorf("extract symbols from %s: %w", filePath, err)
+		return fileIndexResult{}, fmt.Errorf("extract symbols from %s: %w", filePath, err)
 	}
 	if len(syms) == 0 {
-		return 0, nil
+		return fileIndexResult{}, nil
 	}
 
 	// Build chunks from symbols.
 	lines := strings.Split(string(source), "\n")
 	var points []vectorstore.Point
-	upserted := 0
+	result := fileIndexResult{}
 
 	for _, sym := range syms {
 		chunk := extractChunk(lines, sym)
 		if len(chunk) == 0 {
 			continue
 		}
+
+		result.intendedChunks++
 
 		content := string(chunk)
 		if len(content) > maxChunkBytes {
@@ -306,6 +337,7 @@ func (idx *Indexer) indexFile(
 
 		vec, err := idx.embedder.Embed(ctx, content)
 		if err != nil {
+			result.embedErrors++
 			idx.logger.Warn("embed failed, skip chunk",
 				"file", filePath, "symbol", sym.Name, "error", err)
 			continue
@@ -332,9 +364,9 @@ func (idx *Indexer) indexFile(
 		// Batch upsert when buffer is full.
 		if len(points) >= upsertBatch {
 			if err := idx.qdrant.Upsert(ctx, vectorstore.CollectionCodeChunks, points); err != nil {
-				return upserted, fmt.Errorf("upsert batch: %w", err)
+				return result, fmt.Errorf("upsert batch: %w", err)
 			}
-			upserted += len(points)
+			result.upserted += len(points)
 			points = points[:0]
 		}
 	}
@@ -342,12 +374,15 @@ func (idx *Indexer) indexFile(
 	// Flush remaining points.
 	if len(points) > 0 {
 		if err := idx.qdrant.Upsert(ctx, vectorstore.CollectionCodeChunks, points); err != nil {
-			return upserted, fmt.Errorf("upsert remaining: %w", err)
+			return result, fmt.Errorf("upsert remaining: %w", err)
 		}
-		upserted += len(points)
+		result.upserted += len(points)
 	}
 
-	return upserted, nil
+	if result.embedErrors > 0 {
+		return result, fmt.Errorf("embedding failed for %d/%d chunks", result.embedErrors, result.intendedChunks)
+	}
+	return result, nil
 }
 
 // extractChunk slices the source lines for a symbol with a small context window.
@@ -545,13 +580,17 @@ func stateFilePath(repoPath string) string {
 	return filepath.Join(repoPath, ".git", stateFileName)
 }
 
-func readState(repoPath string) indexState {
-	data, err := os.ReadFile(stateFilePath(repoPath))
+func readState(repoPath string, loggers ...*slog.Logger) indexState {
+	path := stateFilePath(repoPath)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return indexState{}
 	}
 	var s indexState
 	if err := json.Unmarshal(data, &s); err != nil {
+		if len(loggers) > 0 && loggers[0] != nil {
+			loggers[0].Warn("corrupt code index state ignored", "path", path, "error", err)
+		}
 		return indexState{}
 	}
 	return s
@@ -562,7 +601,49 @@ func writeState(repoPath string, s indexState) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(stateFilePath(repoPath), data, 0o644)
+	data = append(data, '\n')
+	return writeStateFileAtomic(stateFilePath(repoPath), data, 0o644)
+}
+
+func writeStateFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+
+	if dirHandle, err := os.Open(dir); err == nil {
+		_ = dirHandle.Sync()
+		_ = dirHandle.Close()
+	}
+	return nil
 }
 
 // isProbablyText returns true if data looks like text (no NUL bytes in first 512 bytes).

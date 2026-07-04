@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -19,6 +20,91 @@ func mustOpenStore(t *testing.T, ctx context.Context) *Store {
 		t.Fatalf("migrate: %v", err)
 	}
 	return store
+}
+
+func TestMigrateAppliesVersionedMigrationsIdempotently(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+
+	var count, maxVersion int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&count, &maxVersion); err != nil {
+		t.Fatalf("query schema_migrations: %v", err)
+	}
+	if count != len(schemaMigrations) {
+		t.Fatalf("schema_migrations count = %d, want %d", count, len(schemaMigrations))
+	}
+	if maxVersion != schemaMigrations[len(schemaMigrations)-1].version {
+		t.Fatalf("max schema version = %d, want %d", maxVersion, schemaMigrations[len(schemaMigrations)-1].version)
+	}
+}
+
+func TestMigrateAddsReviewLogColumnsFromOldSnapshot(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "old.db")
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	_, err = raw.ExecContext(ctx, `CREATE TABLE review_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		patch_event_id TEXT NOT NULL,
+		repo_id TEXT NOT NULL,
+		status TEXT NOT NULL,
+		review_event_id TEXT,
+		failure_reason TEXT,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		UNIQUE(patch_event_id, repo_id)
+	)`)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("create old review_log: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw db: %v", err)
+	}
+
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate old snapshot: %v", err)
+	}
+
+	for _, column := range []string{"status_event_id", "status_event_kind", "status_published_at"} {
+		exists, err := store.hasColumn(ctx, "review_log", column)
+		if err != nil {
+			t.Fatalf("hasColumn(%s): %v", column, err)
+		}
+		if !exists {
+			t.Fatalf("expected migrated column %s", column)
+		}
+	}
+
+	var name string
+	if err := store.db.QueryRowContext(ctx, `SELECT name FROM schema_migrations WHERE version=1`).Scan(&name); err != nil {
+		t.Fatalf("schema migration version not recorded: %v", err)
+	}
+	if name != "review_log_status_event_columns" {
+		t.Fatalf("migration name = %q", name)
+	}
+}
+
+func TestHasColumnPropagatesQueryErrors(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if _, err := store.hasColumn(ctx, "review_log", "status_event_id"); err == nil {
+		t.Fatal("expected hasColumn to return query error after database close")
+	}
 }
 
 func TestGetRecentFewShotsReturnsPositiveExamplesNewestFirst(t *testing.T) {
