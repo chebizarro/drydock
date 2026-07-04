@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,7 +16,32 @@ import (
 	_ "modernc.org/sqlite" // Register sqlite driver for validation
 )
 
+const (
+	defaultRelays          = "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
+	defaultPlannerBaseURL  = "http://127.0.0.1:11434/v1"
+	defaultPlannerModel    = "qwen2.5-coder-14b-instruct-q4_k_m"
+	defaultCoder32BBaseURL = "http://127.0.0.1:11434/v1"
+	defaultCoder32BModel   = "qwen2.5-coder-32b-instruct-q4_k_m"
+	defaultLLM70BBaseURL   = "http://127.0.0.1:11435/v1"
+	defaultLLM70BModel     = "llama-3.3-70b-instruct-q4_k_m"
+	defaultCoder14BBaseURL = "http://127.0.0.1:11434/v1"
+	defaultCoder14BModel   = "qwen2.5-coder-14b-instruct-q4_k_m"
+	defaultMetaBaseURL     = "http://127.0.0.1:11436/v1"
+	defaultMetaModel       = "llama-3.3-70b-instruct-q4_k_m"
+	defaultEmbedModel      = "nomic-embed-text"
+)
+
+var defaultPublicRelaySet = map[string]struct{}{
+	"wss://relay.damus.io":   {},
+	"wss://nos.lol":          {},
+	"wss://relay.primal.net": {},
+}
+
 type Config struct {
+	Environment string
+	Production  bool
+	ExplicitEnv map[string]bool
+
 	DatabaseURL         string
 	RepoCacheDir        string
 	RepoCacheMaxCount   int
@@ -63,6 +89,9 @@ type Config struct {
 }
 
 func FromEnv() Config {
+	environment := strings.ToLower(strings.TrimSpace(os.Getenv("DRYDOCK_ENV")))
+	production := isProductionMode(environment, os.Getenv("DRYDOCK_PRODUCTION"))
+
 	signerNsec := envOrDefault("DRYDOCK_SIGNER_NSEC", "")
 	signerNsecFile := envOrDefault("DRYDOCK_SIGNER_NSEC_FILE", "")
 	if signerNsecFile != "" {
@@ -75,6 +104,9 @@ func FromEnv() Config {
 	}
 
 	return Config{
+		Environment:        environment,
+		Production:         production,
+		ExplicitEnv:        configuredEnv(),
 		DatabaseURL:        envOrDefault("DRYDOCK_DATABASE_URL", "file:drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)"),
 		RepoCacheDir:       envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
 		RepoCacheMaxCount:  parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_COUNT", "50"), 50),
@@ -82,21 +114,21 @@ func FromEnv() Config {
 		Relays: splitCSV(
 			envOrDefault(
 				"DRYDOCK_RELAYS",
-				"wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net",
+				devDefault(production, defaultRelays),
 			),
 		),
 		ReadRelays:          splitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
 		WriteRelays:         splitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
 		LogLevel:            parseLogLevel(envOrDefault("DRYDOCK_LOG_LEVEL", "info")),
 		ListenerLookbackMin: parseIntOrDefault(envOrDefault("DRYDOCK_LISTENER_LOOKBACK_MIN", "5"), 5),
-		PlannerBaseURL:      envOrDefault("DRYDOCK_PLANNER_BASE_URL", "http://127.0.0.1:11434/v1"),
-		PlannerModel:        envOrDefault("DRYDOCK_PLANNER_MODEL", "qwen2.5-coder-14b-instruct-q4_k_m"),
-		Coder32BBaseURL:     envOrDefault("DRYDOCK_CODER32B_BASE_URL", "http://127.0.0.1:11434/v1"),
-		Coder32BModel:       envOrDefault("DRYDOCK_CODER32B_MODEL", "qwen2.5-coder-32b-instruct-q4_k_m"),
-		LLM70BBaseURL:       envOrDefault("DRYDOCK_LLM70B_BASE_URL", "http://127.0.0.1:11435/v1"),
-		LLM70BModel:         envOrDefault("DRYDOCK_LLM70B_MODEL", "llama-3.3-70b-instruct-q4_k_m"),
-		Coder14BBaseURL:     envOrDefault("DRYDOCK_CODER14B_BASE_URL", "http://127.0.0.1:11434/v1"),
-		Coder14BModel:       envOrDefault("DRYDOCK_CODER14B_MODEL", "qwen2.5-coder-14b-instruct-q4_k_m"),
+		PlannerBaseURL:      envOrDefault("DRYDOCK_PLANNER_BASE_URL", devDefault(production, defaultPlannerBaseURL)),
+		PlannerModel:        envOrDefault("DRYDOCK_PLANNER_MODEL", devDefault(production, defaultPlannerModel)),
+		Coder32BBaseURL:     envOrDefault("DRYDOCK_CODER32B_BASE_URL", devDefault(production, defaultCoder32BBaseURL)),
+		Coder32BModel:       envOrDefault("DRYDOCK_CODER32B_MODEL", devDefault(production, defaultCoder32BModel)),
+		LLM70BBaseURL:       envOrDefault("DRYDOCK_LLM70B_BASE_URL", devDefault(production, defaultLLM70BBaseURL)),
+		LLM70BModel:         envOrDefault("DRYDOCK_LLM70B_MODEL", devDefault(production, defaultLLM70BModel)),
+		Coder14BBaseURL:     envOrDefault("DRYDOCK_CODER14B_BASE_URL", devDefault(production, defaultCoder14BBaseURL)),
+		Coder14BModel:       envOrDefault("DRYDOCK_CODER14B_MODEL", devDefault(production, defaultCoder14BModel)),
 		LLMAPIKey:           envOrDefault("DRYDOCK_LLM_API_KEY", ""),
 		PlannerAPIKey:       envOrDefault("DRYDOCK_PLANNER_API_KEY", ""),
 		Coder32BAPIKey:      envOrDefault("DRYDOCK_CODER32B_API_KEY", ""),
@@ -111,19 +143,72 @@ func FromEnv() Config {
 		QdrantURL:           envOrDefault("DRYDOCK_QDRANT_URL", ""),
 		QdrantAPIKey:        envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
 		EmbedBaseURL:        envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
-		EmbedModel:          envOrDefault("DRYDOCK_EMBED_MODEL", "nomic-embed-text"),
+		EmbedModel:          envOrDefault("DRYDOCK_EMBED_MODEL", devDefault(production, defaultEmbedModel)),
 		EmbedAPIKey:         envOrDefault("DRYDOCK_EMBED_API_KEY", ""),
 		EmbedDimension:      parseIntOrDefault(envOrDefault("DRYDOCK_EMBED_DIMENSION", "768"), 768),
 		PaymentNWCURI:       envOrDefault("DRYDOCK_NWC_CONNECTION_STRING", ""),
 		PaymentTrustedMints: paymentTrustedMints(),
 		LSPBridgeURL:        envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
-		MetaBaseURL:         envOrDefault("DRYDOCK_META_BASE_URL", "http://127.0.0.1:11436/v1"),
-		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", "llama-3.3-70b-instruct-q4_k_m"),
+		MetaBaseURL:         envOrDefault("DRYDOCK_META_BASE_URL", devDefault(production, defaultMetaBaseURL)),
+		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", devDefault(production, defaultMetaModel)),
 		EvalDatasetPath:     envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
 		NIPsDir:             envOrDefault("DRYDOCK_NIPS_DIR", ""),
 		HealthAddr:          envOrDefault("DRYDOCK_HEALTH_ADDR", ":8081"),
 		PipelineWorkers:     parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
 	}
+}
+
+func devDefault(production bool, value string) string {
+	if production {
+		return ""
+	}
+	return value
+}
+
+func isProductionMode(environment, productionFlag string) bool {
+	if parseBoolOrDefault(productionFlag, false) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(environment)) {
+	case "prod", "production":
+		return true
+	default:
+		return false
+	}
+}
+
+func configuredEnv() map[string]bool {
+	keys := []string{
+		"DRYDOCK_RELAYS",
+		"DRYDOCK_READ_RELAYS",
+		"DRYDOCK_WRITE_RELAYS",
+		"DRYDOCK_LLM_API_KEY",
+		"DRYDOCK_PLANNER_BASE_URL",
+		"DRYDOCK_PLANNER_MODEL",
+		"DRYDOCK_PLANNER_API_KEY",
+		"DRYDOCK_CODER32B_BASE_URL",
+		"DRYDOCK_CODER32B_MODEL",
+		"DRYDOCK_CODER32B_API_KEY",
+		"DRYDOCK_LLM70B_BASE_URL",
+		"DRYDOCK_LLM70B_MODEL",
+		"DRYDOCK_LLM70B_API_KEY",
+		"DRYDOCK_CODER14B_BASE_URL",
+		"DRYDOCK_CODER14B_MODEL",
+		"DRYDOCK_CODER14B_API_KEY",
+		"DRYDOCK_META_BASE_URL",
+		"DRYDOCK_META_MODEL",
+		"DRYDOCK_META_API_KEY",
+		"DRYDOCK_QDRANT_URL",
+		"DRYDOCK_EMBED_BASE_URL",
+		"DRYDOCK_EMBED_MODEL",
+	}
+	configured := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		if strings.TrimSpace(os.Getenv(key)) != "" {
+			configured[key] = true
+		}
+	}
+	return configured
 }
 
 func splitCSV(v string) []string {
@@ -216,6 +301,10 @@ func (v ValidationResult) Log(logger *slog.Logger) {
 func (c *Config) Validate(ctx context.Context) ValidationResult {
 	result := ValidationResult{}
 
+	if c.IsProduction() {
+		c.validateProductionConfig(&result)
+	}
+
 	// --- Required: At least one relay ---
 	if len(c.Relays) == 0 && len(c.ReadRelays) == 0 {
 		result.Errors = append(result.Errors, "no relays configured: set DRYDOCK_RELAYS or DRYDOCK_READ_RELAYS")
@@ -303,6 +392,115 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 
 	return result
+}
+
+// IsProduction reports whether production-mode startup guards should be enforced.
+func (c *Config) IsProduction() bool {
+	if c.Production {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Environment)) {
+	case "prod", "production":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Config) validateProductionConfig(result *ValidationResult) {
+	if result == nil {
+		return
+	}
+
+	if !c.hasExplicitProductionRelays() {
+		result.Errors = append(result.Errors, "production mode requires DRYDOCK_RELAYS or both DRYDOCK_READ_RELAYS and DRYDOCK_WRITE_RELAYS to be explicitly configured")
+	}
+	for _, relay := range append(append([]string{}, c.Relays...), append(c.ReadRelays, c.WriteRelays...)...) {
+		if isDefaultPublicRelay(relay) {
+			result.Errors = append(result.Errors, fmt.Sprintf("production mode must not use built-in public relay default %q; configure private/approved relays explicitly", relay))
+		}
+	}
+
+	c.requireExplicit(result, "DRYDOCK_PLANNER_BASE_URL", c.PlannerBaseURL)
+	c.requireExplicit(result, "DRYDOCK_PLANNER_MODEL", c.PlannerModel)
+	c.requireLLMAPIKey(result, "planner", "DRYDOCK_PLANNER_API_KEY", c.EffectiveLLMAPIKey(c.PlannerAPIKey))
+	c.requireExplicit(result, "DRYDOCK_CODER32B_BASE_URL", c.Coder32BBaseURL)
+	c.requireExplicit(result, "DRYDOCK_CODER32B_MODEL", c.Coder32BModel)
+	c.requireLLMAPIKey(result, "coder32b", "DRYDOCK_CODER32B_API_KEY", c.EffectiveLLMAPIKey(c.Coder32BAPIKey))
+	c.requireExplicit(result, "DRYDOCK_LLM70B_BASE_URL", c.LLM70BBaseURL)
+	c.requireExplicit(result, "DRYDOCK_LLM70B_MODEL", c.LLM70BModel)
+	c.requireLLMAPIKey(result, "70b", "DRYDOCK_LLM70B_API_KEY", c.EffectiveLLMAPIKey(c.LLM70BAPIKey))
+	c.requireExplicit(result, "DRYDOCK_CODER14B_BASE_URL", c.Coder14BBaseURL)
+	c.requireExplicit(result, "DRYDOCK_CODER14B_MODEL", c.Coder14BModel)
+	c.requireLLMAPIKey(result, "coder14b", "DRYDOCK_CODER14B_API_KEY", c.EffectiveLLMAPIKey(c.Coder14BAPIKey))
+	c.requireExplicit(result, "DRYDOCK_META_BASE_URL", c.MetaBaseURL)
+	c.requireExplicit(result, "DRYDOCK_META_MODEL", c.MetaModel)
+	c.requireLLMAPIKey(result, "meta", "DRYDOCK_META_API_KEY", c.EffectiveLLMAPIKey(c.MetaAPIKey))
+
+	for name, rawURL := range map[string]string{
+		"DRYDOCK_PLANNER_BASE_URL":  c.PlannerBaseURL,
+		"DRYDOCK_CODER32B_BASE_URL": c.Coder32BBaseURL,
+		"DRYDOCK_LLM70B_BASE_URL":   c.LLM70BBaseURL,
+		"DRYDOCK_CODER14B_BASE_URL": c.Coder14BBaseURL,
+		"DRYDOCK_META_BASE_URL":     c.MetaBaseURL,
+		"DRYDOCK_QDRANT_URL":        c.QdrantURL,
+		"DRYDOCK_EMBED_BASE_URL":    c.EmbedBaseURL,
+	} {
+		if isLoopbackURL(rawURL) {
+			result.Errors = append(result.Errors, fmt.Sprintf("production mode must not use localhost/loopback URL for %s", name))
+		}
+	}
+
+	c.requireExplicit(result, "DRYDOCK_QDRANT_URL", c.QdrantURL)
+	c.requireExplicit(result, "DRYDOCK_EMBED_BASE_URL", c.EmbedBaseURL)
+	c.requireExplicit(result, "DRYDOCK_EMBED_MODEL", c.EmbedModel)
+}
+
+func (c *Config) hasExplicitProductionRelays() bool {
+	hasSharedRelays := len(c.Relays) > 0 && c.isExplicit("DRYDOCK_RELAYS")
+	hasSplitRelays := len(c.ReadRelays) > 0 && c.isExplicit("DRYDOCK_READ_RELAYS") && len(c.WriteRelays) > 0 && c.isExplicit("DRYDOCK_WRITE_RELAYS")
+	return hasSharedRelays || hasSplitRelays
+}
+
+func (c *Config) requireExplicit(result *ValidationResult, key, value string) {
+	if strings.TrimSpace(value) == "" || !c.isExplicit(key) {
+		result.Errors = append(result.Errors, fmt.Sprintf("production mode requires %s to be explicitly configured", key))
+	}
+}
+
+func (c *Config) requireLLMAPIKey(result *ValidationResult, endpointName, endpointKeyEnv, value string) {
+	if strings.TrimSpace(value) == "" || (!c.isExplicit("DRYDOCK_LLM_API_KEY") && !c.isExplicit(endpointKeyEnv)) {
+		result.Errors = append(result.Errors, fmt.Sprintf("production mode requires an API key for %s LLM endpoint via DRYDOCK_LLM_API_KEY or %s", endpointName, endpointKeyEnv))
+	}
+}
+
+func (c *Config) isExplicit(key string) bool {
+	if c.ExplicitEnv == nil {
+		return true
+	}
+	return c.ExplicitEnv[key]
+}
+
+func isDefaultPublicRelay(relay string) bool {
+	_, ok := defaultPublicRelaySet[normalizeURLForCompare(relay)]
+	return ok
+}
+
+func normalizeURLForCompare(raw string) string {
+	return strings.TrimRight(strings.ToLower(strings.TrimSpace(raw)), "/")
+}
+
+func isLoopbackURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // validateDatabase checks that the database can be opened and is writable.

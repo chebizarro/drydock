@@ -156,6 +156,66 @@ func TestValidate_PartialRAGConfig_Warning(t *testing.T) {
 	}
 }
 
+func TestFromEnv_ProductionMissingUnsafeConfigReturnsErrors(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("DRYDOCK_ENV", "production")
+
+	cfg := FromEnv()
+	if !cfg.IsProduction() {
+		t.Fatal("expected production mode")
+	}
+
+	result := cfg.Validate(context.Background())
+	if !result.HasErrors() {
+		t.Fatal("expected production validation errors")
+	}
+
+	for _, want := range []string{
+		"DRYDOCK_RELAYS",
+		"DRYDOCK_PLANNER_BASE_URL",
+		"DRYDOCK_PLANNER_MODEL",
+		"DRYDOCK_CODER32B_BASE_URL",
+		"DRYDOCK_CODER32B_MODEL",
+		"DRYDOCK_LLM70B_BASE_URL",
+		"DRYDOCK_LLM70B_MODEL",
+		"DRYDOCK_CODER14B_BASE_URL",
+		"DRYDOCK_CODER14B_MODEL",
+		"DRYDOCK_META_BASE_URL",
+		"DRYDOCK_META_MODEL",
+		"DRYDOCK_LLM_API_KEY",
+		"DRYDOCK_QDRANT_URL",
+		"DRYDOCK_EMBED_BASE_URL",
+		"DRYDOCK_EMBED_MODEL",
+	} {
+		if !hasErrorContaining(result, want) {
+			t.Errorf("expected production validation error containing %q; got %#v", want, result.Errors)
+		}
+	}
+}
+
+func TestFromEnv_DevModePermitsLocalhostDefaults(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg := FromEnv()
+	if cfg.IsProduction() {
+		t.Fatal("expected development mode")
+	}
+	if cfg.PlannerBaseURL != defaultPlannerBaseURL {
+		t.Fatalf("expected dev planner default %q, got %q", defaultPlannerBaseURL, cfg.PlannerBaseURL)
+	}
+	if cfg.MetaBaseURL != defaultMetaBaseURL {
+		t.Fatalf("expected dev meta default %q, got %q", defaultMetaBaseURL, cfg.MetaBaseURL)
+	}
+	if len(cfg.Relays) == 0 {
+		t.Fatal("expected dev public relay defaults")
+	}
+
+	result := cfg.Validate(context.Background())
+	if result.HasErrors() {
+		t.Fatalf("expected dev defaults to validate without fatal errors, got %#v", result.Errors)
+	}
+}
+
 func TestValidationResult_HasErrors(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -186,6 +246,50 @@ func TestValidationResult_HasErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func clearConfigEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"DRYDOCK_ENV",
+		"DRYDOCK_PRODUCTION",
+		"DRYDOCK_RELAYS",
+		"DRYDOCK_READ_RELAYS",
+		"DRYDOCK_WRITE_RELAYS",
+		"DRYDOCK_LLM_API_KEY",
+		"DRYDOCK_PLANNER_BASE_URL",
+		"DRYDOCK_PLANNER_MODEL",
+		"DRYDOCK_PLANNER_API_KEY",
+		"DRYDOCK_CODER32B_BASE_URL",
+		"DRYDOCK_CODER32B_MODEL",
+		"DRYDOCK_CODER32B_API_KEY",
+		"DRYDOCK_LLM70B_BASE_URL",
+		"DRYDOCK_LLM70B_MODEL",
+		"DRYDOCK_LLM70B_API_KEY",
+		"DRYDOCK_CODER14B_BASE_URL",
+		"DRYDOCK_CODER14B_MODEL",
+		"DRYDOCK_CODER14B_API_KEY",
+		"DRYDOCK_META_BASE_URL",
+		"DRYDOCK_META_MODEL",
+		"DRYDOCK_META_API_KEY",
+		"DRYDOCK_QDRANT_URL",
+		"DRYDOCK_QDRANT_API_KEY",
+		"DRYDOCK_EMBED_BASE_URL",
+		"DRYDOCK_EMBED_MODEL",
+		"DRYDOCK_EMBED_API_KEY",
+	} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("DRYDOCK_DATABASE_URL", ":memory:")
+}
+
+func hasErrorContaining(result ValidationResult, substr string) bool {
+	for _, err := range result.Errors {
+		if contains(err, substr) {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(s, substr string) bool {

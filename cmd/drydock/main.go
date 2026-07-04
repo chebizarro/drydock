@@ -293,6 +293,12 @@ func main() {
 	} else if cfg.QdrantURL != "" || cfg.EmbedBaseURL != "" {
 		logger.Warn("both DRYDOCK_QDRANT_URL and DRYDOCK_EMBED_BASE_URL must be set for RAG features")
 	}
+	if qdrantClient != nil {
+		_ = healthSrv.AddReadinessCheck("qdrant", qdrantClient)
+	}
+	if embedClient != nil {
+		_ = healthSrv.AddReadinessCheck("embedding", embedClient)
+	}
 
 	// LSP bridge
 	var lspClient *lspbridge.Client
