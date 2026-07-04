@@ -116,8 +116,8 @@ func (fileContextProvider) Build(_ context.Context, in BuildInput) (string, erro
 }
 
 type symbolsCallsitesProvider struct {
-	lspClient *lspbridge.Client   // optional LSP bridge for type-aware analysis
-	search    *searcher           // ripgrep with git grep fallback
+	lspClient *lspbridge.Client // optional LSP bridge for type-aware analysis
+	search    *searcher         // ripgrep with git grep fallback
 }
 
 func (p symbolsCallsitesProvider) LayerName() string { return LayerSymbolsCallsites }
@@ -146,12 +146,20 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 	out.WriteString(strings.Join(syms, ", "))
 	out.WriteString("\n")
 
-	// Try LSP bridge for type-aware definitions and references when available.
-	// Falls back to git grep on any error (bridge down, timeout, etc.).
+	// Try LSP bridge for type-aware definitions, references, and diagnostics when available.
+	// If it is configured but unavailable/empty, surface that degraded status before
+	// falling back so callers can distinguish grep context from LSP-backed context.
 	if p.lspClient != nil {
-		if lspContent := p.queryLSP(ctx, in, syms); lspContent != "" {
-			out.WriteString(lspContent)
+		lspResult := p.queryLSP(ctx, in, syms)
+		if lspResult.content != "" {
+			out.WriteString(lspResult.content)
 			return strings.TrimSpace(out.String()), nil
+		}
+		if lspResult.status != "" {
+			out.WriteString("\n## LSP Status\n")
+			out.WriteString("- ")
+			out.WriteString(lspResult.status)
+			out.WriteString("\n")
 		}
 	}
 
@@ -225,13 +233,18 @@ func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput, extractor
 	return names
 }
 
+type lspQueryResult struct {
+	content string
+	status  string
+}
+
 // queryLSP calls the LSP bridge for type-aware symbol analysis.
-// Returns formatted context string, or empty string on any error (caller falls
-// back to git grep). Changed files are extracted from the patch diff.
-func (p symbolsCallsitesProvider) queryLSP(ctx context.Context, in BuildInput, syms []string) string {
+// It returns formatted context when LSP produced useful results, or a degraded
+// status string when the configured bridge failed/returned no useful data.
+func (p symbolsCallsitesProvider) queryLSP(ctx context.Context, in BuildInput, syms []string) lspQueryResult {
 	files, err := parsePatch(in.PatchEventContent)
 	if err != nil {
-		return ""
+		return lspQueryResult{status: "degraded: could not parse patch for LSP request; using grep fallback"}
 	}
 	var changedFiles []string
 	for _, f := range files {
@@ -247,15 +260,15 @@ func (p symbolsCallsitesProvider) queryLSP(ctx context.Context, in BuildInput, s
 		Symbols:      syms,
 	})
 	if err != nil {
-		return ""
+		return lspQueryResult{status: "degraded: LSP bridge unavailable (" + err.Error() + "); using grep fallback"}
 	}
-	if resp.Error != "" {
-		return ""
+	if resp.Error != "" || resp.Status == "degraded" || resp.Status == "error" || len(resp.LanguageErrors) > 0 {
+		return lspQueryResult{status: formatLSPStatus(resp)}
 	}
 
 	// Only use LSP results if they returned something useful.
 	if len(resp.Definitions) == 0 && len(resp.References) == 0 && len(resp.Diagnostics) == 0 {
-		return ""
+		return lspQueryResult{status: "degraded: LSP bridge returned no definitions, references, or diagnostics; using grep fallback"}
 	}
 
 	var out strings.Builder
@@ -302,7 +315,33 @@ func (p symbolsCallsitesProvider) queryLSP(ctx context.Context, in BuildInput, s
 		}
 	}
 
-	return out.String()
+	return lspQueryResult{content: out.String()}
+}
+
+func formatLSPStatus(resp *lspbridge.AnalyzeResponse) string {
+	if resp == nil {
+		return "degraded: LSP bridge returned no response; using grep fallback"
+	}
+	var parts []string
+	status := resp.Status
+	if status == "" {
+		status = "degraded"
+	}
+	parts = append(parts, status)
+	if resp.Error != "" {
+		parts = append(parts, resp.Error)
+	}
+	for _, langErr := range resp.LanguageErrors {
+		msg := langErr.Language
+		if langErr.Code != "" {
+			msg += "/" + langErr.Code
+		}
+		if langErr.Message != "" {
+			msg += ": " + langErr.Message
+		}
+		parts = append(parts, msg)
+	}
+	return "degraded: LSP bridge reported " + strings.Join(parts, "; ") + "; using grep fallback"
 }
 
 // extractChangedLineNumbers returns 0-based line numbers from the new file
@@ -519,7 +558,6 @@ func extractImportExportLines(diff string) []string {
 	return lines
 }
 
-
 func runGit(ctx context.Context, repoPath string, args ...string) (string, error) {
 	full := append([]string{"-C", repoPath}, args...)
 	out, err := exec.CommandContext(ctx, "git", full...).CombinedOutput()
@@ -557,4 +595,3 @@ func isProbablyText(data []byte) bool {
 	}
 	return true
 }
-

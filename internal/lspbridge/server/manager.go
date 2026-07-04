@@ -205,6 +205,12 @@ func initializeLSP(ctx context.Context, conn *lspConn, rootPath string) error {
 				"references": map[string]any{},
 				"hover":      map[string]any{},
 				"definition": map[string]any{},
+				"publishDiagnostics": map[string]any{
+					"relatedInformation": true,
+				},
+				"diagnostic": map[string]any{
+					"dynamicRegistration": false,
+				},
 			},
 			"workspace": map[string]any{
 				"symbol": map[string]any{},

@@ -126,9 +126,12 @@ func TestSymbolsProviderFallsBackOnLSPError(t *testing.T) {
 	if strings.Contains(result, "Definitions (LSP)") {
 		t.Fatalf("should have fallen back from LSP, but got LSP content:\n%s", result)
 	}
-	// Should still have the symbols header from regex extraction.
+	// Should still have the symbols header and an explicit degraded LSP status.
 	if !strings.Contains(result, "symbols:") {
 		t.Fatalf("expected symbols header, got:\n%s", result)
+	}
+	if !strings.Contains(result, "LSP Status") || !strings.Contains(result, "degraded: LSP bridge unavailable") {
+		t.Fatalf("expected visible degraded LSP status, got:\n%s", result)
 	}
 }
 
@@ -198,8 +201,48 @@ func TestSymbolsProviderLSPEmptyResponseFallsBack(t *testing.T) {
 		t.Fatalf("Build error: %v", err)
 	}
 
-	// Empty LSP response should fall back to git grep.
+	// Empty LSP response should fall back to git grep, but not silently.
 	if strings.Contains(result, "Definitions (LSP)") {
 		t.Fatalf("should fall back on empty LSP response:\n%s", result)
+	}
+	if !strings.Contains(result, "LSP Status") || !strings.Contains(result, "returned no definitions") {
+		t.Fatalf("expected visible empty-LSP degraded status, got:\n%s", result)
+	}
+}
+
+func TestSymbolsProviderLSPStructuredErrorIsSurfaced(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/analyze" {
+			json.NewEncoder(w).Encode(lspbridge.AnalyzeResponse{
+				Status: "degraded",
+				Error:  "one or more language servers failed",
+				LanguageErrors: []lspbridge.LanguageError{{
+					Language: "go",
+					Code:     "language_server_unavailable",
+					Message:  "gopls missing",
+				}},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	provider := symbolsCallsitesProvider{lspClient: lspbridge.NewClient(srv.URL), search: newSearcher()}
+	diff := `diff --git a/handler.go b/handler.go
+--- a/handler.go
++++ b/handler.go
+@@ -40,0 +40,3 @@
++func handleEvent(ctx context.Context, e Event) error {
++	return nil
++}
+`
+
+	result, err := provider.Build(context.Background(), BuildInput{PatchEventContent: diff, RepoPath: "/fake/repo"})
+	if err != nil {
+		t.Fatalf("Build error: %v", err)
+	}
+	if !strings.Contains(result, "LSP Status") || !strings.Contains(result, "gopls missing") {
+		t.Fatalf("expected structured LSP error in degraded status, got:\n%s", result)
 	}
 }

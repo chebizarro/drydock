@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"drydock/internal/lspbridge"
 )
 
 // jsonRPCRequest is a JSON-RPC 2.0 request.
@@ -26,6 +28,8 @@ type jsonRPCRequest struct {
 type jsonRPCResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      *int64          `json:"id"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *jsonRPCError   `json:"error,omitempty"`
 }
@@ -44,13 +48,17 @@ type lspConn struct {
 
 	pending   map[int64]chan jsonRPCResponse
 	pendingMu sync.Mutex
+
+	diagnostics   map[string][]lspbridge.Diagnostic // keyed by document URI
+	diagnosticsMu sync.Mutex
 }
 
 func newLSPConn(stdin io.WriteCloser, stdout io.Reader) *lspConn {
 	c := &lspConn{
-		stdin:   stdin,
-		stdout:  bufio.NewReaderSize(stdout, 64*1024),
-		pending: make(map[int64]chan jsonRPCResponse),
+		stdin:       stdin,
+		stdout:      bufio.NewReaderSize(stdout, 64*1024),
+		pending:     make(map[int64]chan jsonRPCResponse),
+		diagnostics: make(map[string][]lspbridge.Diagnostic),
 	}
 	go c.readLoop()
 	return c
@@ -134,7 +142,8 @@ func (c *lspConn) readLoop() {
 		}
 
 		if resp.ID == nil {
-			continue // notification from server, ignore for now
+			c.handleNotification(resp.Method, resp.Params)
+			continue
 		}
 
 		c.pendingMu.Lock()
@@ -186,6 +195,67 @@ func (c *lspConn) close() {
 	c.stdin.Close()
 }
 
+func (c *lspConn) handleNotification(method string, params json.RawMessage) {
+	if method != "textDocument/publishDiagnostics" || len(params) == 0 {
+		return
+	}
+	var msg struct {
+		URI         string `json:"uri"`
+		Diagnostics []struct {
+			Range struct {
+				Start struct {
+					Line int `json:"line"`
+				} `json:"start"`
+			} `json:"range"`
+			Severity int    `json:"severity"`
+			Source   string `json:"source"`
+			Message  string `json:"message"`
+		} `json:"diagnostics"`
+	}
+	if err := json.Unmarshal(params, &msg); err != nil || msg.URI == "" {
+		return
+	}
+	diags := make([]lspbridge.Diagnostic, 0, len(msg.Diagnostics))
+	for _, d := range msg.Diagnostics {
+		diags = append(diags, lspbridge.Diagnostic{
+			File:     uriToPath(msg.URI),
+			Line:     d.Range.Start.Line + 1,
+			Severity: lspDiagnosticSeverity(d.Severity),
+			Message:  d.Message,
+			Source:   d.Source,
+		})
+	}
+	c.diagnosticsMu.Lock()
+	c.diagnostics[msg.URI] = diags
+	c.diagnosticsMu.Unlock()
+}
+
+func (c *lspConn) publishedDiagnostics(absPath, repoPath string) []lspbridge.Diagnostic {
+	uri := fileURI(absPath)
+	c.diagnosticsMu.Lock()
+	diags := append([]lspbridge.Diagnostic(nil), c.diagnostics[uri]...)
+	c.diagnosticsMu.Unlock()
+	for i := range diags {
+		diags[i].File = relPath(diags[i].File, repoPath)
+	}
+	return diags
+}
+
+func lspDiagnosticSeverity(severity int) string {
+	switch severity {
+	case 1:
+		return "error"
+	case 2:
+		return "warning"
+	case 3:
+		return "info"
+	case 4:
+		return "hint"
+	default:
+		return "unknown"
+	}
+}
+
 // lspSymbolKindName maps LSP SymbolKind numbers to readable names.
 func lspSymbolKindName(kind int) string {
 	names := map[int]string{
@@ -227,13 +297,16 @@ func relPath(absPath, root string) string {
 
 // statusOK writes a JSON response.
 func statusOK(w http.ResponseWriter, v any) {
+	statusJSON(w, http.StatusOK, v)
+}
+
+func statusJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
 
 // statusError writes a JSON error response.
 func statusError(w http.ResponseWriter, code int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	statusJSON(w, code, map[string]string{"error": msg})
 }

@@ -16,10 +16,20 @@ type AnalyzeRequest struct {
 
 // AnalyzeResponse is returned from POST /analyze.
 type AnalyzeResponse struct {
-	Definitions []SymbolInfo  `json:"definitions,omitempty"`
-	References  []Reference   `json:"references,omitempty"`
-	Diagnostics []Diagnostic  `json:"diagnostics,omitempty"`
-	Error       string        `json:"error,omitempty"`
+	Status         string          `json:"status,omitempty"` // ok, degraded, or error
+	LSPAvailable   bool            `json:"lsp_available"`
+	Definitions    []SymbolInfo    `json:"definitions,omitempty"`
+	References     []Reference     `json:"references,omitempty"`
+	Diagnostics    []Diagnostic    `json:"diagnostics,omitempty"`
+	LanguageErrors []LanguageError `json:"language_errors,omitempty"`
+	Error          string          `json:"error,omitempty"`
+}
+
+// LanguageError describes a per-language LSP bridge failure.
+type LanguageError struct {
+	Language string `json:"language"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
 }
 
 // SymbolInfo describes a symbol definition found by the language server.
@@ -51,8 +61,10 @@ type Diagnostic struct {
 
 // HealthResponse is returned from GET /healthz.
 type HealthResponse struct {
-	Status    string            `json:"status"`
-	Processes map[string]string `json:"processes,omitempty"` // language → status
+	Status       string            `json:"status"`
+	Processes    map[string]string `json:"processes,omitempty"` // language → status
+	AllowedRoots []string          `json:"allowed_roots,omitempty"`
+	AuthRequired bool              `json:"auth_required,omitempty"`
 }
 
 // Language constants.

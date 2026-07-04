@@ -46,6 +46,21 @@ func TestClient_Analyze(t *testing.T) {
 	}
 }
 
+func TestClient_Analyze_SendsBearerToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("expected bearer token, got %q", got)
+		}
+		json.NewEncoder(w).Encode(AnalyzeResponse{Status: "ok", LSPAvailable: true})
+	}))
+	defer srv.Close()
+
+	c := NewClientWithToken(srv.URL, "secret")
+	if _, err := c.Analyze(context.Background(), AnalyzeRequest{RepoPath: "/tmp/repo"}); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+}
+
 func TestClient_Analyze_HTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

@@ -13,14 +13,21 @@ import (
 // Client communicates with the LSP bridge service over HTTP.
 type Client struct {
 	baseURL    string
+	apiToken   string
 	httpClient *http.Client
 }
 
 // NewClient creates an LSP bridge client.
 // baseURL should be the bridge root (e.g. "http://localhost:8082").
 func NewClient(baseURL string) *Client {
+	return NewClientWithToken(baseURL, "")
+}
+
+// NewClientWithToken creates an LSP bridge client that authenticates requests.
+func NewClientWithToken(baseURL, apiToken string) *Client {
 	return &Client{
-		baseURL: baseURL,
+		baseURL:  baseURL,
+		apiToken: apiToken,
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -39,6 +46,7 @@ func (c *Client) Analyze(ctx context.Context, req AnalyzeRequest) (*AnalyzeRespo
 		return nil, fmt.Errorf("lspbridge: create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	c.authorize(httpReq)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -79,6 +87,12 @@ func (c *Client) Ping(ctx context.Context) error {
 		return fmt.Errorf("lspbridge: ping returned HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (c *Client) authorize(req *http.Request) {
+	if c.apiToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiToken)
+	}
 }
 
 func truncateStr(s string, n int) string {
