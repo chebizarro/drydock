@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"drydock/internal/db"
 	"drydock/internal/ingest"
@@ -49,6 +50,111 @@ func TestProcessorRejectsInvalidSignature(t *testing.T) {
 	}
 	if ingested != 0 {
 		t.Fatalf("expected 0 ingested events for invalid signature, got %d", ingested)
+	}
+}
+
+func TestProcessorRejectsIDMismatchBeforeDispatch(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	repoSK := nostr.Generate()
+	patchSK := nostr.Generate()
+	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	repoEvt := nostr.Event{
+		Kind:      30617,
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"d", "repo-1"}, {"clone", "https://example.com/repo-1.git"}},
+	}
+	signEvent(t, repoSK, &repoEvt)
+	if err := store.UpsertRepositoryAnnouncement(ctx, repoEvt); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+
+	bad := nostr.Event{
+		Kind:      1617,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
+			{"e", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "", "root"},
+		},
+		Content: "diff --git a/main.go b/main.go\n+package main\n",
+	}
+	signEvent(t, patchSK, &bad)
+	bad.ID = nostr.MustIDFromHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	if bad.CheckID() {
+		t.Fatal("test setup expected mismatched event ID")
+	}
+	if !bad.VerifySignature() {
+		t.Fatal("test setup expected signature to remain valid for event body")
+	}
+
+	if err := processor.ProcessEvent(ctx, bad, "wss://relay.test"); err != nil {
+		t.Fatalf("process should not error on invalid ID: %v", err)
+	}
+	select {
+	case task := <-processor.ReviewQueue:
+		t.Fatalf("invalid-ID event was dispatched to review queue: %+v", task)
+	default:
+	}
+	patches, err := store.CountPatchEvents(ctx)
+	if err != nil {
+		t.Fatalf("count patch events: %v", err)
+	}
+	if patches != 0 {
+		t.Fatalf("expected invalid-ID event not to persist as patch, got %d", patches)
+	}
+
+	valid := nostr.Event{
+		Kind:      1617,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
+			{"e", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "", "root"},
+		},
+		Content: "diff --git a/valid.go b/valid.go\n+package main\n",
+	}
+	signEvent(t, patchSK, &valid)
+	if !valid.CheckID() || !valid.VerifySignature() {
+		t.Fatal("test setup expected valid signed event")
+	}
+	if err := processor.ProcessEvent(ctx, valid, "wss://relay.test"); err != nil {
+		t.Fatalf("process valid event failed: %v", err)
+	}
+	select {
+	case task := <-processor.ReviewQueue:
+		if task.PatchEventID != valid.ID.Hex() || task.RepoID == "" {
+			t.Fatalf("unexpected review task: %+v", task)
+		}
+	default:
+		t.Fatal("valid event was not dispatched to review queue")
+	}
+}
+
+func TestProcessorRejectsFutureTimestamp(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	sk := nostr.Generate()
+
+	event := nostr.Event{
+		Kind:      30617,
+		CreatedAt: nostr.Timestamp(time.Now().Add(11 * time.Minute).Unix()),
+		Tags:      nostr.Tags{{"d", "repo-1"}},
+	}
+	signEvent(t, sk, &event)
+	if !event.CheckID() || !event.VerifySignature() {
+		t.Fatal("test setup expected signed event with valid integrity")
+	}
+
+	if err := processor.ProcessEvent(ctx, event, "wss://relay.test"); err != nil {
+		t.Fatalf("process should not error on future timestamp: %v", err)
+	}
+	ingested, err := store.CountIngestedEvents(ctx)
+	if err != nil {
+		t.Fatalf("count ingested events: %v", err)
+	}
+	if ingested != 0 {
+		t.Fatalf("expected 0 ingested events for future timestamp, got %d", ingested)
 	}
 }
 

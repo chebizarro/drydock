@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"drydock/internal/db"
 	"drydock/internal/metrics"
@@ -83,6 +84,9 @@ func WithMarketplace(h MarketplaceHandler) func(*Processor) {
 }
 
 func NewProcessor(store *db.Store, logger *slog.Logger, opts ...func(*Processor)) *Processor {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	p := &Processor{
 		store:       store,
 		logger:      logger,
@@ -94,15 +98,13 @@ func NewProcessor(store *db.Store, logger *slog.Logger, opts ...func(*Processor)
 	return p
 }
 
+const (
+	maxEventFutureSkew = 10 * time.Minute
+	maxEventPastAge    = 365 * 24 * time.Hour
+)
+
 func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayURL string) error {
-	// Verify event signature before processing. Reject forged or unsigned events.
-	if !event.VerifySignature() {
-		metrics.EventsRejected.Inc()
-		p.logger.Warn("rejected event with invalid signature",
-			"event_id", event.ID.Hex(),
-			"kind", int(event.Kind),
-			"relay", relayURL,
-		)
+	if !p.validateEventForIngest(event, relayURL) {
 		return nil // drop silently — do not propagate invalid events
 	}
 
@@ -243,6 +245,43 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 	default:
 		return nil
 	}
+}
+
+func (p *Processor) validateEventForIngest(event nostr.Event, relayURL string) bool {
+	reason := ""
+	switch {
+	case !event.CheckID():
+		reason = "id_mismatch"
+	case !event.VerifySignature():
+		reason = "invalid_signature"
+	case !eventTimestampPlausible(event.CreatedAt):
+		reason = "implausible_timestamp"
+	}
+	if reason == "" {
+		return true
+	}
+
+	metrics.EventsRejected.Inc()
+	p.logger.Warn("rejected invalid ingest event",
+		"event_id", event.ID.Hex(),
+		"kind", int(event.Kind),
+		"relay", relayURL,
+		"reason", reason,
+		"created_at", int64(event.CreatedAt),
+	)
+	return false
+}
+
+func eventTimestampPlausible(ts nostr.Timestamp) bool {
+	now := time.Now()
+	createdAt := time.Unix(int64(ts), 0)
+	if createdAt.After(now.Add(maxEventFutureSkew)) {
+		return false
+	}
+	if createdAt.Before(now.Add(-maxEventPastAge)) {
+		return false
+	}
+	return true
 }
 
 // hasAutofixTag checks if an event carries the drydock-autofix tag.

@@ -120,7 +120,7 @@ func (v *SummaryVec) With(label string) *Summary {
 var (
 	// Ingest
 	EventsIngested = NewCounterVec() // label: kind (e.g. "1617", "30617")
-	EventsRejected = &Counter{}      // invalid signature
+	EventsRejected = &Counter{}      // invalid ID, signature, or timestamp
 
 	// Review queue
 	ReviewQueueDepth  = &Gauge{} // approximate current depth
@@ -176,19 +176,19 @@ var (
 	CodeChatErrors        = &Counter{}
 
 	// IDE Gateway
-	IDESessionsActive          = &Gauge{}
-	IDEReviewRequestsReceived  = &Counter{}
-	IDEReviewResponsesSent     = &Counter{}
-	IDEReviewErrors            = &Counter{}
-	IDEFixRequestsReceived     = &Counter{}
-	IDEFixResponsesSent        = &Counter{}
+	IDESessionsActive         = &Gauge{}
+	IDEReviewRequestsReceived = &Counter{}
+	IDEReviewResponsesSent    = &Counter{}
+	IDEReviewErrors           = &Counter{}
+	IDEFixRequestsReceived    = &Counter{}
+	IDEFixResponsesSent       = &Counter{}
 
 	// Marketplace
-	MarketplaceRoutingAttempts    = &Counter{}
-	MarketplaceRoutingSuccesses   = &Counter{}
-	MarketplaceRoutingFailures    = &Counter{}
-	MarketplaceNoReviewersFound   = &Counter{}
-	MarketplaceAssignmentsCreated = &Counter{}
+	MarketplaceRoutingAttempts     = &Counter{}
+	MarketplaceRoutingSuccesses    = &Counter{}
+	MarketplaceRoutingFailures     = &Counter{}
+	MarketplaceNoReviewersFound    = &Counter{}
+	MarketplaceAssignmentsCreated  = &Counter{}
 	MarketplaceAssignmentsAccepted = &Counter{}
 	MarketplaceAssignmentsRejected = &Counter{}
 	MarketplaceAssignmentsExpired  = &Counter{}
@@ -206,8 +206,8 @@ var (
 	ConversationErrors          = &Counter{}
 
 	// Circuit breakers
-	CircuitBreakerOpened = NewCounterVec() // label: service (embedding, vectorstore, etc)
-	CircuitBreakerClosed = NewCounterVec() // label: service
+	CircuitBreakerOpened   = NewCounterVec() // label: service (embedding, vectorstore, etc)
+	CircuitBreakerClosed   = NewCounterVec() // label: service
 	CircuitBreakerRejected = NewCounterVec() // label: service (requests rejected due to open circuit)
 
 	// Uptime
@@ -250,7 +250,7 @@ func writeMetrics(w io.Writer) {
 
 	// Events rejected
 	writeCounter(w, "drydock_events_rejected_total",
-		"Events rejected due to invalid signature.", EventsRejected)
+		"Events rejected due to invalid ID, signature, or timestamp.", EventsRejected)
 
 	// Queue
 	writeGauge(w, "drydock_review_queue_depth",
