@@ -141,12 +141,14 @@ func (s *SocketSigner) SignEvent(ctx context.Context, evt *nostr.Event) error {
 		return errors.New("nil event")
 	}
 
-	// Build the unsigned event payload for the signer.
+	// Build the unsigned event payload for the signer from a snapshot of the
+	// requested payload, and verify the signer returns that same payload.
+	requested := cloneEventPayload(evt)
 	unsigned := map[string]any{
-		"kind":       evt.Kind,
-		"content":    evt.Content,
-		"tags":       evt.Tags,
-		"created_at": evt.CreatedAt,
+		"kind":       requested.Kind,
+		"content":    requested.Content,
+		"tags":       requested.Tags,
+		"created_at": requested.CreatedAt,
 	}
 
 	// Get pubkey for second param.
@@ -160,10 +162,13 @@ func (s *SocketSigner) SignEvent(ctx context.Context, evt *nostr.Event) error {
 		return fmt.Errorf("sign_event: %w", err)
 	}
 
-	// Parse the signed event response back into the event struct.
+	// Parse and verify the signed event response before trusting any fields.
 	var signed nostr.Event
 	if err := json.Unmarshal(resp, &signed); err != nil {
 		return fmt.Errorf("parse signed event: %w", err)
+	}
+	if err := verifyRemoteSignedEvent(&requested, &signed, pk); err != nil {
+		return fmt.Errorf("sign_event verification failed: %w", err)
 	}
 
 	evt.ID = signed.ID

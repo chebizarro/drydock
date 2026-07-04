@@ -95,13 +95,19 @@ func (s *DBusSigner) SignEvent(ctx context.Context, evt *nostr.Event) error {
 		return errors.New("nil event")
 	}
 
-	// Serialize the unsigned event to JSON.
-	evtJSON, err := json.Marshal(evt)
+	// Serialize a snapshot of the unsigned event to JSON, and verify the signer
+	// returns that same requested payload.
+	requested := cloneEventPayload(evt)
+	evtJSON, err := json.Marshal(&requested)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)
 	}
 
-	currentUser := s.pubkey.Hex()
+	expectedPubKey, err := s.GetPublicKey(ctx)
+	if err != nil {
+		return fmt.Errorf("dbus SignEvent get pubkey: %w", err)
+	}
+	currentUser := expectedPubKey.Hex()
 
 	call := s.obj.CallWithContext(
 		ctx,
@@ -121,9 +127,12 @@ func (s *DBusSigner) SignEvent(ctx context.Context, evt *nostr.Event) error {
 	}
 
 	// The response may be a full signed event JSON or just a signature.
-	// Try parsing as a full event first.
+	// Try parsing as a full event first, and verify it before trusting any fields.
 	var signed nostr.Event
 	if err := json.Unmarshal([]byte(sigJSON), &signed); err == nil && signed.Sig != [64]byte{} {
+		if err := verifyRemoteSignedEvent(&requested, &signed, expectedPubKey); err != nil {
+			return fmt.Errorf("dbus SignEvent verification failed: %w", err)
+		}
 		evt.ID = signed.ID
 		evt.PubKey = signed.PubKey
 		evt.Sig = signed.Sig

@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"fiatjaf.com/nostr"
 )
 
 // mockSocketSigner starts a Unix domain socket server that emulates a NIP-5F signer.
@@ -230,6 +234,174 @@ func TestSocketSigner_DefaultClientName(t *testing.T) {
 
 	if gotClientName != "drydock" {
 		t.Errorf("expected default client name 'drydock', got %q", gotClientName)
+	}
+}
+
+func TestSocketSigner_SignEventVerifiesSignerResponse(t *testing.T) {
+	expectedSK := nostr.Generate()
+	expectedPK := nostr.GetPublicKey(expectedSK)
+	otherSK := nostr.Generate()
+
+	tests := []struct {
+		name        string
+		respondWith func(t *testing.T, unsigned nostr.Event) nostr.Event
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name: "rejects valid signature from different pubkey",
+			respondWith: func(t *testing.T, unsigned nostr.Event) nostr.Event {
+				t.Helper()
+				signed := unsigned
+				signSocketTestEvent(t, otherSK, &signed)
+				return signed
+			},
+			wantErr:     true,
+			errContains: "pubkey mismatch",
+		},
+		{
+			name: "rejects altered content signed by expected pubkey",
+			respondWith: func(t *testing.T, unsigned nostr.Event) nostr.Event {
+				t.Helper()
+				signed := unsigned
+				signed.Content = unsigned.Content + " tampered"
+				signSocketTestEvent(t, expectedSK, &signed)
+				return signed
+			},
+			wantErr:     true,
+			errContains: "content mismatch",
+		},
+		{
+			name: "accepts matching event signed by expected pubkey",
+			respondWith: func(t *testing.T, unsigned nostr.Event) nostr.Event {
+				t.Helper()
+				signed := unsigned
+				signSocketTestEvent(t, expectedSK, &signed)
+				return signed
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sockPath, cleanup := mockSocketSigner(t, signingResponseHandler(t, expectedPK, tc.respondWith))
+			defer cleanup()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			signer, err := NewSocketSigner(ctx, SocketSignerConfig{SocketPath: sockPath})
+			if err != nil {
+				t.Fatalf("NewSocketSigner: %v", err)
+			}
+			defer signer.Close()
+
+			evt := &nostr.Event{
+				Kind:      1234,
+				CreatedAt: nostr.Now(),
+				Content:   "original content",
+				Tags:      nostr.Tags{{"t", "DRYDOCK-6i2"}, {"p", expectedPK.Hex()}},
+			}
+
+			err = signer.SignEvent(ctx, evt)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected SignEvent error")
+				}
+				if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
+					t.Fatalf("expected error containing %q, got %v", tc.errContains, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SignEvent: %v", err)
+			}
+			if evt.PubKey != expectedPK {
+				t.Fatalf("signed pubkey mismatch: got %s, want %s", evt.PubKey.Hex(), expectedPK.Hex())
+			}
+			if !evt.CheckID() {
+				t.Fatal("signed event failed id check")
+			}
+			if !evt.VerifySignature() {
+				t.Fatal("signed event failed signature verification")
+			}
+		})
+	}
+}
+
+func signingResponseHandler(t *testing.T, signerPK nostr.PubKey, respondWith func(t *testing.T, unsigned nostr.Event) nostr.Event) func(conn net.Conn) {
+	return func(conn net.Conn) {
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		writeFrameTo(conn, handshakeMsg{
+			Name:             "test-signer",
+			SupportedMethods: []string{"get_public_key", "sign_event"},
+		})
+
+		var hello clientHello
+		if err := readFrameFrom(conn, &hello); err != nil {
+			t.Logf("read client hello: %v", err)
+			return
+		}
+
+		for {
+			conn.SetDeadline(time.Now().Add(5 * time.Second))
+			var req rpcRequest
+			if err := readFrameFrom(conn, &req); err != nil {
+				return
+			}
+
+			switch req.Method {
+			case "get_public_key":
+				pubkeyJSON, err := json.Marshal(signerPK.Hex())
+				if err != nil {
+					t.Logf("marshal pubkey: %v", err)
+					return
+				}
+				writeFrameTo(conn, rpcResponse{ID: req.ID, Result: json.RawMessage(pubkeyJSON)})
+			case "sign_event":
+				unsigned, err := unsignedEventFromSocketRequest(req)
+				if err != nil {
+					writeFrameTo(conn, rpcResponse{ID: req.ID, Error: &rpcError{Code: 3, Message: err.Error()}})
+					continue
+				}
+				signed := respondWith(t, unsigned)
+				result, err := json.Marshal(signed)
+				if err != nil {
+					writeFrameTo(conn, rpcResponse{ID: req.ID, Error: &rpcError{Code: 3, Message: err.Error()}})
+					continue
+				}
+				writeFrameTo(conn, rpcResponse{ID: req.ID, Result: json.RawMessage(result)})
+			default:
+				writeFrameTo(conn, rpcResponse{
+					ID:    req.ID,
+					Error: &rpcError{Code: 2, Message: "method not supported"},
+				})
+			}
+		}
+	}
+}
+
+func unsignedEventFromSocketRequest(req rpcRequest) (nostr.Event, error) {
+	if len(req.Params) == 0 {
+		return nostr.Event{}, fmt.Errorf("missing unsigned event param")
+	}
+	data, err := json.Marshal(req.Params[0])
+	if err != nil {
+		return nostr.Event{}, fmt.Errorf("marshal unsigned event param: %w", err)
+	}
+	var evt nostr.Event
+	if err := json.Unmarshal(data, &evt); err != nil {
+		return nostr.Event{}, fmt.Errorf("unmarshal unsigned event param: %w", err)
+	}
+	return evt, nil
+}
+
+func signSocketTestEvent(t *testing.T, sk nostr.SecretKey, evt *nostr.Event) {
+	t.Helper()
+	if err := evt.Sign(sk); err != nil {
+		t.Fatalf("sign event: %v", err)
 	}
 }
 
