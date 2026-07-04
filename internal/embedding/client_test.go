@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"drydock/internal/metrics"
 )
 
 func TestEmbedSuccess(t *testing.T) {
@@ -110,6 +112,36 @@ func TestEmbedNoAuthHeader(t *testing.T) {
 	}
 	if len(vec) != 1 {
 		t.Fatalf("expected 1-dim vector, got %d", len(vec))
+	}
+}
+
+func TestCircuitBreakerMetrics(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{\"error\": \"model not loaded\"}`))
+	}))
+	defer srv.Close()
+
+	openedBefore := metrics.CircuitBreakerOpened.With("embedding").Value()
+	rejectedBefore := metrics.CircuitBreakerRejected.With("embedding").Value()
+
+	client := NewClient(srv.URL, "", "model")
+	for i := 0; i < 5; i++ {
+		_, err := client.Embed(context.Background(), "test text")
+		if err == nil {
+			t.Fatalf("expected failure %d", i+1)
+		}
+	}
+	if got := metrics.CircuitBreakerOpened.With("embedding").Value(); got != openedBefore+1 {
+		t.Fatalf("expected embedding opened metric to increment by 1, got before=%d after=%d", openedBefore, got)
+	}
+
+	_, err := client.Embed(context.Background(), "test text")
+	if err == nil {
+		t.Fatal("expected open circuit rejection")
+	}
+	if got := metrics.CircuitBreakerRejected.With("embedding").Value(); got != rejectedBefore+1 {
+		t.Fatalf("expected embedding rejected metric to increment by 1, got before=%d after=%d", rejectedBefore, got)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"drydock/internal/circuitbreaker"
+	"drydock/internal/metrics"
 )
 
 // Client calls an OpenAI-compatible embedding endpoint.
@@ -49,16 +50,17 @@ func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
 
 	// Check circuit breaker
 	if !c.breaker.Allow() {
+		metrics.CircuitBreakerRejected.With("embedding").Inc()
 		return nil, fmt.Errorf("embed: %w", circuitbreaker.ErrCircuitOpen)
 	}
 
 	vec, err := c.doEmbed(ctx, text)
 	if err != nil {
-		c.breaker.RecordFailure()
+		c.recordFailure()
 		return nil, err
 	}
 
-	c.breaker.RecordSuccess()
+	c.recordSuccess()
 	return vec, nil
 }
 
@@ -108,6 +110,18 @@ func (c *Client) doEmbed(ctx context.Context, text string) ([]float32, error) {
 	return result.Data[0].Embedding, nil
 }
 
+// Ping verifies the embedding service can return a vector for a minimal readiness input.
+func (c *Client) Ping(ctx context.Context) error {
+	vec, err := c.Embed(ctx, "drydock readiness check")
+	if err != nil {
+		return err
+	}
+	if len(vec) == 0 {
+		return fmt.Errorf("embed: readiness check returned empty vector")
+	}
+	return nil
+}
+
 // CircuitState returns the current circuit breaker state.
 func (c *Client) CircuitState() circuitbreaker.State {
 	return c.breaker.State()
@@ -115,6 +129,22 @@ func (c *Client) CircuitState() circuitbreaker.State {
 
 // Model returns the configured model name.
 func (c *Client) Model() string { return c.model }
+
+func (c *Client) recordFailure() {
+	before := c.breaker.State()
+	c.breaker.RecordFailure()
+	if before != circuitbreaker.StateOpen && c.breaker.State() == circuitbreaker.StateOpen {
+		metrics.CircuitBreakerOpened.With("embedding").Inc()
+	}
+}
+
+func (c *Client) recordSuccess() {
+	before := c.breaker.State()
+	c.breaker.RecordSuccess()
+	if before != circuitbreaker.StateClosed && c.breaker.State() == circuitbreaker.StateClosed {
+		metrics.CircuitBreakerClosed.With("embedding").Inc()
+	}
+}
 
 type embeddingRequest struct {
 	Model string `json:"model"`

@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"drydock/internal/metrics"
 )
 
 func TestEnsureCollection_AlreadyExists(t *testing.T) {
@@ -17,7 +20,7 @@ func TestEnsureCollection_AlreadyExists(t *testing.T) {
 					"points_count": 42,
 					"config": map[string]any{
 						"params": map[string]any{
-							"vectors": map[string]any{"size": 384},
+							"vectors": map[string]any{"size": 384, "distance": "Cosine"},
 						},
 					},
 				},
@@ -32,6 +35,59 @@ func TestEnsureCollection_AlreadyExists(t *testing.T) {
 	err := c.EnsureCollection(context.Background(), "test_col", 384)
 	if err != nil {
 		t.Fatalf("EnsureCollection: %v", err)
+	}
+}
+
+func TestEnsureCollection_DimensionMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/collections/test_col" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{
+				"status": "green",
+				"config": map[string]any{
+					"params": map[string]any{
+						"vectors": map[string]any{"size": 768, "distance": "Cosine"},
+					},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "")
+	err := c.EnsureCollection(context.Background(), "test_col", 384)
+	if err == nil {
+		t.Fatal("expected dimension mismatch error")
+	}
+	if got := err.Error(); !strings.Contains(got, "vector size mismatch") || !strings.Contains(got, "existing size 768") || !strings.Contains(got, "configured size 384") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEnsureCollection_DistanceMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{
+				"status": "green",
+				"config": map[string]any{
+					"params": map[string]any{
+						"vectors": map[string]any{"size": 384, "distance": "Dot"},
+					},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "")
+	err := c.EnsureCollection(context.Background(), "test_col", 384)
+	if err == nil {
+		t.Fatal("expected distance mismatch error")
+	}
+	if got := err.Error(); !strings.Contains(got, "distance mismatch") || !strings.Contains(got, "Dot") || !strings.Contains(got, "Cosine") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -79,7 +135,7 @@ func TestGetCollection(t *testing.T) {
 				"points_count": 100,
 				"config": map[string]any{
 					"params": map[string]any{
-						"vectors": map[string]any{"size": 768},
+						"vectors": map[string]any{"size": 768, "distance": "Cosine"},
 					},
 				},
 			},
@@ -100,6 +156,9 @@ func TestGetCollection(t *testing.T) {
 	}
 	if info.VectorSize != 768 {
 		t.Errorf("expected vector size 768, got %d", info.VectorSize)
+	}
+	if info.Distance != "Cosine" {
+		t.Errorf("expected distance Cosine, got %s", info.Distance)
 	}
 }
 
@@ -293,6 +352,36 @@ func TestHTTPError(t *testing.T) {
 	_, err := c.Search(context.Background(), "test_col", []float32{0.1}, 1, nil)
 	if err == nil {
 		t.Fatal("expected error on HTTP 500")
+	}
+}
+
+func TestCircuitBreakerMetrics(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"status":{"error":"qdrant down"}}`))
+	}))
+	defer srv.Close()
+
+	openedBefore := metrics.CircuitBreakerOpened.With("vectorstore").Value()
+	rejectedBefore := metrics.CircuitBreakerRejected.With("vectorstore").Value()
+
+	c := NewClient(srv.URL, "")
+	for i := 0; i < 5; i++ {
+		_, err := c.Count(context.Background(), "test_col", nil)
+		if err == nil {
+			t.Fatalf("expected failure %d", i+1)
+		}
+	}
+	if got := metrics.CircuitBreakerOpened.With("vectorstore").Value(); got != openedBefore+1 {
+		t.Fatalf("expected vectorstore opened metric to increment by 1, got before=%d after=%d", openedBefore, got)
+	}
+
+	_, err := c.Count(context.Background(), "test_col", nil)
+	if err == nil {
+		t.Fatal("expected open circuit rejection")
+	}
+	if got := metrics.CircuitBreakerRejected.With("vectorstore").Value(); got != rejectedBefore+1 {
+		t.Fatalf("expected vectorstore rejected metric to increment by 1, got before=%d after=%d", rejectedBefore, got)
 	}
 }
 

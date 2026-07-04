@@ -103,3 +103,34 @@ func TestReadyzDBDown(t *testing.T) {
 		t.Fatalf("expected status not_ready, got %s", resp.Status)
 	}
 }
+
+func TestReadyzReportsDegradedDependency(t *testing.T) {
+	srv := New(&fakeDB{}, testLogger())
+	srv.SetReady(true)
+	if err := srv.AddReadinessFunc("qdrant", func(ctx context.Context) error {
+		return errors.New("connection refused")
+	}); err != nil {
+		t.Fatalf("AddReadinessFunc: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+	var resp healthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != "degraded" {
+		t.Fatalf("expected status degraded, got %s", resp.Status)
+	}
+	if len(resp.Degraded) != 1 || resp.Degraded[0] != "qdrant" {
+		t.Fatalf("expected qdrant degraded component, got %#v", resp.Degraded)
+	}
+	if len(resp.Components) != 1 || resp.Components[0].Name != "qdrant" || resp.Components[0].Status != "degraded" || resp.Components[0].Error == "" {
+		t.Fatalf("unexpected component status: %#v", resp.Components)
+	}
+}

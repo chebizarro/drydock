@@ -6,13 +6,20 @@ package tracing
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"io"
 	"log/slog"
+	"os"
+	"sync/atomic"
 	"time"
 )
 
 // ctxKey is the context key for trace data.
 type ctxKey struct{}
+
+var fallbackTraceCounter atomic.Uint64
 
 // TraceData holds tracing information for a request.
 type TraceData struct {
@@ -22,11 +29,19 @@ type TraceData struct {
 	StartTime time.Time
 }
 
-// NewTraceID generates a new random trace ID (16 hex characters).
+// NewTraceID generates a new trace ID (16 hex characters).
 func NewTraceID() string {
 	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	if n, err := io.ReadFull(rand.Reader, b); err == nil && n == len(b) {
+		return hex.EncodeToString(b)
+	}
+	return fallbackTraceID()
+}
+
+func fallbackTraceID() string {
+	counter := fallbackTraceCounter.Add(1)
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%d", time.Now().UnixNano(), os.Getpid(), counter)))
+	return hex.EncodeToString(sum[:8])
 }
 
 // WithTrace creates a new context with trace data.
@@ -173,16 +188,16 @@ func (s *Span) EndWithError(err error) time.Duration {
 
 // PipelineStages are the standard pipeline stages for timing.
 const (
-	StageRepoPrepare     = "repo_prepare"
-	StageDocIngest       = "doc_ingest"
-	StageCodeIndex       = "code_index"
+	StageRepoPrepare      = "repo_prepare"
+	StageDocIngest        = "doc_ingest"
+	StageCodeIndex        = "code_index"
 	StageFewShotRetrieval = "fewshot_retrieval"
-	StageContextBuild    = "context_build"
-	StageLLMReview       = "llm_review"
-	StageSecurityScan    = "security_scan"
-	StagePublish         = "publish"
-	StageMetaReview      = "meta_review"
-	StageStatusPublish   = "status_publish"
+	StageContextBuild     = "context_build"
+	StageLLMReview        = "llm_review"
+	StageSecurityScan     = "security_scan"
+	StagePublish          = "publish"
+	StageMetaReview       = "meta_review"
+	StageStatusPublish    = "status_publish"
 )
 
 // PipelineTimer tracks timing for all pipeline stages.
@@ -207,7 +222,7 @@ func (pt *PipelineTimer) Time(stage string, fn func() error) error {
 	err := fn()
 	duration := time.Since(start)
 	pt.stages[stage] = duration
-	
+
 	if err != nil {
 		pt.logger.Warn("pipeline stage failed",
 			"stage", stage,
@@ -232,7 +247,7 @@ func (pt *PipelineTimer) Summary() {
 		attrs = append(attrs, stage+"_ms", duration.Milliseconds())
 	}
 	attrs = append(attrs, "total_ms", total.Milliseconds())
-	
+
 	pt.logger.Info("pipeline timing summary", attrs...)
 }
 

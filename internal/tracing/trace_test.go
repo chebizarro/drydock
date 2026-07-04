@@ -3,6 +3,8 @@ package tracing
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -18,6 +20,28 @@ func TestNewTraceID(t *testing.T) {
 	}
 	if id1 == id2 {
 		t.Error("expected unique trace IDs")
+	}
+}
+
+type failingReader struct{}
+
+func (failingReader) Read(_ []byte) (int, error) { return 0, errors.New("entropy unavailable") }
+
+func TestNewTraceIDFallbackOnEntropyFailure(t *testing.T) {
+	original := crand.Reader
+	crand.Reader = failingReader{}
+	defer func() { crand.Reader = original }()
+
+	id1 := NewTraceID()
+	id2 := NewTraceID()
+	if len(id1) != 16 {
+		t.Fatalf("expected 16 char fallback trace ID, got %d", len(id1))
+	}
+	if id1 == "0000000000000000" {
+		t.Fatal("fallback trace ID should not be all zeros")
+	}
+	if id1 == id2 {
+		t.Fatal("expected fallback trace IDs to remain unique")
 	}
 }
 

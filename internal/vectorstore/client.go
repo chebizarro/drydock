@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"drydock/internal/circuitbreaker"
+	"drydock/internal/metrics"
 )
 
 // Client interacts with a Qdrant instance via its REST API.
@@ -49,6 +51,8 @@ const (
 	CollectionProjectDocs = "project_docs"
 	CollectionFewShot     = "few_shot_reviews"
 	CollectionCodeChunks  = "code_chunks"
+
+	collectionDistanceCosine = "Cosine"
 )
 
 // Point represents a vector point in Qdrant.
@@ -70,21 +74,25 @@ type CollectionInfo struct {
 	Status      string `json:"status"`
 	PointsCount int64  `json:"points_count"`
 	VectorSize  int    `json:"vector_size"`
+	Distance    string `json:"distance"`
 }
 
 // EnsureCollection creates a collection if it does not already exist.
 // vectorSize is the dimensionality of the embedding vectors (e.g. 768 for nomic-embed).
 func (c *Client) EnsureCollection(ctx context.Context, name string, vectorSize int) error {
 	// Check existence first.
-	_, err := c.GetCollection(ctx, name)
+	info, err := c.GetCollection(ctx, name)
 	if err == nil {
-		return nil // already exists
+		if err := validateCollectionConfig(name, info, vectorSize, collectionDistanceCosine); err != nil {
+			return err
+		}
+		return nil // already exists and matches configured embedding dimensions
 	}
 
 	body := map[string]any{
 		"vectors": map[string]any{
 			"size":     vectorSize,
-			"distance": "Cosine",
+			"distance": collectionDistanceCosine,
 		},
 	}
 	_, err = c.do(ctx, http.MethodPut, "/collections/"+name, body)
@@ -108,7 +116,8 @@ func (c *Client) GetCollection(ctx context.Context, name string) (*CollectionInf
 			Config      struct {
 				Params struct {
 					Vectors struct {
-						Size int `json:"size"`
+						Size     int    `json:"size"`
+						Distance string `json:"distance"`
 					} `json:"vectors"`
 				} `json:"params"`
 			} `json:"config"`
@@ -122,6 +131,7 @@ func (c *Client) GetCollection(ctx context.Context, name string) (*CollectionInf
 		Status:      resp.Result.Status,
 		PointsCount: resp.Result.PointsCount,
 		VectorSize:  resp.Result.Config.Params.Vectors.Size,
+		Distance:    resp.Result.Config.Params.Vectors.Distance,
 	}, nil
 }
 
@@ -263,16 +273,17 @@ func (c *Client) Scroll(ctx context.Context, collection string, limit int, offse
 func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte, error) {
 	// Check circuit breaker
 	if !c.breaker.Allow() {
+		metrics.CircuitBreakerRejected.With("vectorstore").Inc()
 		return nil, fmt.Errorf("vectorstore: %w", circuitbreaker.ErrCircuitOpen)
 	}
 
 	respBody, err := c.doHTTP(ctx, method, path, body)
 	if err != nil {
-		c.breaker.RecordFailure()
+		c.recordFailure()
 		return nil, err
 	}
 
-	c.breaker.RecordSuccess()
+	c.recordSuccess()
 	return respBody, nil
 }
 
@@ -316,9 +327,44 @@ func (c *Client) doHTTP(ctx context.Context, method, path string, body any) ([]b
 	return respBody, nil
 }
 
+// Ping verifies the Qdrant service can answer a lightweight collections request.
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.do(ctx, http.MethodGet, "/collections", nil)
+	return err
+}
+
 // CircuitState returns the current circuit breaker state.
 func (c *Client) CircuitState() circuitbreaker.State {
 	return c.breaker.State()
+}
+
+func (c *Client) recordFailure() {
+	before := c.breaker.State()
+	c.breaker.RecordFailure()
+	if before != circuitbreaker.StateOpen && c.breaker.State() == circuitbreaker.StateOpen {
+		metrics.CircuitBreakerOpened.With("vectorstore").Inc()
+	}
+}
+
+func (c *Client) recordSuccess() {
+	before := c.breaker.State()
+	c.breaker.RecordSuccess()
+	if before != circuitbreaker.StateClosed && c.breaker.State() == circuitbreaker.StateClosed {
+		metrics.CircuitBreakerClosed.With("vectorstore").Inc()
+	}
+}
+
+func validateCollectionConfig(name string, info *CollectionInfo, wantSize int, wantDistance string) error {
+	if info == nil {
+		return fmt.Errorf("collection %s exists but returned no configuration", name)
+	}
+	if info.VectorSize != wantSize {
+		return fmt.Errorf("collection %s vector size mismatch: existing size %d, configured size %d; migrate or recreate the collection before indexing", name, info.VectorSize, wantSize)
+	}
+	if info.Distance != "" && !strings.EqualFold(info.Distance, wantDistance) {
+		return fmt.Errorf("collection %s distance mismatch: existing distance %q, configured distance %q; migrate or recreate the collection before indexing", name, info.Distance, wantDistance)
+	}
+	return nil
 }
 
 func truncate(s string, n int) string {
