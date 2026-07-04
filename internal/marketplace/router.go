@@ -167,8 +167,18 @@ func (r *Router) RoutePatch(ctx context.Context, patch PatchInfo) (*RoutingResul
 	now := time.Now()
 	deadline := now.Add(r.cfg.DefaultDeadline)
 
-	for i := 0; i < assignCount; i++ {
-		match := matches[i]
+	for _, match := range matches {
+		if result.AssignedCount >= assignCount {
+			break
+		}
+		if match.Profile.PricePerReview > patch.PriceSats {
+			r.logger.Warn("reviewer price exceeds patch price cap",
+				"reviewer", match.Profile.Pubkey,
+				"reviewer_price_sats", match.Profile.PricePerReview,
+				"patch_price_sats", patch.PriceSats,
+			)
+			continue
+		}
 
 		assignment := ReviewAssignment{
 			AssignmentID:   generateAssignmentID(patch.PatchEventID, match.Profile.Pubkey),
@@ -181,19 +191,23 @@ func (r *Router) RoutePatch(ctx context.Context, patch PatchInfo) (*RoutingResul
 			CreatedAt:      now.Unix(),
 		}
 
-		// Publish assignment event
-		if err := r.publishAssignment(ctx, assignment); err != nil {
-			r.logger.Warn("failed to publish assignment",
-				"reviewer", match.Profile.Pubkey,
-				"error", err)
-			continue
-		}
-
-		// Record in database
+		// Record durably before publishing/acking success. The DB row is the
+		// source of truth for later acceptance, rejection, expiry, and payout
+		// tracking, so a persistence failure is an assignment failure.
 		if err := r.registry.RecordAssignment(ctx, assignment); err != nil {
 			r.logger.Warn("failed to record assignment",
 				"assignment_id", assignment.AssignmentID,
 				"error", err)
+			return result, fmt.Errorf("record assignment %s: %w", assignment.AssignmentID, err)
+		}
+
+		// Publish assignment event after the durable record exists.
+		if err := r.publishAssignment(ctx, assignment); err != nil {
+			r.logger.Warn("failed to publish assignment",
+				"reviewer", match.Profile.Pubkey,
+				"assignment_id", assignment.AssignmentID,
+				"error", err)
+			continue
 		}
 
 		result.Assignments = append(result.Assignments, assignment)

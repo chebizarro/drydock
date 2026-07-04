@@ -40,6 +40,129 @@ func (m *mockPublisher) Publish(ctx context.Context, relays []string, event nost
 	return nil
 }
 
+func TestRouter_RoutePatch_RecordFailureDoesNotReportAssignmentSuccess(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	logger := slog.Default()
+
+	registry := NewRegistry(store, logger)
+	signer := &mockSigner{pubkey: testPubKey()}
+	publisher := &mockPublisher{}
+	router := NewRouter(
+		RouterConfig{
+			DefaultRelays:        []string{"wss://test.relay"},
+			MaxReviewersPerPatch: 1,
+			DefaultDeadline:      24 * time.Hour,
+		},
+		registry,
+		store,
+		signer,
+		publisher,
+		logger,
+	)
+
+	reviewerPubkey := testPubKey().Hex()
+	if err := registry.RegisterReviewer(ctx, ReviewerProfile{
+		Pubkey:         reviewerPubkey,
+		Languages:      []string{"go"},
+		Availability:   AvailabilityAvailable,
+		PricePerReview: 0,
+	}, "reviewer-event-record-failure"); err != nil {
+		t.Fatalf("RegisterReviewer: %v", err)
+	}
+
+	if _, err := store.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_route_patch_assignment_insert
+		BEFORE INSERT ON review_assignments
+		BEGIN
+			SELECT RAISE(ABORT, 'forced assignment persistence failure');
+		END;
+	`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+
+	result, err := router.RoutePatch(ctx, PatchInfo{
+		PatchEventID: "patch-record-failure",
+		RepoID:       "repo-record-failure",
+		AuthorPubkey: testPubKey().Hex(),
+		ChangedFiles: []string{"main.go"},
+		PriceSats:    100,
+	})
+	if err == nil {
+		t.Fatal("RoutePatch succeeded despite assignment persistence failure")
+	}
+	if result == nil {
+		t.Fatal("RoutePatch returned nil result; want partial result showing no successful assignment")
+	}
+	if result.AssignedCount != 0 {
+		t.Fatalf("AssignedCount = %d, want 0", result.AssignedCount)
+	}
+	if len(result.Assignments) != 0 {
+		t.Fatalf("len(Assignments) = %d, want 0", len(result.Assignments))
+	}
+	if len(publisher.published) != 0 {
+		t.Fatalf("published %d assignments despite persistence failure; want 0", len(publisher.published))
+	}
+}
+
+func TestRouter_RoutePatch_RejectsReviewerAbovePatchPriceBeforeAssignment(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	logger := slog.Default()
+
+	registry := NewRegistry(store, logger)
+	publisher := &mockPublisher{}
+	router := NewRouter(
+		RouterConfig{
+			DefaultRelays:        []string{"wss://test.relay"},
+			MaxReviewersPerPatch: 1,
+			DefaultDeadline:      24 * time.Hour,
+		},
+		registry,
+		store,
+		&mockSigner{pubkey: testPubKey()},
+		publisher,
+		logger,
+	)
+
+	reviewerPubkey := testPubKey().Hex()
+	if err := registry.RegisterReviewer(ctx, ReviewerProfile{
+		Pubkey:         reviewerPubkey,
+		Languages:      []string{"go"},
+		Availability:   AvailabilityAvailable,
+		PricePerReview: 100,
+	}, "reviewer-event-over-price"); err != nil {
+		t.Fatalf("RegisterReviewer: %v", err)
+	}
+
+	result, err := router.RoutePatch(ctx, PatchInfo{
+		PatchEventID: "patch-free-review",
+		RepoID:       "repo-free-review",
+		AuthorPubkey: testPubKey().Hex(),
+		ChangedFiles: []string{"main.go"},
+		PriceSats:    0,
+	})
+	if err != nil {
+		t.Fatalf("RoutePatch returned error: %v", err)
+	}
+	if result.AssignedCount != 0 {
+		t.Fatalf("AssignedCount = %d, want 0", result.AssignedCount)
+	}
+	if len(result.Assignments) != 0 {
+		t.Fatalf("len(Assignments) = %d, want 0", len(result.Assignments))
+	}
+	if len(publisher.published) != 0 {
+		t.Fatalf("published %d assignments despite price cap; want 0", len(publisher.published))
+	}
+	assignments, err := store.ListAssignmentsForPatch(ctx, "patch-free-review")
+	if err != nil {
+		t.Fatalf("ListAssignmentsForPatch: %v", err)
+	}
+	if len(assignments) != 0 {
+		t.Fatalf("stored %d assignments despite price cap; want 0", len(assignments))
+	}
+}
+
 func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
