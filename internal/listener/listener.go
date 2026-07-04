@@ -15,6 +15,15 @@ type EventProcessor interface {
 	ProcessEvent(ctx context.Context, event nostr.Event, relayURL string) error
 }
 
+type GiftWrapOpener interface {
+	OpenGiftWrap(ctx context.Context, wrapper nostr.Event) (nostr.Event, error)
+}
+
+type highWaterStore interface {
+	GetListenerHighWaterMark(ctx context.Context) (int64, error)
+	UpdateListenerHighWaterMark(ctx context.Context, ts int64) error
+}
+
 var subscribedKinds = []nostr.Kind{
 	30617, 30618,
 	1617, 1618, 1619,
@@ -22,15 +31,16 @@ var subscribedKinds = []nostr.Kind{
 	1630, 1631, 1632, 1633,
 	1985,
 	nostr.KindEncryptedDirectMessage, // NIP-04 DMs (kind 4)
-	14,                                // NIP-17 sealed DMs
-	31650,                             // IDE workspace session
-	1651,                              // IDE review request
-	1653,                              // IDE fix request
-	30620,                             // Reviewer profile (replaceable)
-	1660,                              // Review assignment
-	1661,                              // Assignment acceptance
-	1662,                              // Assignment rejection
-	1663,                              // Review feedback
+	14,                               // NIP-17 sealed DMs
+	1059,                             // NIP-59 gift wraps for private ContextVM payloads
+	31650,                            // IDE workspace session
+	1651,                             // IDE review request
+	1653,                             // IDE fix request
+	30620,                            // Reviewer profile (replaceable)
+	1660,                             // Review assignment
+	1661,                             // Assignment acceptance
+	1662,                             // Assignment rejection
+	1663,                             // Review feedback
 }
 
 func SubscribedKinds() []nostr.Kind {
@@ -47,7 +57,8 @@ type Service struct {
 	processor EventProcessor
 	logger    *slog.Logger
 	pool      *nostr.Pool
-	store     *db.Store
+	store     highWaterStore
+	opener    GiftWrapOpener
 }
 
 // Option is a functional option for the listener Service.
@@ -67,7 +78,17 @@ func WithStore(store *db.Store) Option {
 	}
 }
 
+// WithGiftWrapOpener injects NIP-59 opening/verification for kind-1059 events.
+func WithGiftWrapOpener(opener GiftWrapOpener) Option {
+	return func(s *Service) {
+		s.opener = opener
+	}
+}
+
 func New(cfg Config, processor EventProcessor, logger *slog.Logger, opts ...Option) *Service {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	s := &Service{
 		cfg:       cfg,
 		processor: processor,
@@ -120,63 +141,100 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.logger.Info("starting nostr listener", "relay_count", len(s.cfg.Relays))
 
-	// SubscribeManyNotifyClosed gives us visibility into relay CLOSED reasons (NIP-01)
-	// while maintaining long-lived reconnectable subscriptions.
-	// NOTE: the pool does not currently expose a combined EOSE+CLOSED notification method.
-	// EOSE is still handled internally by the pool for dedup purposes; when the library
-	// adds a combined API we should switch to it for application-level EOSE logging.
-	stream, closedCh := s.pool.SubscribeManyNotifyClosed(ctx, s.cfg.Relays, filter, nostr.SubscriptionOptions{
-		Label: "drydock-listener",
-	})
-
 	var lastSeen atomic.Int64
-
-	// Log relay CLOSED reasons in a background goroutine.
-	go func() {
-		for closed := range closedCh {
-			relayURL := ""
-			if closed.Relay != nil {
-				relayURL = closed.Relay.URL
-			}
-			if closed.HandledAuth {
-				s.logger.Info("relay required auth and was re-authenticated",
-					"relay", relayURL,
-					"reason", closed.Reason,
-				)
-			} else {
-				s.logger.Warn("relay subscription closed",
-					"relay", relayURL,
-					"reason", closed.Reason,
-				)
-			}
-		}
-	}()
+	backoff := time.Second
 
 	for {
+		stream, closedCh := s.pool.SubscribeManyNotifyClosed(ctx, s.cfg.Relays, filter, nostr.SubscriptionOptions{
+			Label: "drydock-listener",
+		})
+
+		streamEnded := false
+		for !streamEnded {
+			select {
+			case <-ctx.Done():
+				s.pool.Close("shutdown")
+				return nil
+			case closed, ok := <-closedCh:
+				if !ok {
+					closedCh = nil
+					continue
+				}
+				s.logClosed(closed)
+			case ie, ok := <-stream:
+				if !ok {
+					streamEnded = true
+					break
+				}
+				backoff = time.Second
+				s.processRelayEvent(ctx, ie, &lastSeen)
+			}
+		}
+
 		select {
 		case <-ctx.Done():
 			s.pool.Close("shutdown")
 			return nil
-		case ie, ok := <-stream:
-			if !ok {
-				return nil
-			}
-			relayURL := ""
-			if ie.Relay != nil {
-				relayURL = ie.Relay.URL
-			}
-			if err := s.processor.ProcessEvent(ctx, ie.Event, relayURL); err != nil {
-				s.logger.Error("failed to process event", "event_id", ie.Event.ID.Hex(), "kind", int(ie.Event.Kind), "relay", relayURL, "error", err)
-			}
-
-			// Track high-water-mark for restart resilience.
-			if s.store != nil {
-				ts := int64(ie.Event.CreatedAt)
-				if ts > lastSeen.Load() {
-					lastSeen.Store(ts)
-					_ = s.store.UpdateListenerHighWaterMark(ctx, ts)
+		case <-time.After(backoff):
+			s.logger.Warn("listener stream ended; resubscribing", "backoff", backoff.String())
+			if backoff < time.Minute {
+				backoff *= 2
+				if backoff > time.Minute {
+					backoff = time.Minute
 				}
 			}
+		}
+	}
+}
+
+func (s *Service) logClosed(closed nostr.RelayClosed) {
+	relayURL := ""
+	if closed.Relay != nil {
+		relayURL = closed.Relay.URL
+	}
+	if closed.HandledAuth {
+		s.logger.Info("relay required auth and was re-authenticated",
+			"relay", relayURL,
+			"reason", closed.Reason,
+		)
+	} else {
+		s.logger.Warn("relay subscription closed",
+			"relay", relayURL,
+			"reason", closed.Reason,
+		)
+	}
+}
+
+func (s *Service) processRelayEvent(ctx context.Context, ie nostr.RelayEvent, lastSeen *atomic.Int64) {
+	relayURL := ""
+	if ie.Relay != nil {
+		relayURL = ie.Relay.URL
+	}
+	event := ie.Event
+	if event.Kind == 1059 {
+		if s.opener == nil {
+			s.logger.Warn("dropping gift wrap without configured opener", "event_id", event.ID.Hex(), "relay", relayURL)
+			return
+		}
+		opened, err := s.opener.OpenGiftWrap(ctx, event)
+		if err != nil {
+			s.logger.Warn("failed to open gift wrap", "event_id", event.ID.Hex(), "relay", relayURL, "error", err)
+			return
+		}
+		event = opened
+	}
+
+	if err := s.processor.ProcessEvent(ctx, event, relayURL); err != nil {
+		s.logger.Error("failed to process event", "event_id", event.ID.Hex(), "kind", int(event.Kind), "relay", relayURL, "error", err)
+		return
+	}
+
+	// Track high-water-mark for restart resilience only after successful processing.
+	if s.store != nil {
+		ts := int64(ie.Event.CreatedAt)
+		if ts > lastSeen.Load() {
+			lastSeen.Store(ts)
+			_ = s.store.UpdateListenerHighWaterMark(ctx, ts)
 		}
 	}
 }
