@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -17,7 +16,7 @@ import (
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
-
+	"drydock/internal/testutil"
 	"fiatjaf.com/nostr"
 )
 
@@ -126,16 +125,22 @@ func seedPatchForPipeline(t *testing.T, ctx context.Context, store *db.Store) (p
 
 // --- Tests ---
 
-func TestProcessEndToEndWithMocks(t *testing.T) {
+func TestProcessEndToEndPersistsAndPublishesReview(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
-	patchID, repoID := seedPatchForPipeline(t, ctx, store)
+	patchID, repoID := seedIntegrationDB(t, ctx, store)
 	logger := testLogger()
 
-	fakeLLM := &reviewengine.FakeLLMForTest{
+	cacheDir := filepath.Join(t.TempDir(), "repos")
+	initRepoInCanonicalCache(t, cacheDir, repoID)
+	repoMgr := repo.NewManager(cacheDir, logger)
+	repoSvc := repo.NewService(store, repoMgr, logger)
+
+	fakeLLM := &testutil.FakeLLM{
 		Responses: []string{
 			`{"change_type":"bugfix","risk_areas":["correctness"],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
-			`{"summary":"Found a bug","findings":[{"severity":"high","category":"correctness","file":"main.go","line":1,"evidence":"missing error check","explanation":"no err handling","suggestion":"add err check","confidence":0.85}],"needs_more_context":[]}`,
+			`{"summary":"Runner process found a real issue","findings":[{"severity":"high","category":"correctness","file":"main.go","line":2,"evidence":"reviewed comment","explanation":"The runner passed assembled context into the reviewer.","suggestion":"Keep the review path wired.","confidence":0.85}],"needs_more_context":[]}`,
+			`{"walkthrough":"The patch adds a reviewed marker comment.","file_summaries":[{"file":"main.go","summary":"Adds a comment below the package declaration"}]}`,
 		},
 	}
 	engine := reviewengine.New(reviewengine.Config{
@@ -145,16 +150,60 @@ func TestProcessEndToEndWithMocks(t *testing.T) {
 		Coder14B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "coder14b"},
 	}, fakeLLM, logger)
 
-	mockPub := &mockPublisher{eventID: "review-event-id-123"}
-	mockMeta := &mockMetaService{}
+	relayPub := &collectingRelayPublisher{}
+	pubSvc := publisher.New(publisher.Config{
+		DefaultRelays:       []string{"wss://relay.test"},
+		DetailSeverityFloor: "high",
+		DefaultTTL:          90 * 24 * time.Hour,
+		SupersededTTL:       7 * 24 * time.Hour,
+	}, store, testSigner{sk: nostr.Generate()}, relayPub, logger)
 
-	queue := make(chan db.ReviewTask, 1)
-	queue <- db.ReviewTask{PatchEventID: patchID, RepoID: repoID}
-	close(queue)
+	runner := New(Config{Workers: 1}, store, repoSvc, contextbuilder.NewDefault(), engine, pubSvc, nil, make(chan db.ReviewTask), logger)
+	if err := runner.process(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}); err != nil {
+		t.Fatalf("process failed: %v", err)
+	}
 
-	// We can't easily mock repo.Service since it's a concrete type, so instead
-	// test the changedFilesFromBundle and meanConfidence helpers which are the
-	// testable pure functions in the pipeline.
+	if len(fakeLLM.Requests) != 3 {
+		t.Fatalf("expected planner, reviewer, walkthrough LLM calls; got %d", len(fakeLLM.Requests))
+	}
+	if !strings.Contains(fakeLLM.Requests[0].User, "+// reviewed") || !strings.Contains(fakeLLM.Requests[1].User, "+// reviewed") {
+		t.Fatalf("LLM prompts did not include assembled patch context: planner=%q reviewer=%q", fakeLLM.Requests[0].User, fakeLLM.Requests[1].User)
+	}
+
+	if len(relayPub.events) < 2 {
+		t.Fatalf("expected summary and high-severity detail events, got %d", len(relayPub.events))
+	}
+	summaryEvt := relayPub.events[0]
+	if summaryEvt.Kind != nostr.KindComment {
+		t.Fatalf("summary kind = %d, want %d", summaryEvt.Kind, nostr.KindComment)
+	}
+	if !summaryEvt.CheckID() || !summaryEvt.VerifySignature() {
+		t.Fatal("published summary event is not a valid signed nostr event")
+	}
+	if !strings.Contains(summaryEvt.Content, "Runner process found a real issue") || !strings.Contains(summaryEvt.Content, "context-hash:") {
+		t.Fatalf("summary content missing review output/footer: %s", summaryEvt.Content)
+	}
+	if !strings.Contains(relayPub.events[1].Content, "The runner passed assembled context") {
+		t.Fatalf("detail content missing finding explanation: %s", relayPub.events[1].Content)
+	}
+
+	status, err := store.GetReviewStatus(ctx, patchID, repoID)
+	if err != nil {
+		t.Fatalf("get review status: %v", err)
+	}
+	if status != "published" {
+		t.Fatalf("review status = %q, want published", status)
+	}
+	storedReviewID, err := store.GetReviewEventID(ctx, patchID, repoID)
+	if err != nil {
+		t.Fatalf("get review event id: %v", err)
+	}
+	if storedReviewID != summaryEvt.ID.Hex() {
+		t.Fatalf("stored review event id = %q, want published summary %q", storedReviewID, summaryEvt.ID.Hex())
+	}
+}
+
+func TestPipelinePureHelpers(t *testing.T) {
 	t.Run("changedFilesFromBundle", func(t *testing.T) {
 		bundle := contextbuilder.ContextBundle{
 			Content: "## patch\ndiff --git a/foo.go b/foo.go\n--- a/foo.go\n+++ b/foo.go\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/bar.go b/bar.go\n",
@@ -192,12 +241,6 @@ func TestProcessEndToEndWithMocks(t *testing.T) {
 			t.Fatalf("expected 'coder32b', got %s", name)
 		}
 	})
-
-	// Verify the mocks are usable (compile-time interface check)
-	_ = mockPub
-	_ = mockMeta
-	_ = engine
-	_ = json.Marshal // used in process
 }
 
 func TestIndexSourceCodePropagatesConfiguredIndexerFailure(t *testing.T) {

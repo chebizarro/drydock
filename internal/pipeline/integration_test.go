@@ -1,10 +1,9 @@
-//go:build integration
-// +build integration
-
 package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"log/slog"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
+	"drydock/internal/testutil"
 
 	"fiatjaf.com/nostr"
 )
@@ -67,14 +67,15 @@ func gitRun(t *testing.T, dir string, args ...string) {
 	}
 }
 
-// initRepoInCache creates a git repo with an initial commit containing main.go
-// directly inside the repo cache directory that the Manager will use. This
-// avoids needing a network-reachable clone URL in tests.
-func initRepoInCache(t *testing.T, cacheDir, repoID string) string {
+// initRepoInCanonicalCache creates a git repo with an initial commit containing main.go
+// directly inside the canonical repo cache directory that Service.PreparePatchSeries uses.
+// This avoids needing a network-reachable clone URL in tests.
+func initRepoInCanonicalCache(t *testing.T, cacheDir, repoID string) string {
 	t.Helper()
-	// Replicate Manager.repoPath(): replace special chars and join with baseDir.
+	// Replicate Manager.canonicalRepoPath() for tests without exporting production internals.
 	safe := strings.NewReplacer("/", "_", "\\", "_", ":", "__", " ", "_").Replace(repoID)
-	repoPath := filepath.Join(cacheDir, safe)
+	sum := sha256.Sum256([]byte("canonical\x00" + repoID))
+	repoPath := filepath.Join(cacheDir, safe+"__canonical_"+hex.EncodeToString(sum[:])[:12])
 
 	os.MkdirAll(repoPath, 0o755)
 	gitRun(t, repoPath, "init", "-b", "master")
@@ -146,10 +147,6 @@ func seedIntegrationDB(t *testing.T, ctx context.Context, store *db.Store) (patc
 // --- Integration tests ---
 
 func TestIntegrationFullPipelineProcess(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
@@ -168,7 +165,7 @@ func TestIntegrationFullPipelineProcess(t *testing.T) {
 
 	// 2. Pre-clone repo into cache so EnsureRepo finds it (avoids clone URL issues)
 	cacheDir := filepath.Join(t.TempDir(), "repos")
-	initRepoInCache(t, cacheDir, repoID)
+	initRepoInCanonicalCache(t, cacheDir, repoID)
 
 	// 3. Real repo service
 	repoMgr := repo.NewManager(cacheDir, logger)
@@ -177,8 +174,9 @@ func TestIntegrationFullPipelineProcess(t *testing.T) {
 	// 4. Real context builder (no optional services)
 	ctxBuilder := contextbuilder.NewDefault()
 
-	// 5. Fake LLM that returns planner + reviewer + walkthrough responses
-	fakeLLM := &reviewengine.FakeLLMForTest{
+	// 5. Fake LLM that returns planner + reviewer + walkthrough responses.
+	// The assertions below verify the real pipeline assembled context and invoked each step.
+	fakeLLM := &testutil.FakeLLM{
 		Responses: []string{
 			`{"change_type":"feature","risk_areas":["correctness"],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
 			`{"summary":"Code looks clean.","findings":[{"severity":"info","category":"style","file":"main.go","line":2,"evidence":"comment","explanation":"trivial comment","suggestion":"remove","confidence":0.95}],"needs_more_context":[]}`,
@@ -291,9 +289,24 @@ func TestIntegrationFullPipelineProcess(t *testing.T) {
 		t.Fatalf("expected wss://relay.test in relay list, got: %v", relayPub.relays[0])
 	}
 
-	// LLM should have received exactly 3 calls (planner + reviewer + walkthrough)
+	// LLM should have received exactly 3 calls (planner + reviewer + walkthrough), and the
+	// assembled context should flow into the prompts rather than bypassing the engine.
 	if len(fakeLLM.Requests) != 3 {
 		t.Fatalf("expected 3 LLM calls (planner + reviewer + walkthrough), got %d", len(fakeLLM.Requests))
+	}
+	if fakeLLM.Requests[0].Model != "planner" || fakeLLM.Requests[1].Model != "coder32b" || fakeLLM.Requests[2].Model != "planner" {
+		t.Fatalf("unexpected LLM call sequence/models: %#v", []string{fakeLLM.Requests[0].Model, fakeLLM.Requests[1].Model, fakeLLM.Requests[2].Model})
+	}
+	for i, req := range fakeLLM.Requests {
+		if !req.JSONMode {
+			t.Fatalf("request %d did not enable JSON mode", i)
+		}
+	}
+	if !strings.Contains(fakeLLM.Requests[0].User, "main.go") || !strings.Contains(fakeLLM.Requests[0].User, "+// reviewed") {
+		t.Fatalf("planner prompt did not include assembled patch context: %s", fakeLLM.Requests[0].User)
+	}
+	if !strings.Contains(fakeLLM.Requests[1].User, "Review focus: logic") || !strings.Contains(fakeLLM.Requests[1].User, "+// reviewed") {
+		t.Fatalf("reviewer prompt did not include planner output and context: %s", fakeLLM.Requests[1].User)
 	}
 
 	// Review should be marked as published in the DB
@@ -306,11 +319,85 @@ func TestIntegrationFullPipelineProcess(t *testing.T) {
 	}
 }
 
-func TestIntegrationApplyFailurePublishesHint(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
+func TestIntegrationMalformedReviewerJSONIsRepairedAndPublished(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	dbPath := filepath.Join(t.TempDir(), "repair.db")
+	store, err := db.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
 
+	patchID, repoID := seedIntegrationDB(t, ctx, store)
+	cacheDir := filepath.Join(t.TempDir(), "repos")
+	initRepoInCanonicalCache(t, cacheDir, repoID)
+
+	repoMgr := repo.NewManager(cacheDir, logger)
+	repoSvc := repo.NewService(store, repoMgr, logger)
+	ctxBuilder := contextbuilder.NewDefault()
+
+	fakeLLM := &testutil.FakeLLM{
+		Responses: []string{
+			`{"change_type":"bugfix","risk_areas":["correctness"],"needed_context":[],"review_focus":"repair path","model_route":"coder32b"}`,
+			`{"summary":"broken reviewer payload","findings":[{"severity":"severe","category":"correctness","file":"main.go","line":2,"evidence":"comment","explanation":"this should be repaired","suggestion":"fix it","confidence":1.7}],"needs_more_context":[]}`,
+			`{"summary":"Repaired review summary","findings":[{"severity":"high","category":"correctness","file":"main.go","line":2,"evidence":"comment added by patch","explanation":"Repaired explanation that should be published.","suggestion":"Keep behavior intentional.","confidence":0.88}],"needs_more_context":[]}`,
+			`{"walkthrough":"The patch adds a review marker comment.","file_summaries":[{"file":"main.go","summary":"Adds a comment below the package declaration"}]}`,
+		},
+	}
+	engine := reviewengine.New(reviewengine.Config{
+		Planner:  reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "planner"},
+		Coder32B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "coder32b"},
+		LLM70B:   reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "llm70b"},
+		Coder14B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "coder14b"},
+	}, fakeLLM, logger)
+
+	relayPub := &collectingRelayPublisher{}
+	pubSvc := publisher.New(publisher.Config{
+		DefaultRelays:       []string{"wss://relay.test"},
+		DetailSeverityFloor: "high",
+		DefaultTTL:          90 * 24 * time.Hour,
+		SupersededTTL:       7 * 24 * time.Hour,
+	}, store, testSigner{sk: nostr.Generate()}, relayPub, logger)
+
+	runner := New(Config{Workers: 1}, store, repoSvc, ctxBuilder, engine, pubSvc, nil, make(chan db.ReviewTask), logger)
+	if err := runner.process(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}); err != nil {
+		t.Fatalf("process failed: %v", err)
+	}
+
+	if len(fakeLLM.Requests) != 4 {
+		t.Fatalf("expected planner, reviewer, reviewer repair, walkthrough calls; got %d", len(fakeLLM.Requests))
+	}
+	if !strings.Contains(fakeLLM.Requests[2].System, "repair malformed") || !strings.Contains(fakeLLM.Requests[2].User, "severe") {
+		t.Fatalf("third LLM call was not a reviewer repair request: system=%q user=%q", fakeLLM.Requests[2].System, fakeLLM.Requests[2].User)
+	}
+	if len(relayPub.events) < 2 {
+		t.Fatalf("expected summary and detail events from repaired high finding, got %d", len(relayPub.events))
+	}
+	if !strings.Contains(relayPub.events[0].Content, "Repaired review summary") {
+		t.Fatalf("summary event did not contain repaired review summary: %s", relayPub.events[0].Content)
+	}
+	if strings.Contains(relayPub.events[0].Content, "broken reviewer payload") || strings.Contains(relayPub.events[0].Content, "severe") {
+		t.Fatalf("summary event leaked unrepaired reviewer payload: %s", relayPub.events[0].Content)
+	}
+	if !strings.Contains(relayPub.events[1].Content, "Repaired explanation") {
+		t.Fatalf("detail event did not contain repaired finding: %s", relayPub.events[1].Content)
+	}
+
+	status, err := store.GetReviewStatus(ctx, patchID, repoID)
+	if err != nil {
+		t.Fatalf("get review status: %v", err)
+	}
+	if status != "published" {
+		t.Fatalf("expected review status 'published', got %q", status)
+	}
+}
+
+func TestIntegrationApplyFailurePublishesHint(t *testing.T) {
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
@@ -368,14 +455,14 @@ func TestIntegrationApplyFailurePublishesHint(t *testing.T) {
 
 	// 2. Pre-clone repo into cache with only main.go — the bad diff won't apply
 	cacheDir := filepath.Join(t.TempDir(), "repos")
-	initRepoInCache(t, cacheDir, rID)
+	initRepoInCanonicalCache(t, cacheDir, rID)
 
 	// 3. Build pipeline
 	repoMgr := repo.NewManager(cacheDir, logger)
 	repoSvc := repo.NewService(store, repoMgr, logger)
 	ctxBuilder := contextbuilder.NewDefault()
 
-	fakeLLM := &reviewengine.FakeLLMForTest{}
+	fakeLLM := &testutil.FakeLLM{}
 	engine := reviewengine.New(reviewengine.Config{
 		Planner:  reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "p"},
 		Coder32B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "c"},

@@ -119,6 +119,10 @@ func New(
 
 // HandleEvent processes an IDE-related event.
 func (h *Handler) HandleEvent(ctx context.Context, event nostr.Event, relayURL string) error {
+	if !event.CheckID() || !event.VerifySignature() {
+		h.logger.Warn("rejecting IDE event with invalid signature", "event_id", event.ID.Hex(), "kind", int(event.Kind))
+		return nil
+	}
 	switch int(event.Kind) {
 	case KindIDESession:
 		return h.handleSession(ctx, event, relayURL)
