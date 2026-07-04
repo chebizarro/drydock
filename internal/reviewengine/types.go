@@ -41,6 +41,31 @@ type WalkthroughOutput struct {
 	FileSummaries []FileSummary `json:"file_summaries"`
 }
 
+type StepState string
+
+const (
+	StepStateSucceeded StepState = "succeeded"
+	StepStateSkipped   StepState = "skipped"
+	StepStateFailed    StepState = "failed"
+)
+
+type StepStatus struct {
+	State StepState `json:"state"`
+	Error string    `json:"error,omitempty"`
+}
+
+type ModelFailure struct {
+	Route ModelRoute `json:"route"`
+	Error string     `json:"error"`
+}
+
+type EnsembleStatus struct {
+	RequiredReviewers  int            `json:"required_reviewers"`
+	SucceededReviewers []ModelRoute   `json:"succeeded_reviewers"`
+	FailedReviewers    []ModelFailure `json:"failed_reviewers,omitempty"`
+	Degraded           bool           `json:"degraded"`
+}
+
 type Finding struct {
 	Severity      string  `json:"severity"`
 	Category      string  `json:"category"`
@@ -197,4 +222,3 @@ func (r ReviewerOutput) Validate() error {
 	}
 	return nil
 }
-

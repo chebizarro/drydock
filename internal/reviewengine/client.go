@@ -28,6 +28,9 @@ type ChatRequest struct {
 	Temperature float64
 	System      string
 	User        string
+	// JSONMode asks OpenAI-compatible providers to constrain output to a JSON
+	// object when they support response_format/json_object.
+	JSONMode bool
 }
 
 // LLMHTTPError represents an HTTP-level error from the LLM endpoint.
@@ -82,6 +85,9 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 			{"role": "user", "content": req.User},
 		},
 		"temperature": req.Temperature,
+	}
+	if req.JSONMode {
+		payload["response_format"] = map[string]string{"type": "json_object"}
 	}
 	body, _ := json.Marshal(payload)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.BaseURL+"/chat/completions", bytes.NewReader(body))

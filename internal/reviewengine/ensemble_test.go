@@ -12,26 +12,26 @@ import (
 
 // mockEnsembleClient returns predefined responses for different models.
 type mockEnsembleClient struct {
-	plannerResp   string
-	model1Resp    string
-	model2Resp    string
+	plannerResp     string
+	model1Resp      string
+	model2Resp      string
 	walkthroughResp string
-	callCount     int
+	callCount       int
 }
 
 func (m *mockEnsembleClient) ChatCompletion(_ context.Context, req ChatRequest) (string, error) {
 	m.callCount++
-	
+
 	// Planner call (first call or model matches planner)
 	if strings.Contains(req.System, "route the review") || strings.Contains(req.System, "planner") {
 		return m.plannerResp, nil
 	}
-	
+
 	// Walkthrough call
 	if strings.Contains(req.System, "walkthrough") {
 		return m.walkthroughResp, nil
 	}
-	
+
 	// Reviewer calls - alternate between model responses
 	if m.model2Resp != "" && m.callCount > 2 {
 		return m.model2Resp, nil
@@ -41,7 +41,7 @@ func (m *mockEnsembleClient) ChatCompletion(_ context.Context, req ChatRequest) 
 
 func TestMergeFindings_Deduplication(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	
+
 	// Same finding from two models
 	reviews := []modelResult{
 		{
@@ -87,7 +87,7 @@ func TestMergeFindings_Deduplication(t *testing.T) {
 	if len(merged) != 1 {
 		t.Errorf("expected 1 merged finding, got %d", len(merged))
 	}
-	
+
 	// Should use higher confidence base + boost
 	expectedConf := 0.85 + 0.10 // base + 1 boost
 	if math.Abs(merged[0].Confidence-expectedConf) > 0.001 {
@@ -97,7 +97,7 @@ func TestMergeFindings_Deduplication(t *testing.T) {
 
 func TestMergeFindings_ConsensusBoost(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	
+
 	// Finding from 3 models
 	reviews := []modelResult{
 		{Route: RouteCoder32B, Review: ReviewerOutput{Summary: "1", Findings: []Finding{
@@ -120,7 +120,7 @@ func TestMergeFindings_ConsensusBoost(t *testing.T) {
 	if len(merged) != 1 {
 		t.Errorf("expected 1 merged finding, got %d", len(merged))
 	}
-	
+
 	// 3 models = 2 boosts: 0.70 + 0.20 = 0.90
 	expectedConf := 0.90
 	if math.Abs(merged[0].Confidence-expectedConf) > 0.001 {
@@ -130,7 +130,7 @@ func TestMergeFindings_ConsensusBoost(t *testing.T) {
 
 func TestMergeFindings_RequireConsensus(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	
+
 	reviews := []modelResult{
 		{Route: RouteCoder32B, Review: ReviewerOutput{Summary: "1", Findings: []Finding{
 			{Severity: "high", Category: "security", File: "a.go", Line: 5, Confidence: 0.90},
@@ -160,7 +160,7 @@ func TestMergeFindings_RequireConsensus(t *testing.T) {
 
 func TestMergeFindings_UniqueFindings(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	
+
 	reviews := []modelResult{
 		{Route: RouteCoder32B, Review: ReviewerOutput{Summary: "1", Findings: []Finding{
 			{Severity: "high", Category: "security", File: "a.go", Line: 5, Confidence: 0.90},
@@ -185,7 +185,7 @@ func TestMergeFindings_UniqueFindings(t *testing.T) {
 
 func TestMergeFindings_SortOrder(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	
+
 	reviews := []modelResult{
 		{Route: RouteCoder32B, Review: ReviewerOutput{Summary: "1", Findings: []Finding{
 			{Severity: "low", Category: "style", File: "c.go", Line: 30, Confidence: 0.90},
@@ -215,7 +215,7 @@ func TestMergeFindings_SortOrder(t *testing.T) {
 
 func TestMergeFindings_ConfidenceCap(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	
+
 	// Same finding from many models - should cap at 1.0
 	reviews := []modelResult{
 		{Route: RouteCoder32B, Review: ReviewerOutput{Summary: "1", Findings: []Finding{
@@ -260,19 +260,51 @@ func TestCollectNeedsMoreContext(t *testing.T) {
 func TestFindingKey(t *testing.T) {
 	f1 := Finding{File: "Main.go", Line: 10, Category: "SECURITY"}
 	f2 := Finding{File: "main.go", Line: 10, Category: "security"}
-	
+
 	k1 := findingKey(f1)
 	k2 := findingKey(f2)
-	
+
 	// Keys should match (case-insensitive)
 	if k1 != k2 {
 		t.Errorf("keys should match: %s vs %s", k1, k2)
 	}
 }
 
+type failingEnsembleReviewerClient struct{}
+
+func (f *failingEnsembleReviewerClient) ChatCompletion(_ context.Context, req ChatRequest) (string, error) {
+	if strings.Contains(req.System, "planner") {
+		return `{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`, nil
+	}
+	if req.Model == "llm70b" {
+		return `{"summary":`, nil
+	}
+	return `{"summary":"single model success","findings":[],"needs_more_context":[]}`, nil
+}
+
+func TestRunEnsembleFailsClosedWhenRequiredReviewerFails(t *testing.T) {
+	engine := New(Config{
+		Planner:  ModelEndpoint{Model: "planner"},
+		Coder32B: ModelEndpoint{Model: "coder32b"},
+		LLM70B:   ModelEndpoint{Model: "llm70b"},
+	}, &failingEnsembleReviewerClient{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := engine.RunEnsemble(context.Background(), RunInput{
+		ContextBundle:   "ctx",
+		ChangedFiles:    []string{"main.go"},
+		SkipWalkthrough: true,
+	}, EnsembleConfig{Enabled: true, Models: []ModelRoute{RouteCoder32B, RouteLLM70B}})
+	if err == nil {
+		t.Fatal("expected ensemble to fail closed when a required reviewer fails")
+	}
+	if !strings.Contains(err.Error(), "ensemble failed closed") || !strings.Contains(err.Error(), "llm70b") {
+		t.Fatalf("expected clear fail-closed error naming failed reviewer, got: %v", err)
+	}
+}
+
 func TestDefaultEnsembleConfig(t *testing.T) {
 	cfg := DefaultEnsembleConfig()
-	
+
 	if cfg.Enabled {
 		t.Error("default ensemble should be disabled")
 	}
@@ -287,21 +319,21 @@ func TestDefaultEnsembleConfig(t *testing.T) {
 // mockEnsembleEngine wraps the engine for testing
 func setupEnsembleTest(t *testing.T) (*Engine, *mockEnsembleClient) {
 	t.Helper()
-	
+
 	plannerResp, _ := json.Marshal(PlannerOutput{
 		ChangeType:  "feature",
 		RiskAreas:   []string{"security"},
 		ReviewFocus: "test focus",
 		ModelRoute:  RouteCoder32B,
 	})
-	
+
 	review1, _ := json.Marshal(ReviewerOutput{
 		Summary: "Review from model 1",
 		Findings: []Finding{
 			{Severity: "high", Category: "security", File: "main.go", Line: 10, Evidence: "issue", Explanation: "bad", Confidence: 0.85},
 		},
 	})
-	
+
 	review2, _ := json.Marshal(ReviewerOutput{
 		Summary: "Review from model 2",
 		Findings: []Finding{
@@ -309,23 +341,23 @@ func setupEnsembleTest(t *testing.T) (*Engine, *mockEnsembleClient) {
 			{Severity: "medium", Category: "correctness", File: "util.go", Line: 20, Evidence: "unique", Explanation: "only in model 2", Confidence: 0.75},
 		},
 	})
-	
+
 	walkthrough, _ := json.Marshal(WalkthroughOutput{
 		Walkthrough: "Test walkthrough",
 	})
-	
+
 	client := &mockEnsembleClient{
 		plannerResp:     string(plannerResp),
 		model1Resp:      string(review1),
 		model2Resp:      string(review2),
 		walkthroughResp: string(walkthrough),
 	}
-	
+
 	engine := New(Config{
 		Planner:  ModelEndpoint{Model: "planner"},
 		Coder32B: ModelEndpoint{Model: "coder32b"},
 		LLM70B:   ModelEndpoint{Model: "llm70b"},
 	}, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	
+
 	return engine, client
 }

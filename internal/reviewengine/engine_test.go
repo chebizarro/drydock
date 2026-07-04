@@ -106,6 +106,78 @@ func TestEngineTestCoverageGapsAddedToChecklist(t *testing.T) {
 	}
 }
 
+func TestEngineRepairsMalformedFencedReviewerJSON(t *testing.T) {
+	fake := &FakeLLMForTest{
+		Responses: []string{
+			`{"change_type":"bugfix","risk_areas":[],"needed_context":[],"review_focus":"correctness","model_route":"coder32b"}`,
+			"```json\n{\"summary\":\"ok\" \"findings\":[],\"needs_more_context\":[]}\n```",
+			`{"summary":"ok after repair","findings":[],"needs_more_context":[]}`,
+			`{"walkthrough":"Repair path works.","file_summaries":[]}`,
+		},
+	}
+	engine := New(Config{
+		Planner:  ModelEndpoint{BaseURL: "http://planner", Model: "p"},
+		Coder32B: ModelEndpoint{BaseURL: "http://32b", Model: "32b"},
+		LLM70B:   ModelEndpoint{BaseURL: "http://70b", Model: "70b"},
+		Coder14B: ModelEndpoint{BaseURL: "http://14b", Model: "14b"},
+	}, fake, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	out, err := engine.Run(context.Background(), RunInput{
+		ContextBundle: "ctx",
+		ChangedFiles:  []string{"main.go"},
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.Review.Summary != "ok after repair" {
+		t.Fatalf("expected repaired review summary, got %q", out.Review.Summary)
+	}
+	if len(fake.Requests) != 4 {
+		t.Fatalf("expected planner + reviewer + repair + walkthrough requests, got %d", len(fake.Requests))
+	}
+	if !fake.Requests[1].JSONMode || !fake.Requests[2].JSONMode {
+		t.Fatal("expected reviewer and repair requests to use JSON mode")
+	}
+	if !strings.Contains(fake.Requests[2].System, "repair") {
+		t.Fatalf("expected repair prompt, got system prompt %q", fake.Requests[2].System)
+	}
+}
+
+func TestEngineWalkthroughFailureReflectedInStatus(t *testing.T) {
+	fake := &FakeLLMForTest{
+		Responses: []string{
+			`{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
+			`{"summary":"ok","findings":[],"needs_more_context":[]}`,
+			`{"walkthrough":`,
+			`still not json`,
+			`{"file_summaries": "wrong type"}`,
+		},
+	}
+	engine := New(Config{
+		Planner:  ModelEndpoint{BaseURL: "http://planner", Model: "p"},
+		Coder32B: ModelEndpoint{BaseURL: "http://32b", Model: "32b"},
+		LLM70B:   ModelEndpoint{BaseURL: "http://70b", Model: "70b"},
+		Coder14B: ModelEndpoint{BaseURL: "http://14b", Model: "14b"},
+	}, fake, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	out, err := engine.Run(context.Background(), RunInput{
+		ContextBundle: "ctx",
+		ChangedFiles:  []string{"main.go"},
+	})
+	if err != nil {
+		t.Fatalf("run should keep walkthrough non-fatal: %v", err)
+	}
+	if out.WalkthroughStatus.State != StepStateFailed {
+		t.Fatalf("expected failed walkthrough status, got %#v", out.WalkthroughStatus)
+	}
+	if out.WalkthroughStatus.Error == "" {
+		t.Fatal("expected walkthrough failure error to be recorded")
+	}
+	if out.Walkthrough.Walkthrough != "" {
+		t.Fatalf("expected empty walkthrough body on failure, got %q", out.Walkthrough.Walkthrough)
+	}
+}
+
 func TestEngineStructuredSuggestionsPreserved(t *testing.T) {
 	fake := &fakeLLM{
 		responses: []string{

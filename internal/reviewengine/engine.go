@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-
-	"drydock/internal/llmutil"
 )
 
 type ModelEndpoint struct {
@@ -44,11 +42,13 @@ type RunInput struct {
 }
 
 type RunOutput struct {
-	Planner     PlannerOutput
-	Review      ReviewerOutput
-	Route       ModelRoute
-	Checklist   []string
-	Walkthrough WalkthroughOutput
+	Planner           PlannerOutput
+	Review            ReviewerOutput
+	Route             ModelRoute
+	Checklist         []string
+	Walkthrough       WalkthroughOutput
+	WalkthroughStatus StepStatus
+	EnsembleStatus    EnsembleStatus
 }
 
 type Engine struct {
@@ -62,20 +62,16 @@ func New(cfg Config, client LLMClient, logger *slog.Logger) *Engine {
 }
 
 func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
-	plannerRaw, err := e.client.ChatCompletion(ctx, ChatRequest{
+	planner, err := e.completeStructured(ctx, ChatRequest{
 		BaseURL:     e.cfg.Planner.BaseURL,
 		APIKey:      e.cfg.Planner.APIKey,
 		Model:       e.cfg.Planner.Model,
 		Temperature: e.cfg.PlannerTemp,
 		System:      plannerSystemPrompt(),
 		User:        plannerUserPrompt(in.ContextBundle, in.ChangedFiles),
-	})
+	}, "planner", ParsePlannerOutput)
 	if err != nil {
-		return RunOutput{}, fmt.Errorf("planner completion: %w", err)
-	}
-	planner, err := ParsePlannerOutput(llmutil.ExtractJSON(plannerRaw))
-	if err != nil {
-		return RunOutput{}, fmt.Errorf("planner output invalid: %w", err)
+		return RunOutput{}, err
 	}
 
 	checklist := BuildChecklist(in.ChangedFiles)
@@ -91,56 +87,52 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	if err != nil {
 		return RunOutput{}, err
 	}
-	reviewerRaw, err := e.client.ChatCompletion(ctx, ChatRequest{
+	review, err := e.completeStructuredReviewer(ctx, ChatRequest{
 		BaseURL:     endpoint.BaseURL,
 		APIKey:      endpoint.APIKey,
 		Model:       endpoint.Model,
 		Temperature: e.cfg.ReviewerTemp,
 		System:      system,
 		User:        user,
-	})
+	}, "reviewer")
 	if err != nil {
-		return RunOutput{}, fmt.Errorf("reviewer completion: %w", err)
-	}
-	review, err := ParseReviewerOutput(llmutil.ExtractJSON(reviewerRaw))
-	if err != nil {
-		return RunOutput{}, fmt.Errorf("reviewer output invalid: %w", err)
+		return RunOutput{}, err
 	}
 
 	// Generate walkthrough (using planner model — lightweight 14B)
-	var walkthrough WalkthroughOutput
-	if !in.SkipWalkthrough {
-		wtRaw, wtErr := e.client.ChatCompletion(ctx, ChatRequest{
-			BaseURL:     e.cfg.Planner.BaseURL,
-			APIKey:      e.cfg.Planner.APIKey,
-			Model:       e.cfg.Planner.Model,
-			Temperature: e.cfg.PlannerTemp,
-			System:      walkthroughSystemPrompt(),
-			User:        walkthroughUserPrompt(in.ContextBundle, in.ChangedFiles),
-		})
-		if wtErr != nil {
-			// Walkthrough is non-fatal — log and continue without it.
-			e.logger.Warn("walkthrough generation failed, continuing without",
-				"error", wtErr)
-		} else {
-			parsed, parseErr := ParseWalkthroughOutput(llmutil.ExtractJSON(wtRaw))
-			if parseErr != nil {
-				e.logger.Warn("walkthrough parse failed, continuing without",
-					"error", parseErr)
-			} else {
-				walkthrough = parsed
-			}
-		}
+	walkthrough, walkthroughStatus := e.generateWalkthrough(ctx, in)
+
+	e.logger.Info("review engine completed", "route", planner.ModelRoute, "findings", len(review.Findings), "checklist_items", len(checklist), "walkthrough_status", walkthroughStatus.State, "has_walkthrough", walkthrough.Walkthrough != "")
+	return RunOutput{
+		Planner:           planner,
+		Review:            review,
+		Route:             planner.ModelRoute,
+		Checklist:         checklist,
+		Walkthrough:       walkthrough,
+		WalkthroughStatus: walkthroughStatus,
+	}, nil
+}
+
+func (e *Engine) generateWalkthrough(ctx context.Context, in RunInput) (WalkthroughOutput, StepStatus) {
+	if in.SkipWalkthrough {
+		return WalkthroughOutput{}, StepStatus{State: StepStateSkipped}
 	}
 
-	e.logger.Info("review engine completed", "route", planner.ModelRoute, "findings", len(review.Findings), "checklist_items", len(checklist), "has_walkthrough", walkthrough.Walkthrough != "")
-	return RunOutput{
-		Planner:     planner,
-		Review:      review,
-		Route:       planner.ModelRoute,
-		Checklist:   checklist,
-		Walkthrough: walkthrough,
-	}, nil
+	walkthrough, err := e.completeStructuredWalkthrough(ctx, ChatRequest{
+		BaseURL:     e.cfg.Planner.BaseURL,
+		APIKey:      e.cfg.Planner.APIKey,
+		Model:       e.cfg.Planner.Model,
+		Temperature: e.cfg.PlannerTemp,
+		System:      walkthroughSystemPrompt(),
+		User:        walkthroughUserPrompt(in.ContextBundle, in.ChangedFiles),
+	}, "walkthrough")
+	if err != nil {
+		if e.logger != nil {
+			e.logger.Warn("walkthrough failed after repair attempts, continuing with failed status", "error", err)
+		}
+		return WalkthroughOutput{}, StepStatus{State: StepStateFailed, Error: err.Error()}
+	}
+	return walkthrough, StepStatus{State: StepStateSucceeded}
 }
 
 func (e *Engine) routeEndpoint(route ModelRoute) (ModelEndpoint, error) {

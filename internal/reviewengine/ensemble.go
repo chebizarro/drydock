@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 
-	"drydock/internal/llmutil"
 	"drydock/internal/metrics"
 )
 
@@ -47,20 +46,16 @@ type modelResult struct {
 // merges their findings using consensus scoring.
 func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfig) (RunOutput, error) {
 	// Run planner first (single model)
-	plannerRaw, err := e.client.ChatCompletion(ctx, ChatRequest{
+	planner, err := e.completeStructured(ctx, ChatRequest{
 		BaseURL:     e.cfg.Planner.BaseURL,
 		APIKey:      e.cfg.Planner.APIKey,
 		Model:       e.cfg.Planner.Model,
 		Temperature: e.cfg.PlannerTemp,
 		System:      plannerSystemPrompt(),
 		User:        plannerUserPrompt(in.ContextBundle, in.ChangedFiles),
-	})
+	}, "planner", ParsePlannerOutput)
 	if err != nil {
-		return RunOutput{}, fmt.Errorf("planner completion: %w", err)
-	}
-	planner, err := ParsePlannerOutput(llmutil.ExtractJSON(plannerRaw))
-	if err != nil {
-		return RunOutput{}, fmt.Errorf("planner output invalid: %w", err)
+		return RunOutput{}, err
 	}
 
 	// Build shared reviewer prompt
@@ -92,21 +87,16 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 				results <- modelResult{Route: r, Err: err}
 				return
 			}
-			reviewerRaw, err := e.client.ChatCompletion(ctx, ChatRequest{
+			review, err := e.completeStructuredReviewer(ctx, ChatRequest{
 				BaseURL:     endpoint.BaseURL,
 				APIKey:      endpoint.APIKey,
 				Model:       endpoint.Model,
 				Temperature: e.cfg.ReviewerTemp,
 				System:      system,
 				User:        user,
-			})
+			}, fmt.Sprintf("reviewer %s", r))
 			if err != nil {
-				results <- modelResult{Route: r, Err: fmt.Errorf("reviewer %s: %w", r, err)}
-				return
-			}
-			review, err := ParseReviewerOutput(llmutil.ExtractJSON(reviewerRaw))
-			if err != nil {
-				results <- modelResult{Route: r, Err: fmt.Errorf("reviewer %s parse: %w", r, err)}
+				results <- modelResult{Route: r, Err: err}
 				return
 			}
 			results <- modelResult{Route: r, Review: review}
@@ -122,21 +112,33 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 	// Collect results
 	var reviews []modelResult
 	var errs []error
+	var failures []ModelFailure
+	var succeeded []ModelRoute
 	for res := range results {
 		if res.Err != nil {
 			errs = append(errs, res.Err)
+			failures = append(failures, ModelFailure{Route: res.Route, Error: res.Err.Error()})
 			e.logger.Warn("ensemble model failed", "route", res.Route, "error", res.Err)
 		} else {
 			reviews = append(reviews, res)
+			succeeded = append(succeeded, res.Route)
 			e.logger.Info("ensemble model completed", "route", res.Route, "findings", len(res.Review.Findings))
 		}
 	}
 
-	// Need at least one successful review
+	status := EnsembleStatus{
+		RequiredReviewers:  len(models),
+		SucceededReviewers: succeeded,
+		FailedReviewers:    failures,
+		Degraded:           len(failures) > 0,
+	}
+
+	// Fail closed: every configured ensemble reviewer is required. Publishing a
+	// single-model success as an ensemble review hides reviewer failures.
+	if len(errs) > 0 {
+		return RunOutput{}, fmt.Errorf("ensemble failed closed: %d of %d required reviewer(s) failed: %s", len(errs), len(models), joinErrors(errs))
+	}
 	if len(reviews) == 0 {
-		if len(errs) > 0 {
-			return RunOutput{}, fmt.Errorf("all ensemble models failed: %v", errs[0])
-		}
 		return RunOutput{}, fmt.Errorf("no models configured for ensemble")
 	}
 
@@ -166,27 +168,7 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 	}
 
 	// Generate walkthrough (using planner model — lightweight 14B)
-	var walkthrough WalkthroughOutput
-	if !in.SkipWalkthrough {
-		wtRaw, wtErr := e.client.ChatCompletion(ctx, ChatRequest{
-			BaseURL:     e.cfg.Planner.BaseURL,
-			APIKey:      e.cfg.Planner.APIKey,
-			Model:       e.cfg.Planner.Model,
-			Temperature: e.cfg.PlannerTemp,
-			System:      walkthroughSystemPrompt(),
-			User:        walkthroughUserPrompt(in.ContextBundle, in.ChangedFiles),
-		})
-		if wtErr != nil {
-			e.logger.Warn("walkthrough generation failed, continuing without", "error", wtErr)
-		} else {
-			parsed, parseErr := ParseWalkthroughOutput(llmutil.ExtractJSON(wtRaw))
-			if parseErr != nil {
-				e.logger.Warn("walkthrough parse failed, continuing without", "error", parseErr)
-			} else {
-				walkthrough = parsed
-			}
-		}
-	}
+	walkthrough, walkthroughStatus := e.generateWalkthrough(ctx, in)
 
 	// Record ensemble metrics
 	metrics.EnsembleReviewsRun.Inc()
@@ -199,15 +181,28 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 		"models", len(reviews),
 		"findings_merged", len(merged),
 		"checklist_items", len(checklist),
+		"walkthrough_status", walkthroughStatus.State,
 		"has_walkthrough", walkthrough.Walkthrough != "")
 
 	return RunOutput{
-		Planner:     planner,
-		Review:      review,
-		Route:       planner.ModelRoute, // Primary route from planner
-		Checklist:   checklist,
-		Walkthrough: walkthrough,
+		Planner:           planner,
+		Review:            review,
+		Route:             planner.ModelRoute, // Primary route from planner
+		Checklist:         checklist,
+		Walkthrough:       walkthrough,
+		WalkthroughStatus: walkthroughStatus,
+		EnsembleStatus:    status,
 	}, nil
+}
+
+func joinErrors(errs []error) string {
+	parts := make([]string, 0, len(errs))
+	for _, err := range errs {
+		if err != nil {
+			parts = append(parts, err.Error())
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 // findingKey generates a deduplication key for a finding.
