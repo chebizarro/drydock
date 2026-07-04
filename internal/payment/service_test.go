@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,27 +16,50 @@ import (
 
 // fakeInvoiceProvider is a test double for InvoiceProvider.
 type fakeInvoiceProvider struct {
-	invoices      map[string]InvoiceStatus
-	createdStatus InvoiceStatus
+	mu                 sync.Mutex
+	invoices           map[string]InvoiceStatus
+	createdStatus      InvoiceStatus
+	createInvoiceCalls int
 }
 
 func (f *fakeInvoiceProvider) CreateInvoice(ctx context.Context, sats int64, memo string, expiry time.Duration) (Invoice, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	id := "inv_" + memo
 	f.invoices[id] = f.createdStatus
+	f.createInvoiceCalls++
 	return Invoice{ID: id, Request: "lnbc" + memo}, nil
 }
 
 func (f *fakeInvoiceProvider) LookupInvoice(ctx context.Context, invoiceID string) (InvoiceStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.invoices[invoiceID], nil
+}
+
+func (f *fakeInvoiceProvider) setInvoiceStatus(invoiceID string, status InvoiceStatus) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.invoices[invoiceID] = status
+}
+
+func (f *fakeInvoiceProvider) createCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.createInvoiceCalls
 }
 
 // fakeMintClient is a test double for MintClient.
 type fakeMintClient struct {
+	mu           sync.Mutex
 	tokens       map[string]ParsedToken
 	meltedTokens map[string]bool
+	meltCalls    int
 }
 
 func (f *fakeMintClient) ParseToken(raw string) (ParsedToken, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if t, ok := f.tokens[raw]; ok {
 		return t, nil
 	}
@@ -47,11 +71,20 @@ func (f *fakeMintClient) CreateMeltQuote(ctx context.Context, mintURL, bolt11 st
 }
 
 func (f *fakeMintClient) MeltToken(ctx context.Context, mintURL string, quote MeltQuote, token ParsedToken) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.meltedTokens[token.Raw] {
 		return errTokenSpent
 	}
 	f.meltedTokens[token.Raw] = true
+	f.meltCalls++
 	return nil
+}
+
+func (f *fakeMintClient) meltCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.meltCalls
 }
 
 var errInvalidToken = &tokenError{"invalid_token"}
@@ -222,8 +255,8 @@ func TestAuthorizePatch_CashuMeltRequiresSettledInvoice(t *testing.T) {
 	if result.Allowed {
 		t.Fatal("expected unsettled invoice lookup to deny access")
 	}
-	if result.Reason != "invoice_not_settled" {
-		t.Fatalf("expected reason invoice_not_settled, got %q", result.Reason)
+	if result.Reason != "payment_pending" {
+		t.Fatalf("expected reason payment_pending, got %q", result.Reason)
 	}
 
 	rec, err := store.GetReviewPayment(context.Background(), event.ID.Hex())
@@ -281,6 +314,154 @@ func TestAuthorizePatch_CashuMeltAuthorizesWhenInvoiceSettled(t *testing.T) {
 	}
 	if rec.AccessKind != "cashu_review" {
 		t.Fatalf("expected cashu_review record, got %q", rec.AccessKind)
+	}
+}
+
+func TestAuthorizePatch_CashuMeltReconcilesAfterSettlement(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+
+	token := "cashuAreconcile"
+	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
+		MintURL:    "https://mint.example.com",
+		Unit:       "sat",
+		AmountSats: 110,
+		Raw:        token,
+	}
+	event := nostr.Event{
+		ID:     mustParseID("5555555555555555555555555555555555555555555555555555555555555555"),
+		PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		Tags:   nostr.Tags{{"cashu", token}},
+	}
+	policy := repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100}
+
+	result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
+	if err != nil {
+		t.Fatalf("first AuthorizePatch: %v", err)
+	}
+	if result.Allowed || result.Reason != "payment_pending" {
+		t.Fatalf("expected recoverable payment_pending denial, got allowed=%v reason=%q", result.Allowed, result.Reason)
+	}
+	rec, err := store.GetReviewPayment(context.Background(), event.ID.Hex())
+	if err != nil {
+		t.Fatalf("GetReviewPayment: %v", err)
+	}
+	if rec.Status != "token_spent" {
+		t.Fatalf("expected token_spent pending settlement state, got %q", rec.Status)
+	}
+
+	svc.invoice.(*fakeInvoiceProvider).setInvoiceStatus(rec.InvoiceID, InvoiceStatus{Settled: true})
+	result, err = svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
+	if err != nil {
+		t.Fatalf("reconcile AuthorizePatch: %v", err)
+	}
+	if !result.Allowed || result.AccessKind != "cashu_review" {
+		t.Fatalf("expected reconciled cashu_review authorization, got allowed=%v kind=%q reason=%q", result.Allowed, result.AccessKind, result.Reason)
+	}
+	if svc.mint.(*fakeMintClient).meltCallCount() != 1 {
+		t.Fatalf("expected reconciliation not to re-melt token")
+	}
+}
+
+func TestAuthorizePatch_ConcurrentDuplicateTokenDeniedCleanly(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+
+	svc.invoice.(*fakeInvoiceProvider).createdStatus = InvoiceStatus{Settled: true}
+	token := "cashuAduplicate"
+	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
+		MintURL:    "https://mint.example.com",
+		Unit:       "sat",
+		AmountSats: 110,
+		Raw:        token,
+	}
+	policy := repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100}
+	events := []nostr.Event{
+		{ID: mustParseID("6666666666666666666666666666666666666666666666666666666666666666"), PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), Tags: nostr.Tags{{"cashu", token}}},
+		{ID: mustParseID("7777777777777777777777777777777777777777777777777777777777777777"), PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), Tags: nostr.Tags{{"cashu", token}}},
+	}
+
+	start := make(chan struct{})
+	type outcome struct {
+		result AuthorizeResult
+		err    error
+	}
+	out := make(chan outcome, len(events))
+	for _, event := range events {
+		event := event
+		go func() {
+			<-start
+			res, err := svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
+			out <- outcome{result: res, err: err}
+		}()
+	}
+	close(start)
+
+	allowed := 0
+	duplicateDenied := 0
+	for range events {
+		got := <-out
+		if got.err != nil {
+			t.Fatalf("duplicate reservation should be a clean denial, got error: %v", got.err)
+		}
+		if got.result.Allowed {
+			allowed++
+		} else if got.result.Reason == "token_already_used" {
+			duplicateDenied++
+		} else {
+			t.Fatalf("unexpected denial reason %q", got.result.Reason)
+		}
+	}
+	if allowed != 1 || duplicateDenied != 1 {
+		t.Fatalf("expected one allowed and one duplicate denial, got allowed=%d duplicateDenied=%d", allowed, duplicateDenied)
+	}
+	if calls := svc.invoice.(*fakeInvoiceProvider).createCalls(); calls != 1 {
+		t.Fatalf("expected only reserved winner to create invoice, got %d calls", calls)
+	}
+	if calls := svc.mint.(*fakeMintClient).meltCallCount(); calls != 1 {
+		t.Fatalf("expected only reserved winner to melt token, got %d calls", calls)
+	}
+}
+
+func TestAuthorizePatch_SubscriptionRecordsInvoicedAmount(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+
+	svc.invoice.(*fakeInvoiceProvider).createdStatus = InvoiceStatus{Settled: true}
+	token := "cashuAsubscription"
+	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
+		MintURL:    "https://mint.example.com",
+		Unit:       "sat",
+		AmountSats: 150,
+		Raw:        token,
+	}
+	event := nostr.Event{
+		ID:     mustParseID("8888888888888888888888888888888888888888888888888888888888888888"),
+		PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		Tags:   nostr.Tags{{"cashu", token, "subscription"}},
+	}
+	policy := repoconfig.PaymentsConfig{
+		Enabled:               true,
+		SubscriptionPriceSats: 100,
+		SubscriptionDays:      30,
+	}
+
+	result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
+	if err != nil {
+		t.Fatalf("AuthorizePatch: %v", err)
+	}
+	if !result.Allowed || result.AccessKind != "cashu_subscription" {
+		t.Fatalf("expected subscription authorization, got allowed=%v kind=%q reason=%q", result.Allowed, result.AccessKind, result.Reason)
+	}
+	sub, active, err := store.GetActiveSubscription(context.Background(), event.PubKey.Hex(), "repo/test", time.Now().Unix())
+	if err != nil {
+		t.Fatalf("GetActiveSubscription: %v", err)
+	}
+	if !active {
+		t.Fatal("expected active subscription")
+	}
+	if sub.PaidAmountSats != 100 {
+		t.Fatalf("expected invoiced paid amount 100, got %d", sub.PaidAmountSats)
 	}
 }
 

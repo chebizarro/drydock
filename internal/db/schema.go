@@ -275,6 +275,18 @@ CREATE INDEX IF NOT EXISTS idx_codechat_turns_sender ON codechat_turns(sender_pu
 CREATE INDEX IF NOT EXISTS idx_codechat_turns_sender_repo ON codechat_turns(sender_pubkey, repo_id);
 CREATE INDEX IF NOT EXISTS idx_codechat_turns_created ON codechat_turns(created_at);
 
+CREATE TABLE IF NOT EXISTS ide_gateway_fixes (
+  fix_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  author_pubkey TEXT NOT NULL DEFAULT '',
+  file TEXT NOT NULL DEFAULT '',
+  diff TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (fix_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ide_gateway_fixes_session ON ide_gateway_fixes(session_id);
+CREATE INDEX IF NOT EXISTS idx_ide_gateway_fixes_created ON ide_gateway_fixes(created_at);
+
 CREATE TABLE IF NOT EXISTS reviewer_profiles (
   pubkey TEXT PRIMARY KEY,
   display_name TEXT NOT NULL DEFAULT '',

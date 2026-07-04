@@ -2,9 +2,42 @@ package db
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
+
+func TestReserveReviewPaymentToken_DuplicateHashReturnsSentinel(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	first := ReviewPaymentRecord{
+		PatchEventID:    "patch-1",
+		RepoID:          "repo-1",
+		AuthorPubkey:    "author-1",
+		RequestedMode:   "review",
+		TokenHash:       "hash123",
+		MintURL:         "https://mint.example.com",
+		TokenAmountSats: 100,
+	}
+	if err := store.ReserveReviewPaymentToken(ctx, first); err != nil {
+		t.Fatalf("ReserveReviewPaymentToken first: %v", err)
+	}
+
+	second := first
+	second.PatchEventID = "patch-2"
+	if err := store.ReserveReviewPaymentToken(ctx, second); !errors.Is(err, ErrTokenHashAlreadyReserved) {
+		t.Fatalf("expected ErrTokenHashAlreadyReserved for duplicate hash, got %v", err)
+	}
+
+	rec, err := store.GetReviewPaymentByTokenHash(ctx, "hash123")
+	if err != nil {
+		t.Fatalf("GetReviewPaymentByTokenHash: %v", err)
+	}
+	if rec.PatchEventID != "patch-1" || rec.Status != "pending" {
+		t.Fatalf("expected original pending reservation, got patch=%q status=%q", rec.PatchEventID, rec.Status)
+	}
+}
 
 func TestUpsertAndGetReviewPayment(t *testing.T) {
 	ctx := context.Background()

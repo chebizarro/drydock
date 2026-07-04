@@ -3,9 +3,13 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
+
+var ErrTokenHashAlreadyReserved = errors.New("payment token hash already reserved")
 
 // ReviewPaymentRecord represents a review payment authorization record.
 type ReviewPaymentRecord struct {
@@ -57,27 +61,82 @@ func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (Revi
 	return rec, nil
 }
 
-// UpsertPendingReviewPayment inserts or updates a pending review payment record.
-func (s *Store) UpsertPendingReviewPayment(ctx context.Context, rec ReviewPaymentRecord) error {
+// ReserveReviewPaymentToken atomically reserves a token hash before any external
+// invoice or mint calls. A unique-constraint conflict is reported as
+// ErrTokenHashAlreadyReserved so callers can distinguish replay/race denials
+// from genuine database failures.
+func (s *Store) ReserveReviewPaymentToken(ctx context.Context, rec ReviewPaymentRecord) error {
 	now := time.Now().Unix()
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO review_payments (
 			patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
 			token_hash, mint_url, token_amount_sats, invoice_id, invoice_request,
 			invoice_expires_at, created_at, updated_at
+		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, '', '', 0, ?, ?)
+	`, rec.PatchEventID, rec.RepoID, rec.AuthorPubkey, rec.RequestedMode,
+		rec.TokenHash, rec.MintURL, rec.TokenAmountSats, now, now)
+	if err != nil {
+		if isSQLiteUniqueConstraint(err) {
+			return ErrTokenHashAlreadyReserved
+		}
+		return fmt.Errorf("reserve review payment token: %w", err)
+	}
+	return nil
+}
+
+// UpsertPendingReviewPayment inserts or updates invoice details for a pending review payment record.
+func (s *Store) UpsertPendingReviewPayment(ctx context.Context, rec ReviewPaymentRecord) error {
+	now := time.Now().Unix()
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO review_payments (
+			patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
+			token_hash, mint_url, token_amount_sats, invoice_id, invoice_request,
+			invoice_expires_at, created_at, updated_at
 		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(patch_event_id) DO UPDATE SET
-			token_hash = excluded.token_hash,
-			mint_url = excluded.mint_url,
-			token_amount_sats = excluded.token_amount_sats,
 			invoice_id = excluded.invoice_id,
 			invoice_request = excluded.invoice_request,
 			invoice_expires_at = excluded.invoice_expires_at,
 			updated_at = excluded.updated_at
+		WHERE review_payments.status = 'pending'
+		  AND review_payments.token_hash = excluded.token_hash
 	`, rec.PatchEventID, rec.RepoID, rec.AuthorPubkey, rec.RequestedMode,
 		rec.TokenHash, rec.MintURL, rec.TokenAmountSats, rec.InvoiceID, rec.InvoiceRequest,
 		rec.InvoiceExpiresAt, now, now)
-	return err
+	if err != nil {
+		if isSQLiteUniqueConstraint(err) {
+			return ErrTokenHashAlreadyReserved
+		}
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check pending payment upsert rows affected: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("upsert pending review payment: expected 1 row for patch %q, got %d", rec.PatchEventID, rows)
+	}
+	return nil
+}
+
+// GetReviewPaymentByTokenHash retrieves a review payment record by reserved token hash.
+func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash string) (ReviewPaymentRecord, error) {
+	var rec ReviewPaymentRecord
+	err := s.db.QueryRowContext(ctx, `
+		SELECT patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
+		       token_hash, mint_url, token_amount_sats, invoice_id, invoice_request,
+		       invoice_expires_at, created_at, updated_at
+		FROM review_payments
+		WHERE token_hash = ?
+	`, tokenHash).Scan(
+		&rec.PatchEventID, &rec.RepoID, &rec.AuthorPubkey, &rec.Status, &rec.AccessKind,
+		&rec.RequestedMode, &rec.TokenHash, &rec.MintURL, &rec.TokenAmountSats,
+		&rec.InvoiceID, &rec.InvoiceRequest, &rec.InvoiceExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
+	)
+	if err != nil {
+		return ReviewPaymentRecord{}, err
+	}
+	return rec, nil
 }
 
 // DeletePendingReviewPayment removes a pending review payment record.
@@ -168,7 +227,10 @@ func (s *Store) UpsertSubscription(ctx context.Context, authorPubkey, repoID, so
 			source_patch_event_id = excluded.source_patch_event_id,
 			source_token_hash = excluded.source_token_hash,
 			paid_amount_sats = excluded.paid_amount_sats,
-			expires_at = MAX(expires_at, ?) + ?,
+			expires_at = CASE
+				WHEN payment_subscriptions.source_token_hash = excluded.source_token_hash THEN payment_subscriptions.expires_at
+				ELSE MAX(payment_subscriptions.expires_at, ?) + ?
+			END,
 			updated_at = ?
 	`, authorPubkey, repoID, sourcePatchEventID, sourceTokenHash,
 		paidAmountSats, now+extendSecs, now, now,
@@ -278,4 +340,12 @@ func (s *Store) IsTokenHashUsed(ctx context.Context, tokenHash string) (bool, er
 		return false, err
 	}
 	return true, nil
+}
+
+func isSQLiteUniqueConstraint(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") || strings.Contains(msg, "constraint failed: UNIQUE")
 }
