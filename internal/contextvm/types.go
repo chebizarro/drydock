@@ -4,14 +4,16 @@ import (
 	"encoding/json"
 
 	"fiatjaf.com/nostr"
+	cascadia "git.sharegap.net/cascadia/cascadia-go"
+	shared "git.sharegap.net/cascadia/cascadia-go/contextvm"
 )
 
 const (
-	KindContextVM nostr.Kind = 25910 // Ephemeral ContextVM messages
-	KindGiftWrap  nostr.Kind = 1059  // NIP-59 encrypted wrapper
+	KindContextVM nostr.Kind = nostr.Kind(cascadia.CAS_INTENT)      // Ephemeral ContextVM messages
+	KindGiftWrap  nostr.Kind = nostr.Kind(cascadia.NIP59_GIFT_WRAP) // NIP-59 encrypted wrapper
 )
 
-const jsonRPCVersion = "2.0"
+const jsonRPCVersion = shared.JSONRPCVersion
 
 // Message is a JSON-RPC 2.0 message carried in a ContextVM event.
 type Message struct {
@@ -23,7 +25,8 @@ type Message struct {
 	Error   *Error          `json:"error,omitempty"`
 }
 
-// Error is a JSON-RPC 2.0 error object.
+// Error mirrors the shared contextvm error shape while retaining drydock's
+// json.RawMessage Data compatibility.
 type Error struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
@@ -31,11 +34,11 @@ type Error struct {
 }
 
 const (
-	ErrorParseError     = -32700
-	ErrorInvalidRequest = -32600
-	ErrorMethodNotFound = -32601
-	ErrorInvalidParams  = -32602
-	ErrorInternal       = -32603
+	ErrorParseError     = shared.ParseErrorCode
+	ErrorInvalidRequest = shared.InvalidRequestCode
+	ErrorMethodNotFound = shared.MethodNotFoundCode
+	ErrorInvalidParams  = shared.InvalidParamsCode
+	ErrorInternal       = shared.InternalErrorCode
 )
 
 // Request is an inbound ContextVM JSON-RPC request with its source event.
