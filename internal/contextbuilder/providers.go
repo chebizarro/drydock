@@ -18,7 +18,7 @@ import (
 )
 
 // DefaultProviders returns the standard provider set, optionally enhanced
-// with Qdrant retrieval and LSP-based analysis when services are configured.
+// with Chartroom/Qdrant retrieval and LSP-based analysis when services are configured.
 func DefaultProviders(opts ...BuilderOptions) []Provider {
 	var opt BuilderOptions
 	if len(opts) > 0 {
@@ -38,9 +38,9 @@ func DefaultProviders(opts ...BuilderOptions) []Provider {
 		projectDocsProvider{},
 	}
 
-	// Add Qdrant retrieval provider if configured.
-	if opt.qdrantProvider != nil {
-		providers = append(providers, opt.qdrantProvider)
+	// Add external retrieval provider if configured.
+	if opt.retrievalProvider != nil {
+		providers = append(providers, opt.retrievalProvider)
 	}
 
 	// Add any extra providers (e.g. security scanner).

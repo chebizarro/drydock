@@ -71,6 +71,11 @@ type Config struct {
 	SignerNsecFile      string
 	SignerSocketPath    string
 	SignerDBus          bool
+	DevMode             bool
+	ChartroomURL        string
+	ChartroomToken      string
+	ChartroomCorpusIDs  []string
+	ChartroomSourceIDs  []string
 	QdrantURL           string
 	QdrantAPIKey        string
 	EmbedBaseURL        string
@@ -140,6 +145,11 @@ func FromEnv() Config {
 		SignerNsecFile:      signerNsecFile,
 		SignerSocketPath:    envOrDefault("DRYDOCK_SIGNER_SOCKET_PATH", ""),
 		SignerDBus:          parseBoolOrDefault(envOrDefault("DRYDOCK_SIGNER_DBUS", ""), false),
+		DevMode:             parseBoolOrDefault(envOrDefault("DEV_MODE", envOrDefault("DRYDOCK_DEV_MODE", "")), false),
+		ChartroomURL:        envOrDefault("DRYDOCK_CHARTROOM_URL", ""),
+		ChartroomToken:      envOrDefault("DRYDOCK_CHARTROOM_TOKEN", envOrDefault("CHARTROOM_HTTP_BEARER_TOKEN", "")),
+		ChartroomCorpusIDs:  splitCSV(envOrDefault("DRYDOCK_CHARTROOM_CORPUS_IDS", "")),
+		ChartroomSourceIDs:  splitCSV(envOrDefault("DRYDOCK_CHARTROOM_SOURCE_IDS", envOrDefault("DRYDOCK_CHARTROOM_SOURCES", ""))),
 		QdrantURL:           envOrDefault("DRYDOCK_QDRANT_URL", ""),
 		QdrantAPIKey:        envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
 		EmbedBaseURL:        envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
@@ -360,6 +370,9 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 
 	// --- Optional service warnings ---
+	if c.ChartroomURL != "" && c.ChartroomToken == "" {
+		result.Warnings = append(result.Warnings, "DRYDOCK_CHARTROOM_URL set but no bearer token configured (set DRYDOCK_CHARTROOM_TOKEN or CHARTROOM_HTTP_BEARER_TOKEN)")
+	}
 	if c.QdrantURL != "" && c.EmbedBaseURL == "" {
 		result.Warnings = append(result.Warnings, "DRYDOCK_QDRANT_URL set but DRYDOCK_EMBED_BASE_URL not set: RAG features disabled")
 	}

@@ -6,13 +6,23 @@ import (
 	"drydock/internal/vectorstore"
 )
 
+// WithChartRoom configures Chartroom-backed retrieval for the context builder.
+func WithChartRoom(cfg ChartRoomConfig) func(*BuilderOptions) {
+	return func(opts *BuilderOptions) {
+		p := NewChartRoomProvider(cfg)
+		if p != nil {
+			opts.retrievalProvider = p
+		}
+	}
+}
+
 // WithQdrant configures Qdrant-based retrieval for the context builder.
 // Both qdrant and embed clients must be non-nil for the provider to activate.
 func WithQdrant(qdrant *vectorstore.Client, embed *embedding.Client) func(*BuilderOptions) {
 	return func(opts *BuilderOptions) {
 		p := NewQdrantProvider(qdrant, embed)
 		if p != nil {
-			opts.qdrantProvider = p
+			opts.retrievalProvider = p
 		}
 	}
 }

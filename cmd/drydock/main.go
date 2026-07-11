@@ -28,7 +28,6 @@ import (
 	"drydock/internal/marketplace"
 	"drydock/internal/metareview"
 	"drydock/internal/metrics"
-	"drydock/internal/nipingest"
 	"drydock/internal/payment"
 	"drydock/internal/pipeline"
 	"drydock/internal/promptrefine"
@@ -45,6 +44,7 @@ import (
 
 func main() {
 	cfg := config.FromEnv()
+	cfg.DevMode = cfg.DevMode || devFlagEnabled(os.Args[1:])
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 
 	// --- NIP ingest mode: run and exit ---
@@ -92,7 +92,7 @@ func main() {
 		logger.Info("reset stuck reviews to pending", "count", n)
 	}
 
-	// --- Signer (chain: bunker → socket → DBus → nsec) ---
+	// --- Signer (production: bunker required; dev mode allows local fallbacks) ---
 	var signer publisher.Signer
 	if cfg.SignerBunkerURL != "" {
 		s, err := signing.NewBunkerSigner(ctx, signing.BunkerSignerConfig{
@@ -102,13 +102,20 @@ func main() {
 			},
 		})
 		if err != nil {
-			logger.Error("failed to create bunker signer", "error", err)
-			os.Exit(1)
+			if !cfg.DevMode {
+				logger.Error("failed to create required bunker signer", "error", err)
+				os.Exit(1)
+			}
+			logger.Warn("bunker signer failed; dev mode fallback enabled", "error", err)
+		} else {
+			signer = s
+			logger.Info("NIP-46 bunker signer ready")
 		}
-		signer = s
-		logger.Info("NIP-46 bunker signer ready")
+	} else if !cfg.DevMode {
+		logger.Error("NIP-46 bunker signer required in non-dev mode; set DRYDOCK_SIGNER_BUNKER_URL or run with --dev / DEV_MODE=true for local fallback")
+		os.Exit(1)
 	}
-	if signer == nil && (cfg.SignerSocketPath != "" || socketSignerAvailable()) {
+	if cfg.DevMode && signer == nil && (cfg.SignerSocketPath != "" || socketSignerAvailable()) {
 		s, err := signing.NewSocketSigner(ctx, signing.SocketSignerConfig{
 			SocketPath: cfg.SignerSocketPath,
 		})
@@ -116,29 +123,29 @@ func main() {
 			logger.Warn("NIP-5F socket signer not available", "error", err)
 		} else {
 			signer = s
-			logger.Info("NIP-5F socket signer ready")
+			logger.Info("NIP-5F socket signer ready", "dev_mode", true)
 		}
 	}
-	if signer == nil && cfg.SignerDBus {
+	if cfg.DevMode && signer == nil && cfg.SignerDBus {
 		s, err := signing.NewDBusSigner(ctx, signing.DBusSignerConfig{})
 		if err != nil {
 			logger.Warn("NIP-55L DBus signer not available", "error", err)
 		} else {
 			signer = s
-			logger.Info("NIP-55L DBus signer ready")
+			logger.Info("NIP-55L DBus signer ready", "dev_mode", true)
 		}
 	}
-	if signer == nil && cfg.SignerNsec != "" {
+	if cfg.DevMode && signer == nil && cfg.SignerNsec != "" {
 		s, err := signing.NewLocalSigner(cfg.SignerNsec)
 		if err != nil {
 			logger.Error("failed to create local signer", "error", err)
 			os.Exit(1)
 		}
 		signer = s
-		logger.Info("local nsec signer ready")
+		logger.Info("local nsec signer ready", "dev_mode", true)
 	}
 	if signer == nil {
-		logger.Warn("no signer configured — review publishing disabled")
+		logger.Warn("no signer configured — review publishing disabled", "dev_mode", cfg.DevMode)
 	}
 
 	// --- Shared Nostr pool (with NIP-42 AUTH if signer available) ---
@@ -196,6 +203,11 @@ func main() {
 		writeRelays = cfg.Relays
 	}
 	relayPub := publisher.NewNostrRelayPublisher(pool, logger)
+	var auditPub *publisher.AuditPublisher
+	if signer != nil {
+		auditPub = publisher.NewAuditPublisher(signer, relayPub, writeRelays, logger)
+		signer = publisher.NewAuditedSigner(signer, auditPub, logger)
+	}
 
 	// --- Health check server ---
 	healthAddr := cfg.HealthAddr
@@ -280,8 +292,6 @@ func main() {
 			}
 		}
 
-		builderOpts = append(builderOpts, contextbuilder.WithQdrant(qdrantClient, embedClient))
-
 		// Code index provider + indexer.
 		codeProvider := codeindex.NewProvider(qdrantClient, embedClient, logger)
 		if codeProvider != nil {
@@ -291,7 +301,20 @@ func main() {
 
 		logger.Info("Qdrant + embedding configured", "qdrant", cfg.QdrantURL, "embed_model", cfg.EmbedModel, "embed_dimension", vectorDim)
 	} else if cfg.QdrantURL != "" || cfg.EmbedBaseURL != "" {
-		logger.Warn("both DRYDOCK_QDRANT_URL and DRYDOCK_EMBED_BASE_URL must be set for RAG features")
+		logger.Warn("both DRYDOCK_QDRANT_URL and DRYDOCK_EMBED_BASE_URL must be set for dev Qdrant-backed features")
+	}
+	if cfg.ChartroomURL != "" {
+		builderOpts = append(builderOpts, contextbuilder.WithChartRoom(contextbuilder.ChartRoomConfig{
+			BaseURL:     cfg.ChartroomURL,
+			BearerToken: cfg.ChartroomToken,
+			CorpusIDs:   cfg.ChartroomCorpusIDs,
+			SourceIDs:   cfg.ChartroomSourceIDs,
+			Audit:       auditPub,
+		}))
+		logger.Info("Chartroom context retrieval configured", "url", cfg.ChartroomURL, "corpora", len(cfg.ChartroomCorpusIDs), "sources", len(cfg.ChartroomSourceIDs))
+	} else if qdrantClient != nil && embedClient != nil {
+		builderOpts = append(builderOpts, contextbuilder.WithQdrant(qdrantClient, embedClient))
+		logger.Warn("using local Qdrant context retrieval fallback; configure DRYDOCK_CHARTROOM_URL for production Chartroom context")
 	}
 	if qdrantClient != nil {
 		_ = healthSrv.AddReadinessCheck("qdrant", qdrantClient)
@@ -349,6 +372,7 @@ func main() {
 			DetailSeverityFloor: "high",
 			DefaultTTL:          90 * 24 * time.Hour,
 			SupersededTTL:       7 * 24 * time.Hour,
+			Audit:               auditPub,
 		}, store, signer, relayPub, logger)
 	}
 
@@ -649,33 +673,20 @@ func runDriftGuard(cfg config.Config, logger *slog.Logger) {
 	}
 }
 
-// runNIPIngest runs the NIP spec ingest pipeline and exits.
-func runNIPIngest(cfg config.Config, logger *slog.Logger) {
-	if cfg.NIPsDir == "" {
-		logger.Error("DRYDOCK_NIPS_DIR must be set for nip-ingest mode")
-		os.Exit(1)
-	}
-	if cfg.QdrantURL == "" || cfg.EmbedBaseURL == "" {
-		logger.Error("DRYDOCK_QDRANT_URL and DRYDOCK_EMBED_BASE_URL must be set for nip-ingest mode")
-		os.Exit(1)
-	}
+// runNIPIngest is retired. NIP and project-document ingestion now belongs
+// in Chartroom; Drydock only consumes Chartroom's /search endpoint.
+func runNIPIngest(_ config.Config, logger *slog.Logger) {
+	logger.Error("nip-ingest mode has been retired; ingest NIPs through Chartroom's ingest pipeline and configure Drydock with DRYDOCK_CHARTROOM_URL plus DRYDOCK_CHARTROOM_TOKEN")
+	os.Exit(1)
+}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
-	qdrantClient := vectorstore.NewClient(cfg.QdrantURL, cfg.QdrantAPIKey)
-	embedClient := embedding.NewClient(cfg.EmbedBaseURL, cfg.EmbedAPIKey, cfg.EmbedModel)
-
-	ingester := nipingest.NewIngester(qdrantClient, embedClient, logger)
-	n, err := ingester.Run(ctx, nipingest.Config{
-		NIPsDir:   cfg.NIPsDir,
-		VectorDim: cfg.EmbedDimension,
-	})
-	if err != nil {
-		logger.Error("NIP ingest failed", "error", err)
-		os.Exit(1)
+func devFlagEnabled(args []string) bool {
+	for _, arg := range args {
+		if arg == "--dev" {
+			return true
+		}
 	}
-	logger.Info("NIP ingest complete", "chunks_upserted", n)
+	return false
 }
 
 // socketSignerAvailable checks if the default NIP-5F socket path exists.

@@ -32,6 +32,7 @@ type Config struct {
 	DetailSeverityFloor string
 	DefaultTTL          time.Duration
 	SupersededTTL       time.Duration
+	Audit               *AuditPublisher
 }
 
 type PublishInput struct {
@@ -48,9 +49,9 @@ type PublishInput struct {
 	Superseded           bool
 	// DetailSeverityFloor overrides the service-level detail severity floor
 	// for this specific review. Empty means use the service default.
-	DetailSeverityFloor  string
+	DetailSeverityFloor string
 	// Walkthrough is an optional change description prepended to the summary.
-	Walkthrough          reviewengine.WalkthroughOutput
+	Walkthrough reviewengine.WalkthroughOutput
 }
 
 type Service struct {
@@ -174,6 +175,19 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	if err := s.store.InsertReviewEvent(ctx, summaryEvent, in.PatchEventID, in.RepoID); err != nil {
 		return "", err
 	}
+	if s.cfg.Audit != nil {
+		if err := s.cfg.Audit.Publish(ctx, AuditInput{
+			Action:  "review-published",
+			Subject: summaryEvent.ID.Hex(),
+			Tags: map[string]string{
+				"event_kind":     strconv.Itoa(int(summaryEvent.Kind)),
+				"patch_event_id": in.PatchEventID,
+				"repo_id":        in.RepoID,
+			},
+		}); err != nil {
+			s.logger.Warn("failed to publish review audit", "review_event_id", summaryEvent.ID.Hex(), "error", err)
+		}
+	}
 
 	detailFloor := s.cfg.DetailSeverityFloor
 	if in.DetailSeverityFloor != "" {
@@ -208,6 +222,20 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 			s.logger.Error("failed to store detail finding event",
 				"patch_event_id", in.PatchEventID, "detail_event_id", detail.ID.Hex(),
 				"error", err)
+		}
+		if s.cfg.Audit != nil {
+			if err := s.cfg.Audit.Publish(ctx, AuditInput{
+				Action:  "review-finding-published",
+				Subject: detail.ID.Hex(),
+				Tags: map[string]string{
+					"event_kind":     strconv.Itoa(int(detail.Kind)),
+					"patch_event_id": in.PatchEventID,
+					"repo_id":        in.RepoID,
+					"severity":       finding.Severity,
+				},
+			}); err != nil {
+				s.logger.Warn("failed to publish detail finding audit", "detail_event_id", detail.ID.Hex(), "error", err)
+			}
 		}
 		detailPublished++
 	}

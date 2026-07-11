@@ -96,13 +96,13 @@ type Provider interface {
 // BuilderOptions configures optional service clients for enhanced analysis.
 // All fields are optional — nil means the feature is disabled.
 type BuilderOptions struct {
-	QdrantClient  interface{ /* *vectorstore.Client */ } // nil = no Qdrant retrieval
-	EmbedClient   interface{ /* *embedding.Client */ }   // nil = no embedding
+	QdrantClient any // nil = no Qdrant retrieval
+	EmbedClient  any // nil = no embedding
 
 	// Typed accessors set internally. Use the With* helpers.
-	qdrantProvider Provider
-	lspClient      *lspbridge.Client
-	extraProviders []Provider
+	retrievalProvider Provider
+	lspClient         *lspbridge.Client
+	extraProviders    []Provider
 }
 
 type Builder struct {
@@ -127,7 +127,7 @@ func NewWithOptions(opts BuilderOptions) *Builder {
 
 // isDocLayer returns true if the layer name is a documentation provider.
 func isDocLayer(name string) bool {
-	return name == LayerProjectDocs || name == "qdrant-docs"
+	return name == LayerProjectDocs || name == LayerQdrantDocs || name == LayerChartroomDocs
 }
 
 // matchesExcludePath checks if a file path matches any of the exclusion patterns.
@@ -394,4 +394,3 @@ func filterPatchInput(in BuildInput, excludedFiles []string) BuildInput {
 	result.PatchEventContent = strings.Join(kept, "\n")
 	return result
 }
-
