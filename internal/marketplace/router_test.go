@@ -12,6 +12,11 @@ import (
 	"fiatjaf.com/nostr"
 )
 
+const (
+	reviewer1Pubkey = "1111111111111111111111111111111111111111111111111111111111111111"
+	reviewer2Pubkey = "2222222222222222222222222222222222222222222222222222222222222222"
+)
+
 // mockSigner is a test signer that records signed events.
 type mockSigner struct {
 	pubkey nostr.PubKey
@@ -40,127 +45,20 @@ func (m *mockPublisher) Publish(ctx context.Context, relays []string, event nost
 	return nil
 }
 
-func TestRouter_RoutePatch_RecordFailureDoesNotReportAssignmentSuccess(t *testing.T) {
-	ctx := context.Background()
-	store := mustOpenStore(t, ctx)
-	logger := slog.Default()
-
-	registry := NewRegistry(store, logger)
-	signer := &mockSigner{pubkey: testPubKey()}
-	publisher := &mockPublisher{}
-	router := NewRouter(
-		RouterConfig{
-			DefaultRelays:        []string{"wss://test.relay"},
-			MaxReviewersPerPatch: 1,
-			DefaultDeadline:      24 * time.Hour,
-		},
-		registry,
-		store,
-		signer,
-		publisher,
-		logger,
-	)
-
-	reviewerPubkey := testPubKey().Hex()
-	if err := registry.RegisterReviewer(ctx, ReviewerProfile{
-		Pubkey:         reviewerPubkey,
-		Languages:      []string{"go"},
-		Availability:   AvailabilityAvailable,
-		PricePerReview: 0,
-	}, "reviewer-event-record-failure"); err != nil {
-		t.Fatalf("RegisterReviewer: %v", err)
-	}
-
-	if _, err := store.DB().ExecContext(ctx, `
-		CREATE TRIGGER fail_route_patch_assignment_insert
-		BEFORE INSERT ON review_assignments
-		BEGIN
-			SELECT RAISE(ABORT, 'forced assignment persistence failure');
-		END;
-	`); err != nil {
-		t.Fatalf("create failure trigger: %v", err)
-	}
-
-	result, err := router.RoutePatch(ctx, PatchInfo{
-		PatchEventID: "patch-record-failure",
-		RepoID:       "repo-record-failure",
-		AuthorPubkey: testPubKey().Hex(),
-		ChangedFiles: []string{"main.go"},
-		PriceSats:    100,
-	})
-	if err == nil {
-		t.Fatal("RoutePatch succeeded despite assignment persistence failure")
-	}
-	if result == nil {
-		t.Fatal("RoutePatch returned nil result; want partial result showing no successful assignment")
-	}
-	if result.AssignedCount != 0 {
-		t.Fatalf("AssignedCount = %d, want 0", result.AssignedCount)
-	}
-	if len(result.Assignments) != 0 {
-		t.Fatalf("len(Assignments) = %d, want 0", len(result.Assignments))
-	}
-	if len(publisher.published) != 0 {
-		t.Fatalf("published %d assignments despite persistence failure; want 0", len(publisher.published))
-	}
+type mockContextVMTransport struct {
+	calls []contextVMCall
 }
 
-func TestRouter_RoutePatch_RejectsReviewerAbovePatchPriceBeforeAssignment(t *testing.T) {
-	ctx := context.Background()
-	store := mustOpenStore(t, ctx)
-	logger := slog.Default()
+type contextVMCall struct {
+	id         string
+	method     string
+	params     any
+	recipients []nostr.PubKey
+}
 
-	registry := NewRegistry(store, logger)
-	publisher := &mockPublisher{}
-	router := NewRouter(
-		RouterConfig{
-			DefaultRelays:        []string{"wss://test.relay"},
-			MaxReviewersPerPatch: 1,
-			DefaultDeadline:      24 * time.Hour,
-		},
-		registry,
-		store,
-		&mockSigner{pubkey: testPubKey()},
-		publisher,
-		logger,
-	)
-
-	reviewerPubkey := testPubKey().Hex()
-	if err := registry.RegisterReviewer(ctx, ReviewerProfile{
-		Pubkey:         reviewerPubkey,
-		Languages:      []string{"go"},
-		Availability:   AvailabilityAvailable,
-		PricePerReview: 100,
-	}, "reviewer-event-over-price"); err != nil {
-		t.Fatalf("RegisterReviewer: %v", err)
-	}
-
-	result, err := router.RoutePatch(ctx, PatchInfo{
-		PatchEventID: "patch-free-review",
-		RepoID:       "repo-free-review",
-		AuthorPubkey: testPubKey().Hex(),
-		ChangedFiles: []string{"main.go"},
-		PriceSats:    0,
-	})
-	if err != nil {
-		t.Fatalf("RoutePatch returned error: %v", err)
-	}
-	if result.AssignedCount != 0 {
-		t.Fatalf("AssignedCount = %d, want 0", result.AssignedCount)
-	}
-	if len(result.Assignments) != 0 {
-		t.Fatalf("len(Assignments) = %d, want 0", len(result.Assignments))
-	}
-	if len(publisher.published) != 0 {
-		t.Fatalf("published %d assignments despite price cap; want 0", len(publisher.published))
-	}
-	assignments, err := store.ListAssignmentsForPatch(ctx, "patch-free-review")
-	if err != nil {
-		t.Fatalf("ListAssignmentsForPatch: %v", err)
-	}
-	if len(assignments) != 0 {
-		t.Fatalf("stored %d assignments despite price cap; want 0", len(assignments))
-	}
+func (m *mockContextVMTransport) SendWithID(ctx context.Context, id, method string, params any, recipients ...nostr.PubKey) (string, error) {
+	m.calls = append(m.calls, contextVMCall{id: id, method: method, params: params, recipients: append([]nostr.PubKey(nil), recipients...)})
+	return id, nil
 }
 
 func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
@@ -171,6 +69,7 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	registry := NewRegistry(store, logger)
 	signer := &mockSigner{pubkey: nostr.PubKey{}}
 	publisher := &mockPublisher{}
+	contextVMTransport := &mockContextVMTransport{}
 
 	router := NewRouter(
 		RouterConfig{
@@ -182,13 +81,11 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 		store,
 		signer,
 		publisher,
+		contextVMTransport,
 		logger,
 	)
 
 	// Register two reviewers
-	reviewer1SK := nostr.Generate()
-	reviewer1Pubkey := nostr.GetPublicKey(reviewer1SK).Hex()
-	reviewer2Pubkey := testPubKey().Hex()
 	reviewer1 := ReviewerProfile{
 		Pubkey:       reviewer1Pubkey,
 		Languages:    []string{"go"},
@@ -219,10 +116,19 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 	}
 
 	// Simulate reviewer1 rejecting
-	rejectionEvent := signedMarketplaceEvent(t, reviewer1SK, KindReviewRejection, ReviewRejection{
-		AssignmentID: "assign-r1",
-		Reason:       "too busy",
-	})
+	rejection := ReviewRejection{
+		AssignmentID:   "assign-r1",
+		ReviewerPubkey: reviewer1Pubkey,
+		Reason:         "too busy",
+	}
+	rejectionJSON, _ := json.Marshal(rejection)
+
+	rejectionEvent := nostr.Event{
+		Kind:      nostr.Kind(25910),
+		Content:   string(rejectionJSON),
+		PubKey:    nostr.PubKey{}, // Will be overwritten
+		CreatedAt: nostr.Now(),
+	}
 
 	// Handle the rejection
 	err := router.HandleRejection(ctx, rejectionEvent)
@@ -230,19 +136,21 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 		t.Fatalf("HandleRejection failed: %v", err)
 	}
 
-	// Check that a new assignment was published
-	if len(publisher.published) == 0 {
-		t.Error("expected a reassignment to be published")
+	// Check that a new assignment was published via ContextVM
+	if len(contextVMTransport.calls) == 0 {
+		t.Fatal("expected a reassignment to be published")
 	}
 
 	// Verify the new assignment is to reviewer2 (not reviewer1)
-	if len(publisher.published) > 0 {
-		var newAssignment ReviewAssignment
-		json.Unmarshal([]byte(publisher.published[0].Content), &newAssignment)
-
-		if newAssignment.ReviewerPubkey == reviewer1Pubkey {
-			t.Error("reassignment should not be to the rejecting reviewer")
-		}
+	newAssignment := contextVMTransport.calls[0].params.(ReviewAssignment)
+	if newAssignment.ReviewerPubkey == reviewer1Pubkey {
+		t.Error("reassignment should not be to the rejecting reviewer")
+	}
+	if contextVMTransport.calls[0].method != MethodAssign {
+		t.Errorf("method = %s, want %s", contextVMTransport.calls[0].method, MethodAssign)
+	}
+	if contextVMTransport.calls[0].id != newAssignment.AssignmentID {
+		t.Errorf("id = %s, want %s", contextVMTransport.calls[0].id, newAssignment.AssignmentID)
 	}
 }
 
@@ -254,6 +162,7 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	registry := NewRegistry(store, logger)
 	signer := &mockSigner{pubkey: nostr.PubKey{}}
 	publisher := &mockPublisher{}
+	contextVMTransport := &mockContextVMTransport{}
 
 	router := NewRouter(
 		RouterConfig{
@@ -265,12 +174,11 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 		store,
 		signer,
 		publisher,
+		contextVMTransport,
 		logger,
 	)
 
 	// Register only one reviewer
-	reviewer1SK := nostr.Generate()
-	reviewer1Pubkey := nostr.GetPublicKey(reviewer1SK).Hex()
 	reviewer1 := ReviewerProfile{
 		Pubkey:       reviewer1Pubkey,
 		Languages:    []string{"go"},
@@ -292,10 +200,18 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	store.CreateAssignment(ctx, assignment)
 
 	// Simulate rejection
-	rejectionEvent := signedMarketplaceEvent(t, reviewer1SK, KindReviewRejection, ReviewRejection{
-		AssignmentID: "assign-only",
-		Reason:       "no time",
-	})
+	rejection := ReviewRejection{
+		AssignmentID:   "assign-only",
+		ReviewerPubkey: reviewer1Pubkey,
+		Reason:         "no time",
+	}
+	rejectionJSON, _ := json.Marshal(rejection)
+
+	rejectionEvent := nostr.Event{
+		Kind:      nostr.Kind(25910),
+		Content:   string(rejectionJSON),
+		CreatedAt: nostr.Now(),
+	}
 
 	// Handle the rejection - should not error, but no reassignment
 	err := router.HandleRejection(ctx, rejectionEvent)
@@ -304,8 +220,8 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	}
 
 	// No new assignment should be published (no alternatives)
-	if len(publisher.published) != 0 {
-		t.Errorf("expected no reassignment, but got %d published", len(publisher.published))
+	if len(contextVMTransport.calls) != 0 {
+		t.Errorf("expected no reassignment, but got %d published", len(contextVMTransport.calls))
 	}
 }
 

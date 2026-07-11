@@ -1,6 +1,6 @@
 # Review Marketplace
 
-The Drydock marketplace connects patch authors with specialized human reviewers. Community members can register as reviewers with expertise in specific languages and domains, building reputation through quality reviews.
+The Drydock marketplace connects patch authors with specialized human reviewers. Community members publish standard NIP-89 handler profiles to advertise review capabilities, and marketplace coordination uses ContextVM JSON-RPC over Nostr.
 
 ## Overview
 
@@ -25,34 +25,46 @@ The Drydock marketplace connects patch authors with specialized human reviewers.
 
 | Kind | Name | Publisher | Description |
 |------|------|-----------|-------------|
-| 30620 | Reviewer Profile | Reviewer | Addressable profile with expertise, availability, pricing |
-| 1660 | Review Assignment | Drydock | Assigns patch to reviewer |
-| 1661 | Assignment Acceptance | Reviewer | Reviewer accepts the assignment |
-| 1662 | Assignment Rejection | Reviewer | Reviewer declines (with reason) |
-| 1663 | Review Feedback | Author | Author rates the completed review |
+| 31990 | Reviewer Profile | Reviewer | NIP-89 handler profile advertising reviewer capabilities |
+| 25910 | ContextVM JSON-RPC | Drydock / Reviewer | Assignment, accept, and reject methods |
+| 7000 | Review Feedback | Author / Drydock | NIP-90 feedback for completed review quality and marketplace outcomes |
+| 1059 | NIP-59 Gift Wrap | Any private participant | Encrypted envelope for private marketplace commands |
+
+Deprecated mappings: `30620` is replaced by NIP-89 kind `31990`; `1660`, `1661`, and `1662` are replaced by ContextVM messages on kind `25910`; `1663` is replaced by NIP-90 feedback kind `7000`.
 
 ## Reviewer Registration
 
-### Profile Event (kind 30620)
+### NIP-89 Reviewer Profile (kind 31990)
 
-Reviewers publish an addressable profile:
+Reviewers publish a NIP-89 handler/reviewer profile. The event is addressable and discoverable by tags:
 
 ```json
 {
-  "kind": 30620,
+  "kind": 31990,
   "content": {
+    "name": "Alice Security",
     "display_name": "Alice Security",
-    "languages": ["go", "rust", "python"],
-    "domains": ["security", "cryptography", "performance"],
-    "availability": "available",
-    "price_per_review": 5000,
-    "max_concurrent": 3,
-    "response_time": "4h"
+    "about": "Security-focused Go, Rust, and Python reviewer",
+    "picture": "https://example.com/alice.png",
+    "nip90": true,
+    "drydock": {
+      "languages": ["go", "rust", "python"],
+      "domains": ["security", "cryptography", "performance"],
+      "availability": "available",
+      "price_per_review": 5000,
+      "max_concurrent": 3,
+      "response_time": "4h"
+    }
   },
   "tags": [
-    ["d", "reviewer-profile"],
+    ["d", "drydock-reviewer"],
+    ["k", "1111"],
+    ["k", "7000"],
     ["t", "code-reviewer"],
-    ["t", "security-expert"]
+    ["t", "security-expert"],
+    ["t", "go"],
+    ["t", "rust"],
+    ["t", "python"]
   ]
 }
 ```
@@ -61,31 +73,32 @@ Reviewers publish an addressable profile:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `display_name` | string | Human-readable name |
-| `languages` | string[] | Programming languages (lowercase) |
-| `domains` | string[] | Expertise areas (security, performance, api-design, etc.) |
-| `availability` | string | `available`, `busy`, or `unavailable` |
-| `price_per_review` | int | Price in satoshis (0 = free) |
-| `max_concurrent` | int | Maximum simultaneous assignments |
-| `response_time` | string | Typical response time (e.g., "2h", "24h") |
+| `name` / `display_name` | string | Human-readable reviewer name |
+| `about` | string | Public reviewer summary |
+| `drydock.languages` | string[] | Programming languages (lowercase) |
+| `drydock.domains` | string[] | Expertise areas (security, performance, api-design, etc.) |
+| `drydock.availability` | string | `available`, `busy`, or `unavailable` |
+| `drydock.price_per_review` | int | Price in satoshis (0 = free) |
+| `drydock.max_concurrent` | int | Maximum simultaneous assignments |
+| `drydock.response_time` | string | Typical response time (e.g., "2h", "24h") |
 
 ## Patch Routing
 
 When a patch arrives that needs human review:
 
 1. **Extract Requirements**: Detect languages from changed files
-2. **Find Matches**: Query registry for reviewers matching criteria
+2. **Find Matches**: Query NIP-89 reviewer profiles (`31990`) matching criteria
 3. **Score & Rank**: Calculate match scores based on:
    - Language overlap (50% weight)
    - Domain match (30% weight)
    - Availability (10% weight)
    - Response time (10% weight)
-4. **Assign**: Create assignments for top N matches
-5. **Notify**: Publish assignment events tagging reviewers
+4. **Assign**: Send `marketplace/assign` ContextVM requests to top N matches
+5. **Notify**: Address assignments to reviewers with `p` tags and NIP-59 gift-wrap when private
 
 ### Match Score Calculation
 
-```
+```text
 score = (language_overlap × 0.5) + (domain_match × 0.3) + (availability_bonus × 0.1) + (speed_bonus × 0.1)
 ```
 
@@ -94,6 +107,18 @@ Where:
 - `domain_match`: Jaccard index of domains (if specified)
 - `availability_bonus`: 1.0 if available, 0.5 if busy, 0 if unavailable
 - `speed_bonus`: Based on response_time if fast review requested
+
+## ContextVM Marketplace Methods
+
+Marketplace commands use kind `25910` with JSON-RPC 2.0 payloads.
+
+| Method | Direction | Purpose |
+|--------|-----------|---------|
+| `marketplace/assign` | Drydock → Reviewer | Offers a patch review assignment |
+| `marketplace/accept` | Reviewer → Drydock | Accepts an assignment |
+| `marketplace/reject` | Reviewer → Drydock | Declines an assignment with a reason |
+
+See [ContextVM Integration](contextvm-integration.md) for the shared request, response, and error format.
 
 ## Assignment Lifecycle
 
@@ -110,54 +135,77 @@ Where:
     └─────────┘         └──────────┘
 ```
 
-### Assignment Event (kind 1660)
+### Assignment Request (`marketplace/assign` on kind 25910)
 
 ```json
 {
-  "kind": 1660,
+  "kind": 25910,
   "content": {
-    "assignment_id": "abc123def456",
-    "patch_event_id": "...",
-    "repo_id": "github.com/user/project",
-    "languages": ["go", "rust"],
-    "price_sats": 5000,
-    "deadline": 1714003200
+    "jsonrpc": "2.0",
+    "id": "assign-abc123def456",
+    "method": "marketplace/assign",
+    "params": {
+      "assignment_id": "abc123def456",
+      "patch_event_id": "...",
+      "repo_id": "github.com/user/project",
+      "languages": ["go", "rust"],
+      "price_sats": 5000,
+      "deadline": 1714003200
+    }
   },
   "tags": [
     ["p", "<reviewer-pubkey>"],
     ["e", "<patch-event-id>"],
     ["a", "30617:<repo-naddr>"],
+    ["t", "drydock"],
+    ["method", "marketplace/assign"],
     ["expiration", "1714003200"]
   ]
 }
 ```
 
-### Acceptance Event (kind 1661)
+### Acceptance Request (`marketplace/accept` on kind 25910)
 
 ```json
 {
-  "kind": 1661,
+  "kind": 25910,
   "content": {
-    "assignment_id": "abc123def456",
-    "estimated_time": "2h"
+    "jsonrpc": "2.0",
+    "id": "accept-abc123def456",
+    "method": "marketplace/accept",
+    "params": {
+      "assignment_id": "abc123def456",
+      "estimated_time": "2h"
+    }
   },
   "tags": [
-    ["e", "<assignment-event-id>"]
+    ["p", "<drydock-pubkey>"],
+    ["e", "<assignment-event-id>"],
+    ["t", "drydock"],
+    ["method", "marketplace/accept"]
   ]
 }
 ```
 
-### Rejection Event (kind 1662)
+### Rejection Request (`marketplace/reject` on kind 25910)
 
 ```json
 {
-  "kind": 1662,
+  "kind": 25910,
   "content": {
-    "assignment_id": "abc123def456",
-    "reason": "Outside my expertise area"
+    "jsonrpc": "2.0",
+    "id": "reject-abc123def456",
+    "method": "marketplace/reject",
+    "params": {
+      "assignment_id": "abc123def456",
+      "reason": "Outside my expertise area"
+    }
   },
   "tags": [
-    ["e", "<assignment-event-id>"]
+    ["p", "<drydock-pubkey>"],
+    ["e", "<assignment-event-id>"],
+    ["t", "drydock"],
+    ["method", "marketplace/reject"]
   ]
 }
 ```
@@ -176,7 +224,7 @@ Reputation scores drive routing priority and trust:
 
 ### Calculation
 
-```
+```text
 acceptance_rate = accepted_assignments / total_assignments
 rating_normalized = average_rating / 5.0
 volume_bonus = 1 - (1 / (1 + completed_reviews / 10))
@@ -184,24 +232,23 @@ volume_bonus = 1 - (1 / (1 + completed_reviews / 10))
 overall_score = (acceptance_rate × 0.4) + (rating_normalized × 0.4) + (volume_bonus × 0.2)
 ```
 
-### Feedback Event (kind 1663)
+### Feedback Event (kind 7000)
 
-After a review is completed, the patch author can rate it:
+After a review is completed, the patch author can rate it with NIP-90 feedback:
 
 ```json
 {
-  "kind": 1663,
-  "content": {
-    "review_event_id": "...",
-    "reviewer_pubkey": "...",
-    "rating": 5,
-    "helpful": true,
-    "accurate": true,
-    "comment": "Excellent review, found a critical security issue"
-  },
+  "kind": 7000,
+  "content": "Excellent review, found a critical security issue",
   "tags": [
+    ["status", "success"],
     ["e", "<review-event-id>"],
-    ["p", "<reviewer-pubkey>"]
+    ["p", "<reviewer-pubkey>"],
+    ["rating", "5"],
+    ["helpful", "true"],
+    ["accurate", "true"],
+    ["t", "drydock"],
+    ["t", "review-feedback"]
   ]
 }
 ```
@@ -325,7 +372,7 @@ CREATE TABLE review_feedback (
 ### For Reviewers
 
 1. **Be Specific**: List exact languages and domains you're expert in
-2. **Set Realistic Availability**: Update when you're busy to avoid assignment expiry
+2. **Set Realistic Availability**: Update your NIP-89 profile when you're busy to avoid assignment expiry
 3. **Respond Quickly**: Fast acceptance improves your reputation
 4. **Provide Quality Reviews**: Ratings affect future assignments
 

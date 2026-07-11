@@ -10,7 +10,8 @@ Drydock is a Go-based NIP-34 automated code review agent. The core review pipeli
                         │  wss://relay.damus.io  wss://nos.lol   │
                         └──────┬──────────────────────▲───────────┘
                                │ subscribe            │ publish
-                               │ (NIP-34 kinds)       │ (kind 1111)
+                               │ NIP-34, 30078,       │ 1111, 25910,
+                               │ 25910, 31990         │ 7000
                                ▼                      │
 ┌──────────────────────────────────────────────────────┴──────────┐
 │                        drydock-core                             │
@@ -54,6 +55,27 @@ Drydock is a Go-based NIP-34 automated code review agent. The core review pipeli
        (optional)           (optional)          (optional)
 ```
 
+Nostr-native IDE and marketplace paths share the same relay fabric:
+
+```
+IDE / Editor
+    │
+    ├─ kind 30078  NIP-78 session state
+    └─ kind 25910  ContextVM review/request + review/apply-fix
+           │
+           ▼
+      IDE Gateway ──▶ Review Pipeline ──▶ Publisher ──kind 25910 result/error──▶ IDE / Editor
+
+Reviewer Marketplace
+    │
+    ├─ kind 31990  NIP-89 reviewer profiles for discovery
+    ├─ kind 25910  ContextVM marketplace/assign, accept, reject
+    └─ kind 7000   NIP-90 feedback and completion feedback
+           │
+           ▼
+      Marketplace Router ──▶ Reviewers ──▶ Review Pipeline / Publisher
+```
+
 ## Service Topology
 
 | Service | Binary | Required | Purpose |
@@ -68,6 +90,19 @@ Drydock is a Go-based NIP-34 automated code review agent. The core review pipeli
 - No embedding server → Qdrant cannot be used
 - No LSP bridge → symbols extracted via tree-sitter + callsites via ripgrep/git grep
 - No signer → listen-only mode (events ingested but no reviews published)
+
+## Event Layers
+
+Drydock models Nostr events in four protocol layers:
+
+| Layer | Purpose | Drydock Examples |
+|-------|---------|------------------|
+| Observable | Public facts that can be indexed and reacted to | NIP-34 patches/PRs (`1617`, `1618`, `1619`), comments (`1111`), marketplace feedback (`7000`) |
+| Intent | Commands or decisions addressed to a participant | ContextVM kind `25910` methods such as `review/request`, `review/apply-fix`, `marketplace/assign`, `marketplace/accept`, `marketplace/reject` |
+| Collection | Discoverable addressable records | NIP-89 reviewer profiles (`31990`) and NIP-34 repository announcements (`30617`) |
+| State | Replaceable current state | NIP-78 IDE sessions (`30078`) and repository snapshots (`30618`) |
+
+Private intent payloads should be wrapped with NIP-59 gift-wrap (`1059`) while keeping only non-sensitive routing tags visible.
 
 ## Package Map
 
@@ -87,6 +122,8 @@ Drydock is a Go-based NIP-34 automated code review agent. The core review pipeli
 | `vectorstore` | Qdrant REST API client — CRUD, search, scroll, collection management |
 | `embedding` | HTTP client for OpenAI-compatible embedding endpoints |
 | `nipingest` | Markdown NIP spec ingestion: chunk by heading, embed, upsert to Qdrant with content-hash dedup |
+| `idegateway` | IDE session and ContextVM review/fix protocol handler for kinds `30078` and `25910` |
+| `marketplace` | Reviewer discovery and assignment routing using kinds `31990`, `25910`, and `7000` |
 | `lspbridge` | Shared types + HTTP client for the LSP bridge sidecar |
 | `lspbridge/server` | LSP bridge HTTP server: process lifecycle manager, JSON-RPC 2.0 over stdio |
 | `db` | SQLite storage with WAL mode, migrations, and all state management queries |

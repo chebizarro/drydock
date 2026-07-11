@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"drydock/internal/db"
+
+	"fiatjaf.com/nostr"
 )
 
 func mustOpenStore(t *testing.T, ctx context.Context) *db.Store {
@@ -284,24 +286,139 @@ func TestEventKinds(t *testing.T) {
 		kind int
 	}{
 		{"KindReviewerProfile", KindReviewerProfile},
-		{"KindReviewAssignment", KindReviewAssignment},
-		{"KindReviewAcceptance", KindReviewAcceptance},
-		{"KindReviewRejection", KindReviewRejection},
 		{"KindReviewFeedback", KindReviewFeedback},
 	}
 
 	expectedKinds := map[int]bool{
-		30620: true, // Reviewer profile
-		1660:  true, // Assignment
-		1661:  true, // Acceptance
-		1662:  true, // Rejection
-		1663:  true, // Feedback
+		31990: true, // Reviewer profile (NIP-89 app handler)
+		7000:  true, // NIP-90 feedback
 	}
 
 	for _, tc := range tests {
 		if !expectedKinds[tc.kind] {
 			t.Errorf("%s = %d, not in expected kinds", tc.name, tc.kind)
 		}
+	}
+}
+
+func TestReviewerProfileNIP89Event(t *testing.T) {
+	profile := ReviewerProfile{
+		Pubkey:         "reviewer-pubkey",
+		DisplayName:    "Alice - Code Reviewer",
+		About:          "Security and performance specialist",
+		Languages:      []string{"go", "rust"},
+		Domains:        []string{"security", "performance"},
+		Availability:   AvailabilityAvailable,
+		PricePerReview: 1000,
+		MaxConcurrent:  3,
+		ResponseTime:   "24h",
+	}
+
+	event, err := ReviewerProfileEvent(profile)
+	if err != nil {
+		t.Fatalf("ReviewerProfileEvent failed: %v", err)
+	}
+	if int(event.Kind) != 31990 {
+		t.Fatalf("event kind = %d, want 31990", event.Kind)
+	}
+
+	wantTags := nostr.Tags{
+		{"d", "drydock-reviewer"},
+		{"k", "25910"},
+		{"name", "Alice - Code Reviewer"},
+		{"about", "Security and performance specialist"},
+		{"drydock:languages", "go", "rust"},
+		{"drydock:domains", "security", "performance"},
+		{"drydock:availability", "available"},
+		{"drydock:price", "1000"},
+		{"drydock:methods", "marketplace/assign", "marketplace/accept", "marketplace/reject"},
+	}
+	for _, want := range wantTags {
+		if !hasTag(event.Tags, want) {
+			t.Fatalf("missing tag %v in %v", want, event.Tags)
+		}
+	}
+
+	parsed, ok, err := ParseReviewerProfileEvent(event)
+	if err != nil {
+		t.Fatalf("ParseReviewerProfileEvent failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected Drydock NIP-89 reviewer profile")
+	}
+	if parsed.DisplayName != profile.DisplayName || parsed.About != profile.About {
+		t.Fatalf("parsed profile = %+v, want name/about from tags", parsed)
+	}
+	if len(parsed.Languages) != 2 || parsed.Languages[0] != "go" || parsed.Languages[1] != "rust" {
+		t.Fatalf("parsed languages = %v, want [go rust]", parsed.Languages)
+	}
+	if parsed.PricePerReview != 1000 || parsed.MaxConcurrent != 3 || parsed.ResponseTime != "24h" {
+		t.Fatalf("parsed profile = %+v, want price/max/response time", parsed)
+	}
+}
+
+func hasTag(tags nostr.Tags, want nostr.Tag) bool {
+	for _, tag := range tags {
+		if len(tag) != len(want) {
+			continue
+		}
+		matched := true
+		for i := range tag {
+			if tag[i] != want[i] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func TestReviewFeedbackTags(t *testing.T) {
+	tags := ReviewFeedbackTags("review123", "reviewer456", 5)
+
+	if tagValue(tags, "e") != "review123" {
+		t.Errorf("e tag = %q, want review123", tagValue(tags, "e"))
+	}
+	if tagValue(tags, "p") != "reviewer456" {
+		t.Errorf("p tag = %q, want reviewer456", tagValue(tags, "p"))
+	}
+	if tagValue(tags, "status") != FeedbackStatusSuccess {
+		t.Errorf("status tag = %q, want %q", tagValue(tags, "status"), FeedbackStatusSuccess)
+	}
+	if tagValue(tags, "rating") != "5" {
+		t.Errorf("rating tag = %q, want 5", tagValue(tags, "rating"))
+	}
+	if tagValue(tags, "t") != TagReviewFeedback {
+		t.Errorf("t tag = %q, want %q", tagValue(tags, "t"), TagReviewFeedback)
+	}
+}
+
+func TestParseReviewFeedbackEventReadsRatingFromTag(t *testing.T) {
+	event := nostr.Event{
+		Kind:    KindReviewFeedback,
+		Tags:    ReviewFeedbackTags("review123", "reviewer456", 5),
+		Content: `{"helpful":true,"accurate":true,"comment":"Great review!","rating":1}`,
+	}
+
+	feedback, err := ParseReviewFeedbackEvent(event)
+	if err != nil {
+		t.Fatalf("ParseReviewFeedbackEvent failed: %v", err)
+	}
+
+	if feedback.Rating != 5 {
+		t.Errorf("Rating = %d, want 5", feedback.Rating)
+	}
+	if feedback.ReviewEventID != "review123" {
+		t.Errorf("ReviewEventID = %q, want review123", feedback.ReviewEventID)
+	}
+	if feedback.ReviewerPubkey != "reviewer456" {
+		t.Errorf("ReviewerPubkey = %q, want reviewer456", feedback.ReviewerPubkey)
+	}
+	if !feedback.Helpful || !feedback.Accurate || feedback.Comment != "Great review!" {
+		t.Errorf("feedback content not parsed: %+v", feedback)
 	}
 }
 

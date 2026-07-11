@@ -13,6 +13,8 @@ import (
 
 	"drydock/internal/db"
 	"drydock/internal/metrics"
+
+	"fiatjaf.com/nostr"
 )
 
 // Registry tracks registered reviewers and their profiles.
@@ -32,6 +34,17 @@ type cachedReviewer struct {
 }
 
 const cacheExpiry = 5 * time.Minute
+
+// ReviewerProfileQueryFilter scopes Nostr queries to Drydock reviewer NIP-89 app handlers.
+func ReviewerProfileQueryFilter() nostr.Filter {
+	return nostr.Filter{
+		Kinds: []nostr.Kind{nostr.Kind(KindReviewerProfile)},
+		Tags: nostr.TagMap{
+			"d": []string{ReviewerProfileDTag},
+			"k": []string{ReviewerProfileHandledKind},
+		},
+	}
+}
 
 // NewRegistry creates a reviewer registry.
 func NewRegistry(store *db.Store, logger *slog.Logger) *Registry {
@@ -378,10 +391,10 @@ func (r *Registry) RecordAcceptance(ctx context.Context, acceptance ReviewAccept
 	if err != nil {
 		return fmt.Errorf("find assignment: %w", err)
 	}
-	if err := validatePendingAssignmentTransition(assignment, acceptance.ReviewerPubkey); err != nil {
+	if err := validateAssignmentTransition(assignment, acceptance.ReviewerPubkey); err != nil {
 		return err
 	}
-	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "accepted", acceptance.EventID)
+	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "accepted", "")
 }
 
 // RecordRejection records that a reviewer rejected an assignment.
@@ -390,21 +403,21 @@ func (r *Registry) RecordRejection(ctx context.Context, rejection ReviewRejectio
 	if err != nil {
 		return fmt.Errorf("find assignment: %w", err)
 	}
-	if err := validatePendingAssignmentTransition(assignment, rejection.ReviewerPubkey); err != nil {
+	if err := validateAssignmentTransition(assignment, rejection.ReviewerPubkey); err != nil {
 		return err
 	}
-	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "rejected", rejection.EventID)
+	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "rejected", "")
 }
 
-func validatePendingAssignmentTransition(assignment *db.ReviewAssignment, senderPubkey string) error {
-	if assignment.ReviewerPubkey != senderPubkey {
-		return fmt.Errorf("unauthorized reviewer: sender %s is not assigned reviewer %s", senderPubkey, assignment.ReviewerPubkey)
+func validateAssignmentTransition(assignment *db.ReviewAssignment, reviewerPubkey string) error {
+	if reviewerPubkey == "" || assignment.ReviewerPubkey != reviewerPubkey {
+		return fmt.Errorf("unauthorized reviewer: sender %s is not assigned reviewer %s", reviewerPubkey, assignment.ReviewerPubkey)
 	}
 	if assignment.Status != "pending" {
-		return fmt.Errorf("assignment %s is not pending: status=%s", assignment.AssignmentEventID, assignment.Status)
+		return fmt.Errorf("assignment %s is not pending: %s", assignment.AssignmentEventID, assignment.Status)
 	}
-	if assignment.ExpiresAt > 0 && assignment.ExpiresAt <= time.Now().Unix() {
-		return fmt.Errorf("assignment %s is expired", assignment.AssignmentEventID)
+	if assignment.ExpiresAt > 0 && time.Now().Unix() > assignment.ExpiresAt {
+		return fmt.Errorf("assignment %s expired", assignment.AssignmentEventID)
 	}
 	return nil
 }
@@ -414,19 +427,13 @@ func (r *Registry) RecordFeedback(ctx context.Context, feedback ReviewFeedback) 
 	if !IsValidRating(feedback.Rating) {
 		return fmt.Errorf("invalid rating: %d", feedback.Rating)
 	}
-	if feedback.RaterPubkey == "" {
-		return fmt.Errorf("feedback rater pubkey is required")
-	}
 
 	assignment, err := r.feedbackAssignment(ctx, feedback)
 	if err != nil {
 		return err
 	}
-	if assignment.Status != "completed" {
-		return fmt.Errorf("assignment %s is not completed: status=%s", assignment.AssignmentEventID, assignment.Status)
-	}
-	if assignment.ReviewerPubkey != feedback.ReviewerPubkey && feedback.ReviewerPubkey != "" {
-		return fmt.Errorf("feedback reviewer %s does not match assignment reviewer %s", feedback.ReviewerPubkey, assignment.ReviewerPubkey)
+	if feedback.ReviewerPubkey == "" {
+		feedback.ReviewerPubkey = assignment.ReviewerPubkey
 	}
 	if err := r.authorizeFeedbackRater(ctx, assignment, feedback.RaterPubkey); err != nil {
 		return err
@@ -461,20 +468,9 @@ func (r *Registry) feedbackAssignment(ctx context.Context, feedback ReviewFeedba
 	if feedback.ReviewEventID == "" {
 		return nil, fmt.Errorf("feedback assignment_id or review_event_id is required")
 	}
-
-	var assignmentID int
-	err := r.store.DB().QueryRowContext(ctx, `
-		SELECT id FROM review_assignments WHERE completion_event_id = ?
-	`, feedback.ReviewEventID).Scan(&assignmentID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("feedback references unknown completed review: %s", feedback.ReviewEventID)
-	}
+	assignment, err := r.store.GetAssignmentByCompletionEventID(ctx, feedback.ReviewEventID)
 	if err != nil {
 		return nil, fmt.Errorf("find assignment by review event: %w", err)
-	}
-	assignment, err := r.store.GetAssignmentByID(ctx, assignmentID)
-	if err != nil {
-		return nil, fmt.Errorf("find feedback assignment: %w", err)
 	}
 	return assignment, nil
 }
@@ -487,7 +483,7 @@ func (r *Registry) authorizeFeedbackRater(ctx context.Context, assignment *db.Re
 	if err == nil && patchAuthor == raterPubkey {
 		return nil
 	}
-	if err != nil && assignment.RequesterPubkey == "" {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) && assignment.RequesterPubkey == "" {
 		return fmt.Errorf("resolve assignment requester: %w", err)
 	}
 	return fmt.Errorf("unauthorized feedback rater: sender %s is not requester/patch author", raterPubkey)

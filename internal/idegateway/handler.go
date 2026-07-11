@@ -127,8 +127,8 @@ func (h *Handler) HandleEvent(ctx context.Context, event nostr.Event, relayURL s
 	switch int(event.Kind) {
 	case KindIDESession:
 		return h.handleSession(ctx, event, relayURL)
-	case KindIDECommand:
-		return h.handleContextVMCommand(ctx, event, relayURL)
+	case KindContextVM:
+		return h.handleContextVMEvent(ctx, event, relayURL)
 	default:
 		return nil
 	}
@@ -136,7 +136,7 @@ func (h *Handler) HandleEvent(ctx context.Context, event nostr.Event, relayURL s
 
 // HandledKinds returns the Nostr kinds accepted by the IDE gateway.
 func HandledKinds() []nostr.Kind {
-	return []nostr.Kind{nostr.Kind(KindIDESession), nostr.Kind(KindIDECommand)}
+	return []nostr.Kind{nostr.Kind(KindIDESession), nostr.Kind(KindContextVM)}
 }
 
 // IsHandled checks if a Nostr kind is accepted by the IDE gateway.
@@ -149,32 +149,9 @@ func IsHandled(kind nostr.Kind) bool {
 	return false
 }
 
-// IsIDEEvent checks if an event kind is handled by IDE integration.
+// IsIDEEvent checks if an event is an IDE integration event.
 func IsIDEEvent(kind nostr.Kind) bool {
 	return IsHandled(kind)
-}
-
-func (h *Handler) handleContextVMCommand(ctx context.Context, event nostr.Event, relayURL string) error {
-	msg, err := contextvm.ParseMessage(event.Content)
-	if err != nil {
-		h.logger.Warn("invalid ContextVM IDE command", "event_id", event.ID.Hex(), "error", err)
-		return nil
-	}
-	if msg.ID == "" || msg.Method == "" {
-		h.logger.Warn("ContextVM IDE command missing id or method", "event_id", event.ID.Hex(), "method", msg.Method)
-		return nil
-	}
-
-	paramsEvent := event
-	paramsEvent.Content = string(msg.Params)
-	switch msg.Method {
-	case MethodIDEReview:
-		return h.handleReviewRequest(ctx, paramsEvent, relayURL, msg.ID)
-	case MethodIDEApplyFix:
-		return h.handleFixRequest(ctx, paramsEvent, relayURL, msg.ID)
-	default:
-		return nil
-	}
 }
 
 // handleSession registers or updates an IDE workspace session.
@@ -185,10 +162,14 @@ func (h *Handler) handleSession(ctx context.Context, event nostr.Event, relayURL
 		return nil
 	}
 
-	// Extract session ID from "d" tag.
+	// Extract session ID from NIP-78 "d" tag.
 	for _, tag := range event.Tags {
 		if len(tag) >= 2 && tag[0] == "d" {
-			session.SessionID = tag[1]
+			if strings.HasPrefix(tag[1], BuildSessionDTag("")) {
+				session.SessionID = strings.TrimPrefix(tag[1], BuildSessionDTag(""))
+			} else if session.SessionID == "" {
+				session.SessionID = tag[1]
+			}
 			break
 		}
 	}
@@ -227,8 +208,119 @@ func (h *Handler) handleSession(ctx context.Context, event nostr.Event, relayURL
 	return nil
 }
 
-// handleReviewRequest processes an IDE review request.
-func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, relayURL string, contextVMID string) error {
+// RegisterContextVMHandlers registers IDE gateway ContextVM methods.
+func (h *Handler) RegisterContextVMHandlers(router *contextvm.Router) error {
+	if err := router.Register(MethodReviewRequest, h.HandleReviewRequest); err != nil {
+		return err
+	}
+	return router.Register(MethodApplyFix, h.HandleApplyFixRequest)
+}
+
+// handleContextVMEvent routes IDE ContextVM requests and publishes JSON-RPC responses.
+func (h *Handler) handleContextVMEvent(ctx context.Context, event nostr.Event, relayURL string) error {
+	var msg contextvm.Message
+	if err := json.Unmarshal([]byte(event.Content), &msg); err != nil {
+		h.logger.Warn("invalid ContextVM message", "event_id", event.ID.Hex(), "error", err)
+		return h.publishContextVMResponse(ctx, event, contextvm.Message{
+			JSONRPC: "2.0",
+			ID:      event.ID.Hex(),
+			Error:   &contextvm.Error{Code: contextvm.ErrorParseError, Message: "parse error"},
+		}, relayURL, "")
+	}
+
+	// Ignore responses and methods owned by other ContextVM handlers.
+	if msg.Method == "" || (msg.Method != MethodReviewRequest && msg.Method != MethodApplyFix) {
+		return nil
+	}
+
+	router := contextvm.NewRouter()
+	if err := h.RegisterContextVMHandlers(router); err != nil {
+		return err
+	}
+	resp, err := router.Handle(ctx, contextvm.Request{
+		Event:  event,
+		Relay:  relayURL,
+		Sender: event.PubKey,
+		Msg:    msg,
+	})
+	if err != nil {
+		h.logger.Warn("ContextVM handler failed", "event_id", event.ID.Hex(), "method", msg.Method, "error", err)
+	}
+
+	sessionID := ""
+	switch msg.Method {
+	case MethodReviewRequest:
+		if req, rpcErr := contextvm.ParamsAs[ReviewRequest](contextvm.Request{Msg: msg}); rpcErr == nil {
+			sessionID = req.SessionID
+		}
+	case MethodApplyFix:
+		if req, rpcErr := contextvm.ParamsAs[FixRequest](contextvm.Request{Msg: msg}); rpcErr == nil {
+			sessionID = req.SessionID
+		}
+	}
+
+	if pubErr := h.publishContextVMResponse(ctx, event, resp, relayURL, sessionID); pubErr != nil {
+		return pubErr
+	}
+	if msg.Method == MethodApplyFix {
+		metrics.IDEFixResponsesSent.Inc()
+	}
+	return err
+}
+
+// HandleReviewRequest processes a ContextVM IDE review request.
+func (h *Handler) HandleReviewRequest(ctx context.Context, rpcReq contextvm.Request) (any, *contextvm.Error) {
+	req, rpcErr := contextvm.ParamsAs[ReviewRequest](rpcReq)
+	if rpcErr != nil {
+		h.logger.Warn("invalid review request params", "event_id", rpcReq.Event.ID.Hex(), "error", rpcErr.Message)
+		return nil, rpcErr
+	}
+	if req.RequestID == "" {
+		req.RequestID = rpcReq.Msg.ID
+	}
+	if req.SessionID == "" || req.RequestID == "" {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "session_id and request_id are required"}
+	}
+	if !h.validateRequestEnvelope(rpcReq.Event, req.SessionID, req.RequestID) {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: "request is not addressed to this IDE session/gateway"}
+	}
+	resp, err := h.processReviewRequest(ctx, rpcReq.Event, rpcReq.Relay, req)
+	if err != nil {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+	}
+	return resp, nil
+}
+
+// HandleApplyFixRequest processes a ContextVM IDE fix application request.
+func (h *Handler) HandleApplyFixRequest(ctx context.Context, rpcReq contextvm.Request) (any, *contextvm.Error) {
+	metrics.IDEFixRequestsReceived.Inc()
+
+	req, rpcErr := contextvm.ParamsAs[FixRequest](rpcReq)
+	if rpcErr != nil {
+		h.logger.Warn("invalid fix request params", "event_id", rpcReq.Event.ID.Hex(), "error", rpcErr.Message)
+		return nil, rpcErr
+	}
+	if req.RequestID == "" {
+		req.RequestID = rpcReq.Msg.ID
+	}
+	if req.SessionID == "" || req.RequestID == "" {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "session_id and request_id are required"}
+	}
+	if !h.validateRequestEnvelope(rpcReq.Event, req.SessionID, req.RequestID) {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: "request is not addressed to this IDE session/gateway"}
+	}
+
+	resp, err := h.resolveFixRequest(ctx, rpcReq.Event, req)
+	if err != nil {
+		h.logger.Warn("fix request failed", "request_id", req.RequestID, "fix_id", req.FixID, "error", err.Message)
+		return nil, err
+	}
+	h.logger.Info("IDE fix response created", "request_id", req.RequestID, "fix_id", req.FixID, "success", resp.Success)
+	return resp, nil
+}
+
+// processReviewRequest processes an IDE review request.
+func (h *Handler) processReviewRequest(ctx context.Context, event nostr.Event, _ string, req ReviewRequest) (ReviewResponse, error) {
 	metrics.IDEReviewRequestsReceived.Inc()
 
 	// Acquire semaphore slot.
@@ -236,30 +328,12 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 	case h.sem <- struct{}{}:
 		defer func() { <-h.sem }()
 	case <-ctx.Done():
-		return ctx.Err()
+		return ReviewResponse{}, ctx.Err()
 	}
 
-	req, err := ParseReviewRequest(event.Content)
-	if err != nil {
-		h.logger.Warn("invalid review request", "event_id", event.ID.Hex(), "error", err)
-		return nil
-	}
-
-	if req.RequestID != "" && req.RequestID != contextVMID {
-		h.logger.Warn("review request_id does not match ContextVM id", "event_id", event.ID.Hex(), "request_id", req.RequestID, "contextvm_id", contextVMID)
-		return nil
-	}
-	req.RequestID = contextVMID
-	if req.SessionID == "" || req.RequestID == "" {
-		h.logger.Warn("review request missing session_id or request_id", "event_id", event.ID.Hex())
-		return nil
-	}
-	if !h.validateRequestEnvelope(event, req.SessionID, req.RequestID) {
-		return nil
-	}
 	if req.Diff == "" {
 		h.logger.Debug("empty diff in review request", "event_id", event.ID.Hex())
-		return nil
+		return ReviewResponse{}, fmt.Errorf("empty diff in review request")
 	}
 
 	// Look up the session and verify the request author owns it.
@@ -268,7 +342,7 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 	if !ok || session.PubKey == "" || !strings.EqualFold(session.PubKey, event.PubKey.Hex()) {
 		h.mu.Unlock()
 		h.logger.Warn("rejecting review request from unauthorized session sender", "event_id", event.ID.Hex(), "session_id", req.SessionID)
-		return nil
+		return ReviewResponse{}, fmt.Errorf("unauthorized IDE session sender")
 	}
 	session.LastSeen = time.Now()
 	repoPath := session.Session.WorkspacePath
@@ -288,7 +362,7 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 	})
 	if err != nil {
 		h.logger.Warn("context build failed", "request_id", req.RequestID, "error", err)
-		return h.publishErrorResponse(ctx, event, req, relayURL, "Failed to build context: "+err.Error())
+		return ReviewResponse{}, fmt.Errorf("failed to build context: %w", err)
 	}
 
 	// Run the review engine.
@@ -299,7 +373,7 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 	})
 	if err != nil {
 		h.logger.Warn("review engine failed", "request_id", req.RequestID, "error", err)
-		return h.publishErrorResponse(ctx, event, req, relayURL, "Review failed: "+err.Error())
+		return ReviewResponse{}, fmt.Errorf("review failed: %w", err)
 	}
 
 	// Convert findings to diagnostics.
@@ -328,104 +402,69 @@ func (h *Handler) handleReviewRequest(ctx context.Context, event nostr.Event, re
 		ReviewTimeMs: time.Since(start).Milliseconds(),
 	}
 
-	// Publish response.
-	if err := h.publishReviewResponse(ctx, event, response, relayURL); err != nil {
-		metrics.IDEReviewErrors.Inc()
-		return err
-	}
-
 	metrics.IDEReviewResponsesSent.Inc()
-	h.logger.Info("IDE review response sent",
+	h.logger.Info("IDE review response created",
 		"request_id", req.RequestID,
 		"diagnostics", len(diagnostics),
 		"time_ms", response.ReviewTimeMs,
 	)
 
-	return nil
+	return response, nil
 }
 
-// handleFixRequest processes an IDE fix application request.
-func (h *Handler) handleFixRequest(ctx context.Context, event nostr.Event, relayURL string, contextVMID string) error {
-	metrics.IDEFixRequestsReceived.Inc()
-
-	req, err := ParseFixRequest(event.Content)
-	if err != nil {
-		h.logger.Warn("invalid fix request", "event_id", event.ID.Hex(), "error", err)
-		return nil
-	}
-
-	if req.RequestID != "" && req.RequestID != contextVMID {
-		h.logger.Warn("fix request_id does not match ContextVM id", "event_id", event.ID.Hex(), "request_id", req.RequestID, "contextvm_id", contextVMID)
-		return nil
-	}
-	req.RequestID = contextVMID
-	if req.SessionID == "" || req.RequestID == "" {
-		h.logger.Warn("fix request missing session_id or request_id", "event_id", event.ID.Hex())
-		return nil
-	}
-	if !h.validateRequestEnvelope(event, req.SessionID, req.RequestID) {
-		return nil
-	}
-
+func (h *Handler) resolveFixRequest(ctx context.Context, event nostr.Event, req FixRequest) (FixResponse, *contextvm.Error) {
 	now := time.Now()
 	h.cleanupExpiredFixes(ctx, now)
 
 	response := FixResponse{
 		RequestID: req.RequestID,
 		SessionID: req.SessionID,
+		FixID:     req.FixID,
 	}
 
 	fix, ok := h.lookupFix(ctx, req.FixID, req.SessionID, now)
 	if ok && fix.AuthorPubKey != "" && !strings.EqualFold(fix.AuthorPubKey, event.PubKey.Hex()) {
-		h.logger.Warn("rejecting fix request from unauthorized sender", "event_id", event.ID.Hex(), "session_id", req.SessionID)
-		return nil
+		return response, &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: "fix does not belong to this requester"}
 	}
 	switch {
 	case req.FixID == "":
-		response.Success = false
-		response.Error = "missing fix_id"
+		return response, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "missing fix_id"}
 	case !ok:
-		response.Success = false
-		response.Error = "fix not found or expired"
+		return response, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "fix not found or expired"}
 	case fix.SessionID != req.SessionID:
-		response.Success = false
-		response.Error = "fix does not belong to this session"
+		return response, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "fix does not belong to this session"}
 	case req.File != "" && fix.File != "" && fix.File != req.File:
-		response.Success = false
-		response.Error = "fix does not match requested file"
+		return response, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "fix does not match requested file"}
 	default:
 		response.Success = true
+		response.Patch = fix.Diff
 		response.Diff = fix.Diff
 	}
 
-	if err := h.publishFixResponse(ctx, event, response, relayURL); err != nil {
-		return err
-	}
-
-	metrics.IDEFixResponsesSent.Inc()
-	h.logger.Info("IDE fix response sent", "request_id", req.RequestID, "success", response.Success)
-
-	return nil
+	return response, nil
 }
 
-// publishReviewResponse publishes a ContextVM review response event.
+// publishReviewResponse publishes a ContextVM JSON-RPC review response event.
 func (h *Handler) publishReviewResponse(ctx context.Context, reqEvent nostr.Event, resp ReviewResponse, relayURL string) error {
-	content, err := contextvm.MarshalResult(resp.RequestID, resp)
+	rpcResp := JSONRPCResponse{
+		JSONRPC: "2.0",
+		ID:      resp.RequestID,
+		Result:  resp,
+	}
+
+	content, err := json.Marshal(rpcResp)
 	if err != nil {
 		return fmt.Errorf("marshal response: %w", err)
 	}
 
 	responseEvent := nostr.Event{
-		Kind:      nostr.Kind(KindIDEReviewResponse),
+		Kind:      nostr.Kind(KindContextVM),
 		CreatedAt: nostr.Now(),
-		Content:   content,
+		Content:   string(content),
 		Tags: nostr.Tags{
-			{"e", reqEvent.ID.Hex()},     // Reference the request event
+			{"e", reqEvent.ID.Hex()},     // Reference the request
 			{"p", reqEvent.PubKey.Hex()}, // Tag the requester
 			{"session", resp.SessionID},  // Session reference
-			{"request", resp.RequestID},  // ContextVM request correlation
-			{"method", MethodIDEReview},
-			{"t", "drydock-ide"},
 		},
 	}
 
@@ -452,25 +491,26 @@ func (h *Handler) publishErrorResponse(ctx context.Context, reqEvent nostr.Event
 	return h.publishReviewResponse(ctx, reqEvent, resp, relayURL)
 }
 
-// publishFixResponse publishes a ContextVM fix response event.
-func (h *Handler) publishFixResponse(ctx context.Context, reqEvent nostr.Event, resp FixResponse, relayURL string) error {
-	content, err := contextvm.MarshalResult(resp.RequestID, resp)
+// publishContextVMResponse publishes a ContextVM JSON-RPC response event.
+func (h *Handler) publishContextVMResponse(ctx context.Context, reqEvent nostr.Event, resp contextvm.Message, relayURL, sessionID string) error {
+	content, err := json.Marshal(resp)
 	if err != nil {
 		return fmt.Errorf("marshal response: %w", err)
 	}
 
+	tags := nostr.Tags{
+		{"e", reqEvent.ID.Hex()},
+		{"p", reqEvent.PubKey.Hex()},
+	}
+	if sessionID != "" {
+		tags = append(tags, nostr.Tag{"session", sessionID})
+	}
+
 	responseEvent := nostr.Event{
-		Kind:      nostr.Kind(KindIDEFixResponse),
+		Kind:      nostr.Kind(KindContextVM),
 		CreatedAt: nostr.Now(),
-		Content:   content,
-		Tags: nostr.Tags{
-			{"e", reqEvent.ID.Hex()},
-			{"p", reqEvent.PubKey.Hex()},
-			{"session", resp.SessionID},
-			{"request", resp.RequestID},
-			{"method", MethodIDEApplyFix},
-			{"t", "drydock-ide"},
-		},
+		Content:   string(content),
+		Tags:      tags,
 	}
 
 	if err := h.signer.SignEvent(ctx, &responseEvent); err != nil {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"drydock/internal/contextvm"
 	"drydock/internal/db"
 	"drydock/internal/metrics"
 	"drydock/internal/ratelimit"
@@ -42,18 +43,30 @@ func (h *Handler) WithFeedbackLimiter(limiter *ratelimit.Limiter) *Handler {
 	return h
 }
 
+// RegisterContextVMMethods registers marketplace intent handlers on a ContextVM router.
+func (h *Handler) RegisterContextVMMethods(router *contextvm.Router) error {
+	if router == nil {
+		return errors.New("contextvm router is required")
+	}
+	return errors.Join(
+		router.Register(MethodAssign, h.HandleAssignmentIntent),
+		router.Register(MethodAccept, h.handleContextVMAcceptance),
+		router.Register(MethodReject, h.handleContextVMRejection),
+	)
+}
+
 // HandleEvent processes a marketplace event.
 func (h *Handler) HandleEvent(ctx context.Context, event nostr.Event, relayURL string) error {
 	switch event.Kind {
 	case KindReviewerProfile:
 		return h.handleReviewerProfile(ctx, event)
-	case KindReviewAssignment:
-		return h.handleAssignment(ctx, event)
-	case KindReviewAcceptance:
-		return h.handleAcceptance(ctx, event)
-	case KindReviewRejection:
-		return h.handleRejection(ctx, event)
 	case KindReviewFeedback:
+		if tagValue(event.Tags, "t") != TagReviewFeedback {
+			h.logger.Debug("ignoring non-marketplace NIP-90 feedback",
+				"event_id", event.ID.Hex(),
+			)
+			return nil
+		}
 		return h.handleFeedback(ctx, event)
 	default:
 		h.logger.Debug("ignoring unknown marketplace event kind",
@@ -66,24 +79,22 @@ func (h *Handler) HandleEvent(ctx context.Context, event nostr.Event, relayURL s
 
 // handleReviewerProfile processes a reviewer profile announcement.
 func (h *Handler) handleReviewerProfile(ctx context.Context, event nostr.Event) error {
-	var profile ReviewerProfile
-	if err := json.Unmarshal([]byte(event.Content), &profile); err != nil {
+	profile, ok, err := ParseReviewerProfileEvent(event)
+	if err != nil {
 		h.logger.Warn("failed to parse reviewer profile",
 			"event_id", event.ID.Hex(),
 			"error", err,
 		)
 		return nil // don't error on malformed events
 	}
+	if !ok {
+		h.logger.Debug("ignoring non-drydock NIP-89 app handler",
+			"event_id", event.ID.Hex(),
+		)
+		return nil
+	}
 
 	profile.Pubkey = event.PubKey.Hex()
-
-	// Extract d-tag for identifier (standard NIP-33 replaceable event)
-	for _, tag := range event.Tags {
-		if len(tag) >= 2 && tag[0] == "d" {
-			// d-tag is the stable identifier; pubkey is still the key
-			break
-		}
-	}
 
 	if err := h.registry.RegisterReviewer(ctx, profile, event.ID.Hex()); err != nil {
 		h.logger.Error("failed to register reviewer",
@@ -102,70 +113,86 @@ func (h *Handler) handleReviewerProfile(ctx context.Context, event nostr.Event) 
 	return nil
 }
 
-// handleAssignment processes a review assignment event.
-func (h *Handler) handleAssignment(ctx context.Context, event nostr.Event) error {
-	// Assignment events are created by the router, not ingested externally.
-	// This handler is for assignments created by other nodes in the network.
-	var assignment struct {
-		AssignmentID   string `json:"assignment_id"`
-		PatchEventID   string `json:"patch_event_id"`
-		RepoID         string `json:"repo_id"`
-		ReviewerPubkey string `json:"reviewer_pubkey"`
-		Priority       int    `json:"priority"`
-		PriceSats      int64  `json:"price_sats"`
-		Deadline       int64  `json:"deadline"`
-		ExpiresAt      int64  `json:"expires_at"`
+// HandleAssignmentIntent processes a ContextVM marketplace/assign intent.
+func (h *Handler) HandleAssignmentIntent(ctx context.Context, req contextvm.Request) (any, *contextvm.Error) {
+	assignment, rpcErr := contextvm.ParamsAs[ReviewAssignment](req)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if assignment.AssignmentID == "" || assignment.PatchEventID == "" || assignment.RepoID == "" {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "assignment_id, patch_event_id, and repo_id are required"}
+	}
+	if assignment.ReviewerPubkey == "" {
+		assignment.ReviewerPubkey = tagValue(req.Event.Tags, "p")
+	}
+	if assignment.CreatedAt == 0 {
+		assignment.CreatedAt = int64(req.Event.CreatedAt)
+	}
+	assignmentEventID := req.Msg.ID
+	if assignmentEventID == "" {
+		assignmentEventID = req.Event.ID.Hex()
+	}
+	requesterPubkey, err := h.authorizeAssignmentIntent(ctx, req.Sender.Hex(), assignment.PatchEventID, assignment.RepoID, assignment.PriceSats)
+	if err != nil {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: err.Error()}
 	}
 
-	if err := json.Unmarshal([]byte(event.Content), &assignment); err != nil {
-		h.logger.Warn("failed to parse assignment event",
-			"event_id", event.ID.Hex(),
+	if err := h.store.CreateAssignment(ctx, db.ReviewAssignment{
+		PatchEventID:      assignment.PatchEventID,
+		RepoID:            assignment.RepoID,
+		ReviewerPubkey:    assignment.ReviewerPubkey,
+		RequesterPubkey:   requesterPubkey,
+		Status:            "pending",
+		Priority:          2,
+		PriceSats:         assignment.PriceSats,
+		AssignmentEventID: assignmentEventID,
+		ExpiresAt:         assignment.Deadline,
+	}); err != nil {
+		h.logger.Error("failed to store contextvm assignment",
+			"assignment_id", assignment.AssignmentID,
 			"error", err,
 		)
+		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+	}
+
+	metrics.MarketplaceAssignmentsCreated.Inc()
+
+	h.logger.Info("stored contextvm review assignment",
+		"assignment_id", assignment.AssignmentID,
+		"patch_event_id", assignment.PatchEventID,
+		"reviewer", assignment.ReviewerPubkey,
+	)
+
+	return map[string]string{"status": "stored", "assignment_id": assignment.AssignmentID}, nil
+}
+
+// handleAssignment processes a legacy review assignment event for compatibility with older tests/helpers.
+// Live assignment delivery uses ContextVM MethodAssign.
+func (h *Handler) handleAssignment(ctx context.Context, event nostr.Event) error {
+	var assignment ReviewAssignment
+	if err := json.Unmarshal([]byte(event.Content), &assignment); err != nil {
+		h.logger.Warn("failed to parse assignment event", "event_id", event.ID.Hex(), "error", err)
 		return nil
 	}
 	assignmentEventID := assignment.AssignmentID
 	if assignmentEventID == "" {
 		assignmentEventID = event.ID.Hex()
 	}
-	expiresAt := assignment.ExpiresAt
-	if expiresAt == 0 {
-		expiresAt = assignment.Deadline
-	}
 	requesterPubkey, err := h.authorizeAssignmentIntent(ctx, event.PubKey.Hex(), assignment.PatchEventID, assignment.RepoID, assignment.PriceSats)
 	if err != nil {
 		return err
 	}
-
-	// Store the assignment
-	err = h.store.CreateAssignment(ctx, db.ReviewAssignment{
+	return h.store.CreateAssignment(ctx, db.ReviewAssignment{
 		PatchEventID:      assignment.PatchEventID,
 		RepoID:            assignment.RepoID,
 		ReviewerPubkey:    assignment.ReviewerPubkey,
 		RequesterPubkey:   requesterPubkey,
 		Status:            "pending",
-		Priority:          assignment.Priority,
+		Priority:          2,
 		PriceSats:         assignment.PriceSats,
 		AssignmentEventID: assignmentEventID,
-		ExpiresAt:         expiresAt,
+		ExpiresAt:         assignment.Deadline,
 	})
-	if err != nil {
-		h.logger.Error("failed to store assignment",
-			"event_id", event.ID.Hex(),
-			"error", err,
-		)
-		return err
-	}
-
-	metrics.MarketplaceAssignmentsCreated.Inc()
-
-	h.logger.Info("stored review assignment",
-		"event_id", event.ID.Hex(),
-		"patch_event_id", assignment.PatchEventID,
-		"reviewer", assignment.ReviewerPubkey,
-	)
-
-	return nil
 }
 
 func (h *Handler) authorizeAssignmentIntent(ctx context.Context, senderPubkey, patchEventID, repoID string, priceSats int64) (string, error) {
@@ -211,14 +238,40 @@ func (h *Handler) authorizeAssignmentIntent(ctx context.Context, senderPubkey, p
 	return patchAuthor, nil
 }
 
-// handleAcceptance processes an assignment acceptance event.
-func (h *Handler) handleAcceptance(ctx context.Context, event nostr.Event) error {
-	return h.router.HandleAcceptance(ctx, event)
+// handleContextVMAcceptance processes a ContextVM assignment acceptance intent.
+func (h *Handler) handleContextVMAcceptance(ctx context.Context, req contextvm.Request) (any, *contextvm.Error) {
+	if _, rpcErr := contextvm.ParamsAs[ReviewAcceptance](req); rpcErr != nil {
+		return nil, rpcErr
+	}
+	event := req.Event
+	event.Content = string(req.Msg.Params)
+	event.PubKey = req.Sender
+	if err := h.router.HandleAcceptance(ctx, event); err != nil {
+		h.logger.Error("failed to handle marketplace acceptance intent",
+			"event_id", req.Event.ID.Hex(),
+			"error", err,
+		)
+		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+	}
+	return map[string]string{"status": "accepted"}, nil
 }
 
-// handleRejection processes an assignment rejection event.
-func (h *Handler) handleRejection(ctx context.Context, event nostr.Event) error {
-	return h.router.HandleRejection(ctx, event)
+// handleContextVMRejection processes a ContextVM assignment rejection intent.
+func (h *Handler) handleContextVMRejection(ctx context.Context, req contextvm.Request) (any, *contextvm.Error) {
+	if _, rpcErr := contextvm.ParamsAs[ReviewRejection](req); rpcErr != nil {
+		return nil, rpcErr
+	}
+	event := req.Event
+	event.Content = string(req.Msg.Params)
+	event.PubKey = req.Sender
+	if err := h.router.HandleRejection(ctx, event); err != nil {
+		h.logger.Error("failed to handle marketplace rejection intent",
+			"event_id", req.Event.ID.Hex(),
+			"error", err,
+		)
+		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+	}
+	return map[string]string{"status": "rejected"}, nil
 }
 
 // handleFeedback processes review feedback/rating events.
@@ -240,22 +293,23 @@ func (h *Handler) handleFeedback(ctx context.Context, event nostr.Event) error {
 		}
 	}
 
-	var feedback ReviewFeedback
-
-	if err := json.Unmarshal([]byte(event.Content), &feedback); err != nil {
-		h.logger.Warn("failed to parse feedback event",
-			"event_id", event.ID.Hex(),
-			"error", err,
-		)
-		return nil
+	feedback, err := ParseReviewFeedbackEvent(event)
+	if err != nil {
+		// Legacy compatibility: older callers/tests send feedback as JSON content
+		// without the NIP-90 t/status/rating tags.
+		if jsonErr := json.Unmarshal([]byte(event.Content), &feedback); jsonErr != nil {
+			h.logger.Warn("failed to parse feedback event",
+				"event_id", event.ID.Hex(),
+				"error", err,
+			)
+			return nil
+		}
 	}
 	feedback.RaterPubkey = event.PubKey.Hex()
 	feedback.CreatedAt = int64(event.CreatedAt)
 	feedback.EventID = event.ID.Hex()
 
-	// Store authorized, non-duplicate feedback.
-	err := h.registry.RecordFeedback(ctx, feedback)
-	if err != nil {
+	if err := h.registry.RecordFeedback(ctx, feedback); err != nil {
 		h.logger.Error("failed to store feedback",
 			"event_id", event.ID.Hex(),
 			"error", err,
@@ -267,7 +321,6 @@ func (h *Handler) handleFeedback(ctx context.Context, event nostr.Event) error {
 
 	h.logger.Info("recorded review feedback",
 		"event_id", event.ID.Hex(),
-		"assignment_id", feedback.AssignmentID,
 		"review_event_id", feedback.ReviewEventID,
 		"rating", feedback.Rating,
 	)

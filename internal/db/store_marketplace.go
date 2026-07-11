@@ -38,20 +38,20 @@ type ReputationScore struct {
 
 // ReviewAssignment represents a review task assigned to a reviewer.
 type ReviewAssignment struct {
-	ID                  int    `json:"id"`
-	PatchEventID        string `json:"patch_event_id"`
-	RepoID              string `json:"repo_id"`
-	ReviewerPubkey      string `json:"reviewer_pubkey"`
-	RequesterPubkey     string `json:"requester_pubkey"`
-	Status              string `json:"status"`
-	Priority            int    `json:"priority"`
-	PriceSats           int64  `json:"price_sats"`
-	AssignmentEventID   string `json:"assignment_event_id"`
-	AcceptanceEventID   string `json:"acceptance_event_id,omitempty"`
-	CompletionEventID   string `json:"completion_event_id,omitempty"`
-	ExpiresAt           int64  `json:"expires_at"`
-	CreatedAt           int64  `json:"created_at"`
-	UpdatedAt           int64  `json:"updated_at"`
+	ID                int    `json:"id"`
+	PatchEventID      string `json:"patch_event_id"`
+	RepoID            string `json:"repo_id"`
+	ReviewerPubkey    string `json:"reviewer_pubkey"`
+	RequesterPubkey   string `json:"requester_pubkey"`
+	Status            string `json:"status"`
+	Priority          int    `json:"priority"`
+	PriceSats         int64  `json:"price_sats"`
+	AssignmentEventID string `json:"assignment_event_id"`
+	AcceptanceEventID string `json:"acceptance_event_id,omitempty"`
+	CompletionEventID string `json:"completion_event_id,omitempty"`
+	ExpiresAt         int64  `json:"expires_at"`
+	CreatedAt         int64  `json:"created_at"`
+	UpdatedAt         int64  `json:"updated_at"`
 }
 
 // ReviewFeedback represents feedback on a completed review.
@@ -291,6 +291,15 @@ func (s *Store) GetAssignmentByID(ctx context.Context, id int) (*ReviewAssignmen
 
 // GetAssignmentByEventID retrieves an assignment by its Nostr event ID.
 func (s *Store) GetAssignmentByEventID(ctx context.Context, eventID string) (*ReviewAssignment, error) {
+	return s.getAssignmentByColumn(ctx, "assignment_event_id", eventID)
+}
+
+// GetAssignmentByCompletionEventID retrieves an assignment by its completed review event ID.
+func (s *Store) GetAssignmentByCompletionEventID(ctx context.Context, eventID string) (*ReviewAssignment, error) {
+	return s.getAssignmentByColumn(ctx, "completion_event_id", eventID)
+}
+
+func (s *Store) getAssignmentByColumn(ctx context.Context, column, eventID string) (*ReviewAssignment, error) {
 	var a ReviewAssignment
 	var acceptanceEventID, completionEventID sql.NullString
 
@@ -298,7 +307,7 @@ func (s *Store) GetAssignmentByEventID(ctx context.Context, eventID string) (*Re
 		SELECT id, patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
 				status, priority, price_sats, assignment_event_id,
 				acceptance_event_id, completion_event_id, expires_at, created_at, updated_at
-		FROM review_assignments WHERE assignment_event_id = ?
+		FROM review_assignments WHERE `+column+` = ?
 	`, eventID).Scan(
 		&a.ID, &a.PatchEventID, &a.RepoID, &a.ReviewerPubkey, &a.RequesterPubkey,
 		&a.Status, &a.Priority, &a.PriceSats, &a.AssignmentEventID,

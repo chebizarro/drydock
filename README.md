@@ -16,11 +16,18 @@ Nostr Relays ──subscribe──▶ Listener ──▶ Ingest ──▶ Pipeli
                                                                        │
                                                                        ▼
 Nostr Relays ◀──publish──────────────────────────────── Publisher (kind 1111)
+
+IDE clients ──kind 30078 session + kind 25910 ContextVM──▶ IDE Gateway
+Review marketplace ──kind 31990 profiles + kind 25910 assignments──▶ Reviewers
 ```
 
-Drydock subscribes to NIP-34 event kinds (patches, PRs, repository announcements, status updates). When a new patch arrives, it clones the referenced repository, builds a deterministic context bundle within a 64K token budget, routes the patch through a planner→reviewer LLM pipeline, and publishes structured kind 1111 review comments. A meta-review loop evaluates review quality and feeds improvements back into the system.
+Drydock subscribes to NIP-34 event kinds (patches, PRs, repository announcements, status updates). When a new patch arrives, it clones the referenced repository, builds a deterministic context bundle within a 64K token budget, routes the patch through a planner→reviewer LLM pipeline, and publishes structured kind 1111 review comments. IDE and marketplace flows use ContextVM JSON-RPC over kind 25910 events for review requests, fix requests, assignments, accepts, and rejects. A meta-review loop evaluates review quality and feeds improvements back into the system.
 
 All inference runs locally via OpenAI-compatible endpoints (Ollama, llama.cpp, vLLM). No code leaves your infrastructure.
+
+## Nostr Protocol
+
+Drydock is Nostr-native. See [Nostr Event Kinds](docs/event-kinds.md) for the current kind and tag map, including deprecated project-specific kinds, and [ContextVM Integration](docs/contextvm-integration.md) for kind 25910 JSON-RPC methods used by IDE and marketplace workflows.
 
 ## Quick Start
 
@@ -66,6 +73,8 @@ Key settings:
 | [Configuration](docs/configuration.md) | Complete environment variable reference |
 | [Deployment](docs/deployment.md) | Native, Docker, signing, LLM setup, production hardening |
 | [Nostr Protocol](docs/nostr-protocol.md) | Subscribed kinds, NIP-42 AUTH, comment structure, publishing rules |
+| [Nostr Event Kinds](docs/event-kinds.md) | Current Nostr-native event kinds, tag conventions, deprecated kind replacements |
+| [ContextVM Integration](docs/contextvm-integration.md) | Kind 25910 JSON-RPC methods for review, fix, and marketplace commands |
 | [Review Engine](docs/review-engine.md) | Two-stage planner→reviewer pipeline, model routing, finding schema |
 | [Context Builder](docs/context-builder.md) | 7-layer priority system, token budget, exclusion rules |
 | [Meta-Review](docs/meta-review.md) | Self-improvement loop, gating logic, feedback routing |

@@ -1,6 +1,6 @@
 # Nostr Protocol Integration
 
-Drydock integrates with the Nostr protocol as both a consumer (listening for NIP-34 code collaboration events) and a producer (publishing structured review comments).
+Drydock integrates with Nostr as both a consumer and producer of signed events. The current strategy uses standard NIPs where possible and carries application commands through ContextVM JSON-RPC envelopes on kind `25910`, instead of maintaining Drydock-only request/response event kinds.
 
 ## Subscribed Event Kinds
 
@@ -18,6 +18,84 @@ Drydock integrates with the Nostr protocol as both a consumer (listening for NIP
 | 1632 | NIP-34 | Status: closed | Root status tracking — patches with closed roots are not reviewed |
 | 1633 | NIP-34 | Status: draft | Root status tracking |
 | 1985 | NIP-32 | Label | Monitored and stored |
+| 30078 | NIP-78 | Application data | IDE session state and replaceable Drydock client state |
+| 31990 | NIP-89 | Handler/reviewer profile | Reviewer capability profiles for marketplace discovery |
+| 25910 | ContextVM | JSON-RPC transport | Review, fix, assignment, accept, and reject commands |
+| 7000 | NIP-90 | Job feedback | Marketplace feedback and review completion feedback |
+| 1059 | NIP-59 | Gift wrap | Encrypted wrapper for private Drydock events |
+
+## Nostr-Native Event Strategy
+
+Drydock avoids bespoke one-off event kinds for application commands. The mapping is:
+
+| Use Case | Previous Kind(s) | Current Kind |
+|----------|------------------|--------------|
+| IDE session | 31650 | 30078 (NIP-78) |
+| IDE review request/response | 1651, 1652 | 25910 (ContextVM JSON-RPC) |
+| IDE fix request/response | 1653, 1654 | 25910 (ContextVM JSON-RPC) |
+| Reviewer profile | 30620 | 31990 (NIP-89) |
+| Marketplace assignment | 1660 | 25910 (ContextVM JSON-RPC) |
+| Marketplace accept/reject | 1661, 1662 | 25910 (ContextVM JSON-RPC) |
+| Marketplace feedback | 1663 | 7000 (NIP-90 feedback) |
+
+## ContextVM JSON-RPC Transport (kind 25910)
+
+ContextVM messages use kind `25910` with JSON-RPC 2.0 in the event `content`. Nostr supplies identity, signatures, relay transport, and routing tags; ContextVM supplies method names, parameters, correlation IDs, responses, and errors.
+
+Example request:
+
+```json
+{
+  "kind": 25910,
+  "content": {
+    "jsonrpc": "2.0",
+    "id": "req-01HZX...",
+    "method": "review/request",
+    "params": {
+      "session_id": "session-uuid",
+      "file": "src/auth.go",
+      "selection": {"start": 10, "end": 25},
+      "trigger": "save"
+    }
+  },
+  "tags": [
+    ["p", "<drydock-pubkey>"],
+    ["t", "drydock"],
+    ["method", "review/request"]
+  ]
+}
+```
+
+Example response:
+
+```json
+{
+  "kind": 25910,
+  "content": {
+    "jsonrpc": "2.0",
+    "id": "req-01HZX...",
+    "result": {
+      "diagnostics": []
+    }
+  },
+  "tags": [
+    ["p", "<requester-pubkey>"],
+    ["e", "<request-event-id>"],
+    ["t", "drydock"],
+    ["method", "review/request"]
+  ]
+}
+```
+
+Supported methods are documented in [ContextVM Integration](contextvm-integration.md).
+
+## Encryption (NIP-59 Gift Wrap)
+
+Private IDE, review, fix, marketplace assignment, acceptance, and rejection payloads should be protected with NIP-59 gift-wrap. The outer visible event is a gift-wrap event (`1059`) addressed to the recipient; the sealed rumor inside carries the Drydock event such as kind `25910`.
+
+Use gift-wrap when event content includes source code, diagnostics, assignment details, reviewer decisions, or payment-sensitive metadata. Public discovery data, such as NIP-89 reviewer profiles (`31990`), may remain unwrapped when the reviewer intends it to be discoverable.
+
+Routing tags on encrypted envelopes must be sufficient for relay delivery without leaking private payload details. Prefer `p` tags for recipients and avoid sensitive filenames, repository names, or finding text in outer tags.
 
 ## NIP-11 Relay Capability Probing
 
@@ -70,7 +148,7 @@ Both summary and detail events use the same tag structure:
 
 Every review comment includes a plaintext footer:
 
-```
+```text
 ---
 model: coder32b
 context-hash: a1b2c3...

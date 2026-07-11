@@ -5,11 +5,10 @@
 //
 // # Nostr Event Kinds
 //
-//   - kind 30620: Reviewer profile (addressable, d=pubkey)
-//   - kind 1660:  Review assignment (Drydock assigns patch to reviewer)
-//   - kind 1661:  Review acceptance (reviewer accepts assignment)
-//   - kind 1662:  Review rejection (reviewer declines assignment)
-//   - kind 1663:  Review feedback (patch author rates the review)
+//   - kind 31990: Reviewer NIP-89 application handler (d=drydock-reviewer)
+//   - kind 25910: Review assignment ContextVM intent (marketplace/assign)
+//   - kind 25910: ContextVM JSON-RPC intents for assignment acceptance/rejection
+//   - kind 7000:  NIP-90 review feedback (patch author rates the review)
 //
 // # Reputation Model
 //
@@ -22,20 +21,42 @@ package marketplace
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"time"
+
+	"fiatjaf.com/nostr"
 )
 
 // Event kinds for marketplace.
 const (
-	KindReviewerProfile  = 30620 // Addressable reviewer profile
-	KindReviewAssignment = 1660  // Drydock assigns patch to reviewer
-	KindReviewAcceptance = 1661  // Reviewer accepts assignment
-	KindReviewRejection  = 1662  // Reviewer declines assignment
-	KindReviewFeedback   = 1663  // Patch author rates the review
+	KindReviewerProfile = 31990 // NIP-89 application handler
+	KindReviewFeedback  = 7000  // NIP-90 feedback (patch author rates the review)
+
+	// Legacy constants retained for compatibility with older tests/helpers.
+	// Live marketplace assignment/accept/reject now uses ContextVM kind 25910.
+	KindReviewAssignment = 1660
+	KindReviewAcceptance = 1661
+	KindReviewRejection  = 1662
+)
+
+// NIP-90 feedback tags for marketplace review feedback.
+const (
+	FeedbackStatusSuccess = "success"
+	TagReviewFeedback     = "review-feedback"
+)
+
+const (
+	ReviewerProfileDTag        = "drydock-reviewer"
+	ReviewerProfileHandledKind = "25910"
+
+	MethodAssign = "marketplace/assign"
+	MethodAccept = "marketplace/accept"
+	MethodReject = "marketplace/reject"
 )
 
 // ReviewerProfile represents a community reviewer's registration.
-// Published as kind 30620 with "d" tag set to the reviewer's pubkey.
+// Published as kind 31990 with "d" tag set to ReviewerProfileDTag.
 type ReviewerProfile struct {
 	Pubkey         string            `json:"pubkey"`
 	DisplayName    string            `json:"display_name,omitempty"`
@@ -60,7 +81,7 @@ const (
 )
 
 // ReviewAssignment represents Drydock assigning a patch to a reviewer.
-// Published as kind 1660.
+// Published as a ContextVM intent (kind 25910, marketplace/assign).
 type ReviewAssignment struct {
 	AssignmentID   string   `json:"assignment_id"`
 	PatchEventID   string   `json:"patch_event_id"`
@@ -73,38 +94,36 @@ type ReviewAssignment struct {
 }
 
 // ReviewAcceptance represents a reviewer accepting an assignment.
-// Published as kind 1661 in reply to the assignment.
+// Sent as ContextVM method marketplace/accept in reply to the assignment.
 type ReviewAcceptance struct {
 	AssignmentID   string `json:"assignment_id"`
 	ReviewerPubkey string `json:"reviewer_pubkey"`
 	EstimatedTime  string `json:"estimated_time,omitempty"` // e.g., "2h"
 	CreatedAt      int64  `json:"created_at"`
-	EventID        string `json:"-"`
 }
 
 // ReviewRejection represents a reviewer declining an assignment.
-// Published as kind 1662 in reply to the assignment.
+// Sent as ContextVM method marketplace/reject in reply to the assignment.
 type ReviewRejection struct {
 	AssignmentID   string `json:"assignment_id"`
 	ReviewerPubkey string `json:"reviewer_pubkey"`
 	Reason         string `json:"reason,omitempty"` // e.g., "busy", "not my expertise"
 	CreatedAt      int64  `json:"created_at"`
-	EventID        string `json:"-"`
 }
 
 // ReviewFeedback represents a patch author's rating of a review.
-// Published as kind 1663 in reply to the review.
+// Published as NIP-90 feedback kind 7000 in reply to the review.
 type ReviewFeedback struct {
-	AssignmentID   int    `json:"assignment_id,omitempty"`
-	ReviewEventID  string `json:"review_event_id,omitempty"`
-	ReviewerPubkey string `json:"reviewer_pubkey,omitempty"`
-	RaterPubkey    string `json:"-"`
+	AssignmentID   int    `json:"assignment_id,omitempty"` // Legacy compatibility; NIP-90 uses review_event_id/e-tag.
+	ReviewEventID  string `json:"review_event_id"`
+	ReviewerPubkey string `json:"reviewer_pubkey"`
+	RaterPubkey    string `json:"rater_pubkey,omitempty"`
 	Rating         int    `json:"rating"`   // 1-5 stars
 	Helpful        bool   `json:"helpful"`  // Was the review helpful?
 	Accurate       bool   `json:"accurate"` // Were findings accurate?
 	Comment        string `json:"comment,omitempty"`
+	EventID        string `json:"event_id,omitempty"`
 	CreatedAt      int64  `json:"created_at"`
-	EventID        string `json:"-"`
 }
 
 // ReputationScore holds a reviewer's calculated reputation.
@@ -136,11 +155,117 @@ type MatchedReviewer struct {
 	MatchScore float64         `json:"match_score"` // How well they match criteria
 }
 
+// ReviewerProfileAppContent is the JSON content stored in the NIP-89 app handler event.
+type ReviewerProfileAppContent struct {
+	Pubkey        string `json:"pubkey"`
+	MaxConcurrent int    `json:"max_concurrent"`
+	ResponseTime  string `json:"response_time,omitempty"`
+}
+
+// DrydockTag builds a drydock-specific NIP-89 capability tag.
+func DrydockTag(name string, values ...string) nostr.Tag {
+	return append(nostr.Tag{"drydock:" + name}, values...)
+}
+
+// ReviewerProfileTags builds NIP-89 standard and Drydock capability tags for a reviewer.
+func ReviewerProfileTags(profile ReviewerProfile) nostr.Tags {
+	tags := nostr.Tags{
+		{"d", ReviewerProfileDTag},
+		{"k", ReviewerProfileHandledKind},
+		{"name", profile.DisplayName},
+		{"about", profile.About},
+		DrydockTag("languages", profile.Languages...),
+		DrydockTag("domains", profile.Domains...),
+		DrydockTag("availability", string(profile.Availability)),
+		DrydockTag("price", strconv.FormatInt(profile.PricePerReview, 10)),
+		DrydockTag("methods", MethodAssign, MethodAccept, MethodReject),
+	}
+	return tags
+}
+
+// ReviewerProfileContent builds the NIP-89 content for a reviewer profile event.
+func ReviewerProfileContent(profile ReviewerProfile) (string, error) {
+	content, err := json.Marshal(ReviewerProfileAppContent{
+		Pubkey:        profile.Pubkey,
+		MaxConcurrent: profile.MaxConcurrent,
+		ResponseTime:  profile.ResponseTime,
+	})
+	return string(content), err
+}
+
+// ReviewerProfileEvent builds an unsigned NIP-89 app handler event for a reviewer.
+func ReviewerProfileEvent(profile ReviewerProfile) (nostr.Event, error) {
+	content, err := ReviewerProfileContent(profile)
+	if err != nil {
+		return nostr.Event{}, err
+	}
+	return nostr.Event{
+		Kind:      nostr.Kind(KindReviewerProfile),
+		CreatedAt: nostr.Now(),
+		Content:   content,
+		Tags:      ReviewerProfileTags(profile),
+	}, nil
+}
+
 // ParseReviewerProfile parses a ReviewerProfile from event content.
 func ParseReviewerProfile(content string) (ReviewerProfile, error) {
 	var profile ReviewerProfile
 	err := json.Unmarshal([]byte(content), &profile)
 	return profile, err
+}
+
+// ParseReviewerProfileEvent parses a ReviewerProfile from a Drydock NIP-89 app handler event.
+func ParseReviewerProfileEvent(event nostr.Event) (ReviewerProfile, bool, error) {
+	if int(event.Kind) != KindReviewerProfile {
+		return ReviewerProfile{}, false, nil
+	}
+
+	var content ReviewerProfileAppContent
+	if err := json.Unmarshal([]byte(event.Content), &content); err != nil {
+		return ReviewerProfile{}, false, err
+	}
+
+	profile := ReviewerProfile{
+		Pubkey:        content.Pubkey,
+		MaxConcurrent: content.MaxConcurrent,
+		ResponseTime:  content.ResponseTime,
+	}
+
+	var hasDTag, hasHandledKind bool
+	for _, tag := range event.Tags {
+		if len(tag) < 2 {
+			continue
+		}
+		switch tag[0] {
+		case "d":
+			hasDTag = tag[1] == ReviewerProfileDTag
+		case "k":
+			if tag[1] == ReviewerProfileHandledKind {
+				hasHandledKind = true
+			}
+		case "name":
+			profile.DisplayName = tag[1]
+		case "about":
+			profile.About = tag[1]
+		case "drydock:languages":
+			profile.Languages = append([]string(nil), tag[1:]...)
+		case "drydock:domains":
+			profile.Domains = append([]string(nil), tag[1:]...)
+		case "drydock:availability":
+			profile.Availability = AvailabilityLevel(tag[1])
+		case "drydock:price":
+			price, err := strconv.ParseInt(tag[1], 10, 64)
+			if err != nil {
+				return ReviewerProfile{}, false, err
+			}
+			profile.PricePerReview = price
+		}
+	}
+
+	if !hasDTag || !hasHandledKind {
+		return ReviewerProfile{}, false, nil
+	}
+	return profile, true, nil
 }
 
 // ParseReviewAssignment parses a ReviewAssignment from event content.
@@ -155,6 +280,64 @@ func ParseReviewFeedback(content string) (ReviewFeedback, error) {
 	var feedback ReviewFeedback
 	err := json.Unmarshal([]byte(content), &feedback)
 	return feedback, err
+}
+
+// ParseReviewFeedbackEvent parses NIP-90 review feedback from a kind 7000 event.
+func ParseReviewFeedbackEvent(event nostr.Event) (ReviewFeedback, error) {
+	if event.Kind != KindReviewFeedback {
+		return ReviewFeedback{}, fmt.Errorf("unexpected feedback kind: %d", event.Kind)
+	}
+	if tagValue(event.Tags, "t") != TagReviewFeedback {
+		return ReviewFeedback{}, fmt.Errorf("missing review feedback t tag")
+	}
+	if status := tagValue(event.Tags, "status"); status != "" && status != FeedbackStatusSuccess {
+		return ReviewFeedback{}, fmt.Errorf("unsupported feedback status: %s", status)
+	}
+
+	feedback, err := ParseReviewFeedback(event.Content)
+	if err != nil {
+		return ReviewFeedback{}, err
+	}
+
+	feedback.ReviewEventID = tagValue(event.Tags, "e")
+	feedback.ReviewerPubkey = tagValue(event.Tags, "p")
+	feedback.RaterPubkey = event.PubKey.Hex()
+	feedback.EventID = event.ID.Hex()
+	feedback.CreatedAt = int64(event.CreatedAt)
+
+	ratingTag := tagValue(event.Tags, "rating")
+	if ratingTag == "" {
+		return ReviewFeedback{}, fmt.Errorf("missing rating tag")
+	}
+	feedback.Rating, err = strconv.Atoi(ratingTag)
+	if err != nil {
+		return ReviewFeedback{}, fmt.Errorf("parse rating tag: %w", err)
+	}
+	if !IsValidRating(feedback.Rating) {
+		return ReviewFeedback{}, fmt.Errorf("invalid rating: %d", feedback.Rating)
+	}
+
+	return feedback, nil
+}
+
+func tagValue(tags nostr.Tags, name string) string {
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == name {
+			return tag[1]
+		}
+	}
+	return ""
+}
+
+// ReviewFeedbackTags builds the required NIP-90 tags for review feedback.
+func ReviewFeedbackTags(reviewEventID, reviewerPubkey string, rating int) nostr.Tags {
+	return nostr.Tags{
+		nostr.Tag{"e", reviewEventID},
+		nostr.Tag{"p", reviewerPubkey},
+		nostr.Tag{"status", FeedbackStatusSuccess},
+		nostr.Tag{"rating", strconv.Itoa(rating)},
+		nostr.Tag{"t", TagReviewFeedback},
+	}
 }
 
 // IsValidRating checks if a rating is in the valid range.

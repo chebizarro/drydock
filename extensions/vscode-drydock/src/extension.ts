@@ -12,7 +12,6 @@
 
 import * as vscode from 'vscode';
 import { execSync } from 'child_process';
-import { createHash } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import {
     finalizeEvent,
@@ -32,19 +31,16 @@ const NodeWebSocket = require('ws');
 
 useWebSocketImplementation(NodeWebSocket);
 
-// Nostr event kinds and ContextVM methods for IDE integration
+// Nostr event kinds for IDE integration
 const KIND_IDE_SESSION = 30078;
+const IDE_SESSION_SCHEMA = 'drydock.ide-session.v1';
 const KIND_CONTEXTVM = 25910;
-const METHOD_IDE_REVIEW = 'ide/review';
-const METHOD_IDE_APPLY_FIX = 'ide/applyFix';
-const IDE_CONTEXT_TAG = 'drydock-ide';
-
-const PRIVATE_KEY_SECRET_KEY = 'drydock.privateKey';
-const PUBLIC_DIFF_WARNING_ACTION = 'Publish Diff';
+const JSONRPC_VERSION = '2.0';
+const METHOD_REVIEW_REQUEST = 'review/request';
+const METHOD_APPLY_FIX = 'review/apply-fix';
 
 // Diagnostic collection for displaying findings
 let diagnosticCollection: vscode.DiagnosticCollection;
-let secretStorage: vscode.SecretStorage | undefined;
 
 // Session state
 let sessionId: string;
@@ -56,15 +52,10 @@ let reviewResponseSubscription: { close: (reason?: string) => void | Promise<voi
 let activeRelayUrls: string[] = [];
 let activeSubscriptionKey: string | undefined;
 let latestReviewRequestId: string | undefined;
-let activeDrydockPubkey: string | undefined;
-let autoReviewInFlight = false;
 
 // Store pending fixes by ID
 const pendingFixes: Map<string, PendingFix> = new Map();
-const pendingFixResponses: Map<string, {
-    resolve: (response: FixResponse) => void;
-    reject: (error: Error) => void;
-}> = new Map();
+const pendingFixRequests: Map<string, { fixId: string; file: string; range: vscode.Range }> = new Map();
 
 interface PendingFix {
     file: string;
@@ -97,43 +88,10 @@ interface ReviewResponse {
     review_time_ms: number;
 }
 
-interface FixRequest {
-    session_id: string;
-    fix_id: string;
-    file: string;
-}
-
-interface FixResponse {
-    request_id: string;
-    session_id: string;
-    success: boolean;
-    diff?: string;
-    error?: string;
-}
-
-interface ContextVMRequest<T> {
-    jsonrpc: '2.0';
-    id: string;
-    method: string;
-    params: T;
-}
-
-interface ContextVMResponse<T> {
-    jsonrpc?: string;
-    id: string;
-    result?: T;
-    error?: {
-        code: number;
-        message: string;
-        data?: unknown;
-    };
-}
-
 interface IDESessionAnnouncement {
     session_id: string;
     workspace_path: string;
     repo_id: string;
-    repo_ref: string;
     editor: string;
     version: string;
     languages: string[];
@@ -147,6 +105,39 @@ interface ReviewRequest {
     full_review: boolean;
 }
 
+interface FixRequest {
+    session_id: string;
+    request_id: string;
+    fix_id: string;
+    file: string;
+}
+
+interface FixResponse {
+    request_id?: string;
+    session_id?: string;
+    fix_id: string;
+    success: boolean;
+    patch?: string;
+}
+
+interface JSONRPCRequest<T> {
+    jsonrpc: '2.0';
+    id: string;
+    method: string;
+    params: T;
+}
+
+interface JSONRPCResponse<T> {
+    jsonrpc: string;
+    id: string;
+    result?: T;
+    error?: {
+        code: number;
+        message: string;
+        data?: unknown;
+    };
+}
+
 interface DrydockConfig {
     relays: string[];
     privateKey: string;
@@ -157,7 +148,6 @@ export function activate(context: vscode.ExtensionContext) {
     console.log('Drydock extension activated');
 
     extensionVersion = String(context.extension.packageJSON.version ?? '0.0.0');
-    secretStorage = context.secrets;
 
     // Create diagnostic collection
     diagnosticCollection = vscode.languages.createDiagnosticCollection('drydock');
@@ -168,15 +158,12 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Register commands
     context.subscriptions.push(
-        vscode.commands.registerCommand('drydock.reviewChanges', () => reviewChanges()),
+        vscode.commands.registerCommand('drydock.reviewChanges', reviewChanges),
         vscode.commands.registerCommand('drydock.applyFix', applyFix),
         vscode.commands.registerCommand('drydock.clearDiagnostics', clearDiagnostics),
-        vscode.commands.registerCommand('drydock.setPrivateKey', () => setPrivateKey(context)),
-        vscode.workspace.onDidSaveTextDocument(document => {
-            void maybeAutoReview(document);
-        }),
         vscode.workspace.onDidChangeConfiguration(event => {
             if (event.affectsConfiguration('drydock.relays') ||
+                event.affectsConfiguration('drydock.privateKey') ||
                 event.affectsConfiguration('drydock.drydockPubkey')) {
                 void refreshRelaySubscription({ announceSession: false, notifyOnFailure: true });
             }
@@ -188,14 +175,10 @@ export function activate(context: vscode.ExtensionContext) {
             relayPool = undefined;
             activeRelayUrls = [];
             activeSubscriptionKey = undefined;
-            activeDrydockPubkey = undefined;
-            rejectPendingFixResponses(new Error('Extension deactivated'));
         })
     );
 
-    void migratePrivateKeySetting(context).finally(() => {
-        void refreshRelaySubscription({ announceSession: false, notifyOnFailure: true });
-    });
+    void refreshRelaySubscription({ announceSession: false, notifyOnFailure: true });
 
     vscode.window.showInformationMessage('Drydock: Ready to review your code');
 }
@@ -205,10 +188,6 @@ export function deactivate() {
     reviewResponseSubscription = undefined;
     relayPool?.destroy();
     relayPool = undefined;
-    activeRelayUrls = [];
-    activeSubscriptionKey = undefined;
-    activeDrydockPubkey = undefined;
-    rejectPendingFixResponses(new Error('Extension deactivated'));
     diagnosticCollection.dispose();
 }
 
@@ -243,15 +222,11 @@ async function reviewChanges() {
             encoding: 'utf-8'
         }).trim().split('\n').filter(f => f);
 
-        const config = await getDrydockConfig();
+        const config = getDrydockConfig();
         const privateKey = parsePrivateKey(config.privateKey);
         const drydockPubkey = tryParsePubkey(config.drydockPubkey);
         if (!drydockPubkey) {
             throw new Error('Configure drydock.drydockPubkey before requesting a review');
-        }
-
-        if (!(await confirmSourceDiffPublish(config.relays))) {
-            return;
         }
 
         await refreshRelaySubscription({ announceSession: true, notifyOnFailure: true });
@@ -277,10 +252,11 @@ async function reviewChanges() {
             title: 'Drydock: Reviewing changes...',
             cancellable: false
         }, async () => {
+            const rpcRequest = buildJSONRPCRequest(requestId, METHOD_REVIEW_REQUEST, request);
             const requestEvent = signEvent({
                 kind: KIND_CONTEXTVM,
-                content: JSON.stringify(buildContextVMRequest(requestId, METHOD_IDE_REVIEW, request)),
-                tags: buildContextVMRequestTags(config, requestId, METHOD_IDE_REVIEW)
+                content: JSON.stringify(rpcRequest),
+                tags: buildContextVMRequestTags(config, requestId, METHOD_REVIEW_REQUEST)
             }, privateKey);
 
             await publishEvent(requestEvent);
@@ -317,6 +293,7 @@ function handleReviewResponse(response: ReviewResponse) {
     const diagnosticsByFile = new Map<string, vscode.Diagnostic[]>();
 
     pendingFixes.clear();
+    pendingFixRequests.clear();
 
     for (const diag of response.diagnostics) {
         const filePath = vscode.Uri.joinPath(workspaceFolder.uri, diag.file);
@@ -335,9 +312,7 @@ function handleReviewResponse(response: ReviewResponse) {
             diagnostic.code = diag.code;
         }
 
-        // Store fix information if available. The suggested fix may be present in
-        // the review response, but apply still retrieves the authoritative fix via
-        // the ContextVM ide/applyFix method.
+        // Store fix information if available
         if (diag.has_fix && diag.fix_id) {
             pendingFixes.set(diag.fix_id, {
                 file: diag.file,
@@ -556,7 +531,7 @@ async function applyFix() {
 
     const items = fixes.map(([fixId, fix]) => ({
         label: `Fix in ${fix.file}`,
-        description: (fix.suggestedFix ?? 'Retrieve fix from Drydock').substring(0, 80),
+        description: fix.suggestedFix ? fix.suggestedFix.substring(0, 80) : fixId,
         fixId,
         fix
     }));
@@ -569,84 +544,73 @@ async function applyFix() {
         return;
     }
 
-    const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, selected.fix.file);
-
     try {
-        const fixResponse = await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: 'Drydock: Retrieving fix...',
-            cancellable: false
-        }, () => requestFix(selected.fixId, selected.fix.file));
-
-        const suggestedFix = fixResponse.diff || selected.fix.suggestedFix;
-        if (!suggestedFix) {
-            throw new Error(fixResponse.error || 'Drydock returned an empty fix');
+        const config = getDrydockConfig();
+        const privateKey = parsePrivateKey(config.privateKey);
+        const drydockPubkey = tryParsePubkey(config.drydockPubkey);
+        if (!drydockPubkey) {
+            throw new Error('Configure drydock.drydockPubkey before requesting a fix');
         }
 
-        const document = await vscode.workspace.openTextDocument(fileUri);
-        const edit = new vscode.WorkspaceEdit();
+        await refreshRelaySubscription({ announceSession: true, notifyOnFailure: true });
 
-        if (isUnifiedDiff(suggestedFix)) {
-            const hunks = parseUnifiedDiffHunks(suggestedFix);
-            const updatedText = applyUnifiedDiffToText(document.getText(), hunks);
-            edit.replace(fileUri, getFullDocumentRange(document), updatedText);
-        } else {
-            const replacement = normalizeReplacementText(suggestedFix);
-            edit.replace(fileUri, selected.fix.range, replacement);
+        if (!relayPool || activeRelayUrls.length === 0) {
+            throw new Error('No Nostr relays configured');
         }
 
-        const applied = await vscode.workspace.applyEdit(edit);
-        if (!applied) {
-            throw new Error('VS Code rejected the workspace edit');
-        }
+        const requestId = uuidv4();
+        const request: FixRequest = {
+            session_id: sessionId,
+            request_id: requestId,
+            fix_id: selected.fixId,
+            file: selected.fix.file
+        };
+        const rpcRequest = buildJSONRPCRequest(requestId, METHOD_APPLY_FIX, request);
+        const requestEvent = signEvent({
+            kind: KIND_CONTEXTVM,
+            content: JSON.stringify(rpcRequest),
+            tags: buildContextVMRequestTags(config, requestId, METHOD_APPLY_FIX)
+        }, privateKey);
 
-        pendingFixes.delete(selected.fixId);
-        removeDiagnosticAtRange(fileUri, selected.fix.range);
-
-        vscode.window.showInformationMessage(`Applied fix in ${selected.fix.file}`);
+        pendingFixRequests.set(requestId, {
+            fixId: selected.fixId,
+            file: selected.fix.file,
+            range: selected.fix.range
+        });
+        await publishEvent(requestEvent);
+        vscode.window.showInformationMessage('Drydock: Fix request published');
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        vscode.window.showErrorMessage(`Failed to apply fix: ${message}`);
+        vscode.window.showErrorMessage(`Failed to request fix: ${message}`);
     }
 }
 
-async function requestFix(fixId: string, file: string): Promise<FixResponse> {
-    const config = await getDrydockConfig();
-    const privateKey = parsePrivateKey(config.privateKey);
-    const drydockPubkey = tryParsePubkey(config.drydockPubkey);
-    if (!drydockPubkey) {
-        throw new Error('Configure drydock.drydockPubkey before requesting a fix');
+async function applySuggestedFix(file: string, range: vscode.Range, suggestedFix: string) {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        vscode.window.showErrorMessage('No workspace folder open');
+        return;
     }
 
-    await refreshRelaySubscription({ announceSession: false, notifyOnFailure: true });
-    if (!relayPool || activeRelayUrls.length === 0) {
-        throw new Error('No Nostr relays configured');
+    const fileUri = vscode.Uri.joinPath(workspaceFolder.uri, file);
+    const document = await vscode.workspace.openTextDocument(fileUri);
+    const edit = new vscode.WorkspaceEdit();
+
+    if (isUnifiedDiff(suggestedFix)) {
+        const hunks = parseUnifiedDiffHunks(suggestedFix);
+        const updatedText = applyUnifiedDiffToText(document.getText(), hunks);
+        edit.replace(fileUri, getFullDocumentRange(document), updatedText);
+    } else {
+        const replacement = normalizeReplacementText(suggestedFix);
+        edit.replace(fileUri, range, replacement);
     }
 
-    const requestId = uuidv4();
-    const request: FixRequest = {
-        session_id: sessionId,
-        fix_id: fixId,
-        file
-    };
-
-    const responsePromise = new Promise<FixResponse>((resolve, reject) => {
-        pendingFixResponses.set(requestId, { resolve, reject });
-    });
-
-    try {
-        const requestEvent = signEvent({
-            kind: KIND_CONTEXTVM,
-            content: JSON.stringify(buildContextVMRequest(requestId, METHOD_IDE_APPLY_FIX, request)),
-            tags: buildContextVMRequestTags(config, requestId, METHOD_IDE_APPLY_FIX)
-        }, privateKey);
-        await publishEvent(requestEvent);
-    } catch (error) {
-        pendingFixResponses.delete(requestId);
-        throw error;
+    const applied = await vscode.workspace.applyEdit(edit);
+    if (!applied) {
+        throw new Error('VS Code rejected the workspace edit');
     }
 
-    return responsePromise;
+    removeDiagnosticAtRange(fileUri, range);
 }
 
 /**
@@ -655,19 +619,13 @@ async function requestFix(fixId: string, file: string): Promise<FixResponse> {
 function clearDiagnostics() {
     diagnosticCollection.clear();
     pendingFixes.clear();
+    pendingFixRequests.clear();
     vscode.window.showInformationMessage('Drydock: Diagnostics cleared');
-}
-
-function rejectPendingFixResponses(error: Error): void {
-    for (const pending of pendingFixResponses.values()) {
-        pending.reject(error);
-    }
-    pendingFixResponses.clear();
 }
 
 async function refreshRelaySubscription(options: { announceSession: boolean; notifyOnFailure: boolean }) {
     try {
-        const config = await getDrydockConfig();
+        const config = getDrydockConfig();
         const relayUrls = normalizeRelayUrls(config.relays);
 
         if (relayUrls.length === 0) {
@@ -675,7 +633,6 @@ async function refreshRelaySubscription(options: { announceSession: boolean; not
             reviewResponseSubscription = undefined;
             activeRelayUrls = [];
             activeSubscriptionKey = undefined;
-            activeDrydockPubkey = undefined;
             relayPool?.destroy();
             relayPool = undefined;
             return;
@@ -683,13 +640,9 @@ async function refreshRelaySubscription(options: { announceSession: boolean; not
 
         relayPool ??= new SimplePool({ enablePing: true, enableReconnect: true });
 
-        const clientPubkey = tryGetPublicKey(config.privateKey);
-        const authorPubkey = tryParsePubkey(config.drydockPubkey);
-        activeDrydockPubkey = authorPubkey;
-
         const subscriptionKey = JSON.stringify({
             relays: relayUrls,
-            clientPubkey,
+            privateKey: config.privateKey,
             drydockPubkey: config.drydockPubkey,
             sessionId
         });
@@ -702,28 +655,28 @@ async function refreshRelaySubscription(options: { announceSession: boolean; not
                 since: Math.floor(Date.now() / 1000)
             };
 
+            const authorPubkey = tryParsePubkey(config.drydockPubkey);
             if (authorPubkey) {
                 filter.authors = [authorPubkey];
             }
 
+            const clientPubkey = tryGetPublicKey(config.privateKey);
             if (clientPubkey) {
                 filter['#p'] = [clientPubkey];
             }
-            filter['#t'] = [IDE_CONTEXT_TAG];
 
             reviewResponseSubscription = relayPool.subscribe(relayUrls, filter, {
                 onevent: (event: Event) => {
                     try {
-                        handleIncomingContextVMEvent(event);
+                        handleIncomingReviewEvent(event);
                     } catch (error) {
-                        console.error('Failed to process Drydock ContextVM response', error);
+                        console.error('Failed to process Drydock review response', error);
                     }
                 },
                 onclose: (reasons: string[]) => {
                     console.warn('Drydock review subscription closed', reasons);
                     reviewResponseSubscription = undefined;
                     activeSubscriptionKey = undefined;
-                    rejectPendingFixResponses(new Error(`Drydock relay subscription closed: ${reasons.join('; ')}`));
                 }
             });
 
@@ -744,59 +697,90 @@ async function refreshRelaySubscription(options: { announceSession: boolean; not
     }
 }
 
-function handleIncomingContextVMEvent(event: Event) {
+function handleIncomingReviewEvent(event: Event) {
     if (event.kind !== KIND_CONTEXTVM) {
         return;
     }
 
-    const expectedAuthor = activeDrydockPubkey;
+    const expectedAuthor = tryParsePubkey(getDrydockConfig().drydockPubkey);
     if (expectedAuthor && event.pubkey !== expectedAuthor) {
         return;
     }
 
-    const envelope = JSON.parse(event.content) as ContextVMResponse<unknown>;
-    if (!envelope.id) {
+    const response = JSON.parse(event.content) as JSONRPCResponse<ReviewResponse | FixResponse>;
+    if (response.jsonrpc !== JSONRPC_VERSION) {
         return;
     }
 
-    const pendingFix = pendingFixResponses.get(envelope.id);
-    if (pendingFix) {
-        pendingFixResponses.delete(envelope.id);
-        if (envelope.error) {
-            pendingFix.reject(new Error(envelope.error.message));
-            return;
+    if (response.error) {
+        if (response.id === latestReviewRequestId || pendingFixRequests.has(response.id)) {
+            vscode.window.showWarningMessage(`Drydock: ${response.error.message}`);
+            pendingFixRequests.delete(response.id);
         }
-        const response = envelope.result as FixResponse | undefined;
-        if (!response) {
-            pendingFix.reject(new Error('Drydock returned an empty fix response'));
-            return;
-        }
-        if (response.session_id !== sessionId) {
-            pendingFix.reject(new Error('Drydock fix response was for a different session'));
-            return;
-        }
-        if (!response.success) {
-            pendingFix.reject(new Error(response.error || 'Drydock could not resolve the fix'));
-            return;
-        }
-        pendingFix.resolve(response);
         return;
     }
 
-    if (latestReviewRequestId && envelope.id !== latestReviewRequestId) {
-        return;
-    }
-    if (envelope.error) {
-        vscode.window.showWarningMessage(`Drydock: ${envelope.error.message}`);
+    if (!response.result) {
         return;
     }
 
-    const response = envelope.result as ReviewResponse | undefined;
-    if (!response || response.session_id !== sessionId || !Array.isArray(response.diagnostics)) {
+    if (isReviewResponse(response.result)) {
+        if (response.result.session_id !== sessionId) {
+            return;
+        }
+
+        if (latestReviewRequestId && response.id !== latestReviewRequestId && response.result.request_id !== latestReviewRequestId) {
+            return;
+        }
+
+        handleReviewResponse(response.result);
         return;
     }
 
-    handleReviewResponse(response);
+    if (isFixResponse(response.result)) {
+        void handleFixResponse(response.id, response.result);
+    }
+}
+
+function isReviewResponse(result: ReviewResponse | FixResponse): result is ReviewResponse {
+    return 'diagnostics' in result && Array.isArray(result.diagnostics);
+}
+
+function isFixResponse(result: ReviewResponse | FixResponse): result is FixResponse {
+    return 'fix_id' in result && 'success' in result;
+}
+
+async function handleFixResponse(responseId: string, response: FixResponse) {
+    if (response.session_id && response.session_id !== sessionId) {
+        return;
+    }
+
+    const pending = pendingFixRequests.get(responseId);
+    if (!pending) {
+        return;
+    }
+    pendingFixRequests.delete(responseId);
+
+    if (!response.success) {
+        vscode.window.showWarningMessage('Drydock: Fix was not available');
+        return;
+    }
+
+    const fix = pendingFixes.get(response.fix_id) ?? pendingFixes.get(pending.fixId);
+    const patch = response.patch ?? fix?.suggestedFix;
+    if (!patch) {
+        vscode.window.showWarningMessage('Drydock: Fix response did not include a patch');
+        return;
+    }
+
+    try {
+        await applySuggestedFix(pending.file, pending.range, patch);
+        pendingFixes.delete(pending.fixId);
+        vscode.window.showInformationMessage(`Applied fix in ${pending.file}`);
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`Failed to apply fix: ${message}`);
+    }
 }
 
 async function publishSessionAnnouncement(config: DrydockConfig) {
@@ -814,17 +798,10 @@ async function publishSessionAnnouncement(config: DrydockConfig) {
     }
 
     const privateKey = parsePrivateKey(config.privateKey);
-    const drydockPubkey = tryParsePubkey(config.drydockPubkey);
-    if (!drydockPubkey) {
-        return;
-    }
-
-    const repoIdentity = getRepoIdentity(workspaceFolder);
     const announcement: IDESessionAnnouncement = {
         session_id: sessionId,
         workspace_path: workspaceFolder.uri.fsPath,
-        repo_id: repoIdentity.repoID,
-        repo_ref: repoIdentity.repoRef,
+        repo_id: '',
         editor: 'vscode',
         version: extensionVersion,
         languages: getWorkspaceLanguages()
@@ -834,11 +811,10 @@ async function publishSessionAnnouncement(config: DrydockConfig) {
         kind: KIND_IDE_SESSION,
         content: JSON.stringify(announcement),
         tags: [
-            ['d', sessionId],
-            ['p', drydockPubkey],
-            ['repo', repoIdentity.repoID],
-            ['r', repoIdentity.repoRef],
-            ['t', IDE_CONTEXT_TAG]
+            ['d', `drydock:ide-session:${sessionId}`],
+            ['type', 'ide-session'],
+            ['schema', IDE_SESSION_SCHEMA],
+            ['client', `vscode-drydock/${extensionVersion}`]
         ]
     }, privateKey);
 
@@ -877,154 +853,13 @@ function signEvent(template: Omit<EventTemplate, 'created_at'>, privateKey: Uint
     }, privateKey);
 }
 
-async function getDrydockConfig(): Promise<DrydockConfig> {
+function getDrydockConfig(): DrydockConfig {
     const config = vscode.workspace.getConfiguration('drydock');
     return {
         relays: config.get<string[]>('relays', []),
-        privateKey: (await secretStorage?.get(PRIVATE_KEY_SECRET_KEY) ?? '').trim(),
+        privateKey: config.get<string>('privateKey', '').trim(),
         drydockPubkey: config.get<string>('drydockPubkey', '').trim()
     };
-}
-
-async function setPrivateKey(context: vscode.ExtensionContext): Promise<void> {
-    const value = await vscode.window.showInputBox({
-        prompt: 'Enter your Nostr private key. It will be stored in VS Code SecretStorage, not settings.',
-        placeHolder: 'nsec1... or 64-character hex key; leave empty to clear',
-        password: true,
-        ignoreFocusOut: true
-    });
-    if (value === undefined) {
-        return;
-    }
-
-    const trimmed = value.trim();
-    if (!trimmed) {
-        await context.secrets.delete(PRIVATE_KEY_SECRET_KEY);
-        vscode.window.showInformationMessage('Drydock: Private key cleared from SecretStorage');
-        await refreshRelaySubscription({ announceSession: false, notifyOnFailure: true });
-        return;
-    }
-
-    try {
-        parsePrivateKey(trimmed);
-    } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        vscode.window.showErrorMessage(`Drydock: Invalid private key: ${message}`);
-        return;
-    }
-
-    await context.secrets.store(PRIVATE_KEY_SECRET_KEY, trimmed);
-    await clearLegacyPrivateKeySetting();
-    vscode.window.showInformationMessage('Drydock: Private key stored securely');
-    await refreshRelaySubscription({ announceSession: false, notifyOnFailure: true });
-}
-
-async function migratePrivateKeySetting(context: vscode.ExtensionContext): Promise<void> {
-    const config = vscode.workspace.getConfiguration('drydock');
-    const legacyPrivateKey = config.get<string>('privateKey', '').trim();
-    if (!legacyPrivateKey) {
-        return;
-    }
-
-    const existingSecret = await context.secrets.get(PRIVATE_KEY_SECRET_KEY);
-    if (!existingSecret) {
-        await context.secrets.store(PRIVATE_KEY_SECRET_KEY, legacyPrivateKey);
-        vscode.window.showWarningMessage('Drydock: Migrated drydock.privateKey from settings to VS Code SecretStorage. The plaintext setting was cleared.');
-    }
-    await clearLegacyPrivateKeySetting();
-}
-
-async function clearLegacyPrivateKeySetting(): Promise<void> {
-    const config = vscode.workspace.getConfiguration('drydock');
-    for (const target of [vscode.ConfigurationTarget.Global, vscode.ConfigurationTarget.Workspace]) {
-        try {
-            await config.update('privateKey', undefined, target);
-        } catch (error) {
-            console.warn('Failed to clear legacy drydock.privateKey setting', error);
-        }
-    }
-}
-
-async function maybeAutoReview(document: vscode.TextDocument): Promise<void> {
-    if (document.uri.scheme !== 'file') {
-        return;
-    }
-    const config = vscode.workspace.getConfiguration('drydock');
-    if (!config.get<boolean>('autoReview', false)) {
-        return;
-    }
-    if (!vscode.workspace.getWorkspaceFolder(document.uri)) {
-        return;
-    }
-    if (autoReviewInFlight) {
-        return;
-    }
-
-    autoReviewInFlight = true;
-    try {
-        await reviewChanges();
-    } finally {
-        autoReviewInFlight = false;
-    }
-}
-
-async function confirmSourceDiffPublish(relays: string[]): Promise<boolean> {
-    const publicRelays = normalizeRelayUrls(relays).filter(isLikelyPublicRelay);
-    if (publicRelays.length === 0) {
-        return true;
-    }
-
-    const selected = await vscode.window.showWarningMessage(
-        `Drydock review requests include your uncommitted source diff. These relay(s) look public: ${publicRelays.join(', ')}. Only continue if you trust them.`,
-        { modal: true },
-        PUBLIC_DIFF_WARNING_ACTION
-    );
-    return selected === PUBLIC_DIFF_WARNING_ACTION;
-}
-
-function isLikelyPublicRelay(relay: string): boolean {
-    try {
-        const url = new URL(relay);
-        const host = url.hostname.toLowerCase();
-        if (host === 'localhost' || host === '::1' || host.endsWith('.local')) {
-            return false;
-        }
-        if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)) {
-            return false;
-        }
-        const private172 = host.match(/^172\.(\d+)\./);
-        if (private172) {
-            const secondOctet = Number(private172[1]);
-            if (secondOctet >= 16 && secondOctet <= 31) {
-                return false;
-            }
-        }
-        return true;
-    } catch {
-        return true;
-    }
-}
-
-function getRepoIdentity(workspaceFolder: vscode.WorkspaceFolder): { repoID: string; repoRef: string } {
-    const hashInput = getGitRemote(workspaceFolder.uri.fsPath) || `workspace:${workspaceFolder.name}`;
-    const repoID = createHash('sha256').update(hashInput).digest('hex');
-    return {
-        repoID,
-        repoRef: `repo:${repoID}`
-    };
-}
-
-function getGitRemote(workspacePath: string): string | undefined {
-    try {
-        const remote = execSync('git config --get remote.origin.url', {
-            cwd: workspacePath,
-            encoding: 'utf-8',
-            stdio: ['ignore', 'pipe', 'ignore']
-        }).trim();
-        return remote || undefined;
-    } catch {
-        return undefined;
-    }
 }
 
 function normalizeRelayUrls(relays: string[]): string[] {
@@ -1038,7 +873,7 @@ function normalizeRelayUrls(relays: string[]): string[] {
 function parsePrivateKey(value: string): Uint8Array {
     const trimmed = value.trim();
     if (!trimmed) {
-        throw new Error('Store a Nostr private key with the "Drydock: Store Nostr Private Key" command before requesting a review');
+        throw new Error('Configure drydock.privateKey before requesting a review');
     }
 
     if (trimmed.startsWith('nsec1')) {
@@ -1084,9 +919,9 @@ function tryParsePubkey(value: string): string | undefined {
     throw new Error('drydock.drydockPubkey must be an npub or 64-character hex public key');
 }
 
-function buildContextVMRequest<T>(id: string, method: string, params: T): ContextVMRequest<T> {
+function buildJSONRPCRequest<T>(id: string, method: string, params: T): JSONRPCRequest<T> {
     return {
-        jsonrpc: '2.0',
+        jsonrpc: JSONRPC_VERSION,
         id,
         method,
         params
@@ -1097,8 +932,7 @@ function buildContextVMRequestTags(config: DrydockConfig, requestId: string, met
     const tags: string[][] = [
         ['session', sessionId],
         ['request', requestId],
-        ['method', method],
-        ['t', IDE_CONTEXT_TAG]
+        ['method', method]
     ];
 
     const drydockPubkey = tryParsePubkey(config.drydockPubkey);
