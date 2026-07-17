@@ -452,7 +452,7 @@ func main() {
 		logger.Info("IDE gateway handler registered")
 
 		marketRegistry := marketplace.NewRegistry(store, logger)
-		marketRouter := marketplace.NewRouter(marketplace.RouterConfig{DefaultRelays: writeRelays}, marketRegistry, store, signer, relayPub, contextVMTransport, logger)
+		marketRouter := marketplace.NewRouter(marketplace.RouterConfig{DefaultRelays: writeRelays}, marketRegistry, store, signer, relayPub, contextVMTransport, paymentSvc, logger)
 		marketHandler := marketplace.NewHandler(marketRegistry, marketRouter, store, logger).
 			WithFeedbackLimiter(feedbackRateLimiter)
 		if err := contextvm.RegisterMarketplaceMethods(contextVMRouter, marketHandler); err != nil {

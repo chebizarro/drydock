@@ -22,6 +22,9 @@ func storeChat(t *testing.T, store *Store, ctx context.Context, eventID, sender,
 	if err := store.SetCodeChatResponse(ctx, eventID, response); err != nil {
 		t.Fatalf("SetCodeChatResponse: %v", err)
 	}
+	if err := store.MarkCodeChatPublished(ctx, eventID); err != nil {
+		t.Fatalf("MarkCodeChatPublished: %v", err)
+	}
 }
 
 func TestBeginCodeChatTurn(t *testing.T) {
@@ -145,6 +148,13 @@ func TestMarkCodeChatFailed(t *testing.T) {
 	// Mark as failed (should not error)
 	if err := store.MarkCodeChatFailed(ctx, "event-1"); err != nil {
 		t.Fatalf("MarkCodeChatFailed: %v", err)
+	}
+	turnNumber, err := store.BeginCodeChatTurn(ctx, turn, 10)
+	if err != nil {
+		t.Fatalf("BeginCodeChatTurn retry: %v", err)
+	}
+	if turnNumber == 0 {
+		t.Fatal("failed codechat turn was not admitted for retry")
 	}
 
 	// Mark non-existent (should not error - no-op)

@@ -164,6 +164,61 @@ var schemaMigrations = []schemaMigration{
 			return nil
 		},
 	},
+	{
+		version: 4,
+		name:    "marketplace_completion_payouts",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			for _, col := range []struct{ table, name, ddl string }{
+				{"reviewer_profiles", "payout_destination", "ALTER TABLE reviewer_profiles ADD COLUMN payout_destination TEXT NOT NULL DEFAULT ''"},
+				{"review_assignments", "review_event_id", "ALTER TABLE review_assignments ADD COLUMN review_event_id TEXT"},
+			} {
+				exists, err := hasColumn(ctx, tx, col.table, col.name)
+				if err != nil {
+					return fmt.Errorf("check %s.%s: %w", col.table, col.name, err)
+				}
+				if !exists {
+					if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+						return fmt.Errorf("add %s.%s: %w", col.table, col.name, err)
+					}
+				}
+			}
+			for _, ddl := range []string{
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_review_assignments_review_event
+				ON review_assignments(review_event_id) WHERE review_event_id IS NOT NULL`,
+				`CREATE TABLE IF NOT EXISTS marketplace_payouts (
+				assignment_id INTEGER PRIMARY KEY,
+				idempotency_key TEXT NOT NULL UNIQUE,
+				amount_sats INTEGER NOT NULL CHECK (amount_sats > 0),
+				destination TEXT NOT NULL,
+				status TEXT NOT NULL CHECK (status IN ('pending', 'submitted', 'settled', 'failed')),
+				payment_hash TEXT NOT NULL DEFAULT '', preimage TEXT NOT NULL DEFAULT '',
+				failure_reason TEXT NOT NULL DEFAULT '', submitted_at INTEGER NOT NULL DEFAULT 0,
+				settled_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+				FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE RESTRICT)`,
+				`CREATE INDEX IF NOT EXISTS idx_marketplace_payouts_status ON marketplace_payouts(status)`,
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_marketplace_payouts_destination ON marketplace_payouts(destination)`,
+				`CREATE TABLE IF NOT EXISTS marketplace_payout_audit (
+				id INTEGER PRIMARY KEY AUTOINCREMENT, assignment_id INTEGER NOT NULL,
+				from_status TEXT NOT NULL DEFAULT '', to_status TEXT NOT NULL,
+				completion_event_id TEXT NOT NULL DEFAULT '', payment_hash TEXT NOT NULL DEFAULT '',
+				detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+				FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE RESTRICT)`,
+				`CREATE INDEX IF NOT EXISTS idx_marketplace_payout_audit_assignment
+				ON marketplace_payout_audit(assignment_id, id)`,
+				`CREATE TRIGGER IF NOT EXISTS marketplace_payout_audit_no_update
+				BEFORE UPDATE ON marketplace_payout_audit BEGIN
+				SELECT RAISE(ABORT, 'marketplace payout audit is immutable'); END`,
+				`CREATE TRIGGER IF NOT EXISTS marketplace_payout_audit_no_delete
+				BEFORE DELETE ON marketplace_payout_audit BEGIN
+				SELECT RAISE(ABORT, 'marketplace payout audit is immutable'); END`,
+			} {
+				if _, err := tx.ExecContext(ctx, ddl); err != nil {
+					return fmt.Errorf("apply marketplace payout ddl: %w", err)
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -924,6 +979,43 @@ func (s *Store) GetRootStatus(ctx context.Context, rootID, repoID string) (kind 
 // This is a public wrapper around the existing isStatusAuthorAllowed logic.
 func (s *Store) CanStatusAuthor(ctx context.Context, rootID, repoID string, author nostr.PubKey) (bool, error) {
 	return s.isStatusAuthorAllowed(ctx, rootID, repoID, author)
+}
+
+// RecordReviewNote attaches an observable best-effort sub-stage outcome to an
+// existing review without changing its pipeline status.
+func (s *Store) RecordReviewNote(ctx context.Context, patchEventID, repoID, note string) error {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE review_log SET failure_reason=?, updated_at=?
+		WHERE patch_event_id=? AND repo_id=?`,
+		note, now, patchEventID, repoID,
+	)
+	if err != nil {
+		return fmt.Errorf("record review note: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("review note rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrReviewNotFound
+	}
+	return nil
+}
+
+// GetReviewNote returns the current note attached to a review.
+func (s *Store) GetReviewNote(ctx context.Context, patchEventID, repoID string) (string, error) {
+	var note sql.NullString
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT failure_reason FROM review_log WHERE patch_event_id=? AND repo_id=?`,
+		patchEventID, repoID,
+	).Scan(&note); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrReviewNotFound
+		}
+		return "", fmt.Errorf("get review note: %w", err)
+	}
+	return note.String, nil
 }
 
 func (s *Store) MarkReviewFailed(ctx context.Context, patchEventID, repoID, reason string) error {

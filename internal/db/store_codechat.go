@@ -32,14 +32,35 @@ func (s *Store) BeginCodeChatTurn(ctx context.Context, turn CodeChatTurn, maxTur
 	}
 	defer tx.Rollback()
 
-	// Check for duplicate event.
-	var exists int
+	// Check for a duplicate event. Failed attempts may be retried; all other
+	// existing states are already in flight, staged, or published.
+	var existingStatus string
 	err = tx.QueryRowContext(ctx,
-		`SELECT 1 FROM codechat_turns WHERE event_id = ?`,
+		`SELECT status FROM codechat_turns WHERE event_id = ?`,
 		turn.EventID,
-	).Scan(&exists)
+	).Scan(&existingStatus)
 	if err == nil {
-		return 0, nil // duplicate
+		if existingStatus != "failed" {
+			return 0, nil
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE codechat_turns SET response = '', status = 'pending' WHERE event_id = ?`,
+			turn.EventID,
+		); err != nil {
+			return 0, fmt.Errorf("reset failed codechat turn: %w", err)
+		}
+		var count int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM codechat_turns
+			WHERE sender_pubkey = ? AND created_at > strftime('%s', 'now', '-1 day')`,
+			turn.SenderPubKey,
+		).Scan(&count); err != nil {
+			return 0, fmt.Errorf("count retry turn: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("commit retry: %w", err)
+		}
+		return count, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("check duplicate: %w", err)
@@ -77,13 +98,42 @@ func (s *Store) BeginCodeChatTurn(ctx context.Context, turn CodeChatTurn, maxTur
 	return count + 1, nil
 }
 
-// SetCodeChatResponse updates a codechat turn with the response.
+// SetCodeChatResponse durably stages a generated response before relay publication.
 func (s *Store) SetCodeChatResponse(ctx context.Context, eventID, response string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE codechat_turns SET response = ?, status = 'published' WHERE event_id = ?`,
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE codechat_turns SET response = ?, status = 'pending' WHERE event_id = ?`,
 		response, eventID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("stage codechat response: event %s not found", eventID)
+	}
+	return nil
+}
+
+// MarkCodeChatPublished marks a staged response as published.
+func (s *Store) MarkCodeChatPublished(ctx context.Context, eventID string) error {
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE codechat_turns SET status = 'published' WHERE event_id = ?`,
+		eventID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("mark codechat published: event %s not found", eventID)
+	}
+	return nil
 }
 
 // MarkCodeChatFailed marks a codechat turn as failed.

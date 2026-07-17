@@ -6,21 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
 // ReviewerProfile holds reviewer information for marketplace operations.
 type ReviewerProfile struct {
-	Pubkey         string   `json:"pubkey"`
-	DisplayName    string   `json:"display_name,omitempty"`
-	Languages      []string `json:"languages"`
-	Domains        []string `json:"domains"`
-	Availability   string   `json:"availability"`
-	PricePerReview int64    `json:"price_per_review,omitempty"`
-	MaxConcurrent  int      `json:"max_concurrent"`
-	EventID        string   `json:"event_id"`
-	CreatedAt      int64    `json:"created_at"`
-	UpdatedAt      int64    `json:"updated_at"`
+	Pubkey            string   `json:"pubkey"`
+	DisplayName       string   `json:"display_name,omitempty"`
+	Languages         []string `json:"languages"`
+	Domains           []string `json:"domains"`
+	Availability      string   `json:"availability"`
+	PricePerReview    int64    `json:"price_per_review,omitempty"`
+	MaxConcurrent     int      `json:"max_concurrent"`
+	PayoutDestination string   `json:"payout_destination,omitempty"`
+	EventID           string   `json:"event_id"`
+	CreatedAt         int64    `json:"created_at"`
+	UpdatedAt         int64    `json:"updated_at"`
 }
 
 // ReputationScore holds a reviewer's computed reputation.
@@ -49,6 +51,7 @@ type ReviewAssignment struct {
 	AssignmentEventID string `json:"assignment_event_id"`
 	AcceptanceEventID string `json:"acceptance_event_id,omitempty"`
 	CompletionEventID string `json:"completion_event_id,omitempty"`
+	ReviewEventID     string `json:"review_event_id,omitempty"`
 	ExpiresAt         int64  `json:"expires_at"`
 	CreatedAt         int64  `json:"created_at"`
 	UpdatedAt         int64  `json:"updated_at"`
@@ -86,9 +89,9 @@ func (s *Store) UpsertReviewerProfile(ctx context.Context, profile ReviewerProfi
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO reviewer_profiles (
 			pubkey, display_name, languages, domains,
-			availability, price_per_review, max_concurrent,
+			availability, price_per_review, max_concurrent, payout_destination,
 			event_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(pubkey) DO UPDATE SET
 			display_name = excluded.display_name,
 			languages = excluded.languages,
@@ -96,11 +99,12 @@ func (s *Store) UpsertReviewerProfile(ctx context.Context, profile ReviewerProfi
 			availability = excluded.availability,
 			price_per_review = excluded.price_per_review,
 			max_concurrent = excluded.max_concurrent,
+			payout_destination = excluded.payout_destination,
 			event_id = excluded.event_id,
 			updated_at = excluded.updated_at
 	`,
 		profile.Pubkey, profile.DisplayName, string(languagesJSON), string(domainsJSON),
-		profile.Availability, profile.PricePerReview, profile.MaxConcurrent,
+		profile.Availability, profile.PricePerReview, profile.MaxConcurrent, profile.PayoutDestination,
 		eventID, now, now,
 	)
 	return err
@@ -113,12 +117,12 @@ func (s *Store) GetReviewerProfile(ctx context.Context, pubkey string) (*Reviewe
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT pubkey, display_name, languages, domains,
-				availability, price_per_review, max_concurrent,
+				availability, price_per_review, max_concurrent, payout_destination,
 				event_id, created_at, updated_at
 		FROM reviewer_profiles WHERE pubkey = ?
 	`, pubkey).Scan(
 		&p.Pubkey, &p.DisplayName, &languagesJSON, &domainsJSON,
-		&p.Availability, &p.PricePerReview, &p.MaxConcurrent,
+		&p.Availability, &p.PricePerReview, &p.MaxConcurrent, &p.PayoutDestination,
 		&p.EventID, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -138,7 +142,7 @@ func (s *Store) GetReviewerProfile(ctx context.Context, pubkey string) (*Reviewe
 func (s *Store) ListAvailableReviewers(ctx context.Context) ([]ReviewerProfile, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT pubkey, display_name, languages, domains,
-				availability, price_per_review, max_concurrent,
+				availability, price_per_review, max_concurrent, payout_destination,
 				event_id, created_at, updated_at
 		FROM reviewer_profiles
 		WHERE availability != 'unavailable'
@@ -156,7 +160,7 @@ func (s *Store) ListAvailableReviewers(ctx context.Context) ([]ReviewerProfile, 
 
 		if err := rows.Scan(
 			&p.Pubkey, &p.DisplayName, &languagesJSON, &domainsJSON,
-			&p.Availability, &p.PricePerReview, &p.MaxConcurrent,
+			&p.Availability, &p.PricePerReview, &p.MaxConcurrent, &p.PayoutDestination,
 			&p.EventID, &p.CreatedAt, &p.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -247,11 +251,13 @@ func (s *Store) CreateAssignment(ctx context.Context, a ReviewAssignment) error 
 		INSERT INTO review_assignments (
 			patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
 			status, priority, price_sats, assignment_event_id,
+			acceptance_event_id, completion_event_id, review_event_id,
 			expires_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		a.PatchEventID, a.RepoID, a.ReviewerPubkey, a.RequesterPubkey,
 		a.Status, a.Priority, a.PriceSats, a.AssignmentEventID,
+		nullIfEmpty(a.AcceptanceEventID), nullIfEmpty(a.CompletionEventID), nullIfEmpty(a.ReviewEventID),
 		a.ExpiresAt, now, now,
 	)
 	return err
@@ -299,34 +305,7 @@ func (s *Store) UpsertAssignmentReceipt(ctx context.Context, a ReviewAssignment)
 
 // GetAssignmentByID retrieves an assignment by its database ID.
 func (s *Store) GetAssignmentByID(ctx context.Context, id int) (*ReviewAssignment, error) {
-	var a ReviewAssignment
-	var acceptanceEventID, completionEventID sql.NullString
-
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
-				status, priority, price_sats, assignment_event_id,
-				acceptance_event_id, completion_event_id, expires_at, created_at, updated_at
-		FROM review_assignments WHERE id = ?
-	`, id).Scan(
-		&a.ID, &a.PatchEventID, &a.RepoID, &a.ReviewerPubkey, &a.RequesterPubkey,
-		&a.Status, &a.Priority, &a.PriceSats, &a.AssignmentEventID,
-		&acceptanceEventID, &completionEventID, &a.ExpiresAt, &a.CreatedAt, &a.UpdatedAt,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("assignment not found: %d", id)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	if acceptanceEventID.Valid {
-		a.AcceptanceEventID = acceptanceEventID.String
-	}
-	if completionEventID.Valid {
-		a.CompletionEventID = completionEventID.String
-	}
-
-	return &a, nil
+	return s.getAssignment(ctx, "id", id)
 }
 
 // GetAssignmentByEventID retrieves an assignment by its Nostr event ID.
@@ -334,39 +313,58 @@ func (s *Store) GetAssignmentByEventID(ctx context.Context, eventID string) (*Re
 	return s.getAssignmentByColumn(ctx, "assignment_event_id", eventID)
 }
 
-// GetAssignmentByCompletionEventID retrieves an assignment by its completed review event ID.
+// GetAssignmentByCompletionEventID retrieves an assignment by its published review event ID.
+// completion_event_id remains a fallback for rows created before migration v4.
 func (s *Store) GetAssignmentByCompletionEventID(ctx context.Context, eventID string) (*ReviewAssignment, error) {
+	assignment, err := s.getAssignmentByColumn(ctx, "review_event_id", eventID)
+	if err == nil {
+		return assignment, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
 	return s.getAssignmentByColumn(ctx, "completion_event_id", eventID)
 }
 
 func (s *Store) getAssignmentByColumn(ctx context.Context, column, eventID string) (*ReviewAssignment, error) {
-	var a ReviewAssignment
-	var acceptanceEventID, completionEventID sql.NullString
+	return s.getAssignment(ctx, column, eventID)
+}
 
+func (s *Store) getAssignment(ctx context.Context, column string, value any) (*ReviewAssignment, error) {
+	switch column {
+	case "id", "assignment_event_id", "completion_event_id", "review_event_id":
+	default:
+		return nil, fmt.Errorf("unsupported assignment lookup column %q", column)
+	}
+	var a ReviewAssignment
+	var acceptanceEventID, completionEventID, reviewEventID sql.NullString
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
 				status, priority, price_sats, assignment_event_id,
-				acceptance_event_id, completion_event_id, expires_at, created_at, updated_at
+				acceptance_event_id, completion_event_id, review_event_id,
+				expires_at, created_at, updated_at
 		FROM review_assignments WHERE `+column+` = ?
-	`, eventID).Scan(
+	`, value).Scan(
 		&a.ID, &a.PatchEventID, &a.RepoID, &a.ReviewerPubkey, &a.RequesterPubkey,
 		&a.Status, &a.Priority, &a.PriceSats, &a.AssignmentEventID,
-		&acceptanceEventID, &completionEventID, &a.ExpiresAt, &a.CreatedAt, &a.UpdatedAt,
+		&acceptanceEventID, &completionEventID, &reviewEventID,
+		&a.ExpiresAt, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("assignment not found: %s", eventID)
+		return nil, fmt.Errorf("assignment not found %v: %w", value, sql.ErrNoRows)
 	}
 	if err != nil {
 		return nil, err
 	}
-
 	if acceptanceEventID.Valid {
 		a.AcceptanceEventID = acceptanceEventID.String
 	}
 	if completionEventID.Valid {
 		a.CompletionEventID = completionEventID.String
 	}
-
+	if reviewEventID.Valid {
+		a.ReviewEventID = reviewEventID.String
+	}
 	return &a, nil
 }
 
@@ -382,8 +380,8 @@ func (s *Store) UpdateAssignmentStatus(ctx context.Context, id int, status strin
 		query = `UPDATE review_assignments SET status = ?, acceptance_event_id = ?, updated_at = ? WHERE id = ?`
 		args = []interface{}{status, eventID, now, id}
 	case "completed":
-		query = `UPDATE review_assignments SET status = ?, completion_event_id = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, eventID, now, id}
+		query = `UPDATE review_assignments SET status = ?, completion_event_id = ?, review_event_id = ?, updated_at = ? WHERE id = ?`
+		args = []interface{}{status, eventID, eventID, now, id}
 	default:
 		query = `UPDATE review_assignments SET status = ?, updated_at = ? WHERE id = ?`
 		args = []interface{}{status, now, id}
@@ -571,6 +569,13 @@ func (s *Store) GetReviewerStats(ctx context.Context, pubkey string) (*ReviewerS
 	}
 
 	return &stats, nil
+}
+
+func nullIfEmpty(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
 }
 
 // CountAvailableReviewers returns the number of reviewers with available status.

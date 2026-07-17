@@ -68,6 +68,12 @@ type Runner struct {
 	workers          int
 	logger           *slog.Logger
 	activityHook     func()
+
+	// Narrow function seams keep failure handling testable without replacing the
+	// concrete services used by the rest of the pipeline.
+	isPatchSuperseded func(context.Context, string, string, string) (bool, error)
+	publishStatus     func(context.Context, publisher.PublishStatusInput) (publisher.PublishStatusResult, error)
+	buildAutoFixPatch func(context.Context, string, []repo.AutoFixSuggestion) (repo.AutoFixResult, error)
 }
 
 type Config struct {
@@ -454,17 +460,16 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 8. Compute mean confidence
 	confidence := meanConfidence(filteredReview.Findings)
 
-	// 9. Check if this patch has been superseded by a newer revision
-	superseded := false
-	if sup, err := r.store.IsPatchSuperseded(ctx, task.PatchEventID, patchRec.RootID, task.RepoID); err != nil {
-		r.logger.Warn("failed to check superseded status, assuming not superseded",
-			"patch_event_id", task.PatchEventID, "error", err)
-	} else {
-		superseded = sup
-		if superseded {
-			r.logger.Info("patch is superseded, using short TTL",
-				"patch_event_id", task.PatchEventID, "root_id", patchRec.RootID)
-		}
+	// 9. Check if this patch has been superseded by a newer revision. Fail
+	// closed after one retry rather than publishing content whose freshness is
+	// unknown.
+	superseded, err := r.checkPatchSuperseded(ctx, task.PatchEventID, patchRec.RootID, task.RepoID)
+	if err != nil {
+		return err
+	}
+	if superseded {
+		r.logger.Info("patch is superseded, using short TTL",
+			"patch_event_id", task.PatchEventID, "root_id", patchRec.RootID)
 	}
 
 	// 10. Publish review
@@ -497,10 +502,12 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		"findings", len(filteredReview.Findings),
 	)
 
-	// 11b. Publish NIP-34 review status event (best-effort, non-fatal).
+	// 11b. Publish NIP-34 review status event. A configured status output is
+	// part of task completion: returning its error lets the existing review
+	// retry path reuse the durable review outbox and retry status idempotently.
 	if r.pubSvc != nil {
-		timer.Time(tracing.StageStatusPublish, func() error {
-			statusResult, statusErr := r.pubSvc.PublishStatus(ctx, publisher.PublishStatusInput{
+		if err := timer.Time(tracing.StageStatusPublish, func() error {
+			statusResult, statusErr := r.publishReviewStatus(ctx, publisher.PublishStatusInput{
 				PatchEventID:  task.PatchEventID,
 				RepoID:        task.RepoID,
 				ReviewEventID: reviewEventID,
@@ -516,7 +523,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 				},
 			})
 			if statusErr != nil {
-				log.Warn("NIP-34 status publish failed (non-fatal)", "error", statusErr)
+				return statusErr
 			} else if statusResult.Published {
 				log.Info("NIP-34 status event published",
 					"status_event_id", statusResult.EventID,
@@ -526,7 +533,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 				log.Debug("NIP-34 status skipped", "reason", statusResult.Reason)
 			}
 			return nil
-		})
+		}); err != nil {
+			return fmt.Errorf("publish NIP-34 status: %w", err)
+		}
 	}
 
 	// 11c. Auto-fix patch generation (best-effort, non-fatal).
@@ -603,14 +612,16 @@ func (r *Runner) publishApplyFailure(ctx context.Context, task db.ReviewTask, hi
 
 // autoFixResult is the pipeline-local view of a fix-patch publish outcome.
 type autoFixResult struct {
+	Attempted    bool
 	Published    bool
 	EventID      string
 	AppliedCount int
+	Reason       string
 }
 
 // tryAutoFix filters eligible findings, synthesizes a combined fix patch on the
-// review branch, and publishes it as a NIP-34 kind 1617 event. Returns nil on
-// skip, non-nil on attempt (success or failure logged internally).
+// review branch, and publishes it as a NIP-34 kind 1617 event. Best-effort
+// failures are recorded on the review and reflected in metrics.
 func (r *Runner) tryAutoFix(
 	ctx context.Context,
 	task db.ReviewTask,
@@ -647,19 +658,24 @@ func (r *Runner) tryAutoFix(
 	}
 
 	// 2. Synthesize combined patch on the review branch.
-	fixResult, err := r.repoSvc.BuildAutoFixPatch(ctx, prep.RepoPath, suggestions)
+	fixResult, err := r.buildAutoFix(ctx, prep.RepoPath, suggestions)
 	if err != nil {
+		metrics.AutoFixPublishFailures.Inc()
+		reason := fmt.Sprintf("patch synthesis failed: %v", err)
+		r.recordAutoFixOutcome(ctx, task, "failed", reason)
 		r.logger.Warn("autofix: patch synthesis failed",
 			"patch_event_id", task.PatchEventID,
 			"error", err)
-		return nil
+		return &autoFixResult{Attempted: true, Reason: reason}
 	}
 	if fixResult.AppliedCount == 0 || fixResult.PatchDiff == "" {
 		metrics.AutoFixSkipped.Inc()
+		reason := "no suggestions applied cleanly"
+		r.recordAutoFixOutcome(ctx, task, "failed", reason)
 		r.logger.Debug("autofix: no suggestions applied cleanly",
 			"patch_event_id", task.PatchEventID,
 			"attempted", len(suggestions))
-		return nil
+		return &autoFixResult{Attempted: true, Reason: reason}
 	}
 
 	// 3. Publish the fix patch.
@@ -673,16 +689,66 @@ func (r *Runner) tryAutoFix(
 		Model:         model,
 	})
 	if err != nil {
+		reason := fmt.Sprintf("publish failed: %v", err)
+		r.recordAutoFixOutcome(ctx, task, "failed", reason)
 		r.logger.Warn("autofix: publish failed (non-fatal)",
 			"patch_event_id", task.PatchEventID,
 			"error", err)
-		return &autoFixResult{Published: false}
+		return &autoFixResult{Attempted: true, Reason: reason}
 	}
 
+	r.recordAutoFixOutcome(ctx, task, "succeeded", pubResult.EventID)
 	return &autoFixResult{
+		Attempted:    true,
 		Published:    pubResult.Published,
 		EventID:      pubResult.EventID,
 		AppliedCount: fixResult.AppliedCount,
+	}
+}
+
+func (r *Runner) checkPatchSuperseded(ctx context.Context, patchEventID, rootID, repoID string) (bool, error) {
+	lookup := r.isPatchSuperseded
+	if lookup == nil {
+		lookup = r.store.IsPatchSuperseded
+	}
+	var lastErr error
+	for attempt := 1; attempt <= 2; attempt++ {
+		superseded, err := lookup(ctx, patchEventID, rootID, repoID)
+		if err == nil {
+			return superseded, nil
+		}
+		lastErr = err
+		r.logger.Warn("failed to check superseded status",
+			"patch_event_id", patchEventID, "attempt", attempt, "error", err)
+	}
+	return false, fmt.Errorf("check superseded status after retry: %w", lastErr)
+}
+
+func (r *Runner) publishReviewStatus(ctx context.Context, in publisher.PublishStatusInput) (publisher.PublishStatusResult, error) {
+	if r.publishStatus != nil {
+		return r.publishStatus(ctx, in)
+	}
+	return r.pubSvc.PublishStatus(ctx, in)
+}
+
+func (r *Runner) buildAutoFix(ctx context.Context, repoPath string, suggestions []repo.AutoFixSuggestion) (repo.AutoFixResult, error) {
+	if r.buildAutoFixPatch != nil {
+		return r.buildAutoFixPatch(ctx, repoPath, suggestions)
+	}
+	return r.repoSvc.BuildAutoFixPatch(ctx, repoPath, suggestions)
+}
+
+func (r *Runner) recordAutoFixOutcome(ctx context.Context, task db.ReviewTask, outcome, reason string) {
+	note := "autofix " + outcome
+	if reason != "" {
+		note += ": " + reason
+	}
+	if err := r.store.RecordReviewNote(ctx, task.PatchEventID, task.RepoID, note); err != nil {
+		r.logger.Error("autofix: failed to persist outcome",
+			"patch_event_id", task.PatchEventID,
+			"repo_id", task.RepoID,
+			"outcome", outcome,
+			"error", err)
 	}
 }
 

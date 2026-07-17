@@ -6,11 +6,11 @@ Drydock provides codebase Q&A through Nostr encrypted direct messages (DMs). Use
 
 ```
 ┌─────────────────┐                    ┌─────────────────────────────┐
-│     User        │   DM (kind 4/14)   │        Drydock              │
+│     User        │  Gift wrap (1059)  │        Drydock              │
 │  (Nostr Client) │ ─────────────────► │                             │
 └─────────────────┘                    │  ┌─────────────────────┐   │
                                        │  │   DM Handler        │   │
-                                       │  │  (NIP-04/NIP-44)    │   │
+                                       │  │  (NIP-17/NIP-59)     │   │
                                        │  └──────────┬──────────┘   │
                                        │             │              │
                                        │             ▼              │
@@ -32,8 +32,8 @@ Drydock provides codebase Q&A through Nostr encrypted direct messages (DMs). Use
                                        └─────────────────────────────┘
 ```
 
-1. **Receive DM**: User sends encrypted DM (NIP-04 or NIP-44) to Drydock's pubkey
-2. **Decrypt & Parse**: Handler decrypts message, extracts repo context from conversation history
+1. **Receive DM**: User sends a NIP-17 direct message inside a NIP-59 kind-1059 gift wrap
+2. **Open & Parse**: The listener verifies and decrypts the gift wrap and seal, then passes the plaintext kind-14 rumor to the handler
 3. **Index Repository**: If new repo, clone and index with tree-sitter + embeddings
 4. **RAG Retrieval**: Find relevant code snippets based on the question
 5. **LLM Response**: Generate answer with code context
@@ -45,8 +45,9 @@ Drydock provides codebase Q&A through Nostr encrypted direct messages (DMs). Use
 
 | Kind | NIP | Description |
 |------|-----|-------------|
-| 4 | NIP-04 | Legacy encrypted DMs (AES-256-CBC) |
-| 14 | NIP-17 | Modern sealed DMs (NIP-44 encryption) |
+| 13 | NIP-17/NIP-59 | Sender-signed, NIP-44-encrypted seal inside the gift wrap |
+| 14 | NIP-17 | Plaintext unsigned direct-message rumor inside the seal |
+| 1059 | NIP-59 | Ephemerally signed NIP-44 gift wrap published to relays |
 
 ### Message Format
 
@@ -95,7 +96,7 @@ DRYDOCK_CODECHAT_ALLOWED_REPOS="github.com/myorg/*,gitlab.com/myteam/*"
 
 ### Keyer Configuration
 
-The handler uses a `nostr.Keyer` interface for encryption/decryption:
+The handler uses a `nostr.Keyer` interface to sign the seal and perform the NIP-44 encryption required by NIP-59:
 
 ```go
 type Keyer interface {
@@ -139,7 +140,7 @@ CREATE TABLE codechat_turns (
 
 ## Security Considerations
 
-1. **Encryption**: All DMs use NIP-04 or NIP-44 encryption end-to-end
+1. **Encryption**: DMs use the complete NIP-17/NIP-59 rumor, seal, and gift-wrap construction; only the outer kind-1059 wrapper is published
 2. **Private Key Handling**: Use bunker signing; never expose nsec in production
 3. **Repository Access**: Only indexes public repositories by default
 4. **Rate Limiting**: Prevents abuse; configurable per-user limits

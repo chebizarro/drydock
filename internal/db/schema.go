@@ -324,6 +324,7 @@ CREATE TABLE IF NOT EXISTS reviewer_profiles (
     CHECK (availability IN ('available', 'limited', 'unavailable')),
   price_per_review INTEGER NOT NULL DEFAULT 0,
   max_concurrent INTEGER NOT NULL DEFAULT 3,
+  payout_destination TEXT NOT NULL DEFAULT '',
   event_id TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -356,6 +357,7 @@ CREATE TABLE IF NOT EXISTS review_assignments (
   assignment_event_id TEXT NOT NULL UNIQUE,
   acceptance_event_id TEXT,
   completion_event_id TEXT,
+  review_event_id TEXT,
   expires_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -364,6 +366,45 @@ CREATE TABLE IF NOT EXISTS review_assignments (
 CREATE INDEX IF NOT EXISTS idx_review_assignments_reviewer ON review_assignments(reviewer_pubkey);
 CREATE INDEX IF NOT EXISTS idx_review_assignments_status ON review_assignments(status);
 CREATE INDEX IF NOT EXISTS idx_review_assignments_expires ON review_assignments(expires_at);
+CREATE TABLE IF NOT EXISTS marketplace_payouts (
+  assignment_id INTEGER PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  amount_sats INTEGER NOT NULL CHECK (amount_sats > 0),
+  destination TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'submitted', 'settled', 'failed')),
+  payment_hash TEXT NOT NULL DEFAULT '',
+  preimage TEXT NOT NULL DEFAULT '',
+  failure_reason TEXT NOT NULL DEFAULT '',
+  submitted_at INTEGER NOT NULL DEFAULT 0,
+  settled_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_marketplace_payouts_status ON marketplace_payouts(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_marketplace_payouts_destination ON marketplace_payouts(destination);
+
+CREATE TABLE IF NOT EXISTS marketplace_payout_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  assignment_id INTEGER NOT NULL,
+  from_status TEXT NOT NULL DEFAULT '',
+  to_status TEXT NOT NULL,
+  completion_event_id TEXT NOT NULL DEFAULT '',
+  payment_hash TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_marketplace_payout_audit_assignment
+  ON marketplace_payout_audit(assignment_id, id);
+CREATE TRIGGER IF NOT EXISTS marketplace_payout_audit_no_update
+BEFORE UPDATE ON marketplace_payout_audit BEGIN
+  SELECT RAISE(ABORT, 'marketplace payout audit is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS marketplace_payout_audit_no_delete
+BEFORE DELETE ON marketplace_payout_audit BEGIN
+  SELECT RAISE(ABORT, 'marketplace payout audit is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS review_feedback (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

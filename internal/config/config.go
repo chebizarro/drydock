@@ -217,8 +217,10 @@ func configuredEnv() map[string]bool {
 		"DRYDOCK_META_MODEL",
 		"DRYDOCK_META_API_KEY",
 		"DRYDOCK_QDRANT_URL",
+		"DRYDOCK_QDRANT_API_KEY",
 		"DRYDOCK_EMBED_BASE_URL",
 		"DRYDOCK_EMBED_MODEL",
+		"DRYDOCK_EMBED_API_KEY",
 	}
 	configured := make(map[string]bool, len(keys))
 	for _, key := range keys {
@@ -492,11 +494,16 @@ func (c *Config) validateProductionConfig(result *ValidationResult) {
 		if isLoopbackURL(rawURL) {
 			result.Errors = append(result.Errors, fmt.Sprintf("production mode must not use localhost/loopback URL for %s", name))
 		}
+		if strings.TrimSpace(rawURL) != "" && !isHTTPSURL(rawURL) {
+			result.Errors = append(result.Errors, fmt.Sprintf("production mode requires %s to use https://", name))
+		}
 	}
 
 	c.requireExplicit(result, "DRYDOCK_QDRANT_URL", c.QdrantURL)
+	c.requireExplicit(result, "DRYDOCK_QDRANT_API_KEY", c.QdrantAPIKey)
 	c.requireExplicit(result, "DRYDOCK_EMBED_BASE_URL", c.EmbedBaseURL)
 	c.requireExplicit(result, "DRYDOCK_EMBED_MODEL", c.EmbedModel)
+	c.requireExplicit(result, "DRYDOCK_EMBED_API_KEY", c.EmbedAPIKey)
 }
 
 func (c *Config) hasExplicitProductionRelays() bool {
@@ -544,6 +551,11 @@ func isLoopbackURL(raw string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func isHTTPSURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && strings.EqualFold(u.Scheme, "https") && u.Hostname() != ""
 }
 
 // validateDatabase checks that the database can be opened and is writable.

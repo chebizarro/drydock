@@ -6,7 +6,9 @@ This document is the Drydock reference for Nostr event kinds and tag conventions
 
 | Kind | Standard | Name | Drydock Use |
 |------|----------|------|-------------|
-| 1059 | NIP-59 | Gift wrap | Encrypted envelope for private Drydock events |
+| 13 | NIP-59 | Seal | Sender-signed encrypted seal inside codechat gift wraps; never published directly |
+| 14 | NIP-17 | Private direct message | Plaintext unsigned codechat rumor inside a seal; never published directly |
+| 1059 | NIP-59 | Gift wrap | Ephemerally signed encrypted envelope for private Drydock events |
 | 1111 | NIP-22 | Comment | Published code review comments and thread replies |
 | 1617 | NIP-34 | Patch | Primary automated review trigger |
 | 1618 | NIP-34 | Pull request | PR tip review trigger |
@@ -66,6 +68,7 @@ Application commands use ContextVM JSON-RPC envelopes in kind `25910`. Supported
 - `marketplace/assign`
 - `marketplace/accept`
 - `marketplace/reject`
+- `marketplace/complete`
 
 See [ContextVM Integration](contextvm-integration.md).
 
@@ -77,9 +80,11 @@ Marketplace reviewers publish NIP-89 profiles to advertise languages, domains, a
 
 Marketplace feedback uses kind `7000` with tags for status, rating, reviewer, and related review events.
 
-### NIP-59 Gift Wrap (`1059`)
+### NIP-17 Direct Messages and NIP-59 Gift Wrap (`13`, `14`, `1059`)
 
-Private Drydock payloads should be gift-wrapped. This includes source code snippets, diagnostics, fix requests, assignments, and reviewer decisions.
+Codechat responses use the complete NIP-17/NIP-59 construction: a plaintext unsigned kind-14 rumor is NIP-44 encrypted into a sender-signed kind-13 seal, then encrypted into an ephemerally signed kind-1059 gift wrap. Only the kind-1059 wrapper, whose sole routing tag is the recipient `p` tag, is published.
+
+Other private Drydock payloads should also be gift-wrapped. This includes source code snippets, diagnostics, fix requests, assignments, and reviewer decisions.
 
 ## Tag Conventions
 

@@ -17,6 +17,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Basic secret scan
+        shell: bash
+        run: |
+          if git grep -nEI '(nsec1[023456789acdefghjklmnpqrstuvwxyz]{58}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)' -- ':!*.md' ':!.beads/*' ':!internal/securityscan/scanner_test.go'; then
+            echo "Potential committed secret detected" >&2
+            exit 1
+          fi
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -44,57 +52,52 @@ jobs:
       - name: Run vet (CGO/tree-sitter)
         run: CGO_ENABLED=1 go vet ./...
 
-      - name: Run tests (CGO/tree-sitter)
-        run: CGO_ENABLED=1 go test -count=1 -timeout=5m ./...
-
-      - name: Symbol extraction gate (shipped build mode)
-        run: CGO_ENABLED=1 go test -count=1 ./internal/symbols ./internal/codeindex
-
-  build-cgo:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        go-version: ['1.26']
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ matrix.go-version }}
-
-      - name: Install C toolchain
-        run: sudo apt-get update && sudo apt-get install -y build-essential
-
-      - name: Go module cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-cgo-${{ runner.os }}-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            go-cgo-${{ runner.os }}-
-
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Build with CGO (tree-sitter)
-        run: CGO_ENABLED=1 go build ./...
-
-      - name: Run tests with CGO
-        run: CGO_ENABLED=1 go test -count=1 -timeout=5m ./...
+      - name: Run tests with race detector (CGO/tree-sitter)
+        run: CGO_ENABLED=1 go test -race -count=1 -timeout=10m ./...
 
   docker:
     runs-on: ubuntu-latest
-    needs: [build-and-test, build-cgo]
-    if: github.ref == 'refs/heads/master'
+    needs: [build-and-test]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate Compose configuration
+        env:
+          DRYDOCK_SIGNER_BUNKER_URL: bunker://ci-placeholder
+          LSP_BRIDGE_AUTH_TOKEN: ci-placeholder
+        run: docker compose config -q
+
       - name: Build Docker image
         run: docker build -t drydock:ci .
+
+      - name: Smoke test image startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker rm -f drydock-smoke >/dev/null 2>&1 || true
+          trap 'docker logs drydock-smoke || true; docker rm -f drydock-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name drydock-smoke -p 18081:8081 \
+            -e DEV_MODE=true \
+            -e DRYDOCK_DATABASE_URL=:memory: \
+            -e DRYDOCK_RELAYS=ws://127.0.0.1:1 \
+            -e DRYDOCK_PLANNER_BASE_URL=http://127.0.0.1:1/v1 \
+            -e DRYDOCK_CODER32B_BASE_URL=http://127.0.0.1:1/v1 \
+            -e DRYDOCK_LLM70B_BASE_URL=http://127.0.0.1:1/v1 \
+            -e DRYDOCK_CODER14B_BASE_URL=http://127.0.0.1:1/v1 \
+            -e DRYDOCK_META_BASE_URL=http://127.0.0.1:1/v1 \
+            drydock:ci
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:18081/healthz; then
+              exit 0
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' drydock-smoke)" != "true" ]; then
+              echo "Drydock container exited before becoming healthy" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "Drydock container did not become healthy within 30 seconds" >&2
+          exit 1

@@ -48,6 +48,37 @@ type InvoiceStatus struct {
 	Expired     bool
 }
 
+// PayoutEvidence is definitive or reconcilable evidence for an outbound payment.
+type PayoutEvidence struct {
+	PaymentHash string
+	Preimage    string
+	SettledAt   int64
+	Settled     bool
+	Failed      bool
+}
+
+// PayoutSubmissionError distinguishes definitive/pre-send failures from
+// ambiguous outcomes that may have reached the wallet.
+type PayoutSubmissionError struct {
+	MayHaveSubmitted bool
+	Err              error
+}
+
+func (e *PayoutSubmissionError) Error() string { return e.Err.Error() }
+func (e *PayoutSubmissionError) Unwrap() error { return e.Err }
+
+// PayoutMayHaveSubmitted reports whether retrying could double-pay.
+func PayoutMayHaveSubmitted(err error) bool {
+	var submissionErr *PayoutSubmissionError
+	return !errors.As(err, &submissionErr) || submissionErr.MayHaveSubmitted
+}
+
+// OutboundPayer is implemented by invoice providers that support NIP-47 pay_invoice.
+type OutboundPayer interface {
+	PayInvoice(ctx context.Context, bolt11 string, amountSats int64) (PayoutEvidence, error)
+	LookupPayment(ctx context.Context, bolt11 string, amountSats int64) (PayoutEvidence, error)
+}
+
 // MintClient handles Cashu token parsing and mint operations.
 type MintClient interface {
 	ParseToken(raw string) (ParsedToken, error)
@@ -117,6 +148,27 @@ func New(cfg Config, store *db.Store, invoice InvoiceProvider, mint MintClient, 
 		cfg.InvoiceExpiry = 5 * time.Minute
 	}
 	return &Service{cfg: cfg, store: store, invoice: invoice, mint: mint, logger: logger}
+}
+
+// SubmitPayout pays a reviewer BOLT11 through the configured outbound provider.
+func (s *Service) SubmitPayout(ctx context.Context, destination string, amountSats int64, idempotencyKey string) (PayoutEvidence, error) {
+	payer, ok := s.invoice.(OutboundPayer)
+	if !ok || payer == nil {
+		return PayoutEvidence{}, &PayoutSubmissionError{MayHaveSubmitted: false, Err: errors.New("outbound NWC payer is not configured")}
+	}
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return PayoutEvidence{}, &PayoutSubmissionError{MayHaveSubmitted: false, Err: errors.New("payout idempotency key is required")}
+	}
+	return payer.PayInvoice(ctx, destination, amountSats)
+}
+
+// ReconcilePayout looks up an already-submitted outbound payment without resubmitting it.
+func (s *Service) ReconcilePayout(ctx context.Context, destination string, amountSats int64) (PayoutEvidence, error) {
+	payer, ok := s.invoice.(OutboundPayer)
+	if !ok || payer == nil {
+		return PayoutEvidence{}, errors.New("outbound NWC payer is not configured")
+	}
+	return payer.LookupPayment(ctx, destination, amountSats)
 }
 
 // AuthorizeResult describes the outcome of a payment authorization attempt.

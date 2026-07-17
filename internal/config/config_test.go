@@ -200,8 +200,31 @@ func TestFromEnv_ProductionMissingUnsafeConfigReturnsErrors(t *testing.T) {
 		"DRYDOCK_META_MODEL",
 		"DRYDOCK_LLM_API_KEY",
 		"DRYDOCK_QDRANT_URL",
+		"DRYDOCK_QDRANT_API_KEY",
 		"DRYDOCK_EMBED_BASE_URL",
 		"DRYDOCK_EMBED_MODEL",
+		"DRYDOCK_EMBED_API_KEY",
+	} {
+		if !hasErrorContaining(result, want) {
+			t.Errorf("expected production validation error containing %q; got %#v", want, result.Errors)
+		}
+	}
+}
+
+func TestValidateProductionRequiresAuthenticatedTLSEndpoints(t *testing.T) {
+	cfg := Config{
+		Production:   true,
+		QdrantURL:    "http://qdrant.example.internal:6333",
+		EmbedBaseURL: "http://embed.example.internal/v1",
+	}
+	result := ValidationResult{}
+	cfg.validateProductionConfig(&result)
+
+	for _, want := range []string{
+		"DRYDOCK_QDRANT_URL to use https://",
+		"DRYDOCK_EMBED_BASE_URL to use https://",
+		"DRYDOCK_QDRANT_API_KEY",
+		"DRYDOCK_EMBED_API_KEY",
 	} {
 		if !hasErrorContaining(result, want) {
 			t.Errorf("expected production validation error containing %q; got %#v", want, result.Errors)

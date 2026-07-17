@@ -93,16 +93,17 @@ func (r *Registry) RegisterReviewer(ctx context.Context, profile ReviewerProfile
 
 	// Persist to database (convert to DB type)
 	dbProfile := db.ReviewerProfile{
-		Pubkey:         profile.Pubkey,
-		DisplayName:    profile.DisplayName,
-		Languages:      profile.Languages,
-		Domains:        profile.Domains,
-		Availability:   string(profile.Availability),
-		PricePerReview: profile.PricePerReview,
-		MaxConcurrent:  profile.MaxConcurrent,
-		EventID:        eventID,
-		CreatedAt:      profile.CreatedAt,
-		UpdatedAt:      profile.UpdatedAt,
+		Pubkey:            profile.Pubkey,
+		DisplayName:       profile.DisplayName,
+		Languages:         profile.Languages,
+		Domains:           profile.Domains,
+		Availability:      string(profile.Availability),
+		PricePerReview:    profile.PricePerReview,
+		MaxConcurrent:     profile.MaxConcurrent,
+		PayoutDestination: profile.PayoutDestination,
+		EventID:           eventID,
+		CreatedAt:         profile.CreatedAt,
+		UpdatedAt:         profile.UpdatedAt,
 	}
 	if err := r.store.UpsertReviewerProfile(ctx, dbProfile, eventID); err != nil {
 		return fmt.Errorf("upsert reviewer profile: %w", err)
@@ -150,15 +151,16 @@ func (r *Registry) GetReviewer(ctx context.Context, pubkey string) (*ReviewerPro
 
 	// Convert to marketplace types
 	profile := ReviewerProfile{
-		Pubkey:         dbProfile.Pubkey,
-		DisplayName:    dbProfile.DisplayName,
-		Languages:      dbProfile.Languages,
-		Domains:        dbProfile.Domains,
-		Availability:   AvailabilityLevel(dbProfile.Availability),
-		PricePerReview: dbProfile.PricePerReview,
-		MaxConcurrent:  dbProfile.MaxConcurrent,
-		CreatedAt:      dbProfile.CreatedAt,
-		UpdatedAt:      dbProfile.UpdatedAt,
+		Pubkey:            dbProfile.Pubkey,
+		DisplayName:       dbProfile.DisplayName,
+		Languages:         dbProfile.Languages,
+		Domains:           dbProfile.Domains,
+		Availability:      AvailabilityLevel(dbProfile.Availability),
+		PricePerReview:    dbProfile.PricePerReview,
+		MaxConcurrent:     dbProfile.MaxConcurrent,
+		PayoutDestination: dbProfile.PayoutDestination,
+		CreatedAt:         dbProfile.CreatedAt,
+		UpdatedAt:         dbProfile.UpdatedAt,
 	}
 
 	reputation := ReputationScore{
@@ -198,15 +200,16 @@ func (r *Registry) FindReviewers(ctx context.Context, criteria RoutingCriteria, 
 	for _, dbProfile := range dbProfiles {
 		// Convert to marketplace type
 		profile := ReviewerProfile{
-			Pubkey:         dbProfile.Pubkey,
-			DisplayName:    dbProfile.DisplayName,
-			Languages:      dbProfile.Languages,
-			Domains:        dbProfile.Domains,
-			Availability:   AvailabilityLevel(dbProfile.Availability),
-			PricePerReview: dbProfile.PricePerReview,
-			MaxConcurrent:  dbProfile.MaxConcurrent,
-			CreatedAt:      dbProfile.CreatedAt,
-			UpdatedAt:      dbProfile.UpdatedAt,
+			Pubkey:            dbProfile.Pubkey,
+			DisplayName:       dbProfile.DisplayName,
+			Languages:         dbProfile.Languages,
+			Domains:           dbProfile.Domains,
+			Availability:      AvailabilityLevel(dbProfile.Availability),
+			PricePerReview:    dbProfile.PricePerReview,
+			MaxConcurrent:     dbProfile.MaxConcurrent,
+			PayoutDestination: dbProfile.PayoutDestination,
+			CreatedAt:         dbProfile.CreatedAt,
+			UpdatedAt:         dbProfile.UpdatedAt,
 		}
 		// Skip unavailable reviewers
 		if profile.Availability == AvailabilityUnavailable {

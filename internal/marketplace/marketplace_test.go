@@ -303,15 +303,16 @@ func TestEventKinds(t *testing.T) {
 
 func TestReviewerProfileNIP89Event(t *testing.T) {
 	profile := ReviewerProfile{
-		Pubkey:         "reviewer-pubkey",
-		DisplayName:    "Alice - Code Reviewer",
-		About:          "Security and performance specialist",
-		Languages:      []string{"go", "rust"},
-		Domains:        []string{"security", "performance"},
-		Availability:   AvailabilityAvailable,
-		PricePerReview: 1000,
-		MaxConcurrent:  3,
-		ResponseTime:   "24h",
+		Pubkey:            "reviewer-pubkey",
+		DisplayName:       "Alice - Code Reviewer",
+		About:             "Security and performance specialist",
+		Languages:         []string{"go", "rust"},
+		Domains:           []string{"security", "performance"},
+		Availability:      AvailabilityAvailable,
+		PricePerReview:    1000,
+		PayoutDestination: "lnbc1profilepayout",
+		MaxConcurrent:     3,
+		ResponseTime:      "24h",
 	}
 
 	event, err := ReviewerProfileEvent(profile)
@@ -331,7 +332,8 @@ func TestReviewerProfileNIP89Event(t *testing.T) {
 		{"drydock:domains", "security", "performance"},
 		{"drydock:availability", "available"},
 		{"drydock:price", "1000"},
-		{"drydock:methods", "marketplace/assign", "marketplace/accept", "marketplace/reject"},
+		{"drydock:payout", "lnbc1profilepayout"},
+		{"drydock:methods", "marketplace/assign", "marketplace/accept", "marketplace/reject", "marketplace/complete"},
 	}
 	for _, want := range wantTags {
 		if !hasTag(event.Tags, want) {

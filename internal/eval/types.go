@@ -7,16 +7,16 @@ import (
 )
 
 type Dataset struct {
-	ID    string    `json:"id"`
+	ID    string      `json:"id"`
 	Cases []PatchCase `json:"cases"`
 }
 
 type PatchCase struct {
-	CaseID            string             `json:"case_id"`
-	PatchDiff         string             `json:"patch_diff"`
-	ChangedFiles      []string           `json:"changed_files"`
-	ContextBundle     string             `json:"context_bundle"`
-	ExpectedFindings  []ExpectedFinding  `json:"expected_findings"`
+	CaseID           string            `json:"case_id"`
+	PatchDiff        string            `json:"patch_diff"`
+	ChangedFiles     []string          `json:"changed_files"`
+	ContextBundle    string            `json:"context_bundle"`
+	ExpectedFindings []ExpectedFinding `json:"expected_findings"`
 }
 
 type ExpectedFinding struct {
@@ -37,15 +37,17 @@ type RunCaseInput struct {
 }
 
 type Metrics struct {
-	TotalCases            int     `json:"total_cases"`
-	ExpectedFindings      int     `json:"expected_findings"`
-	PredictedFindings     int     `json:"predicted_findings"`
-	TruePositives         int     `json:"true_positives"`
-	FalsePositives        int     `json:"false_positives"`
-	FalseNegatives        int     `json:"false_negatives"`
-	Recall                float64 `json:"recall"`
-	FalsePositiveRate     float64 `json:"false_positive_rate"`
-	CalibrationMAE        float64 `json:"calibration_mae"`
+	TotalCases              int     `json:"total_cases"`
+	ExpectedFindings        int     `json:"expected_findings"`
+	PredictedFindings       int     `json:"predicted_findings"`
+	TruePositives           int     `json:"true_positives"`
+	FalsePositives          int     `json:"false_positives"`
+	FalseNegatives          int     `json:"false_negatives"`
+	Recall                  float64 `json:"recall"`
+	FalsePositiveRate       float64 `json:"false_positive_rate"`
+	CalibrationMAE          float64 `json:"calibration_mae"`
 	HighConfidencePrecision float64 `json:"high_conf_precision"`
+	SeverityMatches         int     `json:"severity_matches"`
+	SeverityMismatches      int     `json:"severity_mismatches"`
+	SeverityAgreement       float64 `json:"severity_agreement"`
 }
-

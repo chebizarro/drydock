@@ -13,8 +13,10 @@ import (
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/metareview"
+	"drydock/internal/metrics"
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
+	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
 	"drydock/internal/testutil"
 	"fiatjaf.com/nostr"
@@ -258,6 +260,77 @@ func TestIndexSourceCodeNoIndexerIsNoop(t *testing.T) {
 	runner := &Runner{}
 	if err := runner.indexSourceCode(context.Background(), "/repo", "repo-id", testLogger()); err != nil {
 		t.Fatalf("nil code indexer should be no-op: %v", err)
+	}
+}
+
+func TestCheckPatchSupersededFailsClosedAfterRetry(t *testing.T) {
+	calls := 0
+	runner := &Runner{
+		logger: testLogger(),
+		isPatchSuperseded: func(context.Context, string, string, string) (bool, error) {
+			calls++
+			return false, errors.New("database unavailable")
+		},
+	}
+
+	_, err := runner.checkPatchSuperseded(context.Background(), "patch", "root", "repo")
+	if err == nil || !strings.Contains(err.Error(), "database unavailable") {
+		t.Fatalf("expected supersession lookup error, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("supersession lookup calls = %d, want 2", calls)
+	}
+}
+
+func TestPublishReviewStatusReturnsFailure(t *testing.T) {
+	wantErr := errors.New("relay rejected status")
+	runner := &Runner{
+		publishStatus: func(context.Context, publisher.PublishStatusInput) (publisher.PublishStatusResult, error) {
+			return publisher.PublishStatusResult{}, wantErr
+		},
+	}
+
+	_, err := runner.publishReviewStatus(context.Background(), publisher.PublishStatusInput{})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("status publication error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestTryAutoFixRecordsSynthesisFailure(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedPatchForPipeline(t, ctx, store)
+	beforeFailures := metrics.AutoFixPublishFailures.Value()
+
+	runner := &Runner{
+		store:  store,
+		logger: testLogger(),
+		buildAutoFixPatch: func(context.Context, string, []repo.AutoFixSuggestion) (repo.AutoFixResult, error) {
+			return repo.AutoFixResult{}, errors.New("git apply failed")
+		},
+	}
+	cfg := repoconfig.Default()
+	cfg.AutoFix.MinConfidence = 0.5
+	cfg.AutoFix.MaxFindings = 3
+	review := reviewengine.ReviewerOutput{Findings: []reviewengine.Finding{{
+		File:          "main.go",
+		Confidence:    0.9,
+		SuggestedDiff: "diff --git a/main.go b/main.go",
+	}}}
+
+	result := runner.tryAutoFix(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}, repo.PrepareResult{RepoPath: "/repo"}, review, cfg, "review-event", "model")
+	if result == nil || !result.Attempted || result.Published {
+		t.Fatalf("unexpected autofix result: %#v", result)
+	}
+	if metrics.AutoFixPublishFailures.Value() != beforeFailures+1 {
+		t.Fatalf("autofix failure metric did not increment")
+	}
+	note, err := store.GetReviewNote(ctx, patchID, repoID)
+	if err != nil {
+		t.Fatalf("get review note: %v", err)
+	}
+	if !strings.Contains(note, "autofix failed") || !strings.Contains(note, "git apply failed") {
+		t.Fatalf("autofix failure note = %q", note)
 	}
 }
 

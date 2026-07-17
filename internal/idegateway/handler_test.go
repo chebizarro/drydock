@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"drydock/internal/contextvm"
+	"drydock/internal/db"
 
 	"fiatjaf.com/nostr"
 )
@@ -162,12 +163,14 @@ func TestHandleFixRequestReturnsStoredFix(t *testing.T) {
 	pub := &mockPublisher{}
 	h := newTestHandler(pub)
 
-	h.storeFix(context.Background(), "fix-1", storedFix{
+	if err := h.storeFix(context.Background(), "fix-1", storedFix{
 		SessionID: "sess-1",
 		File:      "main.go",
 		Diff:      "@@ -1 +1 @@\n-old\n+new",
 		CreatedAt: time.Now(),
-	})
+	}); err != nil {
+		t.Fatalf("storeFix failed: %v", err)
+	}
 
 	params := json.RawMessage(`{"session_id":"sess-1","request_id":"req-1","fix_id":"fix-1","file":"main.go"}`)
 
@@ -205,17 +208,41 @@ func TestHandleFixRequestMissingFix(t *testing.T) {
 	}
 }
 
+func TestStoreFixReturnsPersistenceError(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h := newTestHandler(&mockPublisher{})
+	h.store = store
+	if err := h.storeFix(ctx, "fix-1", storedFix{
+		SessionID: "sess-1",
+		File:      "main.go",
+		Diff:      "diff",
+		CreatedAt: time.Now(),
+	}); err == nil {
+		t.Fatal("storeFix succeeded after durable store failure")
+	}
+}
+
 func TestCleanupExpiredFixes(t *testing.T) {
 	pub := &mockPublisher{}
 	h := newTestHandler(pub)
 	h.fixTTL = time.Second
 
-	h.storeFix(context.Background(), "expired", storedFix{
+	if err := h.storeFix(context.Background(), "expired", storedFix{
 		SessionID: "sess-1",
 		File:      "main.go",
 		Diff:      "diff",
 		CreatedAt: time.Now().Add(-2 * time.Second),
-	})
+	}); err != nil {
+		t.Fatalf("storeFix failed: %v", err)
+	}
 
 	h.cleanupExpiredFixes(context.Background(), time.Now())
 

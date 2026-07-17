@@ -8,9 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"drydock/internal/db"
 	"drydock/internal/ratelimit"
+	"drydock/internal/reviewengine"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/keyer"
+	"fiatjaf.com/nostr/nip59"
 )
 
 func TestParseMessage_RepoPrefix(t *testing.T) {
@@ -58,6 +62,136 @@ func TestParseMessage_RepoPrefix(t *testing.T) {
 				t.Errorf("question: got %q, want %q", result.question, tc.wantQ)
 			}
 		})
+	}
+}
+
+type responseKeyer struct{}
+
+func (responseKeyer) GetPublicKey(context.Context) (nostr.PubKey, error) {
+	return nostr.MustPubKeyFromHex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), nil
+}
+func (responseKeyer) SignEvent(_ context.Context, event *nostr.Event) error {
+	event.ID = event.GetID()
+	return nil
+}
+func (responseKeyer) Encrypt(context.Context, string, nostr.PubKey) (string, error) {
+	return "ciphertext", nil
+}
+func (responseKeyer) Decrypt(context.Context, string, nostr.PubKey) (string, error) {
+	return "repo:test/repo what does main do?", nil
+}
+
+type responseLLM struct{}
+
+func (responseLLM) ChatCompletion(context.Context, reviewengine.ChatRequest) (string, error) {
+	return "main starts the service", nil
+}
+
+type recordingPublisher struct{ events []nostr.Event }
+
+func (p *recordingPublisher) Publish(_ context.Context, _ []string, event nostr.Event) error {
+	p.events = append(p.events, event)
+	return nil
+}
+
+func TestHandleDM_PersistenceFailureBlocksPublish(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`CREATE TRIGGER fail_codechat_response_stage
+		BEFORE UPDATE OF response ON codechat_turns
+		WHEN NEW.status = 'pending' AND NEW.response != ''
+		BEGIN SELECT RAISE(ABORT, 'forced persistence failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	publisher := &recordingPublisher{}
+	h := New(Config{}, store, nil, nil, responseLLM{}, responseKeyer{}, publisher,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	event := nostr.Event{
+		ID:        nostr.MustIDFromHex("1111111111111111111111111111111111111111111111111111111111111111"),
+		PubKey:    nostr.MustPubKeyFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		Kind:      kindPrivateDirectMessage,
+		CreatedAt: nostr.Now(),
+		Content:   "repo:test/repo what does main do?",
+		Tags:      nostr.Tags{{"p", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+	}
+
+	if err := h.HandleDM(ctx, event, ""); err == nil {
+		t.Fatal("HandleDM succeeded despite response persistence failure")
+	}
+	if len(publisher.events) != 0 {
+		t.Fatalf("published %d events after persistence failure, want 0", len(publisher.events))
+	}
+}
+
+func TestSendEncryptedResponseUsesNIP17GiftWrap(t *testing.T) {
+	ctx := context.Background()
+	sender := keyer.NewPlainKeySigner(nostr.Generate())
+	recipient := keyer.NewPlainKeySigner(nostr.Generate())
+	recipientPubKey, err := recipient.GetPublicKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	senderPubKey, err := sender.GetPublicKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := &recordingPublisher{}
+	h := &Handler{
+		cfg:     Config{DefaultRelays: []string{"wss://relay.test"}},
+		keyer:   sender,
+		publish: publisher,
+	}
+	incoming := nostr.Event{
+		ID:     nostr.MustIDFromHex("2222222222222222222222222222222222222222222222222222222222222222"),
+		PubKey: recipientPubKey,
+		Kind:   kindPrivateDirectMessage,
+	}
+
+	if err := h.sendEncryptedResponse(ctx, incoming, "end-to-end response", ""); err != nil {
+		t.Fatalf("sendEncryptedResponse failed: %v", err)
+	}
+	if len(publisher.events) != 1 {
+		t.Fatalf("published events = %d, want 1", len(publisher.events))
+	}
+	wrapper := publisher.events[0]
+	if wrapper.Kind != nostr.KindGiftWrap {
+		t.Fatalf("outer kind = %d, want %d", wrapper.Kind, nostr.KindGiftWrap)
+	}
+	if !wrapper.VerifySignature() {
+		t.Fatal("gift wrap has invalid ephemeral signature")
+	}
+	if len(wrapper.Tags) != 1 || len(wrapper.Tags[0]) < 2 || wrapper.Tags[0][0] != "p" || wrapper.Tags[0][1] != recipientPubKey.Hex() {
+		t.Fatalf("gift wrap leaks non-routing tags: %#v", wrapper.Tags)
+	}
+
+	rumor, err := nip59.GiftUnwrap(wrapper, func(other nostr.PubKey, ciphertext string) (string, error) {
+		return recipient.Decrypt(ctx, ciphertext, other)
+	})
+	if err != nil {
+		t.Fatalf("GiftUnwrap failed: %v", err)
+	}
+	if rumor.Kind != kindPrivateDirectMessage {
+		t.Fatalf("rumor kind = %d, want %d", rumor.Kind, kindPrivateDirectMessage)
+	}
+	if rumor.PubKey != senderPubKey {
+		t.Fatalf("rumor pubkey = %s, want %s", rumor.PubKey.Hex(), senderPubKey.Hex())
+	}
+	if rumor.Content != "end-to-end response" {
+		t.Fatalf("rumor content = %q", rumor.Content)
+	}
+	if !rumor.Tags.ContainsAny("p", []string{recipientPubKey.Hex()}) {
+		t.Fatalf("rumor missing recipient tag: %#v", rumor.Tags)
+	}
+	if !rumor.Tags.ContainsAny("e", []string{incoming.ID.Hex()}) {
+		t.Fatalf("rumor missing reply reference: %#v", rumor.Tags)
 	}
 }
 

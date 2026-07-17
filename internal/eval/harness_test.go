@@ -24,8 +24,8 @@ func TestHarnessComputesMetrics(t *testing.T) {
 			{
 				CaseID: "c1",
 				ExpectedFindings: []ExpectedFinding{
-					{Category: "security", File: "a.go", Line: 10},
-					{Category: "correctness", File: "b.go", Line: 20},
+					{Category: "security", File: "a.go", Line: 10, Severity: "high"},
+					{Category: "correctness", File: "b.go", Line: 20, Severity: "medium"},
 				},
 			},
 		},
@@ -55,6 +55,42 @@ func TestHarnessComputesMetrics(t *testing.T) {
 	}
 	if m.HighConfidencePrecision != 0.5 {
 		t.Fatalf("expected high confidence precision 0.5, got %f", m.HighConfidencePrecision)
+	}
+	if m.SeverityMatches != 1 || m.SeverityMismatches != 0 || m.SeverityAgreement != 1 {
+		t.Fatalf("unexpected severity metrics: %+v", m)
+	}
+}
+
+func TestHarnessLineToleranceAndSeverityDisagreement(t *testing.T) {
+	ds := Dataset{
+		ID: "d-tolerance",
+		Cases: []PatchCase{{
+			CaseID: "c1",
+			ExpectedFindings: []ExpectedFinding{{
+				Category: "security",
+				File:     "a.go",
+				Line:     10,
+				Severity: "high",
+			}},
+		}},
+	}
+	runner := fakeRunner{out: reviewengine.ReviewerOutput{Findings: []reviewengine.Finding{{
+		Category:   "security",
+		File:       "a.go",
+		Line:       12,
+		Severity:   "medium",
+		Confidence: 0.9,
+	}}}}
+
+	m, err := (&Harness{Runner: runner, LineTolerance: 2}).RunMonthly(context.Background(), ds)
+	if err != nil {
+		t.Fatalf("run monthly: %v", err)
+	}
+	if m.TruePositives != 1 || m.FalsePositives != 0 || m.FalseNegatives != 0 {
+		t.Fatalf("expected finding within line tolerance to match: %+v", m)
+	}
+	if m.SeverityMatches != 0 || m.SeverityMismatches != 1 || m.SeverityAgreement != 0 {
+		t.Fatalf("unexpected severity disagreement metrics: %+v", m)
 	}
 }
 
@@ -91,5 +127,3 @@ func mustStore(t *testing.T, ctx context.Context) *db.Store {
 	}
 	return store
 }
-
-

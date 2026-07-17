@@ -210,6 +210,38 @@ func TestHandleReply_BasicConversation(t *testing.T) {
 	}
 }
 
+func TestHandleReply_PersistenceFailureBlocksPublish(t *testing.T) {
+	store := setupTestDB(t)
+	seedReviewEvent(t, store, testReviewID, testPatchID, testRepoID)
+	if _, err := store.DB().Exec(`CREATE TRIGGER fail_conversation_response_stage
+		BEFORE UPDATE OF response_content ON conversations
+		WHEN NEW.status = 'pending' AND NEW.response_content != ''
+		BEGIN SELECT RAISE(ABORT, 'forced persistence failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	llm := &fakeLLM{responses: []string{"response must not publish"}}
+	h, relayPub := makeHandler(t, store, llm)
+	replyEvent := nostr.Event{
+		ID:        nostr.MustIDFromHex("3434343434343434343434343434343434343434343434343434343434343434"),
+		PubKey:    nostr.MustPubKeyFromHex("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+		Kind:      nostr.KindComment,
+		CreatedAt: nostr.Now(),
+		Content:   "Please explain.",
+		Tags: nostr.Tags{
+			{"e", testReviewID},
+			{"p", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+
+	if err := h.HandleReply(context.Background(), replyEvent, ""); err == nil {
+		t.Fatal("HandleReply succeeded despite response persistence failure")
+	}
+	if len(relayPub.published) != 0 {
+		t.Fatalf("published %d events after persistence failure, want 0", len(relayPub.published))
+	}
+}
+
 func TestHandleReply_RateLimitAt3Turns(t *testing.T) {
 	store := setupTestDB(t)
 	seedReviewEvent(t, store, testReviewID, testPatchID, testRepoID)

@@ -62,6 +62,26 @@ type nwcError struct {
 }
 
 // makeInvoiceParams are the params for make_invoice method.
+type nwcResponseError struct {
+	Code    string
+	Message string
+}
+
+func (e *nwcResponseError) Error() string {
+	return fmt.Sprintf("NWC error [%s]: %s", e.Code, e.Message)
+}
+
+type payInvoiceParams struct {
+	Invoice string `json:"invoice"`
+	Amount  int64  `json:"amount,omitempty"`
+}
+
+type payInvoiceResult struct {
+	Preimage string `json:"preimage"`
+	FeesPaid int64  `json:"fees_paid,omitempty"`
+}
+
+// makeInvoiceParams are the params for make_invoice method.
 type makeInvoiceParams struct {
 	Amount      int64  `json:"amount"`                // millisats
 	Description string `json:"description,omitempty"` // memo
@@ -91,6 +111,7 @@ type lookupInvoiceParams struct {
 // lookupInvoiceResult is the result of lookup_invoice.
 type lookupInvoiceResult struct {
 	Type        string `json:"type"` // "incoming" or "outgoing"
+	State       string `json:"state,omitempty"`
 	Invoice     string `json:"invoice,omitempty"`
 	PaymentHash string `json:"payment_hash"`
 	Preimage    string `json:"preimage,omitempty"`
@@ -191,6 +212,106 @@ func (p *NWCInvoiceProvider) CreateInvoice(ctx context.Context, sats int64, memo
 		return Invoice{}, fmt.Errorf("failed to parse make_invoice result: %w", err)
 	}
 	return validateCreatedInvoice(invoiceResult, params.Amount, time.Now().Unix())
+}
+
+// PayInvoice pays a reviewer invoice via NIP-47 pay_invoice.
+func (p *NWCInvoiceProvider) PayInvoice(ctx context.Context, bolt11 string, amountSats int64) (PayoutEvidence, error) {
+	bolt11 = strings.TrimSpace(bolt11)
+	if !strings.HasPrefix(strings.ToLower(bolt11), "ln") || amountSats <= 0 || amountSats > math.MaxInt64/1000 {
+		return PayoutEvidence{}, &PayoutSubmissionError{MayHaveSubmitted: false, Err: errors.New("valid BOLT11 destination and positive amount are required")}
+	}
+	result, err := p.sendRequest(ctx, "pay_invoice", payInvoiceParams{Invoice: bolt11, Amount: amountSats * 1000})
+	if err != nil {
+		var responseErr *nwcResponseError
+		return PayoutEvidence{}, &PayoutSubmissionError{MayHaveSubmitted: !errors.As(err, &responseErr), Err: err}
+	}
+	var paid payInvoiceResult
+	if err := json.Unmarshal(result, &paid); err != nil {
+		return PayoutEvidence{}, &PayoutSubmissionError{MayHaveSubmitted: true, Err: fmt.Errorf("parse pay_invoice result: %w", err)}
+	}
+	evidence, err := validatePayInvoiceResult(paid, time.Now().Unix())
+	if err != nil {
+		return PayoutEvidence{}, &PayoutSubmissionError{MayHaveSubmitted: true, Err: err}
+	}
+	return evidence, nil
+}
+
+// LookupPayment reconciles a submitted outgoing payment without paying again.
+func (p *NWCInvoiceProvider) LookupPayment(ctx context.Context, bolt11 string, amountSats int64) (PayoutEvidence, error) {
+	bolt11 = strings.TrimSpace(bolt11)
+	if !strings.HasPrefix(strings.ToLower(bolt11), "ln") || amountSats <= 0 || amountSats > math.MaxInt64/1000 {
+		return PayoutEvidence{}, errors.New("valid BOLT11 destination and positive amount are required")
+	}
+	result, err := p.sendRequest(ctx, "lookup_invoice", lookupInvoiceParams{Invoice: bolt11})
+	if err != nil {
+		return PayoutEvidence{}, fmt.Errorf("lookup outgoing invoice failed: %w", err)
+	}
+	var lookup lookupInvoiceResult
+	if err := json.Unmarshal(result, &lookup); err != nil {
+		return PayoutEvidence{}, fmt.Errorf("parse outgoing lookup result: %w", err)
+	}
+	return validateOutgoingPayment(bolt11, amountSats*1000, lookup, time.Now().Unix())
+}
+
+func validatePayInvoiceResult(result payInvoiceResult, now int64) (PayoutEvidence, error) {
+	preimage, err := hex.DecodeString(result.Preimage)
+	if err != nil || len(preimage) != 32 {
+		return PayoutEvidence{}, errors.New("pay_invoice returned malformed preimage")
+	}
+	hash := sha256.Sum256(preimage)
+	return PayoutEvidence{
+		PaymentHash: hex.EncodeToString(hash[:]),
+		Preimage:    strings.ToLower(result.Preimage),
+		SettledAt:   now,
+		Settled:     true,
+	}, nil
+}
+
+func validateOutgoingPayment(bolt11 string, expectedMSats int64, result lookupInvoiceResult, now int64) (PayoutEvidence, error) {
+	if result.Type != "outgoing" || result.Invoice != bolt11 || result.Amount != expectedMSats {
+		return PayoutEvidence{}, errors.New("outgoing payment lookup correlation mismatch")
+	}
+	state := strings.ToLower(result.State)
+	if state == "" {
+		if result.Preimage != "" || result.SettledAt > 0 {
+			state = "settled"
+		} else {
+			state = "pending"
+		}
+	}
+	if state != "pending" && state != "settled" && state != "failed" {
+		return PayoutEvidence{}, fmt.Errorf("outgoing payment lookup returned unknown state %q", result.State)
+	}
+	if state == "failed" {
+		return PayoutEvidence{Failed: true}, nil
+	}
+	if state == "pending" {
+		if result.Preimage != "" || result.SettledAt != 0 {
+			return PayoutEvidence{}, errors.New("pending outgoing payment returned settlement evidence")
+		}
+		return PayoutEvidence{}, nil
+	}
+	if result.SettledAt <= 0 || result.SettledAt > now+300 {
+		return PayoutEvidence{}, errors.New("settled outgoing payment returned invalid settled_at")
+	}
+	hashBytes, err := parsePaymentHash(result.PaymentHash)
+	if err != nil {
+		return PayoutEvidence{}, fmt.Errorf("settled outgoing payment hash: %w", err)
+	}
+	preimage, err := hex.DecodeString(result.Preimage)
+	if err != nil || len(preimage) != 32 {
+		return PayoutEvidence{}, errors.New("settled outgoing payment returned malformed preimage")
+	}
+	hash := sha256.Sum256(preimage)
+	if !strings.EqualFold(hex.EncodeToString(hash[:]), hex.EncodeToString(hashBytes)) {
+		return PayoutEvidence{}, errors.New("outgoing payment preimage does not match payment hash")
+	}
+	return PayoutEvidence{
+		PaymentHash: strings.ToLower(result.PaymentHash),
+		Preimage:    strings.ToLower(result.Preimage),
+		SettledAt:   result.SettledAt,
+		Settled:     true,
+	}, nil
 }
 
 // LookupInvoice checks the status of a Lightning invoice via NWC.
@@ -378,6 +499,9 @@ func (p *NWCInvoiceProvider) sendRequest(ctx context.Context, method string, par
 			if !ok {
 				return nil, errors.New("subscription closed")
 			}
+			if responseEvt.PubKey != p.conn.WalletPubkey || !responseEvt.CheckID() || !responseEvt.VerifySignature() {
+				continue
+			}
 
 			// Check if response is for our request
 			if !hasTag(responseEvt.Tags, "e", evt.ID.Hex()) {
@@ -398,7 +522,7 @@ func (p *NWCInvoiceProvider) sendRequest(ctx context.Context, method string, par
 
 			// Check for error
 			if resp.Error != nil {
-				return nil, fmt.Errorf("NWC error [%s]: %s", resp.Error.Code, resp.Error.Message)
+				return nil, &nwcResponseError{Code: resp.Error.Code, Message: resp.Error.Message}
 			}
 
 			// Verify result type matches

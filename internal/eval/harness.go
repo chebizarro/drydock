@@ -12,10 +12,13 @@ import (
 	"drydock/internal/reviewengine"
 )
 
+const DefaultLineTolerance = 2
+
 type Harness struct {
-	Runner ReviewRunner
-	Store  *db.Store
-	Logger *slog.Logger
+	Runner        ReviewRunner
+	Store         *db.Store
+	Logger        *slog.Logger
+	LineTolerance int
 }
 
 func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
@@ -28,6 +31,9 @@ func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
 	tp := 0
 	fp := 0
 	fn := 0
+	severityMatches := 0
+	severityMismatches := 0
+	lineTolerance := max(h.LineTolerance, 0)
 
 	var calibrationAbsSum float64
 	calibrationN := 0
@@ -44,21 +50,22 @@ func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
 			return Metrics{}, fmt.Errorf("review case %s: %w", c.CaseID, err)
 		}
 
-		expectedMap := make(map[string]bool, len(c.ExpectedFindings))
-		matchedExpected := make(map[string]bool, len(c.ExpectedFindings))
-		for _, exp := range c.ExpectedFindings {
-			expectedMap[expectedKey(exp)] = true
-			totalExpected++
-		}
+		matchedExpected := make([]bool, len(c.ExpectedFindings))
+		totalExpected += len(c.ExpectedFindings)
 
 		for _, pred := range out.Findings {
 			totalPredicted++
-			key := predictedKey(pred)
 			label := 0.0
-			if expectedMap[key] && !matchedExpected[key] {
+			matchIndex := findExpectedMatch(c.ExpectedFindings, matchedExpected, pred, lineTolerance)
+			if matchIndex >= 0 {
 				tp++
 				label = 1
-				matchedExpected[key] = true
+				matchedExpected[matchIndex] = true
+				if normalizeLabel(c.ExpectedFindings[matchIndex].Severity) == normalizeLabel(pred.Severity) {
+					severityMatches++
+				} else {
+					severityMismatches++
+				}
 			} else {
 				fp++
 			}
@@ -73,8 +80,8 @@ func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
 			}
 		}
 
-		for key := range expectedMap {
-			if !matchedExpected[key] {
+		for _, matched := range matchedExpected {
+			if !matched {
 				fn++
 			}
 		}
@@ -84,6 +91,7 @@ func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
 	fpRate := ratio(fp, tp+fp)
 	calibration := ratioFloat(calibrationAbsSum, float64(calibrationN))
 	highConfPrecision := ratio(highConfTP, highConfN)
+	severityAgreement := ratio(severityMatches, severityMatches+severityMismatches)
 
 	metrics := Metrics{
 		TotalCases:              len(ds.Cases),
@@ -96,6 +104,9 @@ func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
 		FalsePositiveRate:       fpRate,
 		CalibrationMAE:          calibration,
 		HighConfidencePrecision: highConfPrecision,
+		SeverityMatches:         severityMatches,
+		SeverityMismatches:      severityMismatches,
+		SeverityAgreement:       severityAgreement,
 	}
 
 	if h.Store != nil {
@@ -125,18 +136,38 @@ func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
 			"recall", metrics.Recall,
 			"false_positive_rate", metrics.FalsePositiveRate,
 			"calibration_mae", metrics.CalibrationMAE,
+			"severity_agreement", metrics.SeverityAgreement,
 		)
 	}
 
 	return metrics, nil
 }
 
-func expectedKey(f ExpectedFinding) string {
-	return strings.ToLower(strings.TrimSpace(f.Category)) + "|" + normalizePath(f.File) + "|" + fmt.Sprint(f.Line)
+func findExpectedMatch(expected []ExpectedFinding, matched []bool, pred reviewengine.Finding, lineTolerance int) int {
+	bestIndex := -1
+	bestDistance := lineTolerance + 1
+	for i, exp := range expected {
+		if matched[i] || normalizeLabel(exp.Category) != normalizeLabel(pred.Category) || normalizePath(exp.File) != normalizePath(pred.File) {
+			continue
+		}
+		distance := abs(exp.Line - pred.Line)
+		if distance <= lineTolerance && distance < bestDistance {
+			bestIndex = i
+			bestDistance = distance
+		}
+	}
+	return bestIndex
 }
 
-func predictedKey(f reviewengine.Finding) string {
-	return strings.ToLower(strings.TrimSpace(f.Category)) + "|" + normalizePath(f.File) + "|" + fmt.Sprint(f.Line)
+func normalizeLabel(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func abs(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func normalizePath(p string) string {
@@ -156,4 +187,3 @@ func ratioFloat(n, d float64) float64 {
 	}
 	return n / d
 }
-

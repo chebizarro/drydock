@@ -21,9 +21,13 @@ import (
 	"drydock/internal/vectorstore"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip59"
 )
 
 const (
+	// kindPrivateDirectMessage is the plaintext rumor defined by NIP-17.
+	kindPrivateDirectMessage nostr.Kind = 14
+
 	// MaxTurnsPerConversation limits conversation length per DM thread.
 	MaxTurnsPerConversation = 10
 
@@ -121,9 +125,9 @@ func (h *Handler) WithRateLimiter(limiter *ratelimit.Limiter) *Handler {
 	return h
 }
 
-// HandleDM processes an encrypted DM event (kind 4 NIP-04 or kind 14 sealed).
-// It decrypts the message, queries the code index, generates a response, and
-// publishes an encrypted reply.
+// HandleDM processes a NIP-17 kind-14 rumor after its NIP-59 gift wrap and
+// seal have been opened and verified by the listener. It queries the code
+// index, generates a response, and publishes a fully gift-wrapped reply.
 func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL string) error {
 	metrics.CodeChatDMsReceived.Inc()
 
@@ -201,7 +205,7 @@ func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL stri
 		response := "I need to know which codebase you're asking about. " +
 			"Please include the repository in your message, like:\n\n" +
 			"`repo:npub1.../reponame` what does the main function do?"
-		return h.sendEncryptedResponse(ctx, event, response, relayURL)
+		return h.publishStoredResponse(ctx, event, response, relayURL)
 	}
 
 	// 5. Query code index for relevant context.
@@ -237,14 +241,8 @@ func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL stri
 	}
 	responseText = strings.TrimSpace(responseText)
 
-	// 8. Store the response.
-	if err := h.store.SetCodeChatResponse(ctx, event.ID.Hex(), responseText); err != nil {
-		h.logger.Warn("failed to record codechat response", "error", err)
-	}
-
-	// 9. Send encrypted response.
-	if err := h.sendEncryptedResponse(ctx, event, responseText, relayURL); err != nil {
-		metrics.CodeChatErrors.Inc()
+	// 8-9. Durably stage the response, publish it, then mark it published.
+	if err := h.publishStoredResponse(ctx, event, responseText, relayURL); err != nil {
 		return err
 	}
 
@@ -264,18 +262,9 @@ func (h *Handler) IsDMToUs(_ context.Context, event nostr.Event) bool {
 		return false
 	}
 
-	// Kind 4 (NIP-04): check p-tag for recipient
-	if event.Kind == nostr.KindEncryptedDirectMessage {
-		for _, tag := range event.Tags {
-			if len(tag) >= 2 && tag[0] == "p" && strings.EqualFold(tag[1], h.ourPubKey) {
-				return true
-			}
-		}
-	}
-
-	// Kind 14 (NIP-17 sealed): the event is already addressed to us if we can decrypt it
-	// For now, we'll try to decrypt in HandleDM and handle failures gracefully.
-	if event.Kind == 14 {
+	// NIP-17 kind 14 is the plaintext rumor recovered from a verified kind-1059
+	// gift wrap. It is not itself encrypted or signed.
+	if event.Kind == kindPrivateDirectMessage {
 		for _, tag := range event.Tags {
 			if len(tag) >= 2 && tag[0] == "p" && strings.EqualFold(tag[1], h.ourPubKey) {
 				return true
@@ -300,14 +289,12 @@ func (h *Handler) WaitIdle() {
 	wg.Wait()
 }
 
-// decryptDM decrypts the content of an encrypted DM event using the Keyer's Cipher.
-func (h *Handler) decryptDM(ctx context.Context, event nostr.Event) (string, error) {
-	// Use the keyer's Decrypt method (implements NIP-44 with conversation key caching).
-	plaintext, err := h.keyer.Decrypt(ctx, event.Content, event.PubKey)
-	if err != nil {
-		return "", fmt.Errorf("decrypt DM: %w", err)
+// decryptDM returns the plaintext content of an already-unwrapped NIP-17 rumor.
+func (h *Handler) decryptDM(_ context.Context, event nostr.Event) (string, error) {
+	if event.Kind != kindPrivateDirectMessage {
+		return "", fmt.Errorf("unsupported DM kind %d: expected unwrapped NIP-17 rumor", event.Kind)
 	}
-	return plaintext, nil
+	return event.Content, nil
 }
 
 // parsedMessage contains extracted info from a DM.
@@ -457,27 +444,57 @@ func payloadInt(payload map[string]any, key string) int {
 	}
 }
 
-// sendEncryptedResponse encrypts and publishes a DM response using the Keyer's Cipher.
-func (h *Handler) sendEncryptedResponse(ctx context.Context, incomingEvent nostr.Event, response, relayURL string) error {
-	// Encrypt using the keyer's Encrypt method (NIP-44).
-	ciphertext, err := h.keyer.Encrypt(ctx, response, incomingEvent.PubKey)
-	if err != nil {
-		return fmt.Errorf("encrypt response: %w", err)
+func (h *Handler) publishStoredResponse(ctx context.Context, incomingEvent nostr.Event, response, relayURL string) error {
+	if err := h.store.SetCodeChatResponse(ctx, incomingEvent.ID.Hex(), response); err != nil {
+		metrics.CodeChatErrors.Inc()
+		if markErr := h.store.MarkCodeChatFailed(ctx, incomingEvent.ID.Hex()); markErr != nil {
+			return errors.Join(fmt.Errorf("stage codechat response: %w", err), fmt.Errorf("mark codechat retryable: %w", markErr))
+		}
+		return fmt.Errorf("stage codechat response: %w", err)
 	}
+	if err := h.sendEncryptedResponse(ctx, incomingEvent, response, relayURL); err != nil {
+		metrics.CodeChatErrors.Inc()
+		return err
+	}
+	if err := h.store.MarkCodeChatPublished(ctx, incomingEvent.ID.Hex()); err != nil {
+		metrics.CodeChatErrors.Inc()
+		return fmt.Errorf("mark codechat response published: %w", err)
+	}
+	return nil
+}
 
-	// Build response event (kind 14 for NIP-17 sealed DM).
-	responseEvent := nostr.Event{
-		Kind:      14, // NIP-17 sealed direct message
+// sendEncryptedResponse publishes a complete NIP-17/NIP-59 gift-wrap flow:
+// plaintext kind-14 rumor, sender-signed NIP-44 seal, and ephemeral kind-1059 wrapper.
+func (h *Handler) sendEncryptedResponse(ctx context.Context, incomingEvent nostr.Event, response, relayURL string) error {
+	sender, err := h.keyer.GetPublicKey(ctx)
+	if err != nil {
+		return fmt.Errorf("get response sender pubkey: %w", err)
+	}
+	rumor := nostr.Event{
+		PubKey:    sender,
+		Kind:      kindPrivateDirectMessage,
 		CreatedAt: nostr.Now(),
-		Content:   ciphertext,
+		Content:   response,
 		Tags: nostr.Tags{
 			{"p", incomingEvent.PubKey.Hex()},
-			{"e", incomingEvent.ID.Hex()}, // reference the original DM
+			{"e", incomingEvent.ID.Hex()},
 		},
 	}
+	rumor.ID = rumor.GetID()
 
-	if err := h.keyer.SignEvent(ctx, &responseEvent); err != nil {
-		return fmt.Errorf("sign response: %w", err)
+	responseEvent, err := nip59.GiftWrap(
+		rumor,
+		incomingEvent.PubKey,
+		func(plaintext string) (string, error) {
+			return h.keyer.Encrypt(ctx, plaintext, incomingEvent.PubKey)
+		},
+		func(event *nostr.Event) error {
+			return h.keyer.SignEvent(ctx, event)
+		},
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("gift-wrap response: %w", err)
 	}
 
 	// Determine relays.

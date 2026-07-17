@@ -52,6 +52,7 @@ func (h *Handler) RegisterContextVMMethods(router *contextvm.Router) error {
 		router.Register(MethodAssign, h.HandleAssignmentIntent),
 		router.Register(MethodAccept, h.handleContextVMAcceptance),
 		router.Register(MethodReject, h.handleContextVMRejection),
+		router.Register(MethodComplete, h.handleContextVMCompletion),
 	)
 }
 
@@ -254,6 +255,27 @@ func (h *Handler) handleContextVMAcceptance(ctx context.Context, req contextvm.R
 		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
 	}
 	return map[string]string{"status": "accepted"}, nil
+}
+
+// handleContextVMCompletion authenticates assignment completion and starts/reconciles payout.
+func (h *Handler) handleContextVMCompletion(ctx context.Context, req contextvm.Request) (any, *contextvm.Error) {
+	completion, rpcErr := contextvm.ParamsAs[ReviewCompletion](req)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if completion.AssignmentID == "" || completion.ReviewEventID == "" {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "assignment_id and review_event_id are required"}
+	}
+	if req.Event.PubKey == nostr.ZeroPK || req.Sender != req.Event.PubKey ||
+		!req.Event.CheckID() || !req.Event.VerifySignature() {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: "completion event failed signature verification"}
+	}
+	if err := h.router.complete(ctx, completion, req.Sender.Hex(), req.Event.ID.Hex()); err != nil {
+		h.logger.Error("failed to handle marketplace completion intent",
+			"event_id", req.Event.ID.Hex(), "error", err)
+		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+	}
+	return map[string]string{"status": "completed", "review_event_id": completion.ReviewEventID}, nil
 }
 
 // handleContextVMRejection processes a ContextVM assignment rejection intent.

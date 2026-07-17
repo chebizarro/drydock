@@ -3,6 +3,7 @@ package marketplace
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"drydock/internal/db"
 	"drydock/internal/metrics"
+	"drydock/internal/payment"
 
 	"fiatjaf.com/nostr"
 )
@@ -27,6 +29,11 @@ type RelayPublisher interface {
 }
 
 // ContextVMTransport publishes ContextVM intents to Nostr relays.
+type PayoutExecutor interface {
+	SubmitPayout(ctx context.Context, destination string, amountSats int64, idempotencyKey string) (payment.PayoutEvidence, error)
+	ReconcilePayout(ctx context.Context, destination string, amountSats int64) (payment.PayoutEvidence, error)
+}
+
 type ContextVMTransport interface {
 	SendWithID(ctx context.Context, id, method string, params any, recipients ...nostr.PubKey) (string, error)
 }
@@ -48,6 +55,7 @@ type Router struct {
 	signer             Signer
 	publisher          RelayPublisher
 	contextVMTransport ContextVMTransport
+	payoutExecutor     PayoutExecutor
 	logger             *slog.Logger
 }
 
@@ -61,11 +69,14 @@ func NewRouter(
 	args ...any,
 ) *Router {
 	var contextVMTransport ContextVMTransport
+	var payoutExecutor PayoutExecutor
 	var logger *slog.Logger
 	for _, arg := range args {
 		switch v := arg.(type) {
 		case ContextVMTransport:
 			contextVMTransport = v
+		case PayoutExecutor:
+			payoutExecutor = v
 		case *slog.Logger:
 			logger = v
 		case nil:
@@ -92,6 +103,7 @@ func NewRouter(
 		signer:             signer,
 		publisher:          publisher,
 		contextVMTransport: contextVMTransport,
+		payoutExecutor:     payoutExecutor,
 		logger:             logger,
 	}
 }
@@ -364,6 +376,91 @@ func (r *Router) HandleAcceptance(ctx context.Context, event nostr.Event) error 
 		"reviewer", acceptance.ReviewerPubkey,
 	)
 
+	return nil
+}
+
+// HandleCompletion processes a signed completion event from the assigned reviewer.
+func (r *Router) HandleCompletion(ctx context.Context, event nostr.Event) error {
+	if event.PubKey == nostr.ZeroPK || !event.CheckID() || !event.VerifySignature() {
+		return fmt.Errorf("completion event failed signature verification")
+	}
+	var completion ReviewCompletion
+	if err := json.Unmarshal([]byte(event.Content), &completion); err != nil {
+		return fmt.Errorf("parse completion: %w", err)
+	}
+	return r.complete(ctx, completion, event.PubKey.Hex(), event.ID.Hex())
+}
+
+func (r *Router) complete(ctx context.Context, completion ReviewCompletion, reviewerPubkey, completionEventID string) error {
+	rec, hasPayout, err := r.store.CompleteAssignmentAndAllocatePayout(
+		ctx, completion.AssignmentID, reviewerPubkey, completionEventID,
+		completion.ReviewEventID, time.Now().Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("record completion: %w", err)
+	}
+	if !hasPayout {
+		return nil
+	}
+	if r.payoutExecutor == nil {
+		return errors.New("review completed but payout executor is not configured")
+	}
+	return r.executePayout(ctx, rec)
+}
+
+func (r *Router) executePayout(ctx context.Context, rec db.MarketplacePayoutRecord) error {
+	if rec.Status == "settled" || rec.Status == "failed" {
+		return nil
+	}
+
+	submit := false
+	if rec.Status == "pending" {
+		claimed, err := r.store.MarkMarketplacePayoutSubmitted(ctx, rec.AssignmentID, time.Now().Unix())
+		if err != nil {
+			return fmt.Errorf("persist payout submission: %w", err)
+		}
+		submit = claimed
+		rec, err = r.store.GetMarketplacePayout(ctx, rec.AssignmentID)
+		if err != nil {
+			return fmt.Errorf("reload payout: %w", err)
+		}
+		if rec.Status == "settled" || rec.Status == "failed" {
+			return nil
+		}
+	}
+	var evidence payment.PayoutEvidence
+	var err error
+	if submit {
+		evidence, err = r.payoutExecutor.SubmitPayout(ctx, rec.Destination, rec.AmountSats, rec.IdempotencyKey)
+		if err != nil && payment.PayoutMayHaveSubmitted(err) {
+			return fmt.Errorf("payout submission outcome is ambiguous: %w", err)
+		}
+	} else {
+		evidence, err = r.payoutExecutor.ReconcilePayout(ctx, rec.Destination, rec.AmountSats)
+		if err != nil {
+			// Lookup errors are not definitive payment failures: the original
+			// submission may still be in flight or the wallet may be unavailable.
+			return fmt.Errorf("payout reconciliation is inconclusive: %w", err)
+		}
+	}
+	if err != nil {
+		if markErr := r.store.MarkMarketplacePayoutFailed(ctx, rec.AssignmentID, err.Error(), time.Now().Unix()); markErr != nil {
+			return errors.Join(err, fmt.Errorf("persist payout failure: %w", markErr))
+		}
+		return fmt.Errorf("payout failed: %w", err)
+	}
+	if evidence.Failed {
+		return r.store.MarkMarketplacePayoutFailed(ctx, rec.AssignmentID, "wallet reports payment failed", time.Now().Unix())
+	}
+	if !evidence.Settled {
+		return nil
+	}
+	if evidence.PaymentHash == "" || evidence.Preimage == "" || evidence.SettledAt <= 0 {
+		return errors.New("wallet returned incomplete payout settlement evidence")
+	}
+	if err := r.store.MarkMarketplacePayoutSettled(ctx, rec.AssignmentID, evidence.PaymentHash, evidence.Preimage, evidence.SettledAt, time.Now().Unix()); err != nil {
+		return fmt.Errorf("persist payout settlement: %w", err)
+	}
 	return nil
 }
 

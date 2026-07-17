@@ -2,11 +2,16 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"fiatjaf.com/nostr"
 )
 
 var ErrTokenHashAlreadyReserved = errors.New("payment token hash already reserved")
@@ -498,6 +503,331 @@ func (s *Store) IsTokenHashUsed(ctx context.Context, tokenHash string) (bool, er
 		return false, err
 	}
 	return true, nil
+}
+
+// MarketplacePayoutRecord is the durable reviewer payout allocated to one assignment.
+type MarketplacePayoutRecord struct {
+	AssignmentID      int
+	IdempotencyKey    string
+	AmountSats        int64
+	Destination       string
+	Status            string
+	PaymentHash       string
+	Preimage          string
+	FailureReason     string
+	CompletionEventID string
+	ReviewEventID     string
+	SubmittedAt       int64
+	SettledAt         int64
+	CreatedAt         int64
+	UpdatedAt         int64
+}
+
+// MarketplacePayoutAuditRecord is an immutable payout transition record.
+type MarketplacePayoutAuditRecord struct {
+	ID                int64
+	AssignmentID      int
+	FromStatus        string
+	ToStatus          string
+	CompletionEventID string
+	PaymentHash       string
+	Detail            string
+	CreatedAt         int64
+}
+
+// CompleteAssignmentAndAllocatePayout atomically authenticates the completion
+// against the assigned reviewer and stored published review, transitions
+// accepted->completed, and allocates exactly one payout for paid assignments.
+func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignmentEventID, reviewerPubkey, completionEventID, reviewEventID string, now int64) (MarketplacePayoutRecord, bool, error) {
+	if assignmentEventID == "" || reviewerPubkey == "" || completionEventID == "" || reviewEventID == "" {
+		return MarketplacePayoutRecord{}, false, errors.New("assignment, reviewer, completion event, and review event are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MarketplacePayoutRecord{}, false, err
+	}
+	defer tx.Rollback()
+
+	var assignmentID int
+	var patchEventID, repoID, storedReviewer, status, storedCompletion, storedReview, destination string
+	var priceSats int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT a.id, a.patch_event_id, a.repo_id, a.reviewer_pubkey, a.status,
+		       COALESCE(a.completion_event_id, ''), COALESCE(a.review_event_id, ''),
+		       a.price_sats, COALESCE(r.payout_destination, '')
+		FROM review_assignments a
+		LEFT JOIN reviewer_profiles r ON r.pubkey = a.reviewer_pubkey
+		WHERE a.assignment_event_id = ?
+	`, assignmentEventID).Scan(&assignmentID, &patchEventID, &repoID, &storedReviewer, &status,
+		&storedCompletion, &storedReview, &priceSats, &destination)
+	if err != nil {
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("lookup completion assignment: %w", err)
+	}
+	if storedReviewer != reviewerPubkey {
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("unauthorized reviewer: sender %s is not assigned reviewer %s", reviewerPubkey, storedReviewer)
+	}
+
+	var reviewPatch, reviewRepo, rawReview string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT patch_event_id, repo_id, raw_event_json FROM review_events WHERE event_id = ?
+	`, reviewEventID).Scan(&reviewPatch, &reviewRepo, &rawReview); err != nil {
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("published review event %s not found: %w", reviewEventID, err)
+	}
+	var reviewEvent nostr.Event
+	if err := json.Unmarshal([]byte(rawReview), &reviewEvent); err != nil {
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("decode published review event: %w", err)
+	}
+	if reviewEvent.ID.Hex() != reviewEventID || !reviewEvent.CheckID() || !reviewEvent.VerifySignature() {
+		return MarketplacePayoutRecord{}, false, errors.New("published review event failed integrity verification")
+	}
+	if reviewEvent.PubKey.Hex() != reviewerPubkey {
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("published review author %s is not assigned reviewer %s", reviewEvent.PubKey.Hex(), reviewerPubkey)
+	}
+	if reviewPatch != patchEventID || reviewRepo != repoID {
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("published review correlation mismatch for assignment %s", assignmentEventID)
+	}
+
+	completedNow := false
+	if status == "accepted" {
+		result, err := tx.ExecContext(ctx, `
+			UPDATE review_assignments
+			SET status = 'completed', completion_event_id = ?, review_event_id = ?, updated_at = ?
+			WHERE id = ? AND reviewer_pubkey = ? AND status = 'accepted'
+		`, completionEventID, reviewEventID, now, assignmentID, reviewerPubkey)
+		if err != nil {
+			return MarketplacePayoutRecord{}, false, err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return MarketplacePayoutRecord{}, false, err
+		}
+		if rows != 1 {
+			return MarketplacePayoutRecord{}, false, fmt.Errorf("completion transition affected %d rows", rows)
+		}
+		completedNow = true
+	} else if status != "completed" || storedCompletion != completionEventID || storedReview != reviewEventID {
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("assignment %s is not accepted: %s", assignmentEventID, status)
+	}
+
+	if priceSats <= 0 {
+		if err := tx.Commit(); err != nil {
+			return MarketplacePayoutRecord{}, false, err
+		}
+		return MarketplacePayoutRecord{}, false, nil
+	}
+	destination = strings.TrimSpace(destination)
+	if destination == "" {
+		return MarketplacePayoutRecord{}, false, errors.New("paid assignment reviewer has no payout destination")
+	}
+	idempotencyKey := "marketplace-payout:" + assignmentEventID
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO marketplace_payouts (
+			assignment_id, idempotency_key, amount_sats, destination, status, created_at, updated_at
+		) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+		ON CONFLICT(assignment_id) DO NOTHING
+	`, assignmentID, idempotencyKey, priceSats, destination, now, now)
+	if err != nil {
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("allocate marketplace payout: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return MarketplacePayoutRecord{}, false, err
+	}
+	if inserted == 1 {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO marketplace_payout_audit
+				(assignment_id, from_status, to_status, completion_event_id, detail, created_at)
+			VALUES (?, '', 'pending', ?, 'completion allocated payout', ?)
+		`, assignmentID, completionEventID, now); err != nil {
+			return MarketplacePayoutRecord{}, false, fmt.Errorf("audit payout allocation: %w", err)
+		}
+	} else if completedNow {
+		return MarketplacePayoutRecord{}, false, errors.New("completed assignment unexpectedly already had a payout")
+	}
+
+	rec, err := getMarketplacePayoutTx(ctx, tx, assignmentID)
+	if err != nil {
+		return MarketplacePayoutRecord{}, false, err
+	}
+	if rec.IdempotencyKey != idempotencyKey || rec.AmountSats != priceSats || rec.Destination != destination {
+		return MarketplacePayoutRecord{}, false, errors.New("existing payout does not match assignment allocation")
+	}
+	rec.CompletionEventID, rec.ReviewEventID = completionEventID, reviewEventID
+	if err := tx.Commit(); err != nil {
+		return MarketplacePayoutRecord{}, false, err
+	}
+	return rec, true, nil
+}
+
+func getMarketplacePayoutTx(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, assignmentID int) (MarketplacePayoutRecord, error) {
+	var rec MarketplacePayoutRecord
+	err := q.QueryRowContext(ctx, `
+		SELECT assignment_id, idempotency_key, amount_sats, destination, status,
+		       payment_hash, preimage, failure_reason, submitted_at, settled_at, created_at, updated_at
+		FROM marketplace_payouts WHERE assignment_id = ?
+	`, assignmentID).Scan(&rec.AssignmentID, &rec.IdempotencyKey, &rec.AmountSats, &rec.Destination,
+		&rec.Status, &rec.PaymentHash, &rec.Preimage, &rec.FailureReason, &rec.SubmittedAt,
+		&rec.SettledAt, &rec.CreatedAt, &rec.UpdatedAt)
+	return rec, err
+}
+
+// GetMarketplacePayout returns the payout for an assignment.
+func (s *Store) GetMarketplacePayout(ctx context.Context, assignmentID int) (MarketplacePayoutRecord, error) {
+	return getMarketplacePayoutTx(ctx, s.db, assignmentID)
+}
+
+// MarkMarketplacePayoutSubmitted durably records submission intent and audit
+// before any external wallet call. claimed is true only for the caller that may
+// submit externally; concurrent callers must reconcile instead.
+func (s *Store) MarkMarketplacePayoutSubmitted(ctx context.Context, assignmentID int, now int64) (claimed bool, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var status string
+	if err := tx.QueryRowContext(ctx, "SELECT status FROM marketplace_payouts WHERE assignment_id=?", assignmentID).Scan(&status); err != nil {
+		return false, err
+	}
+	if status != "pending" {
+		if status == "submitted" || status == "settled" || status == "failed" {
+			return false, tx.Commit()
+		}
+		return false, fmt.Errorf("payout %d has invalid state %s", assignmentID, status)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE marketplace_payouts SET status='submitted', submitted_at=?, updated_at=?
+		WHERE assignment_id=? AND status='pending'
+	`, now, now, assignmentID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return false, fmt.Errorf("claim payout submission affected %d rows (err=%v)", rows, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO marketplace_payout_audit
+			(assignment_id, from_status, to_status, detail, created_at)
+		VALUES (?, 'pending', 'submitted', 'wallet submission claimed', ?)
+	`, assignmentID, now); err != nil {
+		return false, fmt.Errorf("audit payout submission: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// MarkMarketplacePayoutFailed records a definitive failure. Ambiguous outcomes
+// must not call this method and remain submitted for reconciliation.
+func (s *Store) MarkMarketplacePayoutFailed(ctx context.Context, assignmentID int, reason string, now int64) error {
+	if strings.TrimSpace(reason) == "" {
+		return errors.New("payout failure reason is required")
+	}
+	return s.transitionMarketplacePayout(ctx, assignmentID, "submitted", "failed", "", reason, now, 0)
+}
+
+// MarkMarketplacePayoutSettled records settlement only with hash+preimage evidence.
+func (s *Store) MarkMarketplacePayoutSettled(ctx context.Context, assignmentID int, paymentHash, preimage string, settledAt, now int64) error {
+	preimageBytes, preimageErr := hex.DecodeString(preimage)
+	hashBytes, hashErr := hex.DecodeString(paymentHash)
+	if preimageErr != nil || hashErr != nil || len(preimageBytes) != 32 || len(hashBytes) != 32 || settledAt <= 0 || settledAt > now+300 {
+		return errors.New("payout settlement evidence is incomplete or invalid")
+	}
+	derived := sha256.Sum256(preimageBytes)
+	if !strings.EqualFold(hex.EncodeToString(derived[:]), paymentHash) {
+		return errors.New("payout preimage does not match payment hash")
+	}
+	return s.transitionMarketplacePayout(ctx, assignmentID, "submitted", "settled", paymentHash, preimage, now, settledAt)
+}
+
+func (s *Store) transitionMarketplacePayout(ctx context.Context, assignmentID int, from, to, paymentHash, detail string, now, settledAt int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var status, storedHash, storedPreimage string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT status, payment_hash, preimage FROM marketplace_payouts WHERE assignment_id = ?
+	`, assignmentID).Scan(&status, &storedHash, &storedPreimage); err != nil {
+		return err
+	}
+	if status == to {
+		if to != "settled" || (storedHash == paymentHash && storedPreimage == detail) {
+			return tx.Commit()
+		}
+		return errors.New("payout already settled with different evidence")
+	}
+	if status != from {
+		return fmt.Errorf("payout %d cannot transition %s -> %s", assignmentID, status, to)
+	}
+
+	var result sql.Result
+	switch to {
+	case "submitted":
+		result, err = tx.ExecContext(ctx, `
+			UPDATE marketplace_payouts SET status='submitted', submitted_at=?, updated_at=?
+			WHERE assignment_id=? AND status='pending'
+		`, now, now, assignmentID)
+	case "failed":
+		result, err = tx.ExecContext(ctx, `
+			UPDATE marketplace_payouts SET status='failed', failure_reason=?, updated_at=?
+			WHERE assignment_id=? AND status='submitted'
+		`, detail, now, assignmentID)
+	case "settled":
+		result, err = tx.ExecContext(ctx, `
+			UPDATE marketplace_payouts
+			SET status='settled', payment_hash=?, preimage=?, settled_at=?, updated_at=?
+			WHERE assignment_id=? AND status='submitted'
+		`, paymentHash, detail, settledAt, now, assignmentID)
+	default:
+		return fmt.Errorf("unsupported payout state %q", to)
+	}
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read payout transition result: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("payout transition %s -> %s affected %d rows", from, to, rows)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO marketplace_payout_audit
+			(assignment_id, from_status, to_status, payment_hash, detail, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, assignmentID, from, to, paymentHash, detail, now); err != nil {
+		return fmt.Errorf("audit payout transition: %w", err)
+	}
+	return tx.Commit()
+}
+
+// ListMarketplacePayoutAudit returns the immutable transition history.
+func (s *Store) ListMarketplacePayoutAudit(ctx context.Context, assignmentID int) ([]MarketplacePayoutAuditRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, assignment_id, from_status, to_status, completion_event_id,
+		       payment_hash, detail, created_at
+		FROM marketplace_payout_audit WHERE assignment_id = ? ORDER BY id
+	`, assignmentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MarketplacePayoutAuditRecord
+	for rows.Next() {
+		var rec MarketplacePayoutAuditRecord
+		if err := rows.Scan(&rec.ID, &rec.AssignmentID, &rec.FromStatus, &rec.ToStatus,
+			&rec.CompletionEventID, &rec.PaymentHash, &rec.Detail, &rec.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
 }
 
 func isSQLiteUniqueConstraint(err error) bool {

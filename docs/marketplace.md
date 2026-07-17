@@ -52,6 +52,7 @@ Reviewers publish a NIP-89 handler/reviewer profile. The event is addressable an
       "domains": ["security", "cryptography", "performance"],
       "availability": "available",
       "price_per_review": 5000,
+      "payout_destination": "lnbc...",
       "max_concurrent": 3,
       "response_time": "4h"
     }
@@ -79,6 +80,7 @@ Reviewers publish a NIP-89 handler/reviewer profile. The event is addressable an
 | `drydock.domains` | string[] | Expertise areas (security, performance, api-design, etc.) |
 | `drydock.availability` | string | `available`, `busy`, or `unavailable` |
 | `drydock.price_per_review` | int | Price in satoshis (0 = free) |
+| `drydock.payout_destination` | string | Fresh BOLT11 invoice used for reviewer payout |
 | `drydock.max_concurrent` | int | Maximum simultaneous assignments |
 | `drydock.response_time` | string | Typical response time (e.g., "2h", "24h") |
 
@@ -117,8 +119,11 @@ Marketplace commands use kind `25910` with JSON-RPC 2.0 payloads.
 | `marketplace/assign` | Drydock → Reviewer | Offers a patch review assignment |
 | `marketplace/accept` | Reviewer → Drydock | Accepts an assignment |
 | `marketplace/reject` | Reviewer → Drydock | Declines an assignment with a reason |
+| `marketplace/complete` | Reviewer → Drydock | Authenticates a published review event and triggers payout/reconciliation |
 
 See [ContextVM Integration](contextvm-integration.md) for the shared request, response, and error format.
+
+A `marketplace/complete` request contains `assignment_id` and `review_event_id`. Drydock accepts it only from the assigned reviewer, verifies that the stored signed review event belongs to that reviewer and correlates to the assignment patch/repository, then atomically records completion and allocates one payout. Payout transitions are `pending → submitted → settled|failed`; ambiguous wallet outcomes remain `submitted` for `lookup_invoice` reconciliation and are never resubmitted.
 
 ## Assignment Lifecycle
 

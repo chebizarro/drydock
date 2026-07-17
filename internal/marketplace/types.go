@@ -50,25 +50,27 @@ const (
 	ReviewerProfileDTag        = "drydock-reviewer"
 	ReviewerProfileHandledKind = "25910"
 
-	MethodAssign = "marketplace/assign"
-	MethodAccept = "marketplace/accept"
-	MethodReject = "marketplace/reject"
+	MethodAssign   = "marketplace/assign"
+	MethodAccept   = "marketplace/accept"
+	MethodReject   = "marketplace/reject"
+	MethodComplete = "marketplace/complete"
 )
 
 // ReviewerProfile represents a community reviewer's registration.
 // Published as kind 31990 with "d" tag set to ReviewerProfileDTag.
 type ReviewerProfile struct {
-	Pubkey         string            `json:"pubkey"`
-	DisplayName    string            `json:"display_name,omitempty"`
-	About          string            `json:"about,omitempty"`
-	Languages      []string          `json:"languages"`                  // e.g., ["go", "rust", "python"]
-	Domains        []string          `json:"domains"`                    // e.g., ["security", "performance", "api-design"]
-	Availability   AvailabilityLevel `json:"availability"`               // available, busy, unavailable
-	PricePerReview int64             `json:"price_per_review,omitempty"` // sats, 0 = free
-	MaxConcurrent  int               `json:"max_concurrent"`             // max simultaneous reviews
-	ResponseTime   string            `json:"response_time,omitempty"`    // e.g., "24h", "1h"
-	CreatedAt      int64             `json:"created_at"`
-	UpdatedAt      int64             `json:"updated_at"`
+	Pubkey            string            `json:"pubkey"`
+	DisplayName       string            `json:"display_name,omitempty"`
+	About             string            `json:"about,omitempty"`
+	Languages         []string          `json:"languages"`                    // e.g., ["go", "rust", "python"]
+	Domains           []string          `json:"domains"`                      // e.g., ["security", "performance", "api-design"]
+	Availability      AvailabilityLevel `json:"availability"`                 // available, busy, unavailable
+	PricePerReview    int64             `json:"price_per_review,omitempty"`   // sats, 0 = free
+	PayoutDestination string            `json:"payout_destination,omitempty"` // BOLT11 invoice (or future lightning address)
+	MaxConcurrent     int               `json:"max_concurrent"`               // max simultaneous reviews
+	ResponseTime      string            `json:"response_time,omitempty"`      // e.g., "24h", "1h"
+	CreatedAt         int64             `json:"created_at"`
+	UpdatedAt         int64             `json:"updated_at"`
 }
 
 // AvailabilityLevel indicates reviewer availability.
@@ -102,6 +104,15 @@ type ReviewAcceptance struct {
 	EstimatedTime  string `json:"estimated_time,omitempty"` // e.g., "2h"
 	CreatedAt      int64  `json:"created_at"`
 	EventID        string `json:"-"`
+}
+
+// ReviewCompletion authenticates delivery of a published review for an assignment.
+// Sent as ContextVM method marketplace/complete by the assigned reviewer.
+type ReviewCompletion struct {
+	AssignmentID  string `json:"assignment_id"`
+	ReviewEventID string `json:"review_event_id"`
+	CreatedAt     int64  `json:"created_at"`
+	EventID       string `json:"-"`
 }
 
 // ReviewRejection represents a reviewer declining an assignment.
@@ -181,8 +192,11 @@ func ReviewerProfileTags(profile ReviewerProfile) nostr.Tags {
 		DrydockTag("domains", profile.Domains...),
 		DrydockTag("availability", string(profile.Availability)),
 		DrydockTag("price", strconv.FormatInt(profile.PricePerReview, 10)),
-		DrydockTag("methods", MethodAssign, MethodAccept, MethodReject),
 	}
+	if profile.PayoutDestination != "" {
+		tags = append(tags, DrydockTag("payout", profile.PayoutDestination))
+	}
+	tags = append(tags, DrydockTag("methods", MethodAssign, MethodAccept, MethodReject, MethodComplete))
 	return tags
 }
 
@@ -256,6 +270,8 @@ func ParseReviewerProfileEvent(event nostr.Event) (ReviewerProfile, bool, error)
 			profile.Domains = append([]string(nil), tag[1:]...)
 		case "drydock:availability":
 			profile.Availability = AvailabilityLevel(tag[1])
+		case "drydock:payout":
+			profile.PayoutDestination = tag[1]
 		case "drydock:price":
 			price, err := strconv.ParseInt(tag[1], 10, 64)
 			if err != nil {

@@ -61,7 +61,7 @@ type Handler struct {
 	signer    Signer
 	publish   RelayPublisher
 	logger    *slog.Logger
-	ourPubKey string    // cached hex pubkey, resolved once at construction
+	ourPubKey string        // cached hex pubkey, resolved once at construction
 	sem       chan struct{} // bounded concurrency semaphore
 }
 
@@ -231,15 +231,40 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 		return fmt.Errorf("sign conversation response: %w", err)
 	}
 
+	// Persist the signed response in pending state before making it observable.
+	stageResult, err := h.store.DB().ExecContext(ctx,
+		`UPDATE conversations SET response_event_id=?, response_content=?, status='pending' WHERE reply_event_id=?`,
+		responseEvent.ID.Hex(), responseText, replyEvent.ID.Hex(),
+	)
+	if err != nil {
+		metrics.ConversationErrors.Inc()
+		if markErr := h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex()); markErr != nil {
+			return errors.Join(fmt.Errorf("stage conversation response: %w", err), fmt.Errorf("mark conversation retryable: %w", markErr))
+		}
+		return fmt.Errorf("stage conversation response: %w", err)
+	}
+	staged, err := stageResult.RowsAffected()
+	if err != nil {
+		metrics.ConversationErrors.Inc()
+		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
+		return fmt.Errorf("confirm staged conversation response: %w", err)
+	}
+	if staged != 1 {
+		metrics.ConversationErrors.Inc()
+		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
+		return fmt.Errorf("stage conversation response: reply %s not found", replyEvent.ID.Hex())
+	}
+
 	if err := h.publish.Publish(ctx, relays, responseEvent); err != nil {
 		metrics.ConversationErrors.Inc()
 		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
 		return fmt.Errorf("publish conversation response: %w", err)
 	}
 
-	// 10. Update the conversation record with the response (marks status=published).
+	// 10. Mark the durably staged response as published.
 	if err := h.store.SetConversationResponse(ctx, replyEvent.ID.Hex(), responseEvent.ID.Hex(), responseText); err != nil {
-		h.logger.Warn("failed to record conversation response", "error", err)
+		metrics.ConversationErrors.Inc()
+		return fmt.Errorf("mark conversation response published: %w", err)
 	}
 
 	metrics.ConversationResponsesSent.Inc()

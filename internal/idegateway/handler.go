@@ -384,13 +384,15 @@ func (h *Handler) processReviewRequest(ctx context.Context, event nostr.Event, _
 		fixID := ""
 		if f.HasSuggestion() {
 			fixID = generateFixID(req.RequestID, f.File, f.Line, i)
-			h.storeFix(ctx, fixID, storedFix{
+			if err := h.storeFix(ctx, fixID, storedFix{
 				SessionID:    req.SessionID,
 				AuthorPubKey: event.PubKey.Hex(),
 				File:         f.File,
 				Diff:         f.SuggestedDiff,
 				CreatedAt:    start,
-			})
+			}); err != nil {
+				return ReviewResponse{}, fmt.Errorf("persist suggested fix %s: %w", fixID, err)
+			}
 		}
 		diagnostics = append(diagnostics, FindingToDiagnostic(f, fixID))
 	}
@@ -570,7 +572,7 @@ func (h *Handler) CleanupStaleSessions(maxAge time.Duration) {
 	}
 }
 
-func (h *Handler) storeFix(ctx context.Context, fixID string, fix storedFix) {
+func (h *Handler) storeFix(ctx context.Context, fixID string, fix storedFix) error {
 	if h.store != nil {
 		if err := h.store.UpsertIDEGatewayFix(ctx, db.IDEGatewayFix{
 			FixID:        fixID,
@@ -580,12 +582,13 @@ func (h *Handler) storeFix(ctx context.Context, fixID string, fix storedFix) {
 			Diff:         fix.Diff,
 			CreatedAt:    fix.CreatedAt.Unix(),
 		}); err != nil {
-			h.logger.Warn("failed to persist IDE suggested fix", "fix_id", fixID, "session_id", fix.SessionID, "error", err)
+			return fmt.Errorf("upsert IDE suggested fix: %w", err)
 		}
-		return
+		return nil
 	}
 
 	h.fixes.Store(fixID, fix)
+	return nil
 }
 
 func (h *Handler) lookupFix(ctx context.Context, fixID, sessionID string, now time.Time) (storedFix, bool) {

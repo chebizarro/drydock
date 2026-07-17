@@ -18,6 +18,13 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	ctx := context.Background()
 
+	validationResult := cfg.Validate(ctx)
+	validationResult.Log(logger)
+	if validationResult.HasErrors() {
+		logger.Error("configuration validation failed, exiting")
+		os.Exit(1)
+	}
+
 	store, err := db.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
 		logger.Error("open db failed", "error", err)
@@ -36,18 +43,19 @@ func main() {
 	}
 
 	engine := reviewengine.New(reviewengine.Config{
-		Planner:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.PlannerModel},
-		Coder32B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.Coder32BModel},
-		LLM70B:       reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.LLM70BModel},
-		Coder14B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.LLMAPIKey, Model: cfg.Coder14BModel},
+		Planner:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel},
+		Coder32B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey), Model: cfg.Coder32BModel},
+		LLM70B:       reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.LLM70BAPIKey), Model: cfg.LLM70BModel},
+		Coder14B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder14BAPIKey), Model: cfg.Coder14BModel},
 		PlannerTemp:  0.1,
 		ReviewerTemp: 0.1,
 	}, reviewengine.NewOpenAICompatClient(), logger)
 
 	h := eval.Harness{
-		Runner: eval.EngineRunner{Engine: engine},
-		Store:  store,
-		Logger: logger,
+		Runner:        eval.EngineRunner{Engine: engine},
+		Store:         store,
+		Logger:        logger,
+		LineTolerance: eval.DefaultLineTolerance,
 	}
 	metrics, err := h.RunMonthly(ctx, ds)
 	if err != nil {
@@ -67,11 +75,13 @@ func main() {
 	}, store, nil, logger) // nil LLM client — rollback doesn't need LLM
 	rbResult, err := prSvc.EvalAndMaybeRollback(ctx)
 	if err != nil {
-		logger.Warn("prompt version eval check failed", "error", err)
-	} else if rbResult.RolledBack {
-		logger.Warn("prompt version rolled back after eval regression",
+		logger.Error("prompt version eval gate failed", "error", err)
+		os.Exit(1)
+	}
+	if rbResult.RolledBack {
+		logger.Error("prompt version eval gate failed; prompt rolled back",
 			"reason", rbResult.RollbackReason,
 		)
+		os.Exit(1)
 	}
 }
-

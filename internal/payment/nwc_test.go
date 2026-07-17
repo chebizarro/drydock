@@ -198,6 +198,58 @@ func bytesOf(value byte, count int) []byte {
 	return out
 }
 
+func TestValidatePayInvoiceResultRequiresPreimage(t *testing.T) {
+	now := time.Now().Unix()
+	preimage := bytesOf(0x31, 32)
+	evidence, err := validatePayInvoiceResult(payInvoiceResult{Preimage: hex.EncodeToString(preimage)}, now)
+	if err != nil || !evidence.Settled || evidence.SettledAt != now {
+		t.Fatalf("valid pay result rejected: evidence=%+v err=%v", evidence, err)
+	}
+	hash := sha256.Sum256(preimage)
+	if evidence.PaymentHash != hex.EncodeToString(hash[:]) {
+		t.Fatalf("derived hash=%q", evidence.PaymentHash)
+	}
+	if _, err := validatePayInvoiceResult(payInvoiceResult{}, now); err == nil {
+		t.Fatal("missing preimage accepted as settlement")
+	}
+}
+
+func TestValidateOutgoingPaymentSettlementAndAmbiguity(t *testing.T) {
+	now := time.Now().Unix()
+	preimage := bytesOf(0x44, 32)
+	hash := sha256.Sum256(preimage)
+	bolt11 := "lnbc1outgoing"
+	base := lookupInvoiceResult{
+		Type: "outgoing", Invoice: bolt11, Amount: 250000,
+		PaymentHash: hex.EncodeToString(hash[:]),
+	}
+	pending := base
+	pending.State = "pending"
+	evidence, err := validateOutgoingPayment(bolt11, 250000, pending, now)
+	if err != nil || evidence.Settled || evidence.Failed {
+		t.Fatalf("pending lookup=%+v err=%v", evidence, err)
+	}
+	settled := base
+	settled.State = "settled"
+	settled.Preimage = hex.EncodeToString(preimage)
+	settled.SettledAt = now
+	evidence, err = validateOutgoingPayment(bolt11, 250000, settled, now)
+	if err != nil || !evidence.Settled {
+		t.Fatalf("settled lookup=%+v err=%v", evidence, err)
+	}
+	failed := base
+	failed.State = "failed"
+	evidence, err = validateOutgoingPayment(bolt11, 250000, failed, now)
+	if err != nil || !evidence.Failed {
+		t.Fatalf("failed lookup=%+v err=%v", evidence, err)
+	}
+	hostile := settled
+	hostile.Amount++
+	if _, err := validateOutgoingPayment(bolt11, 250000, hostile, now); err == nil {
+		t.Fatal("mismatched payout amount accepted")
+	}
+}
+
 func TestHasTag(t *testing.T) {
 	tests := []struct {
 		name     string
