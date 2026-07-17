@@ -1,7 +1,7 @@
 .PHONY: up down eval logs build test test-nocgo vet ci ps config
 
 COMPOSE ?= docker compose
-SERVICE ?= drydock
+SERVICE ?= drydock-core
 
 up:
 	$(COMPOSE) up --build -d

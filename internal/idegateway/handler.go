@@ -225,7 +225,7 @@ func (h *Handler) handleContextVMEvent(ctx context.Context, event nostr.Event, r
 			JSONRPC: "2.0",
 			ID:      event.ID.Hex(),
 			Error:   &contextvm.Error{Code: contextvm.ErrorParseError, Message: "parse error"},
-		}, relayURL, "")
+		}, relayURL, "", "")
 	}
 
 	// Ignore responses and methods owned by other ContextVM handlers.
@@ -248,6 +248,7 @@ func (h *Handler) handleContextVMEvent(ctx context.Context, event nostr.Event, r
 	}
 
 	sessionID := ""
+	fixID := ""
 	switch msg.Method {
 	case MethodReviewRequest:
 		if req, rpcErr := contextvm.ParamsAs[ReviewRequest](contextvm.Request{Msg: msg}); rpcErr == nil {
@@ -256,10 +257,11 @@ func (h *Handler) handleContextVMEvent(ctx context.Context, event nostr.Event, r
 	case MethodApplyFix:
 		if req, rpcErr := contextvm.ParamsAs[FixRequest](contextvm.Request{Msg: msg}); rpcErr == nil {
 			sessionID = req.SessionID
+			fixID = req.FixID
 		}
 	}
 
-	if pubErr := h.publishContextVMResponse(ctx, event, resp, relayURL, sessionID); pubErr != nil {
+	if pubErr := h.publishContextVMResponse(ctx, event, resp, relayURL, sessionID, fixID); pubErr != nil {
 		return pubErr
 	}
 	if msg.Method == MethodApplyFix {
@@ -462,9 +464,10 @@ func (h *Handler) publishReviewResponse(ctx context.Context, reqEvent nostr.Even
 		CreatedAt: nostr.Now(),
 		Content:   string(content),
 		Tags: nostr.Tags{
-			{"e", reqEvent.ID.Hex()},     // Reference the request
+			{"e", reqEvent.ID.Hex()},     // Reference the request event
 			{"p", reqEvent.PubKey.Hex()}, // Tag the requester
 			{"session", resp.SessionID},  // Session reference
+			{"request", resp.RequestID},  // Request correlation
 		},
 	}
 
@@ -492,7 +495,7 @@ func (h *Handler) publishErrorResponse(ctx context.Context, reqEvent nostr.Event
 }
 
 // publishContextVMResponse publishes a ContextVM JSON-RPC response event.
-func (h *Handler) publishContextVMResponse(ctx context.Context, reqEvent nostr.Event, resp contextvm.Message, relayURL, sessionID string) error {
+func (h *Handler) publishContextVMResponse(ctx context.Context, reqEvent nostr.Event, resp contextvm.Message, relayURL, sessionID, fixID string) error {
 	content, err := json.Marshal(resp)
 	if err != nil {
 		return fmt.Errorf("marshal response: %w", err)
@@ -504,6 +507,12 @@ func (h *Handler) publishContextVMResponse(ctx context.Context, reqEvent nostr.E
 	}
 	if sessionID != "" {
 		tags = append(tags, nostr.Tag{"session", sessionID})
+	}
+	if resp.ID != "" {
+		tags = append(tags, nostr.Tag{"request", resp.ID})
+	}
+	if fixID != "" {
+		tags = append(tags, nostr.Tag{"fix", fixID})
 	}
 
 	responseEvent := nostr.Event{

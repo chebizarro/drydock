@@ -55,6 +55,12 @@ type DriftFlag struct {
 }
 
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	dsn += separator + "_pragma=foreign_keys(1)"
+
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -111,6 +117,23 @@ var schemaMigrations = []schemaMigration{
 				if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
 					return fmt.Errorf("add %s.%s: %w", col.table, col.name, err)
 				}
+			}
+			return nil
+		},
+	},
+	{
+		version: 2,
+		name:    "review_feedback_assignment_rater_unique",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM review_feedback
+				WHERE id NOT IN (
+					SELECT MIN(id) FROM review_feedback GROUP BY assignment_id, rater_pubkey
+				)`); err != nil {
+				return fmt.Errorf("deduplicate review feedback: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_review_feedback_assignment_rater
+				ON review_feedback(assignment_id, rater_pubkey)`); err != nil {
+				return fmt.Errorf("add review feedback assignment/rater uniqueness: %w", err)
 			}
 			return nil
 		},

@@ -29,8 +29,8 @@ services:
       DRYDOCK_READ_RELAYS: ${DRYDOCK_READ_RELAYS:-}
       DRYDOCK_WRITE_RELAYS: ${DRYDOCK_WRITE_RELAYS:-}
       DRYDOCK_LOG_LEVEL: ${DRYDOCK_LOG_LEVEL:-info}
-      # Signing (chain: bunker → socket → nsec)
-      DRYDOCK_SIGNER_BUNKER_URL: ${DRYDOCK_SIGNER_BUNKER_URL:-}
+      # Signing (NIP-46 bunker required outside dev mode)
+      DRYDOCK_SIGNER_BUNKER_URL: ${DRYDOCK_SIGNER_BUNKER_URL:?Set DRYDOCK_SIGNER_BUNKER_URL in .env before starting Drydock}
       DRYDOCK_SIGNER_SOCKET_PATH: ${DRYDOCK_SIGNER_SOCKET_PATH:-}
       DRYDOCK_SIGNER_NSEC: ${DRYDOCK_SIGNER_NSEC:-}
       # LLM endpoints

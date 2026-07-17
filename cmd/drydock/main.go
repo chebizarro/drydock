@@ -48,12 +48,6 @@ func main() {
 	cfg.DevMode = cfg.DevMode || devFlagEnabled(os.Args[1:])
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 
-	// --- NIP ingest mode: run and exit ---
-	if mode := os.Getenv("DRYDOCK_MODE"); mode == "nip-ingest" {
-		runNIPIngest(cfg, logger)
-		return
-	}
-
 	// --- Drift guard mode: export/flag/list and exit ---
 	if mode := os.Getenv("DRYDOCK_MODE"); mode == "drift-guard" {
 		runDriftGuard(cfg, logger)
@@ -690,13 +684,6 @@ func runDriftGuard(cfg config.Config, logger *slog.Logger) {
 		logger.Error("unknown drift-guard subcommand", "cmd", args[0], "valid", "export, flag, list")
 		os.Exit(1)
 	}
-}
-
-// runNIPIngest is retired. NIP and project-document ingestion now belongs
-// in Chartroom; Drydock only consumes Chartroom's /search endpoint.
-func runNIPIngest(_ config.Config, logger *slog.Logger) {
-	logger.Error("nip-ingest mode has been retired; ingest NIPs through Chartroom's ingest pipeline and configure Drydock with DRYDOCK_CHARTROOM_URL plus DRYDOCK_CHARTROOM_TOKEN")
-	os.Exit(1)
 }
 
 func devFlagEnabled(args []string) bool {

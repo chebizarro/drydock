@@ -88,7 +88,6 @@ type Config struct {
 	MetaBaseURL         string
 	MetaModel           string
 	EvalDatasetPath     string
-	NIPsDir             string
 	HealthAddr          string
 	PipelineWorkers     int
 }
@@ -162,7 +161,6 @@ func FromEnv() Config {
 		MetaBaseURL:         envOrDefault("DRYDOCK_META_BASE_URL", devDefault(production, defaultMetaBaseURL)),
 		MetaModel:           envOrDefault("DRYDOCK_META_MODEL", devDefault(production, defaultMetaModel)),
 		EvalDatasetPath:     envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
-		NIPsDir:             envOrDefault("DRYDOCK_NIPS_DIR", ""),
 		HealthAddr:          envOrDefault("DRYDOCK_HEALTH_ADDR", ":8081"),
 		PipelineWorkers:     parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
 	}

@@ -83,14 +83,15 @@ const (
 // ReviewAssignment represents Drydock assigning a patch to a reviewer.
 // Published as a ContextVM intent (kind 25910, marketplace/assign).
 type ReviewAssignment struct {
-	AssignmentID   string   `json:"assignment_id"`
-	PatchEventID   string   `json:"patch_event_id"`
-	RepoID         string   `json:"repo_id"`
-	ReviewerPubkey string   `json:"reviewer_pubkey"`
-	Languages      []string `json:"languages"`  // Languages in the patch
-	PriceSats      int64    `json:"price_sats"` // Offered price
-	Deadline       int64    `json:"deadline"`   // Unix timestamp
-	CreatedAt      int64    `json:"created_at"`
+	AssignmentID    string   `json:"assignment_id"`
+	PatchEventID    string   `json:"patch_event_id"`
+	RepoID          string   `json:"repo_id"`
+	ReviewerPubkey  string   `json:"reviewer_pubkey"`
+	RequesterPubkey string   `json:"requester_pubkey,omitempty"`
+	Languages       []string `json:"languages"`  // Languages in the patch
+	PriceSats       int64    `json:"price_sats"` // Offered price
+	Deadline        int64    `json:"deadline"`   // Unix timestamp
+	CreatedAt       int64    `json:"created_at"`
 }
 
 // ReviewAcceptance represents a reviewer accepting an assignment.
@@ -100,6 +101,7 @@ type ReviewAcceptance struct {
 	ReviewerPubkey string `json:"reviewer_pubkey"`
 	EstimatedTime  string `json:"estimated_time,omitempty"` // e.g., "2h"
 	CreatedAt      int64  `json:"created_at"`
+	EventID        string `json:"-"`
 }
 
 // ReviewRejection represents a reviewer declining an assignment.
@@ -109,6 +111,7 @@ type ReviewRejection struct {
 	ReviewerPubkey string `json:"reviewer_pubkey"`
 	Reason         string `json:"reason,omitempty"` // e.g., "busy", "not my expertise"
 	CreatedAt      int64  `json:"created_at"`
+	EventID        string `json:"-"`
 }
 
 // ReviewFeedback represents a patch author's rating of a review.

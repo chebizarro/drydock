@@ -146,7 +146,7 @@ func initTestRepo(t *testing.T) string {
 func TestBuildAutoFixPatch_AppliesCleanly(t *testing.T) {
 	repoDir := initTestRepo(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mgr := NewManager(t.TempDir(), logger)
+	mgr := NewManager(filepath.Dir(repoDir), logger)
 
 	// The test file has:
 	// line 1: package main
@@ -157,9 +157,9 @@ func TestBuildAutoFixPatch_AppliesCleanly(t *testing.T) {
 
 	suggestions := []AutoFixSuggestion{
 		{
-			FilePath: "main.go",
+			FilePath:      "main.go",
 			SuggestedDiff: "@@ -3,3 +3,3 @@\n func main() {\n-\tfmt.Println(\"hello\")\n+\tfmt.Println(\"world\")\n }\n",
-			Confidence: 0.99,
+			Confidence:    0.99,
 		},
 	}
 
@@ -193,7 +193,7 @@ func TestBuildAutoFixPatch_AppliesCleanly(t *testing.T) {
 func TestBuildAutoFixPatch_SkipsMalformed(t *testing.T) {
 	repoDir := initTestRepo(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mgr := NewManager(t.TempDir(), logger)
+	mgr := NewManager(filepath.Dir(repoDir), logger)
 
 	suggestions := []AutoFixSuggestion{
 		{
@@ -215,7 +215,7 @@ func TestBuildAutoFixPatch_SkipsMalformed(t *testing.T) {
 func TestBuildAutoFixPatch_SkipsNonApplicable(t *testing.T) {
 	repoDir := initTestRepo(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mgr := NewManager(t.TempDir(), logger)
+	mgr := NewManager(filepath.Dir(repoDir), logger)
 
 	// This diff references lines that don't exist
 	suggestions := []AutoFixSuggestion{
@@ -241,14 +241,14 @@ func TestBuildAutoFixPatch_SkipsNonApplicable(t *testing.T) {
 func TestBuildAutoFixPatch_MultiplePartialApply(t *testing.T) {
 	repoDir := initTestRepo(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mgr := NewManager(t.TempDir(), logger)
+	mgr := NewManager(filepath.Dir(repoDir), logger)
 
 	suggestions := []AutoFixSuggestion{
 		{
 			// This one applies
-			FilePath: "main.go",
+			FilePath:      "main.go",
 			SuggestedDiff: "@@ -3,3 +3,3 @@\n func main() {\n-\tfmt.Println(\"hello\")\n+\tfmt.Println(\"world\")\n }\n",
-			Confidence: 0.99,
+			Confidence:    0.99,
 		},
 		{
 			// This one doesn't apply (wrong context)

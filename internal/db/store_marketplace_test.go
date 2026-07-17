@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -180,6 +182,91 @@ func TestCreateAndGetAssignment(t *testing.T) {
 	}
 	if gotByID.AssignmentEventID != "assign-evt-1" {
 		t.Errorf("expected AssignmentEventID 'assign-evt-1', got %q", gotByID.AssignmentEventID)
+	}
+}
+
+func TestUpsertAssignmentReceiptIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	assignment := ReviewAssignment{
+		PatchEventID:      "patch-upsert",
+		RepoID:            "repo-upsert",
+		ReviewerPubkey:    "reviewer-upsert",
+		RequesterPubkey:   "requester-real",
+		Status:            "pending",
+		Priority:          2,
+		AssignmentEventID: "assignment-upsert",
+		ExpiresAt:         time.Now().Add(time.Hour).Unix(),
+	}
+	if err := store.CreateAssignment(ctx, assignment); err != nil {
+		t.Fatalf("CreateAssignment: %v", err)
+	}
+	if err := store.UpsertAssignmentReceipt(ctx, assignment); err != nil {
+		t.Fatalf("UpsertAssignmentReceipt: %v", err)
+	}
+
+	got, err := store.GetAssignmentByEventID(ctx, assignment.AssignmentEventID)
+	if err != nil {
+		t.Fatalf("GetAssignmentByEventID: %v", err)
+	}
+	if got.RequesterPubkey != assignment.RequesterPubkey {
+		t.Fatalf("requester pubkey = %q, want %q", got.RequesterPubkey, assignment.RequesterPubkey)
+	}
+	var count int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_assignments WHERE assignment_event_id=?`, assignment.AssignmentEventID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("assignment count = %d, want 1", count)
+	}
+}
+
+func TestRecordFeedbackConcurrentDuplicateIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	if err := store.CreateAssignment(ctx, ReviewAssignment{
+		PatchEventID:      "patch-feedback-race",
+		RepoID:            "repo-feedback-race",
+		ReviewerPubkey:    "reviewer-feedback-race",
+		RequesterPubkey:   "rater-feedback-race",
+		Status:            "completed",
+		AssignmentEventID: "assignment-feedback-race",
+		ExpiresAt:         time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assignment, err := store.GetAssignmentByEventID(ctx, "assignment-feedback-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const attempts = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- store.RecordFeedback(ctx, ReviewFeedback{
+				AssignmentID: assignment.ID, ReviewerPubkey: assignment.ReviewerPubkey,
+				RaterPubkey: assignment.RequesterPubkey, Rating: 5,
+				EventID: fmt.Sprintf("feedback-race-%d", i),
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("RecordFeedback: %v", err)
+		}
+	}
+	var count int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_feedback WHERE assignment_id=? AND rater_pubkey=?`, assignment.ID, assignment.RequesterPubkey).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("feedback count = %d, want 1", count)
 	}
 }
 

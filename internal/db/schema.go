@@ -352,7 +352,8 @@ CREATE TABLE IF NOT EXISTS review_feedback (
   comment TEXT NOT NULL DEFAULT '',
   event_id TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
-  FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE CASCADE
+  FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE CASCADE,
+  UNIQUE(assignment_id, rater_pubkey)
 );
 CREATE INDEX IF NOT EXISTS idx_review_feedback_reviewer ON review_feedback(reviewer_pubkey);
 CREATE INDEX IF NOT EXISTS idx_review_feedback_assignment ON review_feedback(assignment_id);

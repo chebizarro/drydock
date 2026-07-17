@@ -73,9 +73,8 @@ func gitRun(t *testing.T, dir string, args ...string) {
 func initRepoInCanonicalCache(t *testing.T, cacheDir, repoID string) string {
 	t.Helper()
 	// Replicate Manager.canonicalRepoPath() for tests without exporting production internals.
-	safe := strings.NewReplacer("/", "_", "\\", "_", ":", "__", " ", "_").Replace(repoID)
 	sum := sha256.Sum256([]byte("canonical\x00" + repoID))
-	repoPath := filepath.Join(cacheDir, safe+"__canonical_"+hex.EncodeToString(sum[:])[:12])
+	repoPath := filepath.Join(cacheDir, hex.EncodeToString(sum[:]))
 
 	os.MkdirAll(repoPath, 0o755)
 	gitRun(t, repoPath, "init", "-b", "master")

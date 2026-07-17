@@ -137,7 +137,7 @@ func (h *Handler) HandleAssignmentIntent(ctx context.Context, req contextvm.Requ
 		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: err.Error()}
 	}
 
-	if err := h.store.CreateAssignment(ctx, db.ReviewAssignment{
+	if err := h.store.UpsertAssignmentReceipt(ctx, db.ReviewAssignment{
 		PatchEventID:      assignment.PatchEventID,
 		RepoID:            assignment.RepoID,
 		ReviewerPubkey:    assignment.ReviewerPubkey,
@@ -182,7 +182,7 @@ func (h *Handler) handleAssignment(ctx context.Context, event nostr.Event) error
 	if err != nil {
 		return err
 	}
-	return h.store.CreateAssignment(ctx, db.ReviewAssignment{
+	return h.store.UpsertAssignmentReceipt(ctx, db.ReviewAssignment{
 		PatchEventID:      assignment.PatchEventID,
 		RepoID:            assignment.RepoID,
 		ReviewerPubkey:    assignment.ReviewerPubkey,

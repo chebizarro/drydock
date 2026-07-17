@@ -209,8 +209,8 @@ func TestHandlerRejectsUnauthorizedAndDuplicateFeedback(t *testing.T) {
 	}
 
 	duplicate := signedMarketplaceEvent(t, requesterSK, KindReviewFeedback, ReviewFeedback{AssignmentID: assignment.ID, Rating: 4, Comment: "again"})
-	if err := handler.handleFeedback(ctx, duplicate); err == nil || !strings.Contains(err.Error(), "duplicate feedback") {
-		t.Fatalf("expected duplicate feedback error, got %v", err)
+	if err := handler.handleFeedback(ctx, duplicate); err != nil {
+		t.Fatalf("duplicate feedback should be idempotent, got %v", err)
 	}
 	if count := feedbackCount(t, ctx, store, assignment.ID); count != 1 {
 		t.Fatalf("duplicate feedback changed count to %d, want 1", count)

@@ -10,14 +10,11 @@ case "$MODE" in
   eval)
     exec /usr/local/bin/drydock-eval
     ;;
-  nip-ingest)
-    exec /usr/local/bin/drydock
-    ;;
   drift-guard)
     exec /usr/local/bin/drydock "$@"
     ;;
   *)
-    echo "Unknown DRYDOCK_MODE='$MODE'. Use 'listener', 'eval', 'nip-ingest', or 'drift-guard'." >&2
+    echo "Unknown DRYDOCK_MODE='$MODE'. Use 'listener', 'eval', or 'drift-guard'." >&2
     exit 1
     ;;
 esac

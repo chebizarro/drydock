@@ -2,6 +2,8 @@ package repo
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -155,15 +157,72 @@ func TestCleanupReviewBranchNoop(t *testing.T) {
 	}
 }
 
-func TestRepoPath(t *testing.T) {
-	mgr := NewManager("/base", testLogger())
-	path := mgr.repoPath("abc:def/ghi")
-	if !strings.HasPrefix(path, "/base/") {
-		t.Fatalf("expected path under /base/, got %s", path)
+func TestRepoPathUsesHashAndStaysUnderBase(t *testing.T) {
+	baseDir := t.TempDir()
+	mgr := NewManager(baseDir, testLogger())
+	hostileIDs := []string{
+		"..",
+		".",
+		"a/../../b",
+		filepath.Join(string(filepath.Separator), "tmp", "escape"),
+		"a:b",
+		"control\x00\n\r\tb",
 	}
-	// Verify special chars are sanitized
-	if strings.ContainsAny(path[len("/base/"):], "/\\:") {
-		t.Fatalf("expected sanitized path, got %s", path)
+
+	seen := make(map[string]string)
+	for _, repoID := range hostileIDs {
+		for _, repoPath := range []string{mgr.repoPath(repoID), mgr.canonicalRepoPath(repoID)} {
+			resolved, err := mgr.validateRepoPath(repoPath)
+			if err != nil {
+				t.Fatalf("validate path for repo ID %q: %v", repoID, err)
+			}
+			rel, err := filepath.Rel(baseDir, resolved)
+			if err != nil {
+				t.Fatalf("relative path for repo ID %q: %v", repoID, err)
+			}
+			if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				t.Fatalf("repo ID %q escaped base directory: %s", repoID, resolved)
+			}
+			component := filepath.Base(resolved)
+			if len(component) != sha256.Size*2 || strings.Trim(component, "0123456789abcdef") != "" {
+				t.Fatalf("repo ID %q produced non-SHA-256 cache component %q", repoID, component)
+			}
+			if prior, ok := seen[component]; ok {
+				t.Fatalf("repo ID %q collided with %s", repoID, prior)
+			}
+			seen[component] = fmt.Sprintf("repo ID %q", repoID)
+		}
+	}
+
+	if mgr.repoPath("a/b") == mgr.repoPath("a_b") {
+		t.Fatal("distinct repo IDs must not share a cache path")
+	}
+}
+
+func TestValidateRepoPathRejectsOutsideAndSymlinkEscape(t *testing.T) {
+	parent := t.TempDir()
+	baseDir := filepath.Join(parent, "cache")
+	outsideDir := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManager(baseDir, testLogger())
+
+	for _, path := range []string{baseDir, parent, outsideDir} {
+		if _, err := mgr.validateRepoPath(path); err == nil {
+			t.Fatalf("expected path outside cache to be rejected: %s", path)
+		}
+	}
+
+	linkPath := filepath.Join(baseDir, "escape")
+	if err := os.Symlink(outsideDir, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.validateRepoPath(linkPath); err == nil {
+		t.Fatal("expected symlink escaping cache to be rejected")
 	}
 }
 
@@ -253,6 +312,53 @@ func TestEvictionByCount(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(cacheDir, name)); err != nil {
 			t.Fatalf("expected %q repo to remain: %v", name, err)
 		}
+	}
+}
+
+func TestEvictionSkipsRepoWhileOperationHoldsLock(t *testing.T) {
+	cacheDir := t.TempDir()
+	mgr := NewManager(cacheDir, testLogger(), WithMaxRepoCount(1))
+
+	var paths []string
+	for i, name := range []string{"in-use", "middle", "newest"} {
+		repoPath := filepath.Join(cacheDir, name)
+		initWorkRepo(t, repoPath)
+		marker := filepath.Join(repoPath, accessMarkerFile)
+		accessTime := time.Now().Add(time.Duration(i-3) * time.Hour)
+		if err := os.WriteFile(marker, []byte(accessTime.Format(time.RFC3339)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(marker, accessTime, accessTime); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, repoPath)
+	}
+
+	inUsePath, err := mgr.validateRepoPath(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		mu := mgr.getRepoLock(inUsePath)
+		mu.Lock()
+		close(locked)
+		<-release
+		mu.Unlock()
+		close(done)
+	}()
+	<-locked
+	defer func() {
+		close(release)
+		<-done
+	}()
+
+	mgr.evictIfNeeded()
+
+	if _, err := os.Stat(inUsePath); err != nil {
+		t.Fatalf("in-use repo was evicted during operation: %v", err)
 	}
 }
 

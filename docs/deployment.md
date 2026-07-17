@@ -34,12 +34,12 @@ The health endpoint is available at `http://localhost:8081/readyz`.
 
 ## Docker (Microservices)
 
-Drydock runs as a multi-service Docker Compose stack: drydock-core (always), Qdrant (always), and optionally the LSP bridge.
+Drydock runs as a multi-service Docker Compose stack: drydock-core (always), Qdrant (always), and optionally the LSP bridge. Compose requires `DRYDOCK_SIGNER_BUNKER_URL` and fails configuration with a clear error when it is unset.
 
 ```bash
 # 1. Configure
 cp .env.example .env
-# Edit .env — at minimum set a signer and LLM endpoints
+# Edit .env — set DRYDOCK_SIGNER_BUNKER_URL and your LLM endpoints
 
 # 2. Default stack (drydock-core + Qdrant)
 docker compose up --build -d
@@ -95,7 +95,7 @@ If your LLM endpoints are on a different host, override the `*_BASE_URL` variabl
 ```bash
 make up      # docker compose up --build -d
 make down    # docker compose down --remove-orphans
-make logs    # docker compose logs -f drydock
+make logs    # docker compose logs -f drydock-core
 make eval    # run the evaluation harness in a container
 make build   # go build ./...
 make test    # go test ./...
@@ -105,7 +105,7 @@ make config  # docker compose config (validate compose file)
 
 ## Signing Configuration
 
-Drydock checks signers in priority order. The first successful signer wins:
+In production (including the default Compose stack), Drydock requires a NIP-46 bunker signer. Development mode (`--dev`, `DEV_MODE=true`, or `DRYDOCK_DEV_MODE=true`) also permits the local signer fallbacks below.
 
 ### 1. NIP-46 Bunker (Recommended for Production)
 
@@ -149,7 +149,7 @@ DRYDOCK_SIGNER_NSEC=nsec1your_key_here
 
 ### No Signer
 
-If no signer is configured, Drydock runs in listen-only mode: events are ingested and stored, but the review pipeline is disabled and no comments are published.
+Outside development mode, Drydock exits when no bunker signer is configured. The Compose file catches this earlier during configuration and reports that `DRYDOCK_SIGNER_BUNKER_URL` must be set. In development mode only, Drydock can run without a signer in listen-only mode: events are ingested and stored, but the review pipeline is disabled and no comments are published.
 
 ## LLM Endpoint Configuration
 

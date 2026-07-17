@@ -200,14 +200,15 @@ func (r *Router) RoutePatch(ctx context.Context, patch PatchInfo) (*RoutingResul
 		}
 
 		assignment := ReviewAssignment{
-			AssignmentID:   generateAssignmentID(patch.PatchEventID, match.Profile.Pubkey),
-			PatchEventID:   patch.PatchEventID,
-			RepoID:         patch.RepoID,
-			ReviewerPubkey: match.Profile.Pubkey,
-			Languages:      languages,
-			PriceSats:      match.Profile.PricePerReview,
-			Deadline:       deadline.Unix(),
-			CreatedAt:      now.Unix(),
+			AssignmentID:    generateAssignmentID(patch.PatchEventID, match.Profile.Pubkey),
+			PatchEventID:    patch.PatchEventID,
+			RepoID:          patch.RepoID,
+			ReviewerPubkey:  match.Profile.Pubkey,
+			RequesterPubkey: patch.AuthorPubkey,
+			Languages:       languages,
+			PriceSats:       match.Profile.PricePerReview,
+			Deadline:        deadline.Unix(),
+			CreatedAt:       now.Unix(),
 		}
 
 		// Record durably before publishing/acking success. The DB row is the
@@ -351,6 +352,7 @@ func (r *Router) HandleAcceptance(ctx context.Context, event nostr.Event) error 
 		acceptance.ReviewerPubkey = event.PubKey.Hex()
 	}
 	acceptance.CreatedAt = int64(event.CreatedAt)
+	acceptance.EventID = event.ID.Hex()
 
 	if err := r.registry.RecordAcceptance(ctx, acceptance); err != nil {
 		return fmt.Errorf("record acceptance: %w", err)
@@ -376,6 +378,7 @@ func (r *Router) HandleRejection(ctx context.Context, event nostr.Event) error {
 		rejection.ReviewerPubkey = event.PubKey.Hex()
 	}
 	rejection.CreatedAt = int64(event.CreatedAt)
+	rejection.EventID = event.ID.Hex()
 
 	if err := r.registry.RecordRejection(ctx, rejection); err != nil {
 		return fmt.Errorf("record rejection: %w", err)
@@ -461,13 +464,14 @@ func (r *Router) attemptReassignment(ctx context.Context, originalAssignmentID s
 	deadline := now.Add(r.cfg.DefaultDeadline)
 
 	newAssignment := ReviewAssignment{
-		AssignmentID:   generateAssignmentID(original.PatchEventID, candidate.Profile.Pubkey),
-		PatchEventID:   original.PatchEventID,
-		RepoID:         original.RepoID,
-		ReviewerPubkey: candidate.Profile.Pubkey,
-		PriceSats:      candidate.Profile.PricePerReview,
-		Deadline:       deadline.Unix(),
-		CreatedAt:      now.Unix(),
+		AssignmentID:    generateAssignmentID(original.PatchEventID, candidate.Profile.Pubkey),
+		PatchEventID:    original.PatchEventID,
+		RepoID:          original.RepoID,
+		ReviewerPubkey:  candidate.Profile.Pubkey,
+		RequesterPubkey: original.RequesterPubkey,
+		PriceSats:       candidate.Profile.PricePerReview,
+		Deadline:        deadline.Unix(),
+		CreatedAt:       now.Unix(),
 	}
 
 	// Publish assignment event

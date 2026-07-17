@@ -257,6 +257,46 @@ func (s *Store) CreateAssignment(ctx context.Context, a ReviewAssignment) error 
 	return err
 }
 
+// UpsertAssignmentReceipt stores an assignment delivered over ContextVM idempotently.
+// Existing transition state is preserved when the assignment was already recorded
+// by the router before delivery.
+func (s *Store) UpsertAssignmentReceipt(ctx context.Context, a ReviewAssignment) error {
+	now := time.Now().Unix()
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO review_assignments (
+			patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
+			status, priority, price_sats, assignment_event_id,
+			expires_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(assignment_event_id) DO UPDATE SET
+			requester_pubkey = CASE
+				WHEN review_assignments.requester_pubkey = '' THEN excluded.requester_pubkey
+				ELSE review_assignments.requester_pubkey
+			END,
+			price_sats = excluded.price_sats,
+			expires_at = excluded.expires_at,
+			updated_at = excluded.updated_at
+		WHERE review_assignments.patch_event_id = excluded.patch_event_id
+			AND review_assignments.repo_id = excluded.repo_id
+			AND review_assignments.reviewer_pubkey = excluded.reviewer_pubkey
+	`,
+		a.PatchEventID, a.RepoID, a.ReviewerPubkey, a.RequesterPubkey,
+		a.Status, a.Priority, a.PriceSats, a.AssignmentEventID,
+		a.ExpiresAt, now, now,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("assignment receipt rows affected: %w", err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("assignment receipt conflicts with existing assignment %s", a.AssignmentEventID)
+	}
+	return nil
+}
+
 // GetAssignmentByID retrieves an assignment by its database ID.
 func (s *Store) GetAssignmentByID(ctx context.Context, id int) (*ReviewAssignment, error) {
 	var a ReviewAssignment
@@ -353,6 +393,53 @@ func (s *Store) UpdateAssignmentStatus(ctx context.Context, id int, status strin
 	return err
 }
 
+// TransitionPendingAssignment atomically accepts or rejects a pending,
+// unexpired assignment. Re-delivery of the same transition event is idempotent.
+func (s *Store) TransitionPendingAssignment(ctx context.Context, id int, reviewerPubkey, status, eventID string, now int64) error {
+	if status != "accepted" && status != "rejected" {
+		return fmt.Errorf("unsupported assignment transition status %q", status)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE review_assignments
+		SET status = ?, acceptance_event_id = ?, updated_at = ?
+		WHERE id = ? AND reviewer_pubkey = ? AND status = 'pending' AND expires_at >= ?
+	`, status, eventID, now, id, reviewerPubkey, now)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("assignment transition rows affected: %w", err)
+	}
+	if affected == 1 {
+		return nil
+	}
+
+	var assignmentEventID, storedReviewer, storedStatus, storedEventID string
+	var expiresAt int64
+	err = s.db.QueryRowContext(ctx, `
+		SELECT assignment_event_id, reviewer_pubkey, status,
+			COALESCE(acceptance_event_id, ''), expires_at
+		FROM review_assignments WHERE id = ?
+	`, id).Scan(&assignmentEventID, &storedReviewer, &storedStatus, &storedEventID, &expiresAt)
+	if err != nil {
+		return fmt.Errorf("lookup failed assignment transition: %w", err)
+	}
+	if storedReviewer != reviewerPubkey {
+		return fmt.Errorf("unauthorized reviewer: sender %s is not assigned reviewer %s", reviewerPubkey, storedReviewer)
+	}
+	if storedStatus == status && storedEventID == eventID {
+		return nil
+	}
+	if storedStatus != "pending" {
+		return fmt.Errorf("assignment %s is not pending: %s", assignmentEventID, storedStatus)
+	}
+	if expiresAt > 0 && expiresAt < now {
+		return fmt.Errorf("assignment %s expired", assignmentEventID)
+	}
+	return fmt.Errorf("assignment %s transition did not apply", assignmentEventID)
+}
+
 // ListPendingAssignments returns all pending assignments for a reviewer.
 func (s *Store) ListPendingAssignments(ctx context.Context, pubkey string) ([]ReviewAssignment, error) {
 	rows, err := s.db.QueryContext(ctx, `
@@ -440,6 +527,7 @@ func (s *Store) RecordFeedback(ctx context.Context, fb ReviewFeedback) error {
 			assignment_id, reviewer_pubkey, rater_pubkey,
 			rating, comment, event_id, created_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(assignment_id, rater_pubkey) DO NOTHING
 	`,
 		fb.AssignmentID, fb.ReviewerPubkey, fb.RaterPubkey,
 		fb.Rating, fb.Comment, fb.EventID, now,

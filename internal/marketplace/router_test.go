@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,68 @@ import (
 
 	"fiatjaf.com/nostr"
 )
+
+func TestConcurrentAcceptRejectOnlyOneTransitionWins(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	registry := NewRegistry(store, slog.Default())
+	if err := store.CreateAssignment(ctx, db.ReviewAssignment{
+		PatchEventID:      "patch-transition-race",
+		RepoID:            "repo-transition-race",
+		ReviewerPubkey:    reviewer1Pubkey,
+		RequesterPubkey:   "requester-transition-race",
+		Status:            "pending",
+		Priority:          2,
+		AssignmentEventID: "assignment-transition-race",
+		ExpiresAt:         time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errs <- registry.RecordAcceptance(ctx, ReviewAcceptance{
+			AssignmentID: "assignment-transition-race", ReviewerPubkey: reviewer1Pubkey, EventID: "accept-transition-event",
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		errs <- registry.RecordRejection(ctx, ReviewRejection{
+			AssignmentID: "assignment-transition-race", ReviewerPubkey: reviewer1Pubkey, EventID: "reject-transition-event",
+		})
+	}()
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	for err := range errs {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful transitions = %d, want exactly 1", successes)
+	}
+
+	assignment, err := store.GetAssignmentByEventID(ctx, "assignment-transition-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch assignment.Status {
+	case "accepted":
+		err = registry.RecordAcceptance(ctx, ReviewAcceptance{AssignmentID: assignment.AssignmentEventID, ReviewerPubkey: reviewer1Pubkey, EventID: "accept-transition-event"})
+	case "rejected":
+		err = registry.RecordRejection(ctx, ReviewRejection{AssignmentID: assignment.AssignmentEventID, ReviewerPubkey: reviewer1Pubkey, EventID: "reject-transition-event"})
+	default:
+		t.Fatalf("final assignment status = %q", assignment.Status)
+	}
+	if err != nil {
+		t.Fatalf("winning transition replay should be idempotent: %v", err)
+	}
+}
 
 const (
 	reviewer1Pubkey = "1111111111111111111111111111111111111111111111111111111111111111"

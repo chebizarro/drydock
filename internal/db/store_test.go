@@ -22,6 +22,18 @@ func mustOpenStore(t *testing.T, ctx context.Context) *Store {
 	return store
 }
 
+func TestOpenEnforcesForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	_, err := store.db.ExecContext(ctx, `INSERT INTO review_feedback (
+		assignment_id, reviewer_pubkey, rater_pubkey, rating, comment, event_id, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?)`, 999999, "reviewer", "rater", 5, "", "orphan-feedback", time.Now().Unix())
+	if err == nil {
+		t.Fatal("expected orphan feedback insert to violate assignment foreign key")
+	}
+}
+
 func TestMigrateAppliesVersionedMigrationsIdempotently(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
@@ -93,6 +105,63 @@ func TestMigrateAddsReviewLogColumnsFromOldSnapshot(t *testing.T) {
 	}
 	if name != "review_log_status_event_columns" {
 		t.Fatalf("migration name = %q", name)
+	}
+}
+
+func TestMigrateAddsFeedbackDedupConstraintToExistingDatabase(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "old-feedback.db")
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.ExecContext(ctx, `CREATE TABLE review_feedback (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		assignment_id INTEGER NOT NULL,
+		reviewer_pubkey TEXT NOT NULL,
+		rater_pubkey TEXT NOT NULL,
+		rating INTEGER NOT NULL,
+		comment TEXT NOT NULL DEFAULT '',
+		event_id TEXT NOT NULL UNIQUE,
+		created_at INTEGER NOT NULL
+	);
+	INSERT INTO review_feedback(assignment_id, reviewer_pubkey, rater_pubkey, rating, event_id, created_at)
+	VALUES (1, 'reviewer', 'rater', 5, 'feedback-old-1', 1),
+	(1, 'reviewer', 'rater', 4, 'feedback-old-2', 2);`)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if err := store.CreateAssignment(ctx, ReviewAssignment{
+		PatchEventID: "patch-old-feedback", RepoID: "repo-old-feedback",
+		ReviewerPubkey: "reviewer", RequesterPubkey: "rater", Status: "completed",
+		AssignmentEventID: "assignment-old-feedback", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatalf("CreateAssignment: %v", err)
+	}
+	var count int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_feedback WHERE assignment_id=1 AND rater_pubkey='rater'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("deduplicated feedback count = %d, want 1", count)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO review_feedback(
+		assignment_id, reviewer_pubkey, rater_pubkey, rating, event_id, created_at
+	) VALUES (1, 'reviewer', 'rater', 3, 'feedback-old-3', 3)`); err == nil {
+		t.Fatal("expected migrated assignment/rater uniqueness to reject duplicate")
 	}
 }
 

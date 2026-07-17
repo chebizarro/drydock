@@ -23,6 +23,12 @@ import {
     type Filter,
     type VerifiedEvent
 } from 'nostr-tools';
+import {
+    buildSessionAnnouncementTags,
+    hasResponseCorrelationTags,
+    isTrustedGatewayEvent,
+    type ResponseCorrelation
+} from './protocol';
 
 const { useWebSocketImplementation } = require('nostr-tools/pool') as {
     useWebSocketImplementation: (implementation: unknown) => void;
@@ -33,7 +39,6 @@ useWebSocketImplementation(NodeWebSocket);
 
 // Nostr event kinds for IDE integration
 const KIND_IDE_SESSION = 30078;
-const IDE_SESSION_SCHEMA = 'drydock.ide-session.v1';
 const KIND_CONTEXTVM = 25910;
 const JSONRPC_VERSION = '2.0';
 const METHOD_REVIEW_REQUEST = 'review/request';
@@ -51,11 +56,16 @@ let relayPool: SimplePool | undefined;
 let reviewResponseSubscription: { close: (reason?: string) => void | Promise<void> } | undefined;
 let activeRelayUrls: string[] = [];
 let activeSubscriptionKey: string | undefined;
-let latestReviewRequestId: string | undefined;
+let latestReviewRequest: { requestId: string; eventId: string } | undefined;
 
 // Store pending fixes by ID
 const pendingFixes: Map<string, PendingFix> = new Map();
-const pendingFixRequests: Map<string, { fixId: string; file: string; range: vscode.Range }> = new Map();
+const pendingFixRequests: Map<string, {
+    fixId: string;
+    file: string;
+    range: vscode.Range;
+    eventId: string;
+}> = new Map();
 
 interface PendingFix {
     file: string;
@@ -245,8 +255,6 @@ async function reviewChanges() {
             full_review: true
         };
 
-        latestReviewRequestId = requestId;
-
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: 'Drydock: Reviewing changes...',
@@ -259,6 +267,7 @@ async function reviewChanges() {
                 tags: buildContextVMRequestTags(config, requestId, METHOD_REVIEW_REQUEST)
             }, privateKey);
 
+            latestReviewRequest = { requestId, eventId: requestEvent.id };
             await publishEvent(requestEvent);
         });
 
@@ -575,7 +584,8 @@ async function applyFix() {
         pendingFixRequests.set(requestId, {
             fixId: selected.fixId,
             file: selected.fix.file,
-            range: selected.fix.range
+            range: selected.fix.range,
+            eventId: requestEvent.id
         });
         await publishEvent(requestEvent);
         vscode.window.showInformationMessage('Drydock: Fix request published');
@@ -702,20 +712,37 @@ function handleIncomingReviewEvent(event: Event) {
         return;
     }
 
-    const expectedAuthor = tryParsePubkey(getDrydockConfig().drydockPubkey);
-    if (expectedAuthor && event.pubkey !== expectedAuthor) {
+    const config = getDrydockConfig();
+    const expectedAuthor = tryParsePubkey(config.drydockPubkey);
+    const clientPubkey = tryGetPublicKey(config.privateKey);
+    if (!expectedAuthor || !clientPubkey || !isTrustedGatewayEvent(event, expectedAuthor)) {
         return;
     }
 
     const response = JSON.parse(event.content) as JSONRPCResponse<ReviewResponse | FixResponse>;
-    if (response.jsonrpc !== JSONRPC_VERSION) {
+    if (response.jsonrpc !== JSONRPC_VERSION || typeof response.id !== 'string') {
         return;
     }
 
     if (response.error) {
-        if (response.id === latestReviewRequestId || pendingFixRequests.has(response.id)) {
-            vscode.window.showWarningMessage(`Drydock: ${response.error.message}`);
-            pendingFixRequests.delete(response.id);
+        if (latestReviewRequest?.requestId === response.id) {
+            const correlation = responseCorrelation(clientPubkey, latestReviewRequest);
+            if (hasResponseCorrelationTags(event, correlation)) {
+                vscode.window.showWarningMessage(`Drydock: ${response.error.message}`);
+            }
+            return;
+        }
+
+        const pending = pendingFixRequests.get(response.id);
+        if (pending) {
+            const correlation = responseCorrelation(clientPubkey, {
+                requestId: response.id,
+                eventId: pending.eventId
+            }, pending.fixId);
+            if (hasResponseCorrelationTags(event, correlation)) {
+                vscode.window.showWarningMessage(`Drydock: ${response.error.message}`);
+                pendingFixRequests.delete(response.id);
+            }
         }
         return;
     }
@@ -725,11 +752,12 @@ function handleIncomingReviewEvent(event: Event) {
     }
 
     if (isReviewResponse(response.result)) {
-        if (response.result.session_id !== sessionId) {
-            return;
-        }
-
-        if (latestReviewRequestId && response.id !== latestReviewRequestId && response.result.request_id !== latestReviewRequestId) {
+        const pending = latestReviewRequest;
+        if (!pending
+            || response.id !== pending.requestId
+            || response.result.request_id !== pending.requestId
+            || response.result.session_id !== sessionId
+            || !hasResponseCorrelationTags(event, responseCorrelation(clientPubkey, pending))) {
             return;
         }
 
@@ -738,8 +766,34 @@ function handleIncomingReviewEvent(event: Event) {
     }
 
     if (isFixResponse(response.result)) {
+        const pending = pendingFixRequests.get(response.id);
+        if (!pending
+            || response.result.request_id !== response.id
+            || response.result.session_id !== sessionId
+            || response.result.fix_id !== pending.fixId
+            || !hasResponseCorrelationTags(event, responseCorrelation(clientPubkey, {
+                requestId: response.id,
+                eventId: pending.eventId
+            }, pending.fixId))) {
+            return;
+        }
+
         void handleFixResponse(response.id, response.result);
     }
+}
+
+function responseCorrelation(
+    clientPubkey: string,
+    request: { requestId: string; eventId: string },
+    fixId?: string
+): ResponseCorrelation {
+    return {
+        clientPubkey,
+        requestEventId: request.eventId,
+        sessionId,
+        requestId: request.requestId,
+        fixId
+    };
 }
 
 function isReviewResponse(result: ReviewResponse | FixResponse): result is ReviewResponse {
@@ -807,15 +861,15 @@ async function publishSessionAnnouncement(config: DrydockConfig) {
         languages: getWorkspaceLanguages()
     };
 
+    const drydockPubkey = tryParsePubkey(config.drydockPubkey);
+    if (!drydockPubkey) {
+        return;
+    }
+
     const sessionEvent = signEvent({
         kind: KIND_IDE_SESSION,
         content: JSON.stringify(announcement),
-        tags: [
-            ['d', `drydock:ide-session:${sessionId}`],
-            ['type', 'ide-session'],
-            ['schema', IDE_SESSION_SCHEMA],
-            ['client', `vscode-drydock/${extensionVersion}`]
-        ]
+        tags: buildSessionAnnouncementTags(sessionId, extensionVersion, drydockPubkey)
     }, privateKey);
 
     await publishEvent(sessionEvent);

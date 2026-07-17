@@ -375,7 +375,7 @@ func (r *Registry) RecordAssignment(ctx context.Context, assignment ReviewAssign
 		PatchEventID:      assignment.PatchEventID,
 		RepoID:            assignment.RepoID,
 		ReviewerPubkey:    assignment.ReviewerPubkey,
-		RequesterPubkey:   "", // Filled by caller
+		RequesterPubkey:   assignment.RequesterPubkey,
 		Status:            "pending",
 		Priority:          2,
 		PriceSats:         assignment.PriceSats,
@@ -391,10 +391,7 @@ func (r *Registry) RecordAcceptance(ctx context.Context, acceptance ReviewAccept
 	if err != nil {
 		return fmt.Errorf("find assignment: %w", err)
 	}
-	if err := validateAssignmentTransition(assignment, acceptance.ReviewerPubkey); err != nil {
-		return err
-	}
-	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "accepted", "")
+	return r.store.TransitionPendingAssignment(ctx, assignment.ID, acceptance.ReviewerPubkey, "accepted", acceptance.EventID, time.Now().Unix())
 }
 
 // RecordRejection records that a reviewer rejected an assignment.
@@ -403,23 +400,7 @@ func (r *Registry) RecordRejection(ctx context.Context, rejection ReviewRejectio
 	if err != nil {
 		return fmt.Errorf("find assignment: %w", err)
 	}
-	if err := validateAssignmentTransition(assignment, rejection.ReviewerPubkey); err != nil {
-		return err
-	}
-	return r.store.UpdateAssignmentStatus(ctx, assignment.ID, "rejected", "")
-}
-
-func validateAssignmentTransition(assignment *db.ReviewAssignment, reviewerPubkey string) error {
-	if reviewerPubkey == "" || assignment.ReviewerPubkey != reviewerPubkey {
-		return fmt.Errorf("unauthorized reviewer: sender %s is not assigned reviewer %s", reviewerPubkey, assignment.ReviewerPubkey)
-	}
-	if assignment.Status != "pending" {
-		return fmt.Errorf("assignment %s is not pending: %s", assignment.AssignmentEventID, assignment.Status)
-	}
-	if assignment.ExpiresAt > 0 && time.Now().Unix() > assignment.ExpiresAt {
-		return fmt.Errorf("assignment %s expired", assignment.AssignmentEventID)
-	}
-	return nil
+	return r.store.TransitionPendingAssignment(ctx, assignment.ID, rejection.ReviewerPubkey, "rejected", rejection.EventID, time.Now().Unix())
 }
 
 // RecordFeedback records feedback on a review and updates reputation.
@@ -438,10 +419,6 @@ func (r *Registry) RecordFeedback(ctx context.Context, feedback ReviewFeedback) 
 	if err := r.authorizeFeedbackRater(ctx, assignment, feedback.RaterPubkey); err != nil {
 		return err
 	}
-	if err := r.ensureFeedbackNotDuplicate(ctx, assignment.ID, feedback.RaterPubkey); err != nil {
-		return err
-	}
-
 	dbFeedback := db.ReviewFeedback{
 		AssignmentID:   assignment.ID,
 		ReviewerPubkey: assignment.ReviewerPubkey,
@@ -487,19 +464,6 @@ func (r *Registry) authorizeFeedbackRater(ctx context.Context, assignment *db.Re
 		return fmt.Errorf("resolve assignment requester: %w", err)
 	}
 	return fmt.Errorf("unauthorized feedback rater: sender %s is not requester/patch author", raterPubkey)
-}
-
-func (r *Registry) ensureFeedbackNotDuplicate(ctx context.Context, assignmentID int, raterPubkey string) error {
-	var count int
-	if err := r.store.DB().QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM review_feedback WHERE assignment_id = ? AND rater_pubkey = ?
-	`, assignmentID, raterPubkey).Scan(&count); err != nil {
-		return fmt.Errorf("check duplicate feedback: %w", err)
-	}
-	if count > 0 {
-		return fmt.Errorf("duplicate feedback for assignment %d from rater %s", assignmentID, raterPubkey)
-	}
-	return nil
 }
 
 // RecalculateReputation triggers reputation recalculation for a reviewer.

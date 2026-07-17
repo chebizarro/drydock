@@ -126,6 +126,13 @@ func TestIntegrationMarketplaceContextVMAssignmentAcceptanceAndRejection(t *test
 	if transport.assignment.AssignmentID == "" || len(transport.recipients) != 1 || transport.recipients[0].Hex() != reviewer.pubkey().Hex() {
 		t.Fatalf("ContextVM assignment not addressed to reviewer: %+v recipients=%+v", transport.assignment, transport.recipients)
 	}
+	storedAssignment, err := store.GetAssignmentByEventID(ctx, transport.assignment.AssignmentID)
+	if err != nil {
+		t.Fatalf("GetAssignmentByEventID: %v", err)
+	}
+	if storedAssignment.RequesterPubkey != requester.pubkey().Hex() {
+		t.Fatalf("stored requester = %q, want %q", storedAssignment.RequesterPubkey, requester.pubkey().Hex())
+	}
 
 	cvRouter := contextvm.NewRouter()
 	if err := handler.RegisterContextVMMethods(cvRouter); err != nil {
