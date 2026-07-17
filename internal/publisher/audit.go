@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"fiatjaf.com/nostr"
@@ -115,19 +116,39 @@ func (p *AuditPublisher) Publish(ctx context.Context, in AuditInput) error {
 // non-audit, non-auth event it signs. Audit events are signed by the underlying
 // signer directly to avoid recursive audit emission.
 type AuditedSigner struct {
-	base  Signer
-	audit *AuditPublisher
-	log   *slog.Logger
+	base       Signer
+	audit      *AuditPublisher
+	log        *slog.Logger
+	failClosed bool
+	failures   atomic.Uint64
+}
+
+type AuditedSignerOptions struct {
+	// FailClosed makes signing fail when its audit event cannot be delivered.
+	// The default remains best-effort for existing callers.
+	FailClosed bool
 }
 
 func NewAuditedSigner(base Signer, audit *AuditPublisher, logger *slog.Logger) Signer {
+	return NewAuditedSignerWithOptions(base, audit, logger, AuditedSignerOptions{})
+}
+
+func NewAuditedSignerWithOptions(base Signer, audit *AuditPublisher, logger *slog.Logger, opts AuditedSignerOptions) Signer {
 	if base == nil || audit == nil {
 		return base
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &AuditedSigner{base: base, audit: audit, log: logger}
+	return &AuditedSigner{base: base, audit: audit, log: logger, failClosed: opts.FailClosed}
+}
+
+// AuditFailureCount returns the number of signing-audit delivery failures.
+func (s *AuditedSigner) AuditFailureCount() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.failures.Load()
 }
 
 func (s *AuditedSigner) GetPublicKey(ctx context.Context) (nostr.PubKey, error) {
@@ -148,6 +169,10 @@ func (s *AuditedSigner) SignEvent(ctx context.Context, evt *nostr.Event) error {
 			"event_kind": strconv.Itoa(int(evt.Kind)),
 		},
 	}); err != nil {
+		s.failures.Add(1)
+		if s.failClosed {
+			return fmt.Errorf("publish signing audit: %w", err)
+		}
 		s.log.Warn("failed to publish signing audit", "event_id", evt.ID.Hex(), "event_kind", int(evt.Kind), "error", err)
 	}
 	return nil

@@ -13,20 +13,27 @@ var ErrTokenHashAlreadyReserved = errors.New("payment token hash already reserve
 
 // ReviewPaymentRecord represents a review payment authorization record.
 type ReviewPaymentRecord struct {
-	PatchEventID     string
-	RepoID           string
-	AuthorPubkey     string
-	Status           string // pending, token_spent, authorized
-	AccessKind       string // free_tier, subscription, cashu_review, cashu_subscription
-	RequestedMode    string // review, subscription
-	TokenHash        string
-	MintURL          string
-	TokenAmountSats  int64
-	InvoiceID        string
-	InvoiceRequest   string
-	InvoiceExpiresAt int64
-	CreatedAt        int64
-	UpdatedAt        int64
+	PatchEventID        string
+	RepoID              string
+	AuthorPubkey        string
+	Status              string // pending, token_spent, authorized
+	AccessKind          string // free_tier, subscription, cashu_review, cashu_subscription
+	RequestedMode       string // review, subscription
+	TokenHash           string
+	MintURL             string
+	TokenAmountSats     int64
+	ExpectedAmountSats  int64
+	SubscriptionDays    int
+	InvoiceID           string
+	InvoiceRequest      string
+	InvoiceAmountMSats  int64
+	InvoiceExpiresAt    int64
+	MeltQuoteID         string
+	MeltQuoteAmountSats int64
+	MeltFeeReserveSats  int64
+	MeltState           string // empty, submitted, paid, unpaid
+	CreatedAt           int64
+	UpdatedAt           int64
 }
 
 // SubscriptionRecord represents an active payment subscription.
@@ -46,14 +53,19 @@ func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (Revi
 	var rec ReviewPaymentRecord
 	err := s.db.QueryRowContext(ctx, `
 		SELECT patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
-		       token_hash, mint_url, token_amount_sats, invoice_id, invoice_request,
-		       invoice_expires_at, created_at, updated_at
+		       COALESCE(token_hash, ''), mint_url, token_amount_sats, expected_amount_sats,
+		       subscription_days, invoice_id, invoice_request, invoice_amount_msats,
+		       invoice_expires_at, melt_quote_id, melt_quote_amount_sats,
+		       melt_fee_reserve_sats, melt_state, created_at, updated_at
 		FROM review_payments
 		WHERE patch_event_id = ?
 	`, patchEventID).Scan(
 		&rec.PatchEventID, &rec.RepoID, &rec.AuthorPubkey, &rec.Status, &rec.AccessKind,
 		&rec.RequestedMode, &rec.TokenHash, &rec.MintURL, &rec.TokenAmountSats,
-		&rec.InvoiceID, &rec.InvoiceRequest, &rec.InvoiceExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
+		&rec.ExpectedAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
+		&rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt, &rec.MeltQuoteID,
+		&rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats, &rec.MeltState,
+		&rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
 		return ReviewPaymentRecord{}, err
@@ -70,11 +82,13 @@ func (s *Store) ReserveReviewPaymentToken(ctx context.Context, rec ReviewPayment
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO review_payments (
 			patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
-			token_hash, mint_url, token_amount_sats, invoice_id, invoice_request,
-			invoice_expires_at, created_at, updated_at
-		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, '', '', 0, ?, ?)
+			token_hash, mint_url, token_amount_sats, expected_amount_sats, subscription_days,
+			invoice_id, invoice_request, invoice_amount_msats, invoice_expires_at,
+			created_at, updated_at
+		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, ?, ?, '', '', 0, 0, ?, ?)
 	`, rec.PatchEventID, rec.RepoID, rec.AuthorPubkey, rec.RequestedMode,
-		rec.TokenHash, rec.MintURL, rec.TokenAmountSats, now, now)
+		rec.TokenHash, rec.MintURL, rec.TokenAmountSats, rec.ExpectedAmountSats,
+		rec.SubscriptionDays, now, now)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
 			return ErrTokenHashAlreadyReserved
@@ -90,18 +104,23 @@ func (s *Store) UpsertPendingReviewPayment(ctx context.Context, rec ReviewPaymen
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO review_payments (
 			patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
-			token_hash, mint_url, token_amount_sats, invoice_id, invoice_request,
-			invoice_expires_at, created_at, updated_at
-		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			token_hash, mint_url, token_amount_sats, expected_amount_sats, subscription_days,
+			invoice_id, invoice_request, invoice_amount_msats, invoice_expires_at,
+			created_at, updated_at
+		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(patch_event_id) DO UPDATE SET
+			expected_amount_sats = excluded.expected_amount_sats,
+			subscription_days = excluded.subscription_days,
 			invoice_id = excluded.invoice_id,
 			invoice_request = excluded.invoice_request,
+			invoice_amount_msats = excluded.invoice_amount_msats,
 			invoice_expires_at = excluded.invoice_expires_at,
 			updated_at = excluded.updated_at
 		WHERE review_payments.status = 'pending'
 		  AND review_payments.token_hash = excluded.token_hash
 	`, rec.PatchEventID, rec.RepoID, rec.AuthorPubkey, rec.RequestedMode,
-		rec.TokenHash, rec.MintURL, rec.TokenAmountSats, rec.InvoiceID, rec.InvoiceRequest,
+		rec.TokenHash, rec.MintURL, rec.TokenAmountSats, rec.ExpectedAmountSats,
+		rec.SubscriptionDays, rec.InvoiceID, rec.InvoiceRequest, rec.InvoiceAmountMSats,
 		rec.InvoiceExpiresAt, now, now)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -124,14 +143,19 @@ func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash strin
 	var rec ReviewPaymentRecord
 	err := s.db.QueryRowContext(ctx, `
 		SELECT patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
-		       token_hash, mint_url, token_amount_sats, invoice_id, invoice_request,
-		       invoice_expires_at, created_at, updated_at
+		       COALESCE(token_hash, ''), mint_url, token_amount_sats, expected_amount_sats,
+		       subscription_days, invoice_id, invoice_request, invoice_amount_msats,
+		       invoice_expires_at, melt_quote_id, melt_quote_amount_sats,
+		       melt_fee_reserve_sats, melt_state, created_at, updated_at
 		FROM review_payments
 		WHERE token_hash = ?
 	`, tokenHash).Scan(
 		&rec.PatchEventID, &rec.RepoID, &rec.AuthorPubkey, &rec.Status, &rec.AccessKind,
 		&rec.RequestedMode, &rec.TokenHash, &rec.MintURL, &rec.TokenAmountSats,
-		&rec.InvoiceID, &rec.InvoiceRequest, &rec.InvoiceExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
+		&rec.ExpectedAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
+		&rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt, &rec.MeltQuoteID,
+		&rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats, &rec.MeltState,
+		&rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
 		return ReviewPaymentRecord{}, err
@@ -147,14 +171,51 @@ func (s *Store) DeletePendingReviewPayment(ctx context.Context, patchEventID str
 	return err
 }
 
-// MarkReviewPaymentTokenSpent marks that a payment token has been melted but authorization is not yet complete.
-// This creates a recoverable state if subsequent authorization steps fail.
+// MarkReviewPaymentMeltSubmitted durably records the quote and submission intent.
+// It must commit before the mint call so a crash or ambiguous transport error can
+// be reconciled without ever submitting the proofs a second time.
+func (s *Store) MarkReviewPaymentMeltSubmitted(ctx context.Context, patchEventID, tokenHash string, quoteID string, quoteAmount, feeReserve int64) error {
+	if quoteID == "" || quoteAmount <= 0 || feeReserve < 0 {
+		return errors.New("invalid melt quote evidence")
+	}
+	now := time.Now().Unix()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE review_payments
+		SET melt_quote_id = ?, melt_quote_amount_sats = ?, melt_fee_reserve_sats = ?,
+		    melt_state = 'submitted', updated_at = ?
+		WHERE patch_event_id = ? AND token_hash = ? AND status = 'pending' AND melt_state = ''
+	`, quoteID, quoteAmount, feeReserve, now, patchEventID, tokenHash)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check melt-submitted update: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("mark melt submitted: expected 1 row for patch %q, got %d", patchEventID, rows)
+	}
+	return nil
+}
+
+// MarkReviewPaymentMeltUnpaid records a definitive mint observation without
+// releasing the token hash. A submitted quote is never deleted.
+func (s *Store) MarkReviewPaymentMeltUnpaid(ctx context.Context, patchEventID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE review_payments SET melt_state = 'unpaid', updated_at = ?
+		WHERE patch_event_id = ? AND status = 'pending' AND melt_state = 'submitted'
+	`, time.Now().Unix(), patchEventID)
+	return err
+}
+
+// MarkReviewPaymentTokenSpent records definitive mint evidence that the quote
+// was paid. It is idempotent and monotonic.
 func (s *Store) MarkReviewPaymentTokenSpent(ctx context.Context, patchEventID string) error {
 	now := time.Now().Unix()
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE review_payments
-		SET status = 'token_spent', updated_at = ?
-		WHERE patch_event_id = ? AND status = 'pending'
+		SET status = 'token_spent', melt_state = 'paid', updated_at = ?
+		WHERE patch_event_id = ? AND status = 'pending' AND melt_state IN ('submitted', 'unpaid')
 	`, now, patchEventID)
 	if err != nil {
 		return err
@@ -163,20 +224,27 @@ func (s *Store) MarkReviewPaymentTokenSpent(ctx context.Context, patchEventID st
 	if err != nil {
 		return fmt.Errorf("check token-spent update rows affected: %w", err)
 	}
-	if rows != 1 {
-		return fmt.Errorf("mark review payment token spent: expected 1 row updated for patch %q, got %d", patchEventID, rows)
+	if rows == 1 {
+		return nil
 	}
-	return nil
+	var status, meltState string
+	if err := s.db.QueryRowContext(ctx, `SELECT status, melt_state FROM review_payments WHERE patch_event_id = ?`, patchEventID).Scan(&status, &meltState); err != nil {
+		return err
+	}
+	if (status == "token_spent" || status == "authorized") && meltState == "paid" {
+		return nil
+	}
+	return fmt.Errorf("mark review payment token spent: invalid state for patch %q", patchEventID)
 }
 
 // MarkReviewPaymentAuthorized marks a review payment as authorized.
-// Accepts payments in 'pending' or 'token_spent' status for recovery scenarios.
+// Only definitive token_spent records may be authorized.
 func (s *Store) MarkReviewPaymentAuthorized(ctx context.Context, patchEventID, accessKind string) error {
 	now := time.Now().Unix()
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE review_payments
 		SET status = 'authorized', access_kind = ?, updated_at = ?
-		WHERE patch_event_id = ? AND status IN ('pending', 'token_spent')
+		WHERE patch_event_id = ? AND status = 'token_spent'
 	`, accessKind, now, patchEventID)
 	if err != nil {
 		return err
@@ -236,6 +304,96 @@ func (s *Store) UpsertSubscription(ctx context.Context, authorPubkey, repoID, so
 		paidAmountSats, now+extendSecs, now, now,
 		now, extendSecs, now)
 	return err
+}
+
+// FinalizePaidReview atomically creates/extends a subscription (when requested)
+// and authorizes its source review. All source payment invariants are checked in
+// the same transaction, and repeating an already-authorized payment is harmless.
+func (s *Store) FinalizePaidReview(ctx context.Context, patchEventID, tokenHash string) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	var status, accessKind, requestedMode, storedToken, author, repoID, meltState string
+	var expectedAmount, invoiceAmountMSats, quoteAmount int64
+	var subscriptionDays int
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, access_kind, requested_mode, COALESCE(token_hash, ''),
+				author_pubkey, repo_id, expected_amount_sats, subscription_days, melt_state,
+				invoice_amount_msats, melt_quote_amount_sats
+		FROM review_payments WHERE patch_event_id = ?
+	`, patchEventID).Scan(&status, &accessKind, &requestedMode, &storedToken,
+		&author, &repoID, &expectedAmount, &subscriptionDays, &meltState,
+		&invoiceAmountMSats, &quoteAmount)
+	if err != nil {
+		return "", err
+	}
+	if storedToken == "" || storedToken != tokenHash {
+		return "", errors.New("payment token identity mismatch")
+	}
+	if status == "authorized" {
+		if (requestedMode == "review" && accessKind != "cashu_review") ||
+			(requestedMode == "subscription" && accessKind != "cashu_subscription") {
+			return "", errors.New("authorized payment has inconsistent mode/access kind")
+		}
+		return accessKind, nil
+	}
+	if status != "token_spent" || meltState != "paid" || expectedAmount <= 0 ||
+		expectedAmount > (1<<63-1)/1000 || invoiceAmountMSats != expectedAmount*1000 || quoteAmount != expectedAmount {
+		return "", fmt.Errorf("payment does not have consistent definitive paid evidence (status=%s melt_state=%s)", status, meltState)
+	}
+
+	accessKind = "cashu_review"
+	if requestedMode == "subscription" {
+		if subscriptionDays <= 0 {
+			return "", errors.New("subscription payment has invalid duration")
+		}
+		accessKind = "cashu_subscription"
+		now := time.Now().Unix()
+		extendSecs := int64(subscriptionDays) * 24 * 60 * 60
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO payment_subscriptions (
+				author_pubkey, repo_id, source_patch_event_id, source_token_hash,
+				paid_amount_sats, expires_at, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(author_pubkey, repo_id) DO UPDATE SET
+				source_patch_event_id = excluded.source_patch_event_id,
+				source_token_hash = excluded.source_token_hash,
+				paid_amount_sats = excluded.paid_amount_sats,
+				expires_at = CASE
+					WHEN payment_subscriptions.source_token_hash = excluded.source_token_hash THEN payment_subscriptions.expires_at
+					ELSE MAX(payment_subscriptions.expires_at, ?) + ?
+				END,
+				updated_at = ?
+		`, author, repoID, patchEventID, tokenHash, expectedAmount,
+			now+extendSecs, now, now, now, extendSecs, now)
+		if err != nil {
+			return "", fmt.Errorf("upsert subscription: %w", err)
+		}
+	} else if requestedMode != "review" {
+		return "", fmt.Errorf("unsupported payment mode %q", requestedMode)
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE review_payments SET status = 'authorized', access_kind = ?, updated_at = ?
+		WHERE patch_event_id = ? AND token_hash = ? AND status = 'token_spent' AND melt_state = 'paid'
+	`, accessKind, time.Now().Unix(), patchEventID, tokenHash)
+	if err != nil {
+		return "", err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("read conditional payment authorization result: %w", err)
+	}
+	if rows != 1 {
+		return "", fmt.Errorf("conditional payment authorization affected %d rows", rows)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return accessKind, nil
 }
 
 // TryAuthorizeFreeReview attempts to authorize a review using free-tier quota.

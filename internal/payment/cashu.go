@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -171,51 +172,104 @@ func (c *CashuMintClient) CreateMeltQuote(ctx context.Context, mintURL, bolt11 s
 
 // MeltToken melts a token to pay a Lightning invoice via the mint.
 func (c *CashuMintClient) MeltToken(ctx context.Context, mintURL string, quote MeltQuote, token ParsedToken) error {
-	// NUT-05: POST /v1/melt/bolt11
-	// Request: {"quote": "...", "inputs": [...proofs...]}
-	// Response: {"paid": true, ...}
-
 	mintURL = strings.TrimRight(mintURL, "/")
-	url := mintURL + "/v1/melt/bolt11"
+	endpoint := mintURL + "/v1/melt/bolt11"
+	beforeSend := func(err error) error { return &MeltSubmissionError{MayHaveSubmitted: false, Err: err} }
+	ambiguous := func(err error) error { return &MeltSubmissionError{MayHaveSubmitted: true, Err: err} }
 
+	if quote.ID == "" {
+		return beforeSend(errors.New("empty melt quote id"))
+	}
 	if len(token.Proofs) == 0 {
-		return errors.New("no proofs in token")
+		return beforeSend(errors.New("no proofs in token"))
 	}
-
-	reqBody, err := json.Marshal(meltTokenRequest{
-		Quote:  quote.ID,
-		Inputs: token.Proofs,
-	})
+	reqBody, err := json.Marshal(meltTokenRequest{Quote: quote.ID, Inputs: token.Proofs})
 	if err != nil {
-		return fmt.Errorf("marshal melt request: %w", err)
+		return beforeSend(fmt.Errorf("marshal melt request: %w", err))
 	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(reqBody)))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(string(reqBody)))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return beforeSend(fmt.Errorf("create request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// From this boundary onward the request may have reached the mint. Go's HTTP
+	// errors do not prove that zero bytes were transmitted.
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("mint request: %w", err)
+		return ambiguous(fmt.Errorf("mint request: %w", err))
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("mint returned status %d", resp.StatusCode)
+		return ambiguous(fmt.Errorf("mint returned status %d", resp.StatusCode))
 	}
-
 	var result struct {
-		Paid bool `json:"paid"`
+		Paid  bool   `json:"paid"`
+		State string `json:"state"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("decode melt response: %w", err)
+		return ambiguous(fmt.Errorf("decode melt response: %w", err))
 	}
-
-	if !result.Paid {
-		return errors.New("melt not paid")
+	state := strings.ToLower(result.State)
+	if state != "" && state != "paid" && state != "pending" && state != "unpaid" {
+		return ambiguous(fmt.Errorf("mint returned unknown melt state %q", result.State))
 	}
+	if result.Paid && state != "" && state != "paid" {
+		return ambiguous(errors.New("mint returned contradictory paid/state fields"))
+	}
+	if result.Paid || state == "paid" {
+		return nil
+	}
+	return ambiguous(errors.New("mint did not provide definitive paid evidence"))
+}
 
-	return nil
+// LookupMeltQuote reconciles a previously submitted NUT-05 quote without
+// re-sending proofs.
+func (c *CashuMintClient) LookupMeltQuote(ctx context.Context, mintURL string, quote MeltQuote) (MeltQuoteStatus, error) {
+	if quote.ID == "" {
+		return MeltQuoteStatus{}, errors.New("empty melt quote id")
+	}
+	endpoint := strings.TrimRight(mintURL, "/") + "/v1/melt/quote/bolt11/" + url.PathEscape(quote.ID)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		return MeltQuoteStatus{}, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return MeltQuoteStatus{}, fmt.Errorf("lookup melt quote: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return MeltQuoteStatus{}, fmt.Errorf("lookup melt quote returned status %d", resp.StatusCode)
+	}
+	var result struct {
+		Quote      string `json:"quote"`
+		Amount     int64  `json:"amount"`
+		FeeReserve int64  `json:"fee_reserve"`
+		State      string `json:"state"`
+		Paid       *bool  `json:"paid"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return MeltQuoteStatus{}, fmt.Errorf("decode melt quote status: %w", err)
+	}
+	if result.Quote != quote.ID {
+		return MeltQuoteStatus{}, errors.New("melt quote lookup returned mismatched quote id")
+	}
+	if result.Amount != quote.Amount {
+		return MeltQuoteStatus{}, errors.New("melt quote lookup returned mismatched amount")
+	}
+	if result.FeeReserve != quote.FeeReserve {
+		return MeltQuoteStatus{}, errors.New("melt quote lookup returned mismatched fee reserve")
+	}
+	state := strings.ToLower(result.State)
+	if state == "" && result.Paid != nil && *result.Paid {
+		state = "paid"
+	}
+	if state != "paid" && state != "pending" && state != "unpaid" {
+		return MeltQuoteStatus{}, fmt.Errorf("melt quote returned unknown state %q", result.State)
+	}
+	if result.Paid != nil && ((*result.Paid && state != "paid") || (!*result.Paid && state == "paid")) {
+		return MeltQuoteStatus{}, errors.New("melt quote returned contradictory paid/state fields")
+	}
+	return MeltQuoteStatus{State: state}, nil
 }

@@ -133,8 +133,9 @@ func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL stri
 	if h.rateLimiter != nil {
 		result, err := h.rateLimiter.Allow(ctx, senderPubKey)
 		if err != nil {
-			h.logger.Warn("rate limit check failed", "error", err)
-			// Continue on error - fail open
+			metrics.CodeChatRateLimitFailures.Inc()
+			h.logger.Error("rate limit check failed; denying request", "sender", senderPubKey, "error", err)
+			return nil
 		} else if !result.Allowed {
 			metrics.CodeChatRateLimited.Inc()
 			h.logger.Info("codechat user rate limited",

@@ -65,6 +65,21 @@ CREATE TABLE IF NOT EXISTS review_events (
 CREATE INDEX IF NOT EXISTS idx_review_events_patch_event_id ON review_events(patch_event_id);
 CREATE INDEX IF NOT EXISTS idx_review_events_repo_id ON review_events(repo_id);
 
+CREATE TABLE IF NOT EXISTS review_publication_outbox (
+  patch_event_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN ('summary', 'detail')),
+  detail_index INTEGER NOT NULL DEFAULT 0,
+  event_id TEXT NOT NULL,
+  raw_event_json TEXT NOT NULL,
+  delivered_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (patch_event_id, repo_id, event_type, detail_index),
+  UNIQUE (event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_publication_outbox_delivery
+  ON review_publication_outbox(delivered_at);
+
 CREATE TABLE IF NOT EXISTS thread_cache (
   root_id TEXT PRIMARY KEY,
   event_ids TEXT NOT NULL DEFAULT '',
@@ -232,9 +247,16 @@ CREATE TABLE IF NOT EXISTS review_payments (
   token_hash TEXT,
   mint_url TEXT NOT NULL DEFAULT '',
   token_amount_sats INTEGER NOT NULL DEFAULT 0,
+  expected_amount_sats INTEGER NOT NULL DEFAULT 0,
+  subscription_days INTEGER NOT NULL DEFAULT 0,
   invoice_id TEXT NOT NULL DEFAULT '',
   invoice_request TEXT NOT NULL DEFAULT '',
+  invoice_amount_msats INTEGER NOT NULL DEFAULT 0,
   invoice_expires_at INTEGER NOT NULL DEFAULT 0,
+  melt_quote_id TEXT NOT NULL DEFAULT '',
+  melt_quote_amount_sats INTEGER NOT NULL DEFAULT 0,
+  melt_fee_reserve_sats INTEGER NOT NULL DEFAULT 0,
+  melt_state TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

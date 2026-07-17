@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -123,6 +124,40 @@ func TestMeltToken_MarshalsRequestBody(t *testing.T) {
 	}
 	if len(got.Inputs) != 1 || got.Inputs[0]["id"] != "abc" {
 		t.Errorf("unexpected inputs: %#v", got.Inputs)
+	}
+}
+
+func TestMeltTokenClassifiesPreSendAndAmbiguousFailures(t *testing.T) {
+	client := NewCashuMintClient(0)
+	err := client.MeltToken(context.Background(), "https://mint.invalid", MeltQuote{ID: "q"}, ParsedToken{})
+	var submissionErr *MeltSubmissionError
+	if !errors.As(err, &submissionErr) || submissionErr.MayHaveSubmitted {
+		t.Fatalf("missing proofs must be provably pre-send, got %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`not-json`))
+	}))
+	defer server.Close()
+	err = client.MeltToken(context.Background(), server.URL, MeltQuote{ID: "q"}, ParsedToken{Proofs: json.RawMessage(`[{"amount":1}]`)})
+	if !errors.As(err, &submissionErr) || !submissionErr.MayHaveSubmitted {
+		t.Fatalf("malformed response after send must be ambiguous, got %v", err)
+	}
+}
+
+func TestLookupMeltQuoteValidatesPersistedQuote(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/melt/quote/bolt11/quote-1" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"quote":"quote-1","amount":10,"fee_reserve":1,"state":"PAID","paid":true}`))
+	}))
+	defer server.Close()
+	status, err := NewCashuMintClient(0).LookupMeltQuote(context.Background(), server.URL, MeltQuote{ID: "quote-1", Amount: 10, FeeReserve: 1})
+	if err != nil || status.State != "paid" {
+		t.Fatalf("LookupMeltQuote: status=%+v err=%v", status, err)
 	}
 }
 

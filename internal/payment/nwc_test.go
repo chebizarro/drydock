@@ -1,7 +1,11 @@
 package payment
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
 	"testing"
+	"time"
 
 	"fiatjaf.com/nostr"
 )
@@ -124,6 +128,74 @@ func TestNewNWCInvoiceProvider_InvalidURI(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid URI")
 	}
+}
+
+func TestValidateCreatedInvoiceRejectsHostileResponses(t *testing.T) {
+	now := time.Now().Unix()
+	hash := strings.Repeat("11", 32)
+	valid := makeInvoiceResult{Type: "incoming", Invoice: "lnbc1valid", PaymentHash: hash, Amount: 100000, CreatedAt: now, ExpiresAt: now + 60}
+	cases := map[string]makeInvoiceResult{
+		"empty bolt11":    func() makeInvoiceResult { r := valid; r.Invoice = ""; return r }(),
+		"malformed hash":  func() makeInvoiceResult { r := valid; r.PaymentHash = "nope"; return r }(),
+		"wrong amount":    func() makeInvoiceResult { r := valid; r.Amount++; return r }(),
+		"wrong direction": func() makeInvoiceResult { r := valid; r.Type = "outgoing"; return r }(),
+		"already expired": func() makeInvoiceResult { r := valid; r.ExpiresAt = now; return r }(),
+		"already settled": func() makeInvoiceResult { r := valid; r.SettledAt = now; return r }(),
+	}
+	for name, result := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := validateCreatedInvoice(result, 100000, now); err == nil {
+				t.Fatal("expected hostile make_invoice response to be rejected")
+			}
+		})
+	}
+	if invoice, err := validateCreatedInvoice(valid, 100000, now); err != nil || invoice.ID != hash {
+		t.Fatalf("valid make_invoice rejected: invoice=%+v err=%v", invoice, err)
+	}
+}
+
+func TestValidateLookupInvoiceRejectsMismatchesAndRequiresSettlementEvidence(t *testing.T) {
+	now := time.Now().Unix()
+	preimage := bytesOf(0x42, 32)
+	hashBytes := sha256.Sum256(preimage)
+	hash := hex.EncodeToString(hashBytes[:])
+	expected := Invoice{ID: hash, Request: "lnbc1expected", AmountMSats: 100000, ExpiresAt: now + 60}
+	valid := lookupInvoiceResult{Type: "incoming", Invoice: expected.Request, PaymentHash: hash, Amount: expected.AmountMSats, ExpiresAt: expected.ExpiresAt}
+	cases := map[string]lookupInvoiceResult{
+		"wrong hash":      func() lookupInvoiceResult { r := valid; r.PaymentHash = strings.Repeat("22", 32); return r }(),
+		"wrong invoice":   func() lookupInvoiceResult { r := valid; r.Invoice = "lnbc1hostile"; return r }(),
+		"wrong amount":    func() lookupInvoiceResult { r := valid; r.Amount = 1; return r }(),
+		"wrong direction": func() lookupInvoiceResult { r := valid; r.Type = "outgoing"; return r }(),
+		"wrong expiry":    func() lookupInvoiceResult { r := valid; r.ExpiresAt++; return r }(),
+		"bad preimage":    func() lookupInvoiceResult { r := valid; r.Preimage = strings.Repeat("00", 32); return r }(),
+		"future settled":  func() lookupInvoiceResult { r := valid; r.SettledAt = now + 301; return r }(),
+	}
+	for name, result := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := validateLookupInvoice(expected, result, now); err == nil {
+				t.Fatal("expected hostile lookup_invoice response to be rejected")
+			}
+		})
+	}
+
+	settled := valid
+	settled.Preimage = hex.EncodeToString(preimage)
+	status, err := validateLookupInvoice(expected, settled, now)
+	if err != nil || !status.Settled {
+		t.Fatalf("valid preimage settlement rejected: status=%+v err=%v", status, err)
+	}
+	unsettled, err := validateLookupInvoice(expected, valid, now)
+	if err != nil || unsettled.Settled {
+		t.Fatalf("valid unsettled invoice rejected: status=%+v err=%v", unsettled, err)
+	}
+}
+
+func bytesOf(value byte, count int) []byte {
+	out := make([]byte, count)
+	for i := range out {
+		out[i] = value
+	}
+	return out
 }
 
 func TestHasTag(t *testing.T) {

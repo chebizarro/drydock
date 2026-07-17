@@ -282,9 +282,11 @@ func (h *Handler) handleFeedback(ctx context.Context, event nostr.Event) error {
 	if h.feedbackLimiter != nil {
 		result, err := h.feedbackLimiter.Allow(ctx, senderPubkey)
 		if err != nil {
-			h.logger.Warn("feedback rate limit check failed", "error", err)
-			// Continue on error - fail open
+			metrics.FeedbackRateLimitFailures.Inc()
+			h.logger.Error("feedback rate limit check failed; denying feedback", "sender", senderPubkey, "error", err)
+			return nil
 		} else if !result.Allowed {
+			metrics.FeedbackRateLimited.Inc()
 			h.logger.Info("feedback rate limited",
 				"sender", senderPubkey,
 				"reset_at", result.ResetAt,

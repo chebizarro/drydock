@@ -130,11 +130,13 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 		return err
 	}
 	if !inserted {
-		p.logger.Debug("skipping duplicate event", "event_id", event.ID.Hex(), "kind", int(event.Kind))
-		return nil
+		p.logger.Debug("reprocessing duplicate event through idempotent handler", "event_id", event.ID.Hex(), "kind", int(event.Kind))
+		if !isTrackedHandlerKind(event.Kind) {
+			return nil
+		}
+	} else {
+		metrics.EventsIngested.With(fmt.Sprintf("%d", int(event.Kind))).Inc()
 	}
-
-	metrics.EventsIngested.With(fmt.Sprintf("%d", int(event.Kind))).Inc()
 
 	switch event.Kind {
 	case nostr.KindRepositoryAnnouncement:
@@ -200,35 +202,39 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 				// Queue is full — mark task back to failed so it can be retried
 				// by the next startup's ResetStuckReviews or a future re-enqueue sweep.
 				metrics.ReviewQueueFull.Inc()
+				queueErr := errors.New("review queue full")
 				p.logger.Warn("review queue full, marking task for retry", "event_id", event.ID.Hex(), "repo_id", repoID)
-				_ = p.store.MarkReviewFailed(ctx, event.ID.Hex(), repoID, "review queue full")
+				if err := p.store.MarkReviewFailed(ctx, event.ID.Hex(), repoID, queueErr.Error()); err != nil {
+					return errors.Join(queueErr, fmt.Errorf("mark review failed: %w", err))
+				}
+				return queueErr
 			}
 		}
 		return nil
 	case nostr.KindComment:
 		// Reply to one of our reviews? Route to conversation handler.
 		if p.conversation != nil && p.conversation.IsReplyToUs(ctx, event) {
-			go func() {
-				if err := p.conversation.HandleReply(ctx, event, relayURL); err != nil {
-					p.logger.Error("conversation handler failed",
-						"event_id", event.ID.Hex(),
-						"error", err,
-					)
-				}
-			}()
+			if err := p.conversation.HandleReply(ctx, event, relayURL); err != nil {
+				metrics.ConversationErrors.Inc()
+				p.logger.Error("conversation handler failed",
+					"event_id", event.ID.Hex(),
+					"error", err,
+				)
+				return err
+			}
 		}
 		return nil
 	case nostr.KindEncryptedDirectMessage, 14: // NIP-04 kind 4 or NIP-17 kind 14
 		// Encrypted DM to us? Route to codechat handler.
 		if p.codeChat != nil && p.codeChat.IsDMToUs(ctx, event) {
-			go func() {
-				if err := p.codeChat.HandleDM(ctx, event, relayURL); err != nil {
-					p.logger.Error("codechat handler failed",
-						"event_id", event.ID.Hex(),
-						"error", err,
-					)
-				}
-			}()
+			if err := p.codeChat.HandleDM(ctx, event, relayURL); err != nil {
+				metrics.CodeChatErrors.Inc()
+				p.logger.Error("codechat handler failed",
+					"event_id", event.ID.Hex(),
+					"error", err,
+				)
+				return err
+			}
 		}
 		return nil
 	case contextvm.KindContextVM:
@@ -236,29 +242,29 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 	case 30078: // IDE session state
 		// Route to IDE gateway handler.
 		if p.ideGateway != nil {
-			go func() {
-				if err := p.ideGateway.HandleEvent(ctx, event, relayURL); err != nil {
-					p.logger.Error("IDE gateway handler failed",
-						"event_id", event.ID.Hex(),
-						"kind", int(event.Kind),
-						"error", err,
-					)
-				}
-			}()
+			if err := p.ideGateway.HandleEvent(ctx, event, relayURL); err != nil {
+				metrics.IDEReviewErrors.Inc()
+				p.logger.Error("IDE gateway handler failed",
+					"event_id", event.ID.Hex(),
+					"kind", int(event.Kind),
+					"error", err,
+				)
+				return err
+			}
 		}
 		return nil
 	case 31990, 7000: // Marketplace events
 		// Route to marketplace handler.
 		if p.marketplace != nil {
-			go func() {
-				if err := p.marketplace.HandleEvent(ctx, event, relayURL); err != nil {
-					p.logger.Error("marketplace handler failed",
-						"event_id", event.ID.Hex(),
-						"kind", int(event.Kind),
-						"error", err,
-					)
-				}
-			}()
+			if err := p.marketplace.HandleEvent(ctx, event, relayURL); err != nil {
+				metrics.MarketplaceRoutingFailures.Inc()
+				p.logger.Error("marketplace handler failed",
+					"event_id", event.ID.Hex(),
+					"kind", int(event.Kind),
+					"error", err,
+				)
+				return err
+			}
 		}
 		return nil
 	default:
@@ -319,6 +325,15 @@ func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, rela
 		return nil
 	}
 	return p.contextVMResponder.SendResponseToEvent(ctx, event.ID.Hex(), resp.ID, resp.Result, resp.Error, event.PubKey)
+}
+
+func isTrackedHandlerKind(kind nostr.Kind) bool {
+	switch kind {
+	case nostr.KindComment, nostr.KindEncryptedDirectMessage, 14, 30078, 31990, 7000:
+		return true
+	default:
+		return false
+	}
 }
 
 func eventTimestampPlausible(ts nostr.Timestamp) bool {

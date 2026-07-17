@@ -126,6 +126,13 @@ func TestMarkReviewPaymentAuthorized(t *testing.T) {
 		t.Fatalf("expected initial status 'pending', got %q", got.Status)
 	}
 
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "patch-1", "hash123", "quote-1", 100, 1); err != nil {
+		t.Fatalf("MarkReviewPaymentMeltSubmitted: %v", err)
+	}
+	if err := store.MarkReviewPaymentTokenSpent(ctx, "patch-1"); err != nil {
+		t.Fatalf("MarkReviewPaymentTokenSpent: %v", err)
+	}
+
 	// Mark authorized
 	if err := store.MarkReviewPaymentAuthorized(ctx, "patch-1", "cashu_review"); err != nil {
 		t.Fatalf("MarkReviewPaymentAuthorized: %v", err)
@@ -315,6 +322,9 @@ func TestMarkReviewPaymentTokenSpent(t *testing.T) {
 		t.Fatalf("UpsertPendingReviewPayment: %v", err)
 	}
 
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "patch-1", "hash123", "quote-1", 100, 1); err != nil {
+		t.Fatalf("MarkReviewPaymentMeltSubmitted: %v", err)
+	}
 	// Mark token as spent
 	if err := store.MarkReviewPaymentTokenSpent(ctx, "patch-1"); err != nil {
 		t.Fatalf("MarkReviewPaymentTokenSpent: %v", err)
@@ -352,6 +362,59 @@ func TestMarkReviewPaymentTokenSpent(t *testing.T) {
 	}
 }
 
+func TestFinalizePaidReview_SubscriptionIsAtomicAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	rec := ReviewPaymentRecord{
+		PatchEventID: "paid-sub", RepoID: "repo-1", AuthorPubkey: "author-1",
+		RequestedMode: "subscription", TokenHash: "paid-token", MintURL: "https://mint.example.com",
+		TokenAmountSats: 110, ExpectedAmountSats: 100, SubscriptionDays: 30,
+		InvoiceID: "invoice", InvoiceRequest: "lnbc1", InvoiceAmountMSats: 100000,
+		InvoiceExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}
+	if err := store.UpsertPendingReviewPayment(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, "quote", 100, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkReviewPaymentTokenSpent(ctx, rec.PatchEventID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.db.ExecContext(ctx, `CREATE TRIGGER fail_paid_authorize
+		BEFORE UPDATE OF status ON review_payments
+		WHEN NEW.patch_event_id = 'paid-sub' AND NEW.status = 'authorized'
+		BEGIN SELECT RAISE(ABORT, 'injected authorization failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinalizePaidReview(ctx, rec.PatchEventID, rec.TokenHash); err == nil {
+		t.Fatal("expected injected finalization failure")
+	}
+	if _, active, err := store.GetActiveSubscription(ctx, rec.AuthorPubkey, rec.RepoID, time.Now().Unix()); err != nil || active {
+		t.Fatalf("subscription write must roll back with authorization: active=%v err=%v", active, err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TRIGGER fail_paid_authorize`); err != nil {
+		t.Fatal(err)
+	}
+
+	kind, err := store.FinalizePaidReview(ctx, rec.PatchEventID, rec.TokenHash)
+	if err != nil || kind != "cashu_subscription" {
+		t.Fatalf("FinalizePaidReview: kind=%q err=%v", kind, err)
+	}
+	first, active, err := store.GetActiveSubscription(ctx, rec.AuthorPubkey, rec.RepoID, time.Now().Unix())
+	if err != nil || !active {
+		t.Fatalf("GetActiveSubscription: active=%v err=%v", active, err)
+	}
+	if kind, err = store.FinalizePaidReview(ctx, rec.PatchEventID, rec.TokenHash); err != nil || kind != "cashu_subscription" {
+		t.Fatalf("idempotent FinalizePaidReview: kind=%q err=%v", kind, err)
+	}
+	second, _, _ := store.GetActiveSubscription(ctx, rec.AuthorPubkey, rec.RepoID, time.Now().Unix())
+	if second.ExpiresAt != first.ExpiresAt {
+		t.Fatalf("idempotent recovery extended subscription twice: first=%d second=%d", first.ExpiresAt, second.ExpiresAt)
+	}
+}
+
 func TestIsTokenHashUsed(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
@@ -386,7 +449,13 @@ func TestIsTokenHashUsed(t *testing.T) {
 		t.Error("expected pending payment hash to not be considered used")
 	}
 
-	// Mark as authorized
+	// Mark as definitively paid and authorized.
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "patch-1", "newhash123", "quote-1", 100, 1); err != nil {
+		t.Fatalf("MarkReviewPaymentMeltSubmitted: %v", err)
+	}
+	if err := store.MarkReviewPaymentTokenSpent(ctx, "patch-1"); err != nil {
+		t.Fatalf("MarkReviewPaymentTokenSpent: %v", err)
+	}
 	store.MarkReviewPaymentAuthorized(ctx, "patch-1", "cashu_review")
 
 	// Now should be used

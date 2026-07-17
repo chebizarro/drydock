@@ -2,9 +2,12 @@ package payment
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"strings"
 	"time"
@@ -171,54 +174,129 @@ func NewNWCInvoiceProvider(cfg NWCConfig) (*NWCInvoiceProvider, error) {
 // CreateInvoice creates a Lightning invoice via NWC.
 // NIP-47 method: make_invoice
 func (p *NWCInvoiceProvider) CreateInvoice(ctx context.Context, sats int64, memo string, expiry time.Duration) (Invoice, error) {
-	params := makeInvoiceParams{
-		Amount:      sats * 1000, // convert to millisats
-		Description: memo,
-		Expiry:      int64(expiry.Seconds()),
+	if sats <= 0 || sats > math.MaxInt64/1000 {
+		return Invoice{}, errors.New("invoice amount must be a positive, non-overflowing value")
 	}
+	if expiry <= 0 {
+		return Invoice{}, errors.New("invoice expiry must be positive")
+	}
+	params := makeInvoiceParams{Amount: sats * 1000, Description: memo, Expiry: int64(expiry.Seconds())}
 
 	result, err := p.sendRequest(ctx, "make_invoice", params)
 	if err != nil {
 		return Invoice{}, fmt.Errorf("make_invoice failed: %w", err)
 	}
-
 	var invoiceResult makeInvoiceResult
 	if err := json.Unmarshal(result, &invoiceResult); err != nil {
 		return Invoice{}, fmt.Errorf("failed to parse make_invoice result: %w", err)
 	}
-
-	return Invoice{
-		ID:      invoiceResult.PaymentHash,
-		Request: invoiceResult.Invoice,
-	}, nil
+	return validateCreatedInvoice(invoiceResult, params.Amount, time.Now().Unix())
 }
 
 // LookupInvoice checks the status of a Lightning invoice via NWC.
 // NIP-47 method: lookup_invoice
-func (p *NWCInvoiceProvider) LookupInvoice(ctx context.Context, invoiceID string) (InvoiceStatus, error) {
-	params := lookupInvoiceParams{
-		PaymentHash: invoiceID,
+func (p *NWCInvoiceProvider) LookupInvoice(ctx context.Context, invoice Invoice) (InvoiceStatus, error) {
+	if err := validateExpectedInvoice(invoice); err != nil {
+		return InvoiceStatus{}, err
 	}
-
+	params := lookupInvoiceParams{PaymentHash: invoice.ID}
 	result, err := p.sendRequest(ctx, "lookup_invoice", params)
 	if err != nil {
 		return InvoiceStatus{}, fmt.Errorf("lookup_invoice failed: %w", err)
 	}
-
 	var lookupResult lookupInvoiceResult
 	if err := json.Unmarshal(result, &lookupResult); err != nil {
 		return InvoiceStatus{}, fmt.Errorf("failed to parse lookup_invoice result: %w", err)
 	}
+	return validateLookupInvoice(invoice, lookupResult, time.Now().Unix())
+}
 
-	// Determine status
-	now := time.Now().Unix()
-	settled := lookupResult.SettledAt > 0
-	expired := lookupResult.ExpiresAt > 0 && lookupResult.ExpiresAt < now && !settled
+func validateCreatedInvoice(result makeInvoiceResult, expectedMSats, now int64) (Invoice, error) {
+	if result.Type != "incoming" {
+		return Invoice{}, fmt.Errorf("make_invoice returned type %q, want incoming", result.Type)
+	}
+	if _, err := parsePaymentHash(result.PaymentHash); err != nil {
+		return Invoice{}, fmt.Errorf("invalid make_invoice payment hash: %w", err)
+	}
+	if result.Invoice == "" || !strings.HasPrefix(strings.ToLower(result.Invoice), "ln") {
+		return Invoice{}, errors.New("make_invoice returned an empty or malformed BOLT11")
+	}
+	if result.Amount != expectedMSats || result.Amount <= 0 {
+		return Invoice{}, fmt.Errorf("make_invoice amount mismatch: got %d want %d", result.Amount, expectedMSats)
+	}
+	if result.ExpiresAt <= now {
+		return Invoice{}, errors.New("make_invoice returned an already-expired invoice")
+	}
+	if result.SettledAt != 0 || result.Preimage != "" {
+		return Invoice{}, errors.New("make_invoice unexpectedly returned settlement evidence")
+	}
+	return Invoice{ID: strings.ToLower(result.PaymentHash), Request: result.Invoice, AmountMSats: result.Amount, ExpiresAt: result.ExpiresAt}, nil
+}
 
+func validateExpectedInvoice(invoice Invoice) error {
+	if _, err := parsePaymentHash(invoice.ID); err != nil {
+		return fmt.Errorf("invalid expected payment hash: %w", err)
+	}
+	if invoice.Request == "" || invoice.AmountMSats <= 0 || invoice.ExpiresAt <= 0 {
+		return errors.New("persisted invoice evidence is incomplete")
+	}
+	return nil
+}
+
+func validateLookupInvoice(expected Invoice, result lookupInvoiceResult, now int64) (InvoiceStatus, error) {
+	if err := validateExpectedInvoice(expected); err != nil {
+		return InvoiceStatus{}, err
+	}
+	if result.Type != "incoming" {
+		return InvoiceStatus{}, fmt.Errorf("lookup_invoice returned type %q, want incoming", result.Type)
+	}
+	if _, err := parsePaymentHash(result.PaymentHash); err != nil || !strings.EqualFold(result.PaymentHash, expected.ID) {
+		return InvoiceStatus{}, errors.New("lookup_invoice payment hash mismatch")
+	}
+	if result.Invoice != "" && result.Invoice != expected.Request {
+		return InvoiceStatus{}, errors.New("lookup_invoice BOLT11 mismatch")
+	}
+	if result.Amount != expected.AmountMSats || result.Amount <= 0 {
+		return InvoiceStatus{}, fmt.Errorf("lookup_invoice amount mismatch: got %d want %d", result.Amount, expected.AmountMSats)
+	}
+	if result.ExpiresAt != 0 && result.ExpiresAt != expected.ExpiresAt {
+		return InvoiceStatus{}, errors.New("lookup_invoice expiry mismatch")
+	}
+
+	settled := result.SettledAt > 0 || result.Preimage != ""
+	if result.Preimage != "" {
+		preimage, err := hex.DecodeString(result.Preimage)
+		if err != nil || len(preimage) != 32 {
+			return InvoiceStatus{}, errors.New("lookup_invoice returned malformed preimage")
+		}
+		hash := sha256.Sum256(preimage)
+		if !strings.EqualFold(hex.EncodeToString(hash[:]), expected.ID) {
+			return InvoiceStatus{}, errors.New("lookup_invoice preimage does not match payment hash")
+		}
+	}
+	if result.SettledAt < 0 || (result.SettledAt > now+300) {
+		return InvoiceStatus{}, errors.New("lookup_invoice returned invalid settled_at")
+	}
 	return InvoiceStatus{
-		Settled: settled,
-		Expired: expired,
+		PaymentHash: strings.ToLower(result.PaymentHash), AmountMSats: result.Amount,
+		SettledAt: result.SettledAt, Preimage: result.Preimage, Settled: settled,
+		Expired: !settled && expected.ExpiresAt < now,
 	}, nil
+}
+
+func parsePaymentHash(value string) ([]byte, error) {
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != 32 {
+		return nil, errors.New("payment hash must be 32-byte hex")
+	}
+	allZero := true
+	for _, b := range decoded {
+		allZero = allZero && b == 0
+	}
+	if allZero {
+		return nil, errors.New("payment hash must not be zero")
+	}
+	return decoded, nil
 }
 
 // sendRequest sends a NIP-47 request and waits for the response.

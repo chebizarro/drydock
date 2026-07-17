@@ -170,10 +170,11 @@ var (
 	EnsembleConsensusBoost = &Counter{} // findings boosted by consensus
 
 	// Codechat (DM codebase Q&A)
-	CodeChatDMsReceived   = &Counter{}
-	CodeChatResponsesSent = &Counter{}
-	CodeChatRateLimited   = &Counter{}
-	CodeChatErrors        = &Counter{}
+	CodeChatDMsReceived       = &Counter{}
+	CodeChatResponsesSent     = &Counter{}
+	CodeChatRateLimited       = &Counter{}
+	CodeChatRateLimitFailures = &Counter{}
+	CodeChatErrors            = &Counter{}
 
 	// IDE Gateway
 	IDESessionsActive         = &Gauge{}
@@ -194,6 +195,8 @@ var (
 	MarketplaceAssignmentsExpired  = &Counter{}
 	MarketplaceReviewersActive     = &Gauge{}
 	MarketplaceFeedbackReceived    = &Counter{}
+	FeedbackRateLimited            = &Counter{}
+	FeedbackRateLimitFailures      = &Counter{}
 	MarketplaceReputationUpdates   = &Counter{}
 
 	// Security scan
@@ -333,6 +336,8 @@ func writeMetrics(w io.Writer) {
 		"Codechat responses published.", CodeChatResponsesSent)
 	writeCounter(w, "drydock_codechat_rate_limited_total",
 		"Codechat requests dropped due to rate limit.", CodeChatRateLimited)
+	writeCounter(w, "drydock_codechat_rate_limit_failures_total",
+		"Codechat requests denied because the rate-limit backend failed.", CodeChatRateLimitFailures)
 	writeCounter(w, "drydock_codechat_errors_total",
 		"Codechat processing errors.", CodeChatErrors)
 
@@ -371,6 +376,10 @@ func writeMetrics(w io.Writer) {
 		"Number of active community reviewers.", MarketplaceReviewersActive)
 	writeCounter(w, "drydock_marketplace_feedback_received_total",
 		"Review feedback/ratings received.", MarketplaceFeedbackReceived)
+	writeCounter(w, "drydock_marketplace_feedback_rate_limited_total",
+		"Marketplace feedback dropped due to rate limit.", FeedbackRateLimited)
+	writeCounter(w, "drydock_marketplace_feedback_rate_limit_failures_total",
+		"Marketplace feedback denied because the rate-limit backend failed.", FeedbackRateLimitFailures)
 	writeCounter(w, "drydock_marketplace_reputation_updates_total",
 		"Reviewer reputation recalculations.", MarketplaceReputationUpdates)
 

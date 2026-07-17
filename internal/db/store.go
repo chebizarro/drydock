@@ -138,6 +138,32 @@ var schemaMigrations = []schemaMigration{
 			return nil
 		},
 	},
+	{
+		version: 3,
+		name:    "payment_melt_recovery_evidence",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			for _, col := range []struct{ name, ddl string }{
+				{"expected_amount_sats", "ALTER TABLE review_payments ADD COLUMN expected_amount_sats INTEGER NOT NULL DEFAULT 0"},
+				{"subscription_days", "ALTER TABLE review_payments ADD COLUMN subscription_days INTEGER NOT NULL DEFAULT 0"},
+				{"invoice_amount_msats", "ALTER TABLE review_payments ADD COLUMN invoice_amount_msats INTEGER NOT NULL DEFAULT 0"},
+				{"melt_quote_id", "ALTER TABLE review_payments ADD COLUMN melt_quote_id TEXT NOT NULL DEFAULT ''"},
+				{"melt_quote_amount_sats", "ALTER TABLE review_payments ADD COLUMN melt_quote_amount_sats INTEGER NOT NULL DEFAULT 0"},
+				{"melt_fee_reserve_sats", "ALTER TABLE review_payments ADD COLUMN melt_fee_reserve_sats INTEGER NOT NULL DEFAULT 0"},
+				{"melt_state", "ALTER TABLE review_payments ADD COLUMN melt_state TEXT NOT NULL DEFAULT ''"},
+			} {
+				exists, err := hasColumn(ctx, tx, "review_payments", col.name)
+				if err != nil {
+					return fmt.Errorf("check review_payments.%s: %w", col.name, err)
+				}
+				if !exists {
+					if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+						return fmt.Errorf("add review_payments.%s: %w", col.name, err)
+					}
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -667,6 +693,73 @@ func (s *Store) InsertReviewEvent(ctx context.Context, event nostr.Event, patchE
 	return nil
 }
 
+// GetReviewPublication returns an exact signed event reserved for relay delivery.
+// The stored event is reused across retries so a repeated relay publish has the
+// same Nostr event ID and is idempotent.
+func (s *Store) GetReviewPublication(ctx context.Context, patchEventID, repoID, eventType string, detailIndex int) (event nostr.Event, delivered, found bool, err error) {
+	var raw string
+	var deliveredAt int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT raw_event_json, delivered_at
+		FROM review_publication_outbox
+		WHERE patch_event_id=? AND repo_id=? AND event_type=? AND detail_index=?`,
+		patchEventID, repoID, eventType, detailIndex,
+	).Scan(&raw, &deliveredAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nostr.Event{}, false, false, nil
+		}
+		return nostr.Event{}, false, false, fmt.Errorf("get review publication: %w", err)
+	}
+	if err := json.Unmarshal([]byte(raw), &event); err != nil {
+		return nostr.Event{}, false, false, fmt.Errorf("decode reserved review publication: %w", err)
+	}
+	return event, deliveredAt > 0, true, nil
+}
+
+// ReserveReviewPublication durably stores a signed event before relay delivery.
+// If another attempt already reserved this logical event, that exact event is
+// returned instead of replacing it.
+func (s *Store) ReserveReviewPublication(ctx context.Context, patchEventID, repoID, eventType string, detailIndex int, event nostr.Event) (nostr.Event, bool, error) {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO review_publication_outbox
+			(patch_event_id, repo_id, event_type, detail_index, event_id, raw_event_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(patch_event_id, repo_id, event_type, detail_index) DO NOTHING`,
+		patchEventID, repoID, eventType, detailIndex, event.ID.Hex(), event.String(), time.Now().Unix(),
+	)
+	if err != nil {
+		return nostr.Event{}, false, fmt.Errorf("reserve review publication: %w", err)
+	}
+	reserved, delivered, found, err := s.GetReviewPublication(ctx, patchEventID, repoID, eventType, detailIndex)
+	if err != nil {
+		return nostr.Event{}, false, err
+	}
+	if !found {
+		return nostr.Event{}, false, errors.New("reserved review publication not found")
+	}
+	return reserved, delivered, nil
+}
+
+func (s *Store) MarkReviewPublicationDelivered(ctx context.Context, patchEventID, repoID, eventType string, detailIndex int) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE review_publication_outbox SET delivered_at=?
+		WHERE patch_event_id=? AND repo_id=? AND event_type=? AND detail_index=?`,
+		time.Now().Unix(), patchEventID, repoID, eventType, detailIndex,
+	)
+	if err != nil {
+		return fmt.Errorf("mark review publication delivered: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("review publication rows affected: %w", err)
+	}
+	if affected == 0 {
+		return errors.New("review publication reservation not found")
+	}
+	return nil
+}
+
 func (s *Store) UpsertThreadCache(ctx context.Context, rootID, eventID string, now int64) error {
 	_, err := s.db.ExecContext(
 		ctx,
@@ -920,12 +1013,30 @@ func (s *Store) GetReviewEventID(ctx context.Context, patchEventID, repoID strin
 // idempotency check in PublishReview will find this event ID and skip
 // re-publishing.
 func (s *Store) SetReviewEventID(ctx context.Context, patchEventID, repoID, reviewEventID string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE review_log SET review_event_id=? WHERE patch_event_id=? AND repo_id=? AND review_event_id IS NULL`,
-		reviewEventID, patchEventID, repoID,
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE review_log SET review_event_id=?
+		WHERE patch_event_id=? AND repo_id=?
+		AND (review_event_id IS NULL OR review_event_id=?)`,
+		reviewEventID, patchEventID, repoID, reviewEventID,
 	)
 	if err != nil {
 		return fmt.Errorf("set review event id: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set review event id rows affected: %w", err)
+	}
+	if affected == 0 {
+		var exists int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM review_log WHERE patch_event_id=? AND repo_id=?`,
+			patchEventID, repoID,
+		).Scan(&exists); err != nil {
+			return fmt.Errorf("check review event id reservation: %w", err)
+		}
+		if exists == 0 {
+			return ErrReviewNotFound
+		}
 	}
 	return nil
 }

@@ -2,6 +2,10 @@ package payment
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -25,21 +29,38 @@ type fakeInvoiceProvider struct {
 func (f *fakeInvoiceProvider) CreateInvoice(ctx context.Context, sats int64, memo string, expiry time.Duration) (Invoice, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	id := "inv_" + memo
-	f.invoices[id] = f.createdStatus
+	hash := sha256.Sum256([]byte(memo))
+	id := hex.EncodeToString(hash[:])
+	invoice := Invoice{ID: id, Request: "lnbc" + memo, AmountMSats: sats * 1000, ExpiresAt: time.Now().Add(expiry).Unix()}
+	status := f.createdStatus
+	status.PaymentHash, status.AmountMSats = id, invoice.AmountMSats
+	if status.Settled && status.SettledAt == 0 && status.Preimage == "" {
+		status.SettledAt = time.Now().Unix()
+	}
+	f.invoices[id] = status
 	f.createInvoiceCalls++
-	return Invoice{ID: id, Request: "lnbc" + memo}, nil
+	return invoice, nil
 }
 
-func (f *fakeInvoiceProvider) LookupInvoice(ctx context.Context, invoiceID string) (InvoiceStatus, error) {
+func (f *fakeInvoiceProvider) LookupInvoice(ctx context.Context, invoice Invoice) (InvoiceStatus, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.invoices[invoiceID], nil
+	return f.invoices[invoice.ID], nil
 }
 
 func (f *fakeInvoiceProvider) setInvoiceStatus(invoiceID string, status InvoiceStatus) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	current := f.invoices[invoiceID]
+	if status.PaymentHash == "" {
+		status.PaymentHash = current.PaymentHash
+	}
+	if status.AmountMSats == 0 {
+		status.AmountMSats = current.AmountMSats
+	}
+	if status.Settled && status.SettledAt == 0 && status.Preimage == "" {
+		status.SettledAt = time.Now().Unix()
+	}
 	f.invoices[invoiceID] = status
 }
 
@@ -54,6 +75,8 @@ type fakeMintClient struct {
 	mu           sync.Mutex
 	tokens       map[string]ParsedToken
 	meltedTokens map[string]bool
+	quoteStates  map[string]string
+	meltErr      error
 	meltCalls    int
 }
 
@@ -73,12 +96,26 @@ func (f *fakeMintClient) CreateMeltQuote(ctx context.Context, mintURL, bolt11 st
 func (f *fakeMintClient) MeltToken(ctx context.Context, mintURL string, quote MeltQuote, token ParsedToken) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.meltCalls++
+	if f.meltErr != nil {
+		return f.meltErr
+	}
 	if f.meltedTokens[token.Raw] {
 		return errTokenSpent
 	}
 	f.meltedTokens[token.Raw] = true
-	f.meltCalls++
+	f.quoteStates[quote.ID] = "paid"
 	return nil
+}
+
+func (f *fakeMintClient) LookupMeltQuote(ctx context.Context, mintURL string, quote MeltQuote) (MeltQuoteStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state := f.quoteStates[quote.ID]
+	if state == "" {
+		state = "pending"
+	}
+	return MeltQuoteStatus{State: state}, nil
 }
 
 func (f *fakeMintClient) meltCallCount() int {
@@ -108,6 +145,7 @@ func setupTestService(t *testing.T) (*Service, *db.Store) {
 	mint := &fakeMintClient{
 		tokens:       make(map[string]ParsedToken),
 		meltedTokens: make(map[string]bool),
+		quoteStates:  make(map[string]string),
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -462,6 +500,63 @@ func TestAuthorizePatch_SubscriptionRecordsInvoicedAmount(t *testing.T) {
 	}
 	if sub.PaidAmountSats != 100 {
 		t.Fatalf("expected invoiced paid amount 100, got %d", sub.PaidAmountSats)
+	}
+}
+
+func TestAuthorizePatch_MeltFailureBeforeSendReleasesReservation(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+	mint := svc.mint.(*fakeMintClient)
+	token := "cashuAbefore-send"
+	mint.tokens[token] = ParsedToken{MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 110, Raw: token}
+	mint.meltErr = &MeltSubmissionError{MayHaveSubmitted: false, Err: errors.New("fault before send")}
+	event := nostr.Event{ID: mustParseID("9999999999999999999999999999999999999999999999999999999999999999"), PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), Tags: nostr.Tags{{"cashu", token}}}
+
+	result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100})
+	if err != nil {
+		t.Fatalf("AuthorizePatch: %v", err)
+	}
+	if result.Allowed || result.Reason != "payment_not_submitted" {
+		t.Fatalf("expected provably-not-submitted denial, got allowed=%v reason=%q", result.Allowed, result.Reason)
+	}
+	if _, err := store.GetReviewPayment(context.Background(), event.ID.Hex()); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("safe pre-send failure should release reservation, got %v", err)
+	}
+}
+
+func TestAuthorizePatch_AmbiguousMeltPreservedAndReconciledWithoutRemelt(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+	mint := svc.mint.(*fakeMintClient)
+	token := "cashuAafter-send"
+	mint.tokens[token] = ParsedToken{MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 110, Raw: token}
+	mint.meltErr = &MeltSubmissionError{MayHaveSubmitted: true, Err: errors.New("response lost after send")}
+	event := nostr.Event{ID: mustParseID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"), PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), Tags: nostr.Tags{{"cashu", token}}}
+	policy := repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100}
+
+	result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
+	if err != nil || result.Allowed || result.Reason != "payment_pending" {
+		t.Fatalf("expected preserved ambiguous payment, result=%+v err=%v", result, err)
+	}
+	rec, err := store.GetReviewPayment(context.Background(), event.ID.Hex())
+	if err != nil {
+		t.Fatalf("GetReviewPayment: %v", err)
+	}
+	if rec.MeltState != "submitted" || rec.MeltQuoteID == "" || rec.Status != "pending" {
+		t.Fatalf("ambiguous payment evidence not preserved: %+v", rec)
+	}
+
+	mint.mu.Lock()
+	mint.meltErr = nil
+	mint.quoteStates[rec.MeltQuoteID] = "paid"
+	mint.mu.Unlock()
+	svc.invoice.(*fakeInvoiceProvider).setInvoiceStatus(rec.InvoiceID, InvoiceStatus{Settled: true})
+	result, err = svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
+	if err != nil || !result.Allowed {
+		t.Fatalf("reconciliation failed: result=%+v err=%v", result, err)
+	}
+	if calls := mint.meltCallCount(); calls != 1 {
+		t.Fatalf("reconciliation re-melted token: calls=%d", calls)
 	}
 }
 

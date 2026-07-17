@@ -90,6 +90,10 @@ type Config struct {
 	EvalDatasetPath     string
 	HealthAddr          string
 	PipelineWorkers     int
+	CodeChatLimit       int
+	CodeChatWindow      time.Duration
+	FeedbackLimit       int
+	FeedbackWindow      time.Duration
 }
 
 func FromEnv() Config {
@@ -163,6 +167,10 @@ func FromEnv() Config {
 		EvalDatasetPath:     envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
 		HealthAddr:          envOrDefault("DRYDOCK_HEALTH_ADDR", ":8081"),
 		PipelineWorkers:     parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
+		CodeChatLimit:       parseIntOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "20"), 20),
+		CodeChatWindow:      parseDurationOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "1h"), time.Hour),
+		FeedbackLimit:       parseIntOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "100"), 100),
+		FeedbackWindow:      parseDurationOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW", "24h"), 24*time.Hour),
 	}
 }
 
@@ -269,6 +277,14 @@ func parseIntOrDefault(v string, fallback int) int {
 		return fallback
 	}
 	return result
+}
+
+func parseDurationOrDefault(v string, fallback time.Duration) time.Duration {
+	parsed, err := time.ParseDuration(strings.TrimSpace(v))
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func parseBoolOrDefault(v string, fallback bool) bool {
@@ -385,6 +401,20 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 	if c.PaymentNWCURI == "" && len(c.PaymentTrustedMints) > 0 {
 		result.Warnings = append(result.Warnings, "trusted Cashu mints configured but DRYDOCK_NWC_CONNECTION_STRING is empty: paid reviews cannot be authorized")
+	}
+
+	// --- Rate limits ---
+	if c.CodeChatLimit < 1 {
+		result.Errors = append(result.Errors, "DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS must be at least 1")
+	}
+	if c.CodeChatWindow <= 0 {
+		result.Errors = append(result.Errors, "DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW must be greater than 0")
+	}
+	if c.FeedbackLimit < 1 {
+		result.Errors = append(result.Errors, "DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS must be at least 1")
+	}
+	if c.FeedbackWindow <= 0 {
+		result.Errors = append(result.Errors, "DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW must be greater than 0")
 	}
 
 	// --- Pipeline workers ---

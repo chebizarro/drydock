@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"fiatjaf.com/nostr"
 )
@@ -79,8 +78,10 @@ func (f *fakeProcessor) ProcessEvent(_ context.Context, event nostr.Event, _ str
 }
 
 type fakeHighWaterStore struct {
-	mark    int64
-	updates []int64
+	mark        int64
+	updates     []int64
+	updateErr   error
+	updateCalls int
 }
 
 func (f *fakeHighWaterStore) GetListenerHighWaterMark(context.Context) (int64, error) {
@@ -88,6 +89,10 @@ func (f *fakeHighWaterStore) GetListenerHighWaterMark(context.Context) (int64, e
 }
 
 func (f *fakeHighWaterStore) UpdateListenerHighWaterMark(_ context.Context, ts int64) error {
+	f.updateCalls++
+	if f.updateErr != nil {
+		return f.updateErr
+	}
 	f.mark = ts
 	f.updates = append(f.updates, ts)
 	return nil
@@ -102,31 +107,15 @@ func (f fakeOpener) OpenGiftWrap(context.Context, nostr.Event) (nostr.Event, err
 	return f.opened, f.err
 }
 
-func TestRunExitsWhenNoRelays(t *testing.T) {
+func TestRunReturnsErrorWhenNoRelays(t *testing.T) {
 	proc := &fakeProcessor{}
 	svc := New(Config{
-		Relays:          nil, // no relays
+		Relays:          nil,
 		LookbackMinutes: 5,
-	}, proc, nil)
+	}, proc, noopLogger())
 
-	// Use a logger that doesn't panic on nil (create minimal one)
-	svc.logger = noopLogger()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- svc.Run(ctx)
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Run returned error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not exit after context cancelled with no relays")
+	if err := svc.Run(context.Background()); err == nil {
+		t.Fatal("expected startup error with no relays")
 	}
 }
 
@@ -170,6 +159,31 @@ func TestProcessRelayEventDoesNotAdvanceHighWaterOnProcessingFailure(t *testing.
 
 	if len(store.updates) != 0 {
 		t.Fatalf("expected no high-water update on processing failure, got %v", store.updates)
+	}
+}
+
+func TestProcessRelayEventDoesNotAdvanceHighWaterWhenPersistenceFails(t *testing.T) {
+	proc := &fakeProcessor{}
+	store := &fakeHighWaterStore{updateErr: errors.New("database unavailable")}
+	svc := New(Config{}, proc, noopLogger())
+	svc.store = store
+	var lastSeen atomic.Int64
+	failuresBefore := ListenerCheckpointPersistFailures.Value()
+
+	svc.processRelayEvent(context.Background(), nostr.RelayEvent{Event: nostr.Event{
+		ID:        nostr.MustIDFromHex("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+		Kind:      1,
+		CreatedAt: nostr.Timestamp(4321),
+	}}, &lastSeen)
+
+	if got := lastSeen.Load(); got != 0 {
+		t.Fatalf("lastSeen advanced despite persistence failure: %d", got)
+	}
+	if store.updateCalls != checkpointPersistAttempts {
+		t.Fatalf("expected %d persistence attempts, got %d", checkpointPersistAttempts, store.updateCalls)
+	}
+	if got := ListenerCheckpointPersistFailures.Value(); got != failuresBefore+1 {
+		t.Fatalf("expected checkpoint failure metric to increment, before=%d after=%d", failuresBefore, got)
 	}
 }
 

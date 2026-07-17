@@ -498,6 +498,61 @@ func TestProcessorUsesEAsRootForPRUpdates(t *testing.T) {
 	}
 }
 
+type blockingConversationHandler struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingConversationHandler) IsReplyToUs(context.Context, nostr.Event) bool {
+	return true
+}
+
+func (h *blockingConversationHandler) HandleReply(context.Context, nostr.Event, string) error {
+	close(h.started)
+	<-h.release
+	return nil
+}
+
+func TestProcessorDrainsSynchronousHandlerDuringShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store := mustOpenStore(t, ctx)
+	handler := &blockingConversationHandler{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)), ingest.WithConversation(handler))
+	event := nostr.Event{Kind: nostr.KindComment, CreatedAt: nostr.Now(), Content: "reply"}
+	signEvent(t, nostr.Generate(), &event)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- processor.ProcessEvent(ctx, event, "wss://relay.test")
+	}()
+
+	select {
+	case <-handler.started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("processor returned before in-flight handler drained: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(handler.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("process event: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("processor did not return after handler drained")
+	}
+}
+
 func TestProcessorMarksTaskForRetryWhenQueueFull(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
@@ -536,9 +591,9 @@ func TestProcessorMarksTaskForRetryWhenQueueFull(t *testing.T) {
 	}
 	signEvent(t, patchSK, &patch)
 
-	// Process should not fail even when queue is full — task gets marked for retry.
-	if err := smallProcessor.ProcessEvent(ctx, patch, "wss://relay.test"); err != nil {
-		t.Fatalf("process should not error on full queue: %v", err)
+	// Processing must fail when the queue is full so the listener does not checkpoint past it.
+	if err := smallProcessor.ProcessEvent(ctx, patch, "wss://relay.test"); err == nil {
+		t.Fatal("expected queue-full processing error")
 	}
 }
 

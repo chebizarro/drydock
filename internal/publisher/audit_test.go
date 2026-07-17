@@ -3,6 +3,7 @@ package publisher
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -26,12 +27,13 @@ func (s auditTestSigner) SignEvent(_ context.Context, evt *nostr.Event) error {
 type auditTestPublisher struct {
 	events []nostr.Event
 	relays [][]string
+	err    error
 }
 
 func (p *auditTestPublisher) Publish(_ context.Context, relays []string, event nostr.Event) error {
 	p.events = append(p.events, event)
 	p.relays = append(p.relays, append([]string(nil), relays...))
-	return nil
+	return p.err
 }
 
 func TestAuditPublisherPublishesKind4903(t *testing.T) {
@@ -94,6 +96,28 @@ func TestAuditedSignerAuditsNonAuditEvents(t *testing.T) {
 	}
 	if len(pub.events) != 1 {
 		t.Fatalf("audit signer should not recursively audit kind 4903; got %d events", len(pub.events))
+	}
+}
+
+func TestAuditedSignerCountsFailuresAndCanFailClosed(t *testing.T) {
+	base := auditTestSigner{sk: nostr.Generate()}
+	pub := &auditTestPublisher{err: fmt.Errorf("relay unavailable")}
+	audit := NewAuditPublisher(base, pub, []string{"wss://relay.test"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	bestEffort := NewAuditedSignerWithOptions(base, audit, slog.New(slog.NewTextHandler(io.Discard, nil)), AuditedSignerOptions{}).(*AuditedSigner)
+	if err := bestEffort.SignEvent(context.Background(), &nostr.Event{Kind: nostr.KindComment, CreatedAt: nostr.Now()}); err != nil {
+		t.Fatalf("best-effort signing returned audit error: %v", err)
+	}
+	if got := bestEffort.AuditFailureCount(); got != 1 {
+		t.Fatalf("best-effort audit failure count = %d, want 1", got)
+	}
+
+	failClosed := NewAuditedSignerWithOptions(base, audit, slog.New(slog.NewTextHandler(io.Discard, nil)), AuditedSignerOptions{FailClosed: true}).(*AuditedSigner)
+	if err := failClosed.SignEvent(context.Background(), &nostr.Event{Kind: nostr.KindComment, CreatedAt: nostr.Now()}); err == nil {
+		t.Fatal("fail-closed signer swallowed audit publish failure")
+	}
+	if got := failClosed.AuditFailureCount(); got != 1 {
+		t.Fatalf("fail-closed audit failure count = %d, want 1", got)
 	}
 }
 

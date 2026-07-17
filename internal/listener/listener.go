@@ -2,11 +2,13 @@ package listener
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"time"
 
 	"drydock/internal/db"
+	"drydock/internal/metrics"
 
 	"fiatjaf.com/nostr"
 )
@@ -23,6 +25,13 @@ type highWaterStore interface {
 	GetListenerHighWaterMark(ctx context.Context) (int64, error)
 	UpdateListenerHighWaterMark(ctx context.Context, ts int64) error
 }
+
+var ListenerCheckpointPersistFailures = &metrics.Counter{}
+
+const (
+	checkpointPersistAttempts = 3
+	checkpointRetryBackoff    = 10 * time.Millisecond
+)
 
 var subscribedKinds = []nostr.Kind{
 	30617, 30618,
@@ -101,9 +110,7 @@ func New(cfg Config, processor EventProcessor, logger *slog.Logger, opts ...Opti
 
 func (s *Service) Run(ctx context.Context) error {
 	if len(s.cfg.Relays) == 0 {
-		s.logger.Warn("no relays configured; listener is idle")
-		<-ctx.Done()
-		return nil
+		return errors.New("no relays configured")
 	}
 
 	lookback := s.cfg.LookbackMinutes
@@ -228,9 +235,38 @@ func (s *Service) processRelayEvent(ctx context.Context, ie nostr.RelayEvent, la
 	// Track high-water-mark for restart resilience only after successful processing.
 	if s.store != nil {
 		ts := int64(ie.Event.CreatedAt)
-		if ts > lastSeen.Load() {
+		if ts > lastSeen.Load() && s.persistHighWaterMark(ctx, ts) {
 			lastSeen.Store(ts)
-			_ = s.store.UpdateListenerHighWaterMark(ctx, ts)
 		}
 	}
+}
+
+func (s *Service) persistHighWaterMark(ctx context.Context, ts int64) bool {
+	var err error
+	for attempt := 1; attempt <= checkpointPersistAttempts; attempt++ {
+		err = s.store.UpdateListenerHighWaterMark(ctx, ts)
+		if err == nil {
+			return true
+		}
+		if attempt == checkpointPersistAttempts {
+			break
+		}
+
+		timer := time.NewTimer(time.Duration(attempt) * checkpointRetryBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			err = errors.Join(err, ctx.Err())
+			attempt = checkpointPersistAttempts
+		case <-timer.C:
+		}
+	}
+
+	ListenerCheckpointPersistFailures.Inc()
+	s.logger.Error("failed to persist listener high-water-mark",
+		"high_water_mark", ts,
+		"attempts", checkpointPersistAttempts,
+		"error", err,
+	)
+	return false
 }

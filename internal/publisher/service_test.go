@@ -330,7 +330,7 @@ func (f *failNthRelayPublisher) Publish(_ context.Context, relays []string, even
 	return nil
 }
 
-func TestPublishReviewDetailFailureDoesNotBreakSummary(t *testing.T) {
+func TestPublishReviewDetailFailureLeavesReviewRetryable(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
@@ -358,16 +358,91 @@ func TestPublishReviewDetailFailureDoesNotBreakSummary(t *testing.T) {
 			{Severity: "high", Category: "correctness", File: "main.go", Line: 10, Evidence: "y", Explanation: "wrong", Suggestion: "change"},
 		},
 	})
-	if err != nil {
-		t.Fatalf("expected success (summary published), got error: %v", err)
+	if err == nil {
+		t.Fatal("expected detail delivery error")
 	}
 	if strings.TrimSpace(eventID) == "" {
-		t.Fatal("expected non-empty summary event id")
+		t.Fatal("expected the successfully delivered summary event id")
+	}
+	status, statusErr := store.GetReviewStatus(ctx, patchID, repoID)
+	if statusErr != nil {
+		t.Fatalf("get review status: %v", statusErr)
+	}
+	if status == "published" {
+		t.Fatal("review was marked published despite failed details")
 	}
 
 	// Summary was published (call 0), detail attempts were made (calls 1,2) but failed.
 	if len(fakePub.calls) != 3 {
 		t.Fatalf("expected 3 publish calls (1 summary + 2 detail attempts), got %d", len(fakePub.calls))
+	}
+}
+
+func TestPublishReviewReservationFailureBlocksRelayPublish(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `CREATE TRIGGER fail_review_event_reservation
+		BEFORE UPDATE OF review_event_id ON review_log
+		BEGIN SELECT RAISE(FAIL, 'simulated reservation failure'); END`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+
+	fakePub := &fakeRelayPublisher{}
+	svc := New(Config{DefaultRelays: []string{"wss://fallback.example"}}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	_, err := svc.PublishReview(ctx, PublishInput{PatchEventID: patchID, RepoID: repoID, Summary: "summary", Model: "m", ContextHash: "h"})
+	if err == nil || !strings.Contains(err.Error(), "durably reserve summary review event id") {
+		t.Fatalf("expected durable reservation error, got %v", err)
+	}
+	if len(fakePub.calls) != 0 {
+		t.Fatalf("relay publish occurred without durable reservation: %d calls", len(fakePub.calls))
+	}
+}
+
+func TestPublishReviewRetrySkipsDeliveredEvents(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	fakePub := &failNthRelayPublisher{failOnIndices: map[int]bool{2: true}}
+	svc := New(Config{DefaultRelays: []string{"wss://fallback.example"}, DetailSeverityFloor: "high"}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	input := PublishInput{
+		PatchEventID: patchID, RepoID: repoID, Summary: "Found issues.", Model: "m", ContextHash: "h",
+		Findings: []reviewengine.Finding{
+			{Severity: "critical", File: "a.go", Line: 1, Explanation: "first"},
+			{Severity: "high", File: "b.go", Line: 2, Explanation: "second"},
+		},
+	}
+	if _, err := svc.PublishReview(ctx, input); err == nil {
+		t.Fatal("expected first attempt to fail on the second detail")
+	}
+	if len(fakePub.calls) != 3 {
+		t.Fatalf("first attempt calls = %d, want 3", len(fakePub.calls))
+	}
+	summaryID := fakePub.calls[0].event.ID.Hex()
+	firstDetailID := fakePub.calls[1].event.ID.Hex()
+
+	if _, err := svc.PublishReview(ctx, input); err != nil {
+		t.Fatalf("retry publish: %v", err)
+	}
+	if len(fakePub.calls) != 4 {
+		t.Fatalf("retry should publish only the failed detail; total calls = %d, want 4", len(fakePub.calls))
+	}
+	if fakePub.calls[3].event.ID.Hex() == summaryID || fakePub.calls[3].event.ID.Hex() == firstDetailID {
+		t.Fatal("retry duplicated an already-delivered event")
+	}
+	status, err := store.GetReviewStatus(ctx, patchID, repoID)
+	if err != nil {
+		t.Fatalf("get review status: %v", err)
+	}
+	if status != "published" {
+		t.Fatalf("review status = %q, want published", status)
 	}
 }
 

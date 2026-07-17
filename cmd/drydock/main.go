@@ -33,6 +33,7 @@ import (
 	"drydock/internal/pipeline"
 	"drydock/internal/promptrefine"
 	"drydock/internal/publisher"
+	"drydock/internal/ratelimit"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
 	"drydock/internal/securityscan"
@@ -79,6 +80,18 @@ func main() {
 		logger.Error("failed to migrate database", "error", err)
 		os.Exit(1)
 	}
+
+	rateLimitStore := ratelimit.NewSQLStore(store.DB())
+	codeChatRateLimiter := ratelimit.New(ratelimit.Config{
+		Window:      cfg.CodeChatWindow,
+		MaxRequests: cfg.CodeChatLimit,
+		KeyPrefix:   "codechat:",
+	}, rateLimitStore)
+	feedbackRateLimiter := ratelimit.New(ratelimit.Config{
+		Window:      cfg.FeedbackWindow,
+		MaxRequests: cfg.FeedbackLimit,
+		KeyPrefix:   "marketplace-feedback:",
+	}, rateLimitStore)
 
 	// Reset any entries stuck in "reviewing" from a prior crash
 	if n, err := store.ResetStuckReviews(ctx); err != nil {
@@ -416,7 +429,8 @@ func main() {
 				Endpoint:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel},
 				Temperature:   0.4,
 				DefaultRelays: writeRelays,
-			}, store, qdrantClient, embedClient, llmClient, keyer, relayPub, logger)
+			}, store, qdrantClient, embedClient, llmClient, keyer, relayPub, logger).
+				WithRateLimiter(codeChatRateLimiter)
 			processorOpts = append(processorOpts, ingest.WithCodeChat(codeChatHandler))
 			logger.Info("codechat handler registered")
 		} else {
@@ -438,7 +452,8 @@ func main() {
 
 		marketRegistry := marketplace.NewRegistry(store, logger)
 		marketRouter := marketplace.NewRouter(marketplace.RouterConfig{DefaultRelays: writeRelays}, marketRegistry, store, signer, relayPub, contextVMTransport, logger)
-		marketHandler := marketplace.NewHandler(marketRegistry, marketRouter, store, logger)
+		marketHandler := marketplace.NewHandler(marketRegistry, marketRouter, store, logger).
+			WithFeedbackLimiter(feedbackRateLimiter)
 		if err := contextvm.RegisterMarketplaceMethods(contextVMRouter, marketHandler); err != nil {
 			logger.Error("failed to register marketplace contextvm methods", "error", err)
 			os.Exit(1)

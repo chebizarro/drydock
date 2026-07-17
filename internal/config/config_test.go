@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestValidate_NoRelays(t *testing.T) {
@@ -216,6 +217,51 @@ func TestFromEnv_DevModePermitsLocalhostDefaults(t *testing.T) {
 	}
 }
 
+func TestFromEnv_RateLimitDefaultsAndOverrides(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg := FromEnv()
+	if cfg.CodeChatLimit != 20 || cfg.CodeChatWindow != time.Hour {
+		t.Fatalf("unexpected codechat rate limit defaults: %d per %s", cfg.CodeChatLimit, cfg.CodeChatWindow)
+	}
+	if cfg.FeedbackLimit != 100 || cfg.FeedbackWindow != 24*time.Hour {
+		t.Fatalf("unexpected feedback rate limit defaults: %d per %s", cfg.FeedbackLimit, cfg.FeedbackWindow)
+	}
+
+	t.Setenv("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "7")
+	t.Setenv("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "15m")
+	t.Setenv("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "12")
+	t.Setenv("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW", "6h")
+	cfg = FromEnv()
+	if cfg.CodeChatLimit != 7 || cfg.CodeChatWindow != 15*time.Minute {
+		t.Fatalf("unexpected codechat rate limit overrides: %d per %s", cfg.CodeChatLimit, cfg.CodeChatWindow)
+	}
+	if cfg.FeedbackLimit != 12 || cfg.FeedbackWindow != 6*time.Hour {
+		t.Fatalf("unexpected feedback rate limit overrides: %d per %s", cfg.FeedbackLimit, cfg.FeedbackWindow)
+	}
+}
+
+func TestValidate_RateLimitsMustBePositive(t *testing.T) {
+	cfg := FromEnv()
+	cfg.DatabaseURL = ":memory:"
+	cfg.CodeChatLimit = 0
+	cfg.CodeChatWindow = 0
+	cfg.FeedbackLimit = -1
+	cfg.FeedbackWindow = -time.Second
+
+	result := cfg.Validate(context.Background())
+	for _, key := range []string{
+		"DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS",
+		"DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW",
+		"DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS",
+		"DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW",
+	} {
+		if !hasErrorContaining(result, key) {
+			t.Errorf("expected validation error containing %q; got %#v", key, result.Errors)
+		}
+	}
+}
+
 func TestValidationResult_HasErrors(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -277,6 +323,10 @@ func clearConfigEnv(t *testing.T) {
 		"DRYDOCK_EMBED_BASE_URL",
 		"DRYDOCK_EMBED_MODEL",
 		"DRYDOCK_EMBED_API_KEY",
+		"DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS",
+		"DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW",
+		"DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS",
+		"DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW",
 	} {
 		t.Setenv(key, "")
 	}
