@@ -16,6 +16,10 @@ func TestMarketplacePayoutTransitionsAndPersistenceFaults(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	reviewerSK := nostr.Generate()
 	assignmentID, assignmentEventID, completionEventID, reviewEventID := seedMarketplacePayout(t, ctx, store, reviewerSK)
+	escrow, err := store.GetMarketplaceEscrowAllocation(ctx, assignmentID)
+	if err != nil || escrow.Status != "reserved" || escrow.AmountSats != 321 {
+		t.Fatalf("initial escrow=%+v err=%v", escrow, err)
+	}
 
 	mustExec(t, store, `CREATE TRIGGER fail_completion_update BEFORE UPDATE ON review_assignments
 		WHEN NEW.status = 'completed'
@@ -79,6 +83,10 @@ func TestMarketplacePayoutTransitionsAndPersistenceFaults(t *testing.T) {
 	if err := store.MarkMarketplacePayoutSettled(ctx, assignmentID, hash, preimage, time.Now().Unix(), time.Now().Unix()); err == nil {
 		t.Fatal("expected settled audit fault")
 	}
+	escrow, _ = store.GetMarketplaceEscrowAllocation(ctx, assignmentID)
+	if escrow.Status != "reserved" {
+		t.Fatalf("settlement fault consumed escrow: %+v", escrow)
+	}
 	payout, _ = store.GetMarketplacePayout(ctx, assignmentID)
 	if payout.Status != "submitted" {
 		t.Fatalf("settled audit fault did not roll back payout: %q", payout.Status)
@@ -92,6 +100,18 @@ func TestMarketplacePayoutTransitionsAndPersistenceFaults(t *testing.T) {
 	payout, _ = store.GetMarketplacePayout(ctx, assignmentID)
 	if payout.Status != "settled" || payout.PaymentHash != hash || payout.Preimage != preimage {
 		t.Fatalf("settled evidence not stored: %+v", payout)
+	}
+	escrow, err = store.GetMarketplaceEscrowAllocation(ctx, assignmentID)
+	if err != nil || escrow.Status != "paid" || escrow.PayoutPaymentHash != hash || escrow.PaidAt != settledAt {
+		t.Fatalf("paid escrow=%+v err=%v", escrow, err)
+	}
+	paidAt := escrow.PaidAt
+	if err := store.MarkMarketplacePayoutSettled(ctx, assignmentID, hash, preimage, settledAt, settledAt); err != nil {
+		t.Fatalf("idempotent settle payout: %v", err)
+	}
+	escrow, _ = store.GetMarketplaceEscrowAllocation(ctx, assignmentID)
+	if escrow.PaidAt != paidAt || escrow.Status != "paid" {
+		t.Fatalf("duplicate settlement consumed escrow twice: %+v", escrow)
 	}
 	audit, err := store.ListMarketplacePayoutAudit(ctx, assignmentID)
 	if err != nil || len(audit) != 3 {
@@ -146,9 +166,11 @@ func seedMarketplacePayout(t *testing.T, ctx context.Context, store *Store, revi
 		t.Fatal(err)
 	}
 	assignmentEventID := "assignment-event"
+	requester := strings.Repeat("ab", 32)
+	seedAuthorizedReviewPayment(t, ctx, store, "patch-event", "repo-1", requester, 321)
 	if err := store.CreateAssignment(ctx, ReviewAssignment{
 		PatchEventID: "patch-event", RepoID: "repo-1", ReviewerPubkey: reviewer,
-		RequesterPubkey: strings.Repeat("ab", 32), Status: "accepted", PriceSats: 321,
+		RequesterPubkey: requester, Status: "accepted", PriceSats: 321,
 		AssignmentEventID: assignmentEventID, ExpiresAt: time.Now().Add(time.Hour).Unix(),
 	}); err != nil {
 		t.Fatal(err)

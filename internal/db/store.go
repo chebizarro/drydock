@@ -285,6 +285,132 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 6,
+		name:    "marketplace_assignment_escrow",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			exists, err := hasColumn(ctx, tx, "review_payments", "settled_amount_sats")
+			if err != nil {
+				return fmt.Errorf("check review_payments.settled_amount_sats: %w", err)
+			}
+			if !exists {
+				if _, err := tx.ExecContext(ctx, `ALTER TABLE review_payments
+					ADD COLUMN settled_amount_sats INTEGER NOT NULL DEFAULT 0
+					CHECK (settled_amount_sats >= 0)`); err != nil {
+					return fmt.Errorf("add review_payments.settled_amount_sats: %w", err)
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE review_payments
+				SET settled_amount_sats = expected_amount_sats
+				WHERE status = 'authorized'
+				AND access_kind IN ('cashu_review', 'cashu_subscription')
+				AND melt_state = 'paid'
+				AND expected_amount_sats > 0
+				AND invoice_amount_msats = expected_amount_sats * 1000
+				AND melt_quote_amount_sats = expected_amount_sats`); err != nil {
+				return fmt.Errorf("backfill settled review payment amounts: %w", err)
+			}
+
+			// v6 owns this table. On databases upgraded through v5, schemaSQL may have
+			// created an empty copy before v5 rebuilt review_payments, causing SQLite
+			// to retarget its foreign key to review_payments_before_token_spent.
+			if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS marketplace_escrow_allocations`); err != nil {
+				return fmt.Errorf("reset pre-v6 marketplace escrow table: %w", err)
+			}
+			for _, ddl := range []string{
+				`CREATE TABLE IF NOT EXISTS marketplace_escrow_allocations (
+				assignment_id INTEGER PRIMARY KEY,
+				payment_patch_event_id TEXT NOT NULL,
+				amount_sats INTEGER NOT NULL CHECK (amount_sats > 0),
+				currency TEXT NOT NULL DEFAULT 'sat' CHECK (currency = 'sat'),
+				status TEXT NOT NULL DEFAULT 'reserved' CHECK (status IN ('reserved', 'paid')),
+				payout_payment_hash TEXT NOT NULL DEFAULT '', paid_at INTEGER NOT NULL DEFAULT 0,
+				created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+				FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE RESTRICT,
+				FOREIGN KEY (payment_patch_event_id) REFERENCES review_payments(patch_event_id) ON DELETE RESTRICT)`,
+				`CREATE INDEX IF NOT EXISTS idx_marketplace_escrow_payment
+				ON marketplace_escrow_allocations(payment_patch_event_id)`,
+			} {
+				if _, err := tx.ExecContext(ctx, ddl); err != nil {
+					return fmt.Errorf("apply marketplace escrow ddl: %w", err)
+				}
+			}
+
+			var overallocatedPatch string
+			err = tx.QueryRowContext(ctx, `SELECT p.patch_event_id
+				FROM review_payments p
+				JOIN review_assignments a ON a.patch_event_id = p.patch_event_id
+				WHERE a.price_sats > 0 AND p.status = 'authorized'
+				AND p.access_kind = 'cashu_review' AND p.requested_mode = 'review'
+				AND a.repo_id = p.repo_id AND a.requester_pubkey = p.author_pubkey
+				GROUP BY p.patch_event_id, p.settled_amount_sats
+				HAVING SUM(a.price_sats) > p.settled_amount_sats
+				LIMIT 1`).Scan(&overallocatedPatch)
+			if err == nil {
+				return fmt.Errorf("existing paid assignments over-allocate payment %s", overallocatedPatch)
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("validate existing marketplace allocations: %w", err)
+			}
+			now := time.Now().Unix()
+			if _, err := tx.ExecContext(ctx, `INSERT INTO marketplace_escrow_allocations (
+				assignment_id, payment_patch_event_id, amount_sats, currency, status,
+				payout_payment_hash, paid_at, created_at, updated_at)
+				SELECT a.id, p.patch_event_id, a.price_sats, 'sat',
+				CASE WHEN mp.status = 'settled' THEN 'paid' ELSE 'reserved' END,
+				COALESCE(mp.payment_hash, ''), COALESCE(mp.settled_at, 0), ?, ?
+				FROM review_assignments a
+				JOIN review_payments p ON p.patch_event_id = a.patch_event_id
+				LEFT JOIN marketplace_payouts mp ON mp.assignment_id = a.id
+				WHERE a.price_sats > 0 AND p.status = 'authorized'
+				AND p.access_kind = 'cashu_review' AND p.requested_mode = 'review'
+				AND a.repo_id = p.repo_id AND a.requester_pubkey = p.author_pubkey
+				ON CONFLICT(assignment_id) DO NOTHING`, now, now); err != nil {
+				return fmt.Errorf("backfill marketplace escrow allocations: %w", err)
+			}
+
+			for _, ddl := range []string{
+				`CREATE TRIGGER IF NOT EXISTS marketplace_escrow_allocation_insert_guard
+				BEFORE INSERT ON marketplace_escrow_allocations BEGIN
+				SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM review_assignments a
+				JOIN review_payments p ON p.patch_event_id = NEW.payment_patch_event_id
+				WHERE a.id = NEW.assignment_id AND a.patch_event_id = p.patch_event_id
+				AND a.repo_id = p.repo_id AND a.requester_pubkey = p.author_pubkey
+				AND a.price_sats = NEW.amount_sats AND p.status = 'authorized'
+				AND p.access_kind = 'cashu_review' AND p.requested_mode = 'review')
+				THEN RAISE(ABORT, 'escrow allocation does not match authorized payment and assignment') END;
+				SELECT CASE WHEN NEW.amount_sats + COALESCE((SELECT SUM(amount_sats)
+				FROM marketplace_escrow_allocations WHERE payment_patch_event_id = NEW.payment_patch_event_id), 0)
+				> COALESCE((SELECT settled_amount_sats FROM review_payments
+				WHERE patch_event_id = NEW.payment_patch_event_id), 0)
+				THEN RAISE(ABORT, 'escrow allocation exceeds settled funds') END; END`,
+				`CREATE TRIGGER IF NOT EXISTS marketplace_escrow_allocation_identity_immutable
+				BEFORE UPDATE OF assignment_id, payment_patch_event_id, amount_sats, currency
+				ON marketplace_escrow_allocations BEGIN
+				SELECT RAISE(ABORT, 'escrow allocation identity is immutable'); END`,
+				`CREATE TRIGGER IF NOT EXISTS marketplace_escrow_allocation_status_guard
+				BEFORE UPDATE OF status ON marketplace_escrow_allocations
+				WHEN NOT (OLD.status = 'reserved' AND NEW.status = 'paid') AND OLD.status <> NEW.status BEGIN
+				SELECT RAISE(ABORT, 'invalid escrow allocation transition'); END`,
+				`CREATE TRIGGER IF NOT EXISTS marketplace_escrow_payment_immutable
+				BEFORE UPDATE OF patch_event_id, repo_id, author_pubkey, status, access_kind,
+				requested_mode, settled_amount_sats ON review_payments
+				WHEN EXISTS (SELECT 1 FROM marketplace_escrow_allocations
+				WHERE payment_patch_event_id = OLD.patch_event_id) BEGIN
+				SELECT RAISE(ABORT, 'payment backing marketplace escrow is immutable'); END`,
+				`CREATE TRIGGER IF NOT EXISTS marketplace_escrow_assignment_immutable
+				BEFORE UPDATE OF patch_event_id, repo_id, requester_pubkey, price_sats ON review_assignments
+				WHEN EXISTS (SELECT 1 FROM marketplace_escrow_allocations
+				WHERE assignment_id = OLD.id) BEGIN
+				SELECT RAISE(ABORT, 'escrow-backed assignment terms are immutable'); END`,
+			} {
+				if _, err := tx.ExecContext(ctx, ddl); err != nil {
+					return fmt.Errorf("apply marketplace escrow guard: %w", err)
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

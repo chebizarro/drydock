@@ -353,6 +353,9 @@ func TestAuthorizePatch_CashuMeltAuthorizesWhenInvoiceSettled(t *testing.T) {
 	if rec.AccessKind != "cashu_review" {
 		t.Fatalf("expected cashu_review record, got %q", rec.AccessKind)
 	}
+	if rec.SettledAmountSats != policy.PriceSats {
+		t.Fatalf("settled amount = %d, want %d", rec.SettledAmountSats, policy.PriceSats)
+	}
 }
 
 func TestAuthorizePatch_CashuMeltReconcilesAfterSettlement(t *testing.T) {

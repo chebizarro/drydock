@@ -38,6 +38,8 @@ type ReputationScore struct {
 	UpdatedAt      int64   `json:"updated_at"`
 }
 
+var ErrAssignmentEscrow = errors.New("assignment escrow authorization failed")
+
 // ReviewAssignment represents a review task assigned to a reviewer.
 type ReviewAssignment struct {
 	ID                int    `json:"id"`
@@ -55,6 +57,19 @@ type ReviewAssignment struct {
 	ExpiresAt         int64  `json:"expires_at"`
 	CreatedAt         int64  `json:"created_at"`
 	UpdatedAt         int64  `json:"updated_at"`
+}
+
+// MarketplaceEscrowAllocation is the settled-funds reservation backing one paid assignment.
+type MarketplaceEscrowAllocation struct {
+	AssignmentID        int
+	PaymentPatchEventID string
+	AmountSats          int64
+	Currency            string
+	Status              string
+	PayoutPaymentHash   string
+	PaidAt              int64
+	CreatedAt           int64
+	UpdatedAt           int64
 }
 
 // ReviewFeedback represents feedback on a completed review.
@@ -243,64 +258,153 @@ func (s *Store) UpsertReviewerReputation(ctx context.Context, rep ReputationScor
 	return err
 }
 
-// CreateAssignment inserts a new review assignment.
+// CreateAssignment atomically inserts an assignment and reserves settled funds
+// when price_sats is positive.
 func (s *Store) CreateAssignment(ctx context.Context, a ReviewAssignment) error {
-	now := time.Now().Unix()
+	return s.createAssignment(ctx, a, false)
+}
 
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO review_assignments (
-			patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
-			status, priority, price_sats, assignment_event_id,
-			acceptance_event_id, completion_event_id, review_event_id,
-			expires_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
+// UpsertAssignmentReceipt stores a ContextVM delivery idempotently. Immutable
+// assignment terms and any escrow reservation must exactly match the durable row.
+func (s *Store) UpsertAssignmentReceipt(ctx context.Context, a ReviewAssignment) error {
+	return s.createAssignment(ctx, a, true)
+}
+
+func (s *Store) createAssignment(ctx context.Context, a ReviewAssignment, idempotent bool) error {
+	if a.PriceSats < 0 {
+		return fmt.Errorf("%w: assignment price cannot be negative", ErrAssignmentEscrow)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var paymentStatus, accessKind, requestedMode, paymentRepo, paymentAuthor string
+	var settledAmount int64
+	paymentErr := tx.QueryRowContext(ctx, `
+		SELECT status, access_kind, requested_mode, repo_id, author_pubkey, settled_amount_sats
+		FROM review_payments WHERE patch_event_id = ?
+	`, a.PatchEventID).Scan(&paymentStatus, &accessKind, &requestedMode, &paymentRepo, &paymentAuthor, &settledAmount)
+	if paymentErr == nil {
+		if paymentStatus != "authorized" {
+			return fmt.Errorf("%w: payment for patch %s is %s, not authorized", ErrAssignmentEscrow, a.PatchEventID, paymentStatus)
+		}
+		if paymentRepo != a.RepoID {
+			return fmt.Errorf("%w: payment repo %s does not match assignment repo %s", ErrAssignmentEscrow, paymentRepo, a.RepoID)
+		}
+		if paymentAuthor == "" || paymentAuthor != a.RequesterPubkey {
+			return fmt.Errorf("%w: payment requester %s does not match assignment requester %s", ErrAssignmentEscrow, paymentAuthor, a.RequesterPubkey)
+		}
+	} else if !errors.Is(paymentErr, sql.ErrNoRows) {
+		return fmt.Errorf("lookup assignment payment: %w", paymentErr)
+	} else if a.PriceSats > 0 {
+		return fmt.Errorf("%w: paid assignment for patch %s has no authorized payment", ErrAssignmentEscrow, a.PatchEventID)
+	}
+	if a.PriceSats > 0 {
+		if accessKind != "cashu_review" || requestedMode != "review" {
+			return fmt.Errorf("%w: payment access kind %s cannot fund marketplace payout", ErrAssignmentEscrow, accessKind)
+		}
+		if settledAmount <= 0 {
+			return fmt.Errorf("%w: payment for patch %s has no settled funds", ErrAssignmentEscrow, a.PatchEventID)
+		}
+	}
+
+	now := time.Now().Unix()
+	query := `INSERT INTO review_assignments (
+		patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
+		status, priority, price_sats, assignment_event_id,
+		acceptance_event_id, completion_event_id, review_event_id,
+		expires_at, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	if idempotent {
+		query += ` ON CONFLICT(assignment_event_id) DO NOTHING`
+	}
+	result, err := tx.ExecContext(ctx, query,
 		a.PatchEventID, a.RepoID, a.ReviewerPubkey, a.RequesterPubkey,
 		a.Status, a.Priority, a.PriceSats, a.AssignmentEventID,
 		nullIfEmpty(a.AcceptanceEventID), nullIfEmpty(a.CompletionEventID), nullIfEmpty(a.ReviewEventID),
 		a.ExpiresAt, now, now,
 	)
-	return err
-}
-
-// UpsertAssignmentReceipt stores an assignment delivered over ContextVM idempotently.
-// Existing transition state is preserved when the assignment was already recorded
-// by the router before delivery.
-func (s *Store) UpsertAssignmentReceipt(ctx context.Context, a ReviewAssignment) error {
-	now := time.Now().Unix()
-	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO review_assignments (
-			patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
-			status, priority, price_sats, assignment_event_id,
-			expires_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(assignment_event_id) DO UPDATE SET
-			requester_pubkey = CASE
-				WHEN review_assignments.requester_pubkey = '' THEN excluded.requester_pubkey
-				ELSE review_assignments.requester_pubkey
-			END,
-			price_sats = excluded.price_sats,
-			expires_at = excluded.expires_at,
-			updated_at = excluded.updated_at
-		WHERE review_assignments.patch_event_id = excluded.patch_event_id
-			AND review_assignments.repo_id = excluded.repo_id
-			AND review_assignments.reviewer_pubkey = excluded.reviewer_pubkey
-	`,
-		a.PatchEventID, a.RepoID, a.ReviewerPubkey, a.RequesterPubkey,
-		a.Status, a.Priority, a.PriceSats, a.AssignmentEventID,
-		a.ExpiresAt, now, now,
-	)
 	if err != nil {
 		return err
 	}
-	affected, err := result.RowsAffected()
+	inserted, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("assignment receipt rows affected: %w", err)
+		return fmt.Errorf("assignment rows affected: %w", err)
 	}
-	if affected != 1 {
-		return fmt.Errorf("assignment receipt conflicts with existing assignment %s", a.AssignmentEventID)
+	var assignmentID int64
+	if inserted == 1 {
+		assignmentID, err = result.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("assignment id: %w", err)
+		}
+	} else if idempotent {
+		var patch, repo, reviewer, requester string
+		var price, expires int64
+		var priority int
+		err = tx.QueryRowContext(ctx, `SELECT id, patch_event_id, repo_id, reviewer_pubkey,
+			requester_pubkey, priority, price_sats, expires_at
+			FROM review_assignments WHERE assignment_event_id = ?`, a.AssignmentEventID).Scan(
+			&assignmentID, &patch, &repo, &reviewer, &requester, &priority, &price, &expires)
+		if err != nil {
+			return fmt.Errorf("lookup existing assignment receipt: %w", err)
+		}
+		if patch != a.PatchEventID || repo != a.RepoID || reviewer != a.ReviewerPubkey ||
+			requester != a.RequesterPubkey || priority != a.Priority || price != a.PriceSats || expires != a.ExpiresAt {
+			return fmt.Errorf("%w: assignment receipt conflicts with existing assignment %s", ErrAssignmentEscrow, a.AssignmentEventID)
+		}
+	} else {
+		return fmt.Errorf("assignment insert affected %d rows", inserted)
+	}
+
+	if a.PriceSats > 0 {
+		if err := reserveAssignmentEscrowTx(ctx, tx, int(assignmentID), a.PatchEventID, a.PriceSats, settledAmount, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func reserveAssignmentEscrowTx(ctx context.Context, tx *sql.Tx, assignmentID int, paymentPatchEventID string, amountSats, settledAmount, now int64) error {
+	var storedPayment, status string
+	var storedAmount int64
+	err := tx.QueryRowContext(ctx, `SELECT payment_patch_event_id, amount_sats, status
+		FROM marketplace_escrow_allocations WHERE assignment_id = ?`, assignmentID).Scan(&storedPayment, &storedAmount, &status)
+	if err == nil {
+		if storedPayment != paymentPatchEventID || storedAmount != amountSats || (status != "reserved" && status != "paid") {
+			return fmt.Errorf("%w: existing escrow reservation does not match assignment %d", ErrAssignmentEscrow, assignmentID)
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("lookup assignment escrow: %w", err)
+	}
+	var allocated int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount_sats), 0)
+		FROM marketplace_escrow_allocations WHERE payment_patch_event_id = ?`, paymentPatchEventID).Scan(&allocated); err != nil {
+		return fmt.Errorf("sum payment escrow allocations: %w", err)
+	}
+	if amountSats > settledAmount-allocated {
+		return fmt.Errorf("%w: assignment price %d exceeds unallocated settled funds %d", ErrAssignmentEscrow, amountSats, settledAmount-allocated)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO marketplace_escrow_allocations (
+		assignment_id, payment_patch_event_id, amount_sats, currency, status, created_at, updated_at
+	) VALUES (?, ?, ?, 'sat', 'reserved', ?, ?)`, assignmentID, paymentPatchEventID, amountSats, now, now); err != nil {
+		return fmt.Errorf("%w: reserve assignment escrow: %v", ErrAssignmentEscrow, err)
 	}
 	return nil
+}
+
+// GetMarketplaceEscrowAllocation returns the reservation backing an assignment.
+func (s *Store) GetMarketplaceEscrowAllocation(ctx context.Context, assignmentID int) (MarketplaceEscrowAllocation, error) {
+	var rec MarketplaceEscrowAllocation
+	err := s.db.QueryRowContext(ctx, `SELECT assignment_id, payment_patch_event_id, amount_sats,
+		currency, status, payout_payment_hash, paid_at, created_at, updated_at
+		FROM marketplace_escrow_allocations WHERE assignment_id = ?`, assignmentID).Scan(
+		&rec.AssignmentID, &rec.PaymentPatchEventID, &rec.AmountSats, &rec.Currency,
+		&rec.Status, &rec.PayoutPaymentHash, &rec.PaidAt, &rec.CreatedAt, &rec.UpdatedAt)
+	return rec, err
 }
 
 // GetAssignmentByID retrieves an assignment by its database ID.

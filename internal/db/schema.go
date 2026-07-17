@@ -248,6 +248,7 @@ CREATE TABLE IF NOT EXISTS review_payments (
   mint_url TEXT NOT NULL DEFAULT '',
   token_amount_sats INTEGER NOT NULL DEFAULT 0,
   expected_amount_sats INTEGER NOT NULL DEFAULT 0,
+  settled_amount_sats INTEGER NOT NULL DEFAULT 0 CHECK (settled_amount_sats >= 0),
   subscription_days INTEGER NOT NULL DEFAULT 0,
   invoice_id TEXT NOT NULL DEFAULT '',
   invoice_request TEXT NOT NULL DEFAULT '',
@@ -366,6 +367,22 @@ CREATE TABLE IF NOT EXISTS review_assignments (
 CREATE INDEX IF NOT EXISTS idx_review_assignments_reviewer ON review_assignments(reviewer_pubkey);
 CREATE INDEX IF NOT EXISTS idx_review_assignments_status ON review_assignments(status);
 CREATE INDEX IF NOT EXISTS idx_review_assignments_expires ON review_assignments(expires_at);
+
+CREATE TABLE IF NOT EXISTS marketplace_escrow_allocations (
+  assignment_id INTEGER PRIMARY KEY,
+  payment_patch_event_id TEXT NOT NULL,
+  amount_sats INTEGER NOT NULL CHECK (amount_sats > 0),
+  currency TEXT NOT NULL DEFAULT 'sat' CHECK (currency = 'sat'),
+  status TEXT NOT NULL DEFAULT 'reserved' CHECK (status IN ('reserved', 'paid')),
+  payout_payment_hash TEXT NOT NULL DEFAULT '',
+  paid_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE RESTRICT,
+  FOREIGN KEY (payment_patch_event_id) REFERENCES review_payments(patch_event_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_marketplace_escrow_payment
+  ON marketplace_escrow_allocations(payment_patch_event_id);
 CREATE TABLE IF NOT EXISTS marketplace_payouts (
   assignment_id INTEGER PRIMARY KEY,
   idempotency_key TEXT NOT NULL UNIQUE,

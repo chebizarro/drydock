@@ -167,6 +167,33 @@ func TestHandlerRejectsAssignmentIntentFromNonAuthority(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsPaymentAssignmentMismatches(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	authority := testPubKey()
+	registry := NewRegistry(store, slog.Default())
+	router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: authority}, &mockPublisher{}, slog.Default())
+	handler := NewHandler(registry, router, store, slog.Default())
+	seedAuthorizedMarketplacePayment(t, ctx, store, "patch-paid", "repo-paid", "requester-paid", 100)
+
+	for _, tc := range []struct {
+		name, repo, requester string
+		price                 int64
+		want                  string
+	}{
+		{name: "repo", repo: "wrong-repo", requester: "requester-paid", price: 100, want: "payment repo"},
+		{name: "requester", repo: "repo-paid", requester: "wrong-requester", price: 100, want: "payment requester"},
+		{name: "amount", repo: "repo-paid", requester: "requester-paid", price: 101, want: "exceeds settled funds"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := handler.authorizeAssignmentIntent(ctx, authority.Hex(), "patch-paid", tc.repo, tc.requester, tc.price)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q mismatch rejection, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
 func TestHandlerRejectsUnauthorizedAndDuplicateFeedback(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
@@ -265,6 +292,17 @@ func signedMarketplaceEvent(t *testing.T, sk nostr.SecretKey, kind int, content 
 
 func testPubKey() nostr.PubKey {
 	return nostr.GetPublicKey(nostr.Generate())
+}
+
+func seedAuthorizedMarketplacePayment(t *testing.T, ctx context.Context, store *db.Store, patch, repo, author string, settled int64) {
+	t.Helper()
+	now := time.Now().Unix()
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO review_payments (
+		patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
+		settled_amount_sats, created_at, updated_at
+	) VALUES (?, ?, ?, 'authorized', 'cashu_review', 'review', ?, ?, ?)`, patch, repo, author, settled, now, now); err != nil {
+		t.Fatalf("seed authorized marketplace payment: %v", err)
+	}
 }
 
 func feedbackCount(t *testing.T, ctx context.Context, store *db.Store, assignmentID int) int {

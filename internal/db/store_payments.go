@@ -28,6 +28,7 @@ type ReviewPaymentRecord struct {
 	MintURL             string
 	TokenAmountSats     int64
 	ExpectedAmountSats  int64
+	SettledAmountSats   int64
 	SubscriptionDays    int
 	InvoiceID           string
 	InvoiceRequest      string
@@ -59,7 +60,7 @@ func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (Revi
 	err := s.db.QueryRowContext(ctx, `
 		SELECT patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
 		       COALESCE(token_hash, ''), mint_url, token_amount_sats, expected_amount_sats,
-		       subscription_days, invoice_id, invoice_request, invoice_amount_msats,
+		       settled_amount_sats, subscription_days, invoice_id, invoice_request, invoice_amount_msats,
 		       invoice_expires_at, melt_quote_id, melt_quote_amount_sats,
 		       melt_fee_reserve_sats, melt_state, created_at, updated_at
 		FROM review_payments
@@ -67,7 +68,7 @@ func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (Revi
 	`, patchEventID).Scan(
 		&rec.PatchEventID, &rec.RepoID, &rec.AuthorPubkey, &rec.Status, &rec.AccessKind,
 		&rec.RequestedMode, &rec.TokenHash, &rec.MintURL, &rec.TokenAmountSats,
-		&rec.ExpectedAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
+		&rec.ExpectedAmountSats, &rec.SettledAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
 		&rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt, &rec.MeltQuoteID,
 		&rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats, &rec.MeltState,
 		&rec.CreatedAt, &rec.UpdatedAt,
@@ -149,7 +150,7 @@ func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash strin
 	err := s.db.QueryRowContext(ctx, `
 		SELECT patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
 		       COALESCE(token_hash, ''), mint_url, token_amount_sats, expected_amount_sats,
-		       subscription_days, invoice_id, invoice_request, invoice_amount_msats,
+		       settled_amount_sats, subscription_days, invoice_id, invoice_request, invoice_amount_msats,
 		       invoice_expires_at, melt_quote_id, melt_quote_amount_sats,
 		       melt_fee_reserve_sats, melt_state, created_at, updated_at
 		FROM review_payments
@@ -157,7 +158,7 @@ func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash strin
 	`, tokenHash).Scan(
 		&rec.PatchEventID, &rec.RepoID, &rec.AuthorPubkey, &rec.Status, &rec.AccessKind,
 		&rec.RequestedMode, &rec.TokenHash, &rec.MintURL, &rec.TokenAmountSats,
-		&rec.ExpectedAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
+		&rec.ExpectedAmountSats, &rec.SettledAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
 		&rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt, &rec.MeltQuoteID,
 		&rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats, &rec.MeltState,
 		&rec.CreatedAt, &rec.UpdatedAt,
@@ -248,7 +249,7 @@ func (s *Store) MarkReviewPaymentAuthorized(ctx context.Context, patchEventID, a
 	now := time.Now().Unix()
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE review_payments
-		SET status = 'authorized', access_kind = ?, updated_at = ?
+		SET status = 'authorized', access_kind = ?, settled_amount_sats = expected_amount_sats, updated_at = ?
 		WHERE patch_event_id = ? AND status = 'token_spent'
 	`, accessKind, now, patchEventID)
 	if err != nil {
@@ -322,15 +323,15 @@ func (s *Store) FinalizePaidReview(ctx context.Context, patchEventID, tokenHash 
 	defer tx.Rollback()
 
 	var status, accessKind, requestedMode, storedToken, author, repoID, meltState string
-	var expectedAmount, invoiceAmountMSats, quoteAmount int64
+	var expectedAmount, settledAmount, invoiceAmountMSats, quoteAmount int64
 	var subscriptionDays int
 	err = tx.QueryRowContext(ctx, `
 		SELECT status, access_kind, requested_mode, COALESCE(token_hash, ''),
-				author_pubkey, repo_id, expected_amount_sats, subscription_days, melt_state,
-				invoice_amount_msats, melt_quote_amount_sats
+				author_pubkey, repo_id, expected_amount_sats, settled_amount_sats,
+				subscription_days, melt_state, invoice_amount_msats, melt_quote_amount_sats
 		FROM review_payments WHERE patch_event_id = ?
 	`, patchEventID).Scan(&status, &accessKind, &requestedMode, &storedToken,
-		&author, &repoID, &expectedAmount, &subscriptionDays, &meltState,
+		&author, &repoID, &expectedAmount, &settledAmount, &subscriptionDays, &meltState,
 		&invoiceAmountMSats, &quoteAmount)
 	if err != nil {
 		return "", err
@@ -342,6 +343,9 @@ func (s *Store) FinalizePaidReview(ctx context.Context, patchEventID, tokenHash 
 		if (requestedMode == "review" && accessKind != "cashu_review") ||
 			(requestedMode == "subscription" && accessKind != "cashu_subscription") {
 			return "", errors.New("authorized payment has inconsistent mode/access kind")
+		}
+		if settledAmount <= 0 || settledAmount != expectedAmount {
+			return "", errors.New("authorized payment has inconsistent settled amount")
 		}
 		return accessKind, nil
 	}
@@ -382,7 +386,8 @@ func (s *Store) FinalizePaidReview(ctx context.Context, patchEventID, tokenHash 
 	}
 
 	result, err := tx.ExecContext(ctx, `
-		UPDATE review_payments SET status = 'authorized', access_kind = ?, updated_at = ?
+		UPDATE review_payments
+		SET status = 'authorized', access_kind = ?, settled_amount_sats = expected_amount_sats, updated_at = ?
 		WHERE patch_event_id = ? AND token_hash = ? AND status = 'token_spent' AND melt_state = 'paid'
 	`, accessKind, time.Now().Unix(), patchEventID, tokenHash)
 	if err != nil {
@@ -615,6 +620,16 @@ func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignm
 		}
 		return MarketplacePayoutRecord{}, false, nil
 	}
+	var escrowPayment, escrowStatus string
+	var escrowAmount int64
+	if err := tx.QueryRowContext(ctx, `SELECT payment_patch_event_id, amount_sats, status
+		FROM marketplace_escrow_allocations WHERE assignment_id = ?`, assignmentID).Scan(
+		&escrowPayment, &escrowAmount, &escrowStatus); err != nil {
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("paid assignment has no escrow reservation: %w", err)
+	}
+	if escrowPayment != patchEventID || escrowAmount != priceSats || (escrowStatus != "reserved" && escrowStatus != "paid") {
+		return MarketplacePayoutRecord{}, false, errors.New("paid assignment escrow does not match assignment terms")
+	}
 	destination = strings.TrimSpace(destination)
 	if destination == "" {
 		return MarketplacePayoutRecord{}, false, errors.New("paid assignment reviewer has no payout destination")
@@ -625,7 +640,7 @@ func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignm
 			assignment_id, idempotency_key, amount_sats, destination, status, created_at, updated_at
 		) VALUES (?, ?, ?, ?, 'pending', ?, ?)
 		ON CONFLICT(assignment_id) DO NOTHING
-	`, assignmentID, idempotencyKey, priceSats, destination, now, now)
+	`, assignmentID, idempotencyKey, escrowAmount, destination, now, now)
 	if err != nil {
 		return MarketplacePayoutRecord{}, false, fmt.Errorf("allocate marketplace payout: %w", err)
 	}
@@ -649,7 +664,7 @@ func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignm
 	if err != nil {
 		return MarketplacePayoutRecord{}, false, err
 	}
-	if rec.IdempotencyKey != idempotencyKey || rec.AmountSats != priceSats || rec.Destination != destination {
+	if rec.IdempotencyKey != idempotencyKey || rec.AmountSats != escrowAmount || rec.Destination != destination {
 		return MarketplacePayoutRecord{}, false, errors.New("existing payout does not match assignment allocation")
 	}
 	rec.CompletionEventID, rec.ReviewEventID = completionEventID, reviewEventID
@@ -796,6 +811,18 @@ func (s *Store) transitionMarketplacePayout(ctx context.Context, assignmentID in
 	}
 	if rows != 1 {
 		return fmt.Errorf("payout transition %s -> %s affected %d rows", from, to, rows)
+	}
+	if to == "settled" {
+		result, err := tx.ExecContext(ctx, `UPDATE marketplace_escrow_allocations
+			SET status='paid', payout_payment_hash=?, paid_at=?, updated_at=?
+			WHERE assignment_id=? AND status='reserved'`, paymentHash, settledAt, now, assignmentID)
+		if err != nil {
+			return fmt.Errorf("consume marketplace escrow reservation: %w", err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil || rows != 1 {
+			return fmt.Errorf("consume marketplace escrow reservation affected %d rows (err=%v)", rows, err)
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO marketplace_payout_audit

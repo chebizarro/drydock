@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -146,6 +147,7 @@ func TestCreateAndGetAssignment(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
 
+	seedAuthorizedReviewPayment(t, ctx, store, "patch-123", "repo-1", "requester-1", 500)
 	assignment := ReviewAssignment{
 		PatchEventID:      "patch-123",
 		RepoID:            "repo-1",
@@ -182,6 +184,107 @@ func TestCreateAndGetAssignment(t *testing.T) {
 	}
 	if gotByID.AssignmentEventID != "assign-evt-1" {
 		t.Errorf("expected AssignmentEventID 'assign-evt-1', got %q", gotByID.AssignmentEventID)
+	}
+}
+
+func TestPaidAssignmentRejectsOverAllocationAndMismatches(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("over allocation", func(t *testing.T) {
+		store := mustOpenStore(t, ctx)
+		seedAuthorizedReviewPayment(t, ctx, store, "patch-funded", "repo-funded", "requester-funded", 1000)
+		first := ReviewAssignment{PatchEventID: "patch-funded", RepoID: "repo-funded", ReviewerPubkey: "reviewer-1",
+			RequesterPubkey: "requester-funded", Status: "pending", Priority: 2, PriceSats: 700,
+			AssignmentEventID: "assignment-funded-1", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+		if err := store.CreateAssignment(ctx, first); err != nil {
+			t.Fatalf("first allocation: %v", err)
+		}
+		second := first
+		second.ReviewerPubkey = "reviewer-2"
+		second.AssignmentEventID = "assignment-funded-2"
+		second.PriceSats = 400
+		if err := store.CreateAssignment(ctx, second); !errors.Is(err, ErrAssignmentEscrow) {
+			t.Fatalf("expected escrow over-allocation rejection, got %v", err)
+		}
+		var assignments int
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_assignments WHERE patch_event_id=?`, first.PatchEventID).Scan(&assignments); err != nil {
+			t.Fatal(err)
+		}
+		if assignments != 1 {
+			t.Fatalf("over-allocated assignment persisted; count=%d", assignments)
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE review_payments SET settled_amount_sats=2000 WHERE patch_event_id=?`, first.PatchEventID); err == nil {
+			t.Fatal("escrow-backed payment amount was mutable")
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE review_assignments SET price_sats=1 WHERE assignment_event_id=?`, first.AssignmentEventID); err == nil {
+			t.Fatal("escrow-backed assignment price was mutable")
+		}
+	})
+
+	for _, tc := range []struct {
+		name, repo, requester string
+	}{
+		{name: "repo mismatch", repo: "wrong-repo", requester: "requester-match"},
+		{name: "requester mismatch", repo: "repo-match", requester: "wrong-requester"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := mustOpenStore(t, ctx)
+			seedAuthorizedReviewPayment(t, ctx, store, "patch-match", "repo-match", "requester-match", 100)
+			err := store.CreateAssignment(ctx, ReviewAssignment{PatchEventID: "patch-match", RepoID: tc.repo,
+				ReviewerPubkey: "reviewer-match", RequesterPubkey: tc.requester, Status: "pending", Priority: 2,
+				PriceSats: 100, AssignmentEventID: "assignment-" + tc.name, ExpiresAt: time.Now().Add(time.Hour).Unix()})
+			if !errors.Is(err, ErrAssignmentEscrow) {
+				t.Fatalf("expected mismatch rejection, got %v", err)
+			}
+		})
+	}
+}
+
+func TestConcurrentPaidAssignmentsCannotDoubleClaimPayment(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	seedAuthorizedReviewPayment(t, ctx, store, "patch-race", "repo-race", "requester-race", 100)
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- store.CreateAssignment(ctx, ReviewAssignment{PatchEventID: "patch-race", RepoID: "repo-race",
+				ReviewerPubkey: fmt.Sprintf("reviewer-race-%d", i), RequesterPubkey: "requester-race",
+				Status: "pending", Priority: 2, PriceSats: 100, AssignmentEventID: fmt.Sprintf("assignment-race-%d", i),
+				ExpiresAt: time.Now().Add(time.Hour).Unix()})
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	var succeeded, rejected int
+	for err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrAssignmentEscrow):
+			rejected++
+		default:
+			t.Fatalf("unexpected concurrent assignment error: %v", err)
+		}
+	}
+	if succeeded != 1 || rejected != 1 {
+		t.Fatalf("concurrent results succeeded=%d rejected=%d, want 1/1", succeeded, rejected)
+	}
+	var allocations, allocated int64
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(amount_sats),0)
+		FROM marketplace_escrow_allocations WHERE payment_patch_event_id='patch-race'`).Scan(&allocations, &allocated); err != nil {
+		t.Fatal(err)
+	}
+	if allocations != 1 || allocated != 100 {
+		t.Fatalf("allocations=%d amount=%d, want 1/100", allocations, allocated)
 	}
 }
 
@@ -488,6 +591,17 @@ func TestRecordFeedback(t *testing.T) {
 
 	if err := store.RecordFeedback(ctx, feedback); err != nil {
 		t.Fatalf("RecordFeedback: %v", err)
+	}
+}
+
+func seedAuthorizedReviewPayment(t *testing.T, ctx context.Context, store *Store, patch, repo, author string, settled int64) {
+	t.Helper()
+	now := time.Now().Unix()
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO review_payments (
+		patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
+		settled_amount_sats, created_at, updated_at
+	) VALUES (?, ?, ?, 'authorized', 'cashu_review', 'review', ?, ?, ?)`, patch, repo, author, settled, now, now); err != nil {
+		t.Fatalf("seed authorized review payment: %v", err)
 	}
 }
 

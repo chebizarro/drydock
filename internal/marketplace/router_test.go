@@ -170,7 +170,7 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 		RequesterPubkey:   "author1",
 		Status:            "pending",
 		Priority:          2,
-		PriceSats:         1000,
+		PriceSats:         0,
 		AssignmentEventID: "assign-r1",
 		ExpiresAt:         time.Now().Add(24 * time.Hour).Unix(),
 	}

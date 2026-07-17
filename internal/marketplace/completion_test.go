@@ -225,9 +225,11 @@ func seedAcceptedPaidCompletion(t *testing.T, ctx context.Context, store *db.Sto
 	assignmentID := "assignment-" + reviewer[:12]
 	patchID := "patch-" + reviewer[:12]
 	repoID := "repo-1"
+	requester := testPubKey().Hex()
+	seedAuthorizedMarketplacePayment(t, ctx, store, patchID, repoID, requester, 250)
 	if err := store.CreateAssignment(ctx, db.ReviewAssignment{
 		PatchEventID: patchID, RepoID: repoID, ReviewerPubkey: reviewer,
-		RequesterPubkey: testPubKey().Hex(), Status: "accepted", PriceSats: 250,
+		RequesterPubkey: requester, Status: "accepted", PriceSats: 250,
 		AssignmentEventID: assignmentID, ExpiresAt: time.Now().Add(time.Hour).Unix(),
 	}); err != nil {
 		t.Fatalf("CreateAssignment: %v", err)

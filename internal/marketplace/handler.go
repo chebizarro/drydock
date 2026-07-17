@@ -133,7 +133,7 @@ func (h *Handler) HandleAssignmentIntent(ctx context.Context, req contextvm.Requ
 	if assignmentEventID == "" {
 		assignmentEventID = req.Event.ID.Hex()
 	}
-	requesterPubkey, err := h.authorizeAssignmentIntent(ctx, req.Sender.Hex(), assignment.PatchEventID, assignment.RepoID, assignment.PriceSats)
+	requesterPubkey, err := h.authorizeAssignmentIntent(ctx, req.Sender.Hex(), assignment.PatchEventID, assignment.RepoID, assignment.RequesterPubkey, assignment.PriceSats)
 	if err != nil {
 		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: err.Error()}
 	}
@@ -153,7 +153,11 @@ func (h *Handler) HandleAssignmentIntent(ctx context.Context, req contextvm.Requ
 			"assignment_id", assignment.AssignmentID,
 			"error", err,
 		)
-		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+		code := contextvm.ErrorInternal
+		if errors.Is(err, db.ErrAssignmentEscrow) {
+			code = contextvm.ErrorInvalidRequest
+		}
+		return nil, &contextvm.Error{Code: code, Message: err.Error()}
 	}
 
 	metrics.MarketplaceAssignmentsCreated.Inc()
@@ -179,7 +183,7 @@ func (h *Handler) handleAssignment(ctx context.Context, event nostr.Event) error
 	if assignmentEventID == "" {
 		assignmentEventID = event.ID.Hex()
 	}
-	requesterPubkey, err := h.authorizeAssignmentIntent(ctx, event.PubKey.Hex(), assignment.PatchEventID, assignment.RepoID, assignment.PriceSats)
+	requesterPubkey, err := h.authorizeAssignmentIntent(ctx, event.PubKey.Hex(), assignment.PatchEventID, assignment.RepoID, assignment.RequesterPubkey, assignment.PriceSats)
 	if err != nil {
 		return err
 	}
@@ -196,7 +200,10 @@ func (h *Handler) handleAssignment(ctx context.Context, event nostr.Event) error
 	})
 }
 
-func (h *Handler) authorizeAssignmentIntent(ctx context.Context, senderPubkey, patchEventID, repoID string, priceSats int64) (string, error) {
+func (h *Handler) authorizeAssignmentIntent(ctx context.Context, senderPubkey, patchEventID, repoID, requesterPubkey string, priceSats int64) (string, error) {
+	if priceSats < 0 {
+		return "", fmt.Errorf("assignment intent rejected: price cannot be negative")
+	}
 	if h.router == nil {
 		return "", fmt.Errorf("marketplace assignment intent rejected: router authority is not configured")
 	}
@@ -215,11 +222,22 @@ func (h *Handler) authorizeAssignmentIntent(ctx context.Context, senderPubkey, p
 		if payment.Status != "authorized" {
 			return "", fmt.Errorf("assignment intent rejected: payment for patch %s is %s, not authorized", patchEventID, payment.Status)
 		}
-		if repoID != "" && payment.RepoID != "" && payment.RepoID != repoID {
+		if payment.RepoID != repoID {
 			return "", fmt.Errorf("assignment intent rejected: payment repo %s does not match assignment repo %s", payment.RepoID, repoID)
 		}
 		if payment.AuthorPubkey == "" {
 			return "", fmt.Errorf("assignment intent rejected: authorized payment has no author pubkey")
+		}
+		if requesterPubkey != "" && requesterPubkey != payment.AuthorPubkey {
+			return "", fmt.Errorf("assignment intent rejected: payment requester %s does not match assignment requester %s", payment.AuthorPubkey, requesterPubkey)
+		}
+		if priceSats > 0 {
+			if payment.AccessKind != "cashu_review" || payment.RequestedMode != "review" {
+				return "", fmt.Errorf("assignment intent rejected: payment access kind %s cannot fund marketplace payout", payment.AccessKind)
+			}
+			if payment.SettledAmountSats < priceSats {
+				return "", fmt.Errorf("assignment intent rejected: price %d exceeds settled funds %d", priceSats, payment.SettledAmountSats)
+			}
 		}
 		return payment.AuthorPubkey, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {

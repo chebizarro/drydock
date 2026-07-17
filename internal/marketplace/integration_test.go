@@ -110,6 +110,7 @@ func TestIntegrationMarketplaceContextVMAssignmentAcceptanceAndRejection(t *test
 		t.Fatalf("RegisterReviewer: %v", err)
 	}
 
+	seedAuthorizedMarketplacePayment(t, ctx, store, "patch-route", "repo-1", requester.pubkey().Hex(), 100)
 	route, err := router.RoutePatch(ctx, PatchInfo{
 		PatchEventID: "patch-route",
 		RepoID:       "repo-1",

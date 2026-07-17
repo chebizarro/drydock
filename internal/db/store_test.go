@@ -303,6 +303,7 @@ INSERT INTO review_payments (
 		"reviewer_reputations",
 		"review_assignments",
 		"review_feedback",
+		"marketplace_escrow_allocations",
 		"marketplace_payouts",
 		"marketplace_payout_audit",
 	} {
