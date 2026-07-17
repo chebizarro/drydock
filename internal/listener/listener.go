@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"drydock/internal/db"
+	"drydock/internal/eventkind"
 	"drydock/internal/metrics"
 
 	"fiatjaf.com/nostr"
@@ -34,18 +35,18 @@ const (
 )
 
 var subscribedKinds = []nostr.Kind{
-	30617, 30618,
-	1617, 1618, 1619,
-	1621, nostr.KindComment,
-	1630, 1631, 1632, 1633,
-	1985,
-	nostr.KindEncryptedDirectMessage, // NIP-04 DMs (kind 4)
-	14,                               // NIP-17 sealed DMs
-	1059,                             // NIP-59 gift wraps for private ContextVM payloads
-	30078,                            // IDE workspace session (NIP-78 app data)
-	25910,                            // ContextVM IDE/marketplace intents/responses
-	31990,                            // Reviewer profile (NIP-89 app handler)
-	7000,                             // NIP-90 review feedback
+	eventkind.RepositoryAnnouncement, eventkind.RepositoryState,
+	eventkind.Patch, eventkind.GitPullRequest, eventkind.GitPullRequestUpdate,
+	eventkind.Issue, eventkind.Comment,
+	eventkind.StatusOpen, eventkind.StatusApplied, eventkind.StatusClosed, eventkind.StatusDraft,
+	eventkind.Label,
+	eventkind.EncryptedDirectMessage,
+	eventkind.SealedDirectMessage,
+	eventkind.GiftWrap,
+	eventkind.IDESession,
+	eventkind.ContextVM,
+	eventkind.ReviewerProfile,
+	eventkind.ReviewFeedback,
 }
 
 func SubscribedKinds() []nostr.Kind {
@@ -53,8 +54,9 @@ func SubscribedKinds() []nostr.Kind {
 }
 
 type Config struct {
-	Relays          []string
-	LookbackMinutes int
+	Relays               []string
+	LookbackMinutes      int
+	HighWaterMarkOverlap time.Duration
 }
 
 type Service struct {
@@ -117,6 +119,10 @@ func (s *Service) Run(ctx context.Context) error {
 	if lookback <= 0 {
 		lookback = 5
 	}
+	overlap := s.cfg.HighWaterMarkOverlap
+	if overlap <= 0 {
+		overlap = 30 * time.Second
+	}
 
 	// Determine Since: use persisted high-water-mark if available, else lookback.
 	since := time.Now().Add(-time.Duration(lookback) * time.Minute).Unix()
@@ -126,7 +132,7 @@ func (s *Service) Run(ctx context.Context) error {
 			// Choose the MORE RECENT timestamp (larger unix timestamp) to avoid
 			// re-processing events we've already seen, while still respecting
 			// the lookback window for initial startup.
-			hwmWithOverlap := hwm - 30
+			hwmWithOverlap := hwm - int64(overlap/time.Second)
 			if hwmWithOverlap > since {
 				since = hwmWithOverlap
 			}

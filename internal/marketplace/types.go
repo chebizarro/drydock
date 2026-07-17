@@ -25,13 +25,15 @@ import (
 	"strconv"
 	"time"
 
+	"drydock/internal/eventkind"
+
 	"fiatjaf.com/nostr"
 )
 
 // Event kinds for marketplace.
 const (
-	KindReviewerProfile = 31990 // NIP-89 application handler
-	KindReviewFeedback  = 7000  // NIP-90 feedback (patch author rates the review)
+	KindReviewerProfile = eventkind.ReviewerProfile // NIP-89 application handler
+	KindReviewFeedback  = eventkind.ReviewFeedback  // NIP-90 feedback (patch author rates the review)
 
 	// Legacy constants retained for compatibility with older tests/helpers.
 	// Live marketplace assignment/accept/reject now uses ContextVM kind 25910.
@@ -233,7 +235,7 @@ func ParseReviewerProfile(content string) (ReviewerProfile, error) {
 
 // ParseReviewerProfileEvent parses a ReviewerProfile from a Drydock NIP-89 app handler event.
 func ParseReviewerProfileEvent(event nostr.Event) (ReviewerProfile, bool, error) {
-	if int(event.Kind) != KindReviewerProfile {
+	if event.Kind != KindReviewerProfile {
 		return ReviewerProfile{}, false, nil
 	}
 

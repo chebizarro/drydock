@@ -24,6 +24,9 @@ func (e *Extractor) ExtractChanged(lang string, source []byte, changedLines []ui
 	return nil, fmt.Errorf("tree-sitter requires CGO_ENABLED=1")
 }
 
+// TreeSitterAvailable reports whether this build includes CGO tree-sitter support.
+func TreeSitterAvailable() bool { return false }
+
 // SupportedLanguage always returns false without CGO.
 func SupportedLanguage(lang string) bool { return false }
 

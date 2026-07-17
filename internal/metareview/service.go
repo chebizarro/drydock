@@ -276,7 +276,7 @@ func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOut
 						"created_at": time.Now().Unix(),
 					},
 				}
-				if err := s.qdrant.Upsert(ctx, vectorstore.CollectionFewShot, []vectorstore.Point{point}); err != nil {
+				if err := s.qdrant.Upsert(ctx, s.qdrant.CollectionNames().FewShot, []vectorstore.Point{point}); err != nil {
 					s.logger.Warn("failed to upsert few-shot to Qdrant", "patch_event_id", in.PatchEventID, "error", err)
 				}
 			}

@@ -192,7 +192,7 @@ func TestHandlerRejectsUnauthorizedAndDuplicateFeedback(t *testing.T) {
 		t.Fatalf("GetAssignmentByEventID: %v", err)
 	}
 
-	unauthorized := signedMarketplaceEvent(t, attackerSK, KindReviewFeedback, ReviewFeedback{AssignmentID: assignment.ID, Rating: 5, Comment: "fake"})
+	unauthorized := signedMarketplaceEvent(t, attackerSK, int(KindReviewFeedback), ReviewFeedback{AssignmentID: assignment.ID, Rating: 5, Comment: "fake"})
 	if err := handler.handleFeedback(ctx, unauthorized); err == nil || !strings.Contains(err.Error(), "unauthorized feedback rater") {
 		t.Fatalf("expected unauthorized feedback error, got %v", err)
 	}
@@ -200,7 +200,7 @@ func TestHandlerRejectsUnauthorizedAndDuplicateFeedback(t *testing.T) {
 		t.Fatalf("unauthorized feedback was stored; count=%d", count)
 	}
 
-	authorized := signedMarketplaceEvent(t, requesterSK, KindReviewFeedback, ReviewFeedback{AssignmentID: assignment.ID, Rating: 5, Comment: "legit"})
+	authorized := signedMarketplaceEvent(t, requesterSK, int(KindReviewFeedback), ReviewFeedback{AssignmentID: assignment.ID, Rating: 5, Comment: "legit"})
 	if err := handler.handleFeedback(ctx, authorized); err != nil {
 		t.Fatalf("authorized feedback rejected: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestHandlerRejectsUnauthorizedAndDuplicateFeedback(t *testing.T) {
 		t.Fatalf("authorized feedback count=%d, want 1", count)
 	}
 
-	duplicate := signedMarketplaceEvent(t, requesterSK, KindReviewFeedback, ReviewFeedback{AssignmentID: assignment.ID, Rating: 4, Comment: "again"})
+	duplicate := signedMarketplaceEvent(t, requesterSK, int(KindReviewFeedback), ReviewFeedback{AssignmentID: assignment.ID, Rating: 4, Comment: "again"})
 	if err := handler.handleFeedback(ctx, duplicate); err != nil {
 		t.Fatalf("duplicate feedback should be idempotent, got %v", err)
 	}

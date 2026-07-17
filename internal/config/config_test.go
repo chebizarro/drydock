@@ -21,6 +21,29 @@ func TestFromEnvManagementDefaults(t *testing.T) {
 	}
 }
 
+func TestFromEnvContextInfrastructureDefaults(t *testing.T) {
+	for _, key := range []string{
+		"DRYDOCK_QDRANT_COLLECTION_NIP_SPECS",
+		"DRYDOCK_QDRANT_COLLECTION_PROJECT_DOCS",
+		"DRYDOCK_QDRANT_COLLECTION_FEW_SHOT",
+		"DRYDOCK_QDRANT_COLLECTION_CODE_CHUNKS",
+		"DRYDOCK_QDRANT_RESULTS_PER_COLLECTION",
+		"DRYDOCK_LISTENER_LOOKBACK_MIN",
+		"DRYDOCK_LISTENER_HWM_OVERLAP",
+		"DRYDOCK_LISTENER_MAX_FUTURE_SKEW",
+		"DRYDOCK_LISTENER_MAX_EVENT_AGE",
+	} {
+		t.Setenv(key, "")
+	}
+	cfg := FromEnv()
+	if cfg.QdrantCollections.NIPSpecs != "nip_specs" || cfg.QdrantCollections.ProjectDocs != "project_docs" || cfg.QdrantCollections.FewShot != "few_shot_reviews" || cfg.QdrantCollections.CodeChunks != "code_chunks" {
+		t.Fatalf("unexpected Qdrant defaults: %#v", cfg.QdrantCollections)
+	}
+	if cfg.QdrantResultsPerCollection != 3 || cfg.ListenerLookbackMin != 5 || cfg.ListenerHWMOverlap != 30*time.Second || cfg.ListenerMaxFutureSkew != 10*time.Minute || cfg.ListenerMaxEventAge != 365*24*time.Hour {
+		t.Fatalf("unexpected policy defaults: %#v", cfg)
+	}
+}
+
 func TestValidate_NoRelays(t *testing.T) {
 	cfg := Config{
 		Relays:          []string{},

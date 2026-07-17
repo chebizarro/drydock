@@ -2,6 +2,7 @@ package contextbuilder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -50,12 +51,20 @@ type BuildInput struct {
 	DisableDocs bool
 }
 
+type LayerStatus struct {
+	Layer   string
+	Status  string
+	Message string
+	Tokens  int
+}
+
 type ContextBundle struct {
 	Content       string
 	TokenBudget   int
 	TokenCount    int
 	LayersUsed    []string
 	LayersDropped []string
+	LayerStatuses []LayerStatus
 	// ExcludedFiles lists paths of changed files that were excluded from
 	// review (e.g. lock files, generated code, .proto files). The reviewer
 	// LLM sees a notification about these so it can flag dependency or
@@ -92,6 +101,15 @@ type Provider interface {
 	Priority() int
 	Build(ctx context.Context, in BuildInput) (string, error)
 }
+
+// LayerWarning reports graceful provider degradation while preserving any
+// fallback content returned by the provider.
+type LayerWarning struct {
+	Err error
+}
+
+func (w *LayerWarning) Error() string { return w.Err.Error() }
+func (w *LayerWarning) Unwrap() error { return w.Err }
 
 // BuilderOptions configures optional service clients for enhanced analysis.
 // All fields are optional — nil means the feature is disabled.
@@ -225,17 +243,23 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 
 	// Track doc layers that were disabled by repo config.
 	var docDropped []string
+	statuses := make(map[string]LayerStatus, len(b.Providers))
 
 	layers := make([]layer, 0, len(b.Providers))
 	for _, p := range b.Providers {
 		// Skip doc layers if DisableDocs is set.
 		if in.DisableDocs && isDocLayer(p.LayerName()) {
 			docDropped = append(docDropped, p.LayerName())
+			statuses[p.LayerName()] = LayerStatus{Layer: p.LayerName(), Status: "dropped", Message: "disabled by repository configuration"}
 			continue
 		}
 		content, err := p.Build(ctx, in)
 		if err != nil {
-			return ContextBundle{}, fmt.Errorf("build %s layer: %w", p.LayerName(), err)
+			var warning *LayerWarning
+			if !errors.As(err, &warning) {
+				return ContextBundle{}, fmt.Errorf("build %s layer: %w", p.LayerName(), err)
+			}
+			statuses[p.LayerName()] = LayerStatus{Layer: p.LayerName(), Status: "degraded", Message: warning.Error()}
 		}
 		content = strings.TrimSpace(content)
 		if content == "" {
@@ -269,16 +293,40 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 	used := make([]layer, 0, len(layers))
 	dropped := make([]string, 0, len(layers))
 
-	for i, lr := range layers {
-		if usedTokens+lr.tokens > effectiveBudget {
-			// hard stop policy: once budget hit, this and all lower-priority layers are dropped
-			for _, d := range layers[i:] {
-				dropped = append(dropped, d.name)
+	for _, lr := range layers {
+		remaining := effectiveBudget - usedTokens
+		if lr.tokens > remaining {
+			// Preserve the highest-priority patch/file context when a useful prefix fits.
+			if lr.priority <= 2 && remaining > 0 {
+				if truncated := truncateToTokenBudget(lr.content, remaining, b.Counter); truncated != "" {
+					lr.content = truncated
+					lr.tokens = b.Counter.Count(truncated)
+					usedTokens += lr.tokens
+					used = append(used, lr)
+					message := "truncated to fit token budget"
+					if prior, ok := statuses[lr.name]; ok && prior.Message != "" {
+						message = prior.Message + "; " + message
+					}
+					statuses[lr.name] = LayerStatus{Layer: lr.name, Status: "truncated", Message: message, Tokens: lr.tokens}
+					continue
+				}
 			}
-			break
+			dropped = append(dropped, lr.name)
+			message := "layer exceeds remaining token budget"
+			if prior, ok := statuses[lr.name]; ok && prior.Message != "" {
+				message = prior.Message + "; " + message
+			}
+			statuses[lr.name] = LayerStatus{Layer: lr.name, Status: "dropped", Message: message, Tokens: lr.tokens}
+			continue
 		}
 		usedTokens += lr.tokens
 		used = append(used, lr)
+		if status, ok := statuses[lr.name]; ok && status.Status == "degraded" {
+			status.Tokens = lr.tokens
+			statuses[lr.name] = status
+		} else {
+			statuses[lr.name] = LayerStatus{Layer: lr.name, Status: "used", Tokens: lr.tokens}
+		}
 	}
 
 	parts := make([]string, 0, len(used))
@@ -323,16 +371,41 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 	// Append doc layers that were disabled by repo config to the dropped list.
 	dropped = append(dropped, docDropped...)
 
+	layerStatuses := make([]LayerStatus, 0, len(statuses))
+	for _, p := range b.Providers {
+		if status, ok := statuses[p.LayerName()]; ok {
+			layerStatuses = append(layerStatuses, status)
+		}
+	}
+
 	return ContextBundle{
 		Content:          strings.Join(parts, "\n\n"),
 		TokenBudget:      effectiveBudget,
 		TokenCount:       usedTokens,
 		LayersUsed:       usedNames,
 		LayersDropped:    dropped,
+		LayerStatuses:    layerStatuses,
 		ExcludedFiles:    excludedFiles,
 		TestCoverageGaps: testCoverageGaps,
 		ChangedFiles:     changedFiles,
 	}, nil
+}
+
+func truncateToTokenBudget(content string, budget int, counter TokenCounter) string {
+	if budget <= 0 || content == "" {
+		return ""
+	}
+	runes := []rune(content)
+	low, high := 0, len(runes)
+	for low < high {
+		mid := low + (high-low+1)/2
+		if counter.Count(string(runes[:mid])) <= budget {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	return strings.TrimSpace(string(runes[:low]))
 }
 
 // filterPatchInput returns a copy of in with PatchEventContent filtered to

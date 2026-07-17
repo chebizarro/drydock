@@ -128,9 +128,10 @@ var (
 	ReviewQueueFull   = &Counter{}
 
 	// Pipeline
-	ReviewsStarted  = &Counter{}
-	ReviewsFinished = NewCounterVec() // label: "published", "failed"
-	ReviewDuration  = &Summary{}      // seconds, end-to-end
+	ReviewsStarted        = &Counter{}
+	ContextLayersByStatus = NewCounterVec() // label: used, degraded, truncated, dropped
+	ReviewsFinished       = NewCounterVec() // label: "published", "failed"
+	ReviewDuration        = &Summary{}      // seconds, end-to-end
 
 	// Workers
 	WorkersActive = &Gauge{}
@@ -199,8 +200,9 @@ var (
 	FeedbackRateLimitFailures      = &Counter{}
 	MarketplaceReputationUpdates   = &Counter{}
 
-	// Security scan
+	// Security scan and context extraction capabilities
 	SecurityScanFindings = &Counter{}
+	TreeSitterAvailable  = &Gauge{}
 
 	// Management endpoints
 	DashboardFailures         = NewCounterVec() // label: endpoint
@@ -272,6 +274,8 @@ func writeMetrics(w io.Writer) {
 		"Reviews started by pipeline workers.", ReviewsStarted)
 	writeCounterVec(w, "drydock_reviews_finished_total",
 		"Reviews finished by outcome.", "outcome", ReviewsFinished)
+	writeCounterVec(w, "drydock_context_layers_total",
+		"Context layers by build status.", "status", ContextLayersByStatus)
 	writeSummary(w, "drydock_review_duration_seconds",
 		"End-to-end review duration.", ReviewDuration)
 
@@ -390,6 +394,8 @@ func writeMetrics(w io.Writer) {
 	// Security scan
 	writeCounter(w, "drydock_security_scan_findings_total",
 		"Security findings from deterministic SAST scanner.", SecurityScanFindings)
+	writeGauge(w, "drydock_tree_sitter_available",
+		"Whether this build includes CGO tree-sitter symbol extraction (1=yes, 0=no).", TreeSitterAvailable)
 
 	// Management endpoints
 	writeCounterVec(w, "drydock_dashboard_failures_total",

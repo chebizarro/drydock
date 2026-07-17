@@ -21,19 +21,55 @@ import (
 )
 
 // Client interacts with a Qdrant instance via its REST API.
+type CollectionNames struct {
+	NIPSpecs    string
+	ProjectDocs string
+	FewShot     string
+	CodeChunks  string
+}
+
+type ClientConfig struct {
+	Collections          CollectionNames
+	ResultsPerCollection int
+}
+
 type Client struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
-	breaker    *circuitbreaker.Breaker
+	baseURL              string
+	apiKey               string
+	httpClient           *http.Client
+	breaker              *circuitbreaker.Breaker
+	collections          CollectionNames
+	resultsPerCollection int
 }
 
 // NewClient creates a Qdrant REST client.
 // baseURL should be the Qdrant server root (e.g. "http://localhost:6333").
 func NewClient(baseURL, apiKey string) *Client {
+	return NewClientWithConfig(baseURL, apiKey, ClientConfig{})
+}
+
+func NewClientWithConfig(baseURL, apiKey string, cfg ClientConfig) *Client {
+	defaults := DefaultCollectionNames()
+	if cfg.Collections.NIPSpecs == "" {
+		cfg.Collections.NIPSpecs = defaults.NIPSpecs
+	}
+	if cfg.Collections.ProjectDocs == "" {
+		cfg.Collections.ProjectDocs = defaults.ProjectDocs
+	}
+	if cfg.Collections.FewShot == "" {
+		cfg.Collections.FewShot = defaults.FewShot
+	}
+	if cfg.Collections.CodeChunks == "" {
+		cfg.Collections.CodeChunks = defaults.CodeChunks
+	}
+	if cfg.ResultsPerCollection <= 0 {
+		cfg.ResultsPerCollection = 3
+	}
 	return &Client{
-		baseURL: baseURL,
-		apiKey:  apiKey,
+		baseURL:              baseURL,
+		apiKey:               apiKey,
+		collections:          cfg.Collections,
+		resultsPerCollection: cfg.ResultsPerCollection,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -45,7 +81,8 @@ func NewClient(baseURL, apiKey string) *Client {
 	}
 }
 
-// Drydock collection names.
+// Default Drydock collection names. Exported constants are retained for
+// compatibility; runtime code should use Client.CollectionNames.
 const (
 	CollectionNIPSpecs    = "nip_specs"
 	CollectionProjectDocs = "project_docs"
@@ -54,6 +91,24 @@ const (
 
 	collectionDistanceCosine = "Cosine"
 )
+
+func DefaultCollectionNames() CollectionNames {
+	return CollectionNames{NIPSpecs: CollectionNIPSpecs, ProjectDocs: CollectionProjectDocs, FewShot: CollectionFewShot, CodeChunks: CollectionCodeChunks}
+}
+
+func (c *Client) CollectionNames() CollectionNames {
+	if c == nil {
+		return DefaultCollectionNames()
+	}
+	return c.collections
+}
+
+func (c *Client) ResultsPerCollection() int {
+	if c == nil || c.resultsPerCollection <= 0 {
+		return 3
+	}
+	return c.resultsPerCollection
+}
 
 // Point represents a vector point in Qdrant.
 type Point struct {

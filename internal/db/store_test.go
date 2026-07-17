@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -163,6 +166,199 @@ func TestMigrateAddsFeedbackDedupConstraintToExistingDatabase(t *testing.T) {
 	) VALUES (1, 'reviewer', 'rater', 3, 'feedback-old-3', 3)`); err == nil {
 		t.Fatal("expected migrated assignment/rater uniqueness to reject duplicate")
 	}
+}
+
+func TestMigratePaymentMarketplaceSnapshotMatchesFreshSchema(t *testing.T) {
+	ctx := context.Background()
+	oldPath := filepath.Join(t.TempDir(), "old-payment-marketplace.db")
+	raw, err := sql.Open("sqlite", oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.ExecContext(ctx, `
+CREATE TABLE review_payments (
+  patch_event_id TEXT PRIMARY KEY,
+  repo_id TEXT NOT NULL,
+  author_pubkey TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'authorized')),
+  access_kind TEXT NOT NULL DEFAULT ''
+    CHECK (access_kind IN ('', 'free_tier', 'subscription', 'cashu_review', 'cashu_subscription')),
+  requested_mode TEXT NOT NULL DEFAULT 'review'
+    CHECK (requested_mode IN ('review', 'subscription')),
+  token_hash TEXT,
+  mint_url TEXT NOT NULL DEFAULT '',
+  token_amount_sats INTEGER NOT NULL DEFAULT 0,
+  invoice_id TEXT NOT NULL DEFAULT '',
+  invoice_request TEXT NOT NULL DEFAULT '',
+  invoice_expires_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE payment_subscriptions (
+  author_pubkey TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  source_patch_event_id TEXT NOT NULL UNIQUE,
+  source_token_hash TEXT NOT NULL UNIQUE,
+  paid_amount_sats INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (author_pubkey, repo_id)
+);
+CREATE TABLE free_review_usage (
+  author_pubkey TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  usage_day TEXT NOT NULL,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (author_pubkey, repo_id, usage_day)
+);
+CREATE TABLE reviewer_profiles (
+  pubkey TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL DEFAULT '',
+  languages TEXT NOT NULL DEFAULT '',
+  domains TEXT NOT NULL DEFAULT '',
+  availability TEXT NOT NULL DEFAULT 'available'
+    CHECK (availability IN ('available', 'limited', 'unavailable')),
+  price_per_review INTEGER NOT NULL DEFAULT 0,
+  max_concurrent INTEGER NOT NULL DEFAULT 3,
+  event_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE reviewer_reputations (
+  pubkey TEXT PRIMARY KEY,
+  overall_score REAL NOT NULL DEFAULT 0.5,
+  total_reviews INTEGER NOT NULL DEFAULT 0,
+  accepted_reviews INTEGER NOT NULL DEFAULT 0,
+  rejected_reviews INTEGER NOT NULL DEFAULT 0,
+  average_rating REAL NOT NULL DEFAULT 0,
+  acceptance_rate REAL NOT NULL DEFAULT 0,
+  last_review_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE review_assignments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  patch_event_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  reviewer_pubkey TEXT NOT NULL,
+  requester_pubkey TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'accepted', 'rejected', 'completed', 'expired')),
+  priority INTEGER NOT NULL DEFAULT 2,
+  price_sats INTEGER NOT NULL DEFAULT 0,
+  assignment_event_id TEXT NOT NULL UNIQUE,
+  acceptance_event_id TEXT,
+  completion_event_id TEXT,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(patch_event_id, reviewer_pubkey)
+);
+CREATE TABLE review_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  assignment_id INTEGER NOT NULL,
+  reviewer_pubkey TEXT NOT NULL,
+  rater_pubkey TEXT NOT NULL,
+  rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+  comment TEXT NOT NULL DEFAULT '',
+  event_id TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (assignment_id) REFERENCES review_assignments(id) ON DELETE CASCADE
+);
+INSERT INTO review_payments (
+  patch_event_id, repo_id, author_pubkey, status, created_at, updated_at
+) VALUES ('old-patch', 'old-repo', 'old-author', 'pending', 1, 1);`)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("create old payment/marketplace snapshot: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := Open(ctx, oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	if err := upgraded.Migrate(ctx); err != nil {
+		t.Fatalf("migrate old payment/marketplace snapshot: %v", err)
+	}
+
+	fresh, err := Open(ctx, filepath.Join(t.TempDir(), "fresh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err := fresh.Migrate(ctx); err != nil {
+		t.Fatalf("migrate fresh database: %v", err)
+	}
+
+	for _, table := range []string{
+		"review_payments",
+		"payment_subscriptions",
+		"free_review_usage",
+		"reviewer_profiles",
+		"reviewer_reputations",
+		"review_assignments",
+		"review_feedback",
+		"marketplace_payouts",
+		"marketplace_payout_audit",
+	} {
+		got := readTableColumns(t, ctx, upgraded.db, table)
+		want := readTableColumns(t, ctx, fresh.db, table)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("PRAGMA table_info(%s) after upgrade = %#v, fresh = %#v", table, got, want)
+		}
+	}
+
+	var paymentDDL string
+	if err := upgraded.db.QueryRowContext(ctx,
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='review_payments'`,
+	).Scan(&paymentDDL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(paymentDDL, "'token_spent'") {
+		t.Fatalf("migrated review_payments constraint does not allow token_spent: %s", paymentDDL)
+	}
+	if _, err := upgraded.db.ExecContext(ctx,
+		`UPDATE review_payments SET status='token_spent' WHERE patch_event_id='old-patch'`,
+	); err != nil {
+		t.Fatalf("migrated review_payments rejects token_spent: %v", err)
+	}
+}
+
+type tableColumn struct {
+	Name       string
+	Type       string
+	NotNull    int
+	DefaultSQL sql.NullString
+	PrimaryKey int
+}
+
+func readTableColumns(t *testing.T, ctx context.Context, db *sql.DB, table string) []tableColumn {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		t.Fatalf("table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+
+	var columns []tableColumn
+	for rows.Next() {
+		var cid int
+		var column tableColumn
+		if err := rows.Scan(&cid, &column.Name, &column.Type, &column.NotNull, &column.DefaultSQL, &column.PrimaryKey); err != nil {
+			t.Fatalf("scan table_info(%s): %v", table, err)
+		}
+		columns = append(columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table_info(%s): %v", table, err)
+	}
+	sort.Slice(columns, func(i, j int) bool { return columns[i].Name < columns[j].Name })
+	return columns
 }
 
 func TestHasColumnPropagatesQueryErrors(t *testing.T) {

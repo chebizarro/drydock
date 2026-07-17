@@ -3,14 +3,15 @@ package contextvm
 import (
 	"encoding/json"
 
+	"drydock/internal/eventkind"
+
 	"fiatjaf.com/nostr"
-	cascadia "git.sharegap.net/cascadia/cascadia-go"
 	shared "git.sharegap.net/cascadia/cascadia-go/contextvm"
 )
 
 const (
-	KindContextVM nostr.Kind = nostr.Kind(cascadia.CAS_INTENT)      // Ephemeral ContextVM messages
-	KindGiftWrap  nostr.Kind = nostr.Kind(cascadia.NIP59_GIFT_WRAP) // NIP-59 encrypted wrapper
+	KindContextVM nostr.Kind = eventkind.ContextVM // Ephemeral ContextVM messages
+	KindGiftWrap  nostr.Kind = eventkind.GiftWrap  // NIP-59 encrypted wrapper
 )
 
 const jsonRPCVersion = shared.JSONRPCVersion

@@ -2,6 +2,7 @@ package contextbuilder
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -10,25 +11,26 @@ type fakeProvider struct {
 	name     string
 	priority int
 	content  string
+	err      error
 }
 
 func (f fakeProvider) LayerName() string { return f.name }
 func (f fakeProvider) Priority() int     { return f.priority }
 func (f fakeProvider) Build(context.Context, BuildInput) (string, error) {
-	return f.content, nil
+	return f.content, f.err
 }
 
 type byteCounter struct{}
 
 func (byteCounter) Count(text string) int { return len(text) }
 
-func TestBuilderHardStopsAndDropsLowerPriorityLayers(t *testing.T) {
+func TestBuilderSkipsOversizedLayerAndContinuesPacking(t *testing.T) {
 	b := &Builder{
 		TokenBudget: 10,
 		Counter:     byteCounter{},
 		Providers: []Provider{
 			fakeProvider{name: LayerPatchDiff, priority: 1, content: "12345"},
-			fakeProvider{name: LayerFileContext, priority: 2, content: "123456"},
+			fakeProvider{name: LayerSymbolsCallsites, priority: 3, content: "123456"},
 			fakeProvider{name: LayerTests, priority: 4, content: "xx"},
 		},
 	}
@@ -37,14 +39,32 @@ func TestBuilderHardStopsAndDropsLowerPriorityLayers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	if out.TokenCount != 5 {
-		t.Fatalf("expected token count 5, got %d", out.TokenCount)
+	if out.TokenCount != 7 {
+		t.Fatalf("expected token count 7, got %d", out.TokenCount)
 	}
-	if len(out.LayersUsed) != 1 || out.LayersUsed[0] != LayerPatchDiff {
+	if len(out.LayersUsed) != 2 || out.LayersUsed[0] != LayerPatchDiff || out.LayersUsed[1] != LayerTests {
 		t.Fatalf("unexpected layers used: %#v", out.LayersUsed)
 	}
-	if len(out.LayersDropped) != 2 || out.LayersDropped[0] != LayerFileContext || out.LayersDropped[1] != LayerTests {
-		t.Fatalf("unexpected dropped order: %#v", out.LayersDropped)
+	if len(out.LayersDropped) != 1 || out.LayersDropped[0] != LayerSymbolsCallsites {
+		t.Fatalf("unexpected dropped layers: %#v", out.LayersDropped)
+	}
+}
+
+func TestBuilderSurfacesDegradedLayerStatus(t *testing.T) {
+	b := &Builder{
+		TokenBudget: 100,
+		Counter:     byteCounter{},
+		Providers: []Provider{
+			fakeProvider{name: LayerCommitHistory, priority: 6, err: &LayerWarning{Err: errors.New("git unavailable")}},
+		},
+	}
+
+	out, err := b.Build(context.Background(), BuildInput{})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if len(out.LayerStatuses) != 1 || out.LayerStatuses[0].Status != "degraded" || !strings.Contains(out.LayerStatuses[0].Message, "git unavailable") {
+		t.Fatalf("degraded status not surfaced: %#v", out.LayerStatuses)
 	}
 }
 
@@ -161,7 +181,6 @@ func TestBuilderNoExcludedFilesWhenAllSourceCode(t *testing.T) {
 	}
 }
 
-
 func TestBuilderTestCoverageGapsExtracted(t *testing.T) {
 	// The tests layer content includes finding-candidate markers.
 	testsContent := "### Foo\nfoo_test.go:12: func TestFoo ...\n\n" +
@@ -236,4 +255,3 @@ func TestBuilderDeterministicOrderByPriorityThenName(t *testing.T) {
 		}
 	}
 }
-

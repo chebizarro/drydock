@@ -39,6 +39,7 @@ import (
 	"drydock/internal/reviewengine"
 	"drydock/internal/securityscan"
 	"drydock/internal/signing"
+	"drydock/internal/symbols"
 	"drydock/internal/vectorstore"
 
 	"fiatjaf.com/nostr"
@@ -49,6 +50,13 @@ func main() {
 	cfg := config.FromEnv()
 	cfg.DevMode = cfg.DevMode || devFlagEnabled(os.Args[1:])
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	if symbols.TreeSitterAvailable() {
+		metrics.TreeSitterAvailable.Set(1)
+		logger.Info("tree-sitter symbol extraction available")
+	} else {
+		metrics.TreeSitterAvailable.Set(0)
+		logger.Warn("tree-sitter symbol extraction unavailable; non-CGO build will use regex fallback")
+	}
 
 	// --- Drift guard mode: export/flag/list and exit ---
 	if mode := os.Getenv("DRYDOCK_MODE"); mode == "drift-guard" {
@@ -299,12 +307,15 @@ func main() {
 	var embedClient *embedding.Client
 	var codeIndexer *codeindex.Indexer
 	if cfg.QdrantURL != "" && cfg.EmbedBaseURL != "" {
-		qdrantClient = vectorstore.NewClient(cfg.QdrantURL, cfg.QdrantAPIKey)
+		qdrantClient = vectorstore.NewClientWithConfig(cfg.QdrantURL, cfg.QdrantAPIKey, vectorstore.ClientConfig{
+			Collections:          cfg.QdrantCollections,
+			ResultsPerCollection: cfg.QdrantResultsPerCollection,
+		})
 		embedClient = embedding.NewClient(cfg.EmbedBaseURL, cfg.EmbedAPIKey, cfg.EmbedModel)
 
 		// Ensure collections exist (non-fatal).
 		vectorDim := cfg.EmbedDimension
-		for _, col := range []string{vectorstore.CollectionNIPSpecs, vectorstore.CollectionProjectDocs, vectorstore.CollectionFewShot, vectorstore.CollectionCodeChunks} {
+		for _, col := range []string{cfg.QdrantCollections.NIPSpecs, cfg.QdrantCollections.ProjectDocs, cfg.QdrantCollections.FewShot, cfg.QdrantCollections.CodeChunks} {
 			if err := qdrantClient.EnsureCollection(ctx, col, vectorDim); err != nil {
 				logger.Warn("failed to ensure Qdrant collection", "collection", col, "error", err)
 			}
@@ -465,10 +476,12 @@ func main() {
 		logger.Warn("IDE gateway and marketplace handlers disabled", "requires", "signer")
 	}
 
+	processorOpts = append(processorOpts, ingest.WithTimingPolicy(cfg.ListenerMaxFutureSkew, cfg.ListenerMaxEventAge))
 	processor := ingest.NewProcessor(store, logger, processorOpts...)
 	svc := listener.New(listener.Config{
-		Relays:          readRelays,
-		LookbackMinutes: cfg.ListenerLookbackMin,
+		Relays:               readRelays,
+		LookbackMinutes:      cfg.ListenerLookbackMin,
+		HighWaterMarkOverlap: cfg.ListenerHWMOverlap,
 	}, processor, logger, listener.WithPool(pool), listener.WithStore(store))
 
 	// --- Pipeline runner ---

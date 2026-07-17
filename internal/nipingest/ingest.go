@@ -67,7 +67,7 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 	}
 
 	// Ensure collection exists.
-	if err := ing.qdrant.EnsureCollection(ctx, vectorstore.CollectionNIPSpecs, cfg.VectorDim); err != nil {
+	if err := ing.qdrant.EnsureCollection(ctx, ing.qdrant.CollectionNames().NIPSpecs, cfg.VectorDim); err != nil {
 		return 0, fmt.Errorf("ensure nip_specs collection: %w", err)
 	}
 
@@ -156,7 +156,7 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 		}
 
 		if len(points) > 0 {
-			if err := ing.qdrant.Upsert(ctx, vectorstore.CollectionNIPSpecs, points); err != nil {
+			if err := ing.qdrant.Upsert(ctx, ing.qdrant.CollectionNames().NIPSpecs, points); err != nil {
 				totalFailed += len(points)
 				chunkErrors = append(chunkErrors, fmt.Errorf("upsert NIP-%s (%d chunks): %w", nipID, len(points), err))
 				ing.logger.Warn("upsert failed", "nip", nipID, "error", err)
@@ -236,7 +236,7 @@ func (ing *Ingester) fetchExistingHashes(ctx context.Context) (map[string]string
 	var offset *string
 
 	for {
-		points, next, err := ing.qdrant.Scroll(ctx, vectorstore.CollectionNIPSpecs, 100, offset, nil)
+		points, next, err := ing.qdrant.Scroll(ctx, ing.qdrant.CollectionNames().NIPSpecs, 100, offset, nil)
 		if err != nil {
 			return hashes, err
 		}

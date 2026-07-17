@@ -219,6 +219,72 @@ var schemaMigrations = []schemaMigration{
 			return nil
 		},
 	},
+	{
+		version: 5,
+		name:    "review_payments_token_spent_constraint",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			var tableSQL string
+			if err := tx.QueryRowContext(ctx,
+				`SELECT sql FROM sqlite_master WHERE type='table' AND name='review_payments'`,
+			).Scan(&tableSQL); err != nil {
+				return fmt.Errorf("read review_payments schema: %w", err)
+			}
+			if strings.Contains(tableSQL, "'token_spent'") {
+				return nil
+			}
+
+			const rebuildSQL = `
+ALTER TABLE review_payments RENAME TO review_payments_before_token_spent;
+CREATE TABLE review_payments (
+	patch_event_id TEXT PRIMARY KEY,
+	repo_id TEXT NOT NULL,
+	author_pubkey TEXT NOT NULL,
+	status TEXT NOT NULL CHECK (status IN ('pending', 'token_spent', 'authorized')),
+	access_kind TEXT NOT NULL DEFAULT ''
+	CHECK (access_kind IN ('', 'free_tier', 'subscription', 'cashu_review', 'cashu_subscription')),
+	requested_mode TEXT NOT NULL DEFAULT 'review'
+	CHECK (requested_mode IN ('review', 'subscription')),
+	token_hash TEXT,
+	mint_url TEXT NOT NULL DEFAULT '',
+	token_amount_sats INTEGER NOT NULL DEFAULT 0,
+	expected_amount_sats INTEGER NOT NULL DEFAULT 0,
+	subscription_days INTEGER NOT NULL DEFAULT 0,
+	invoice_id TEXT NOT NULL DEFAULT '',
+	invoice_request TEXT NOT NULL DEFAULT '',
+	invoice_amount_msats INTEGER NOT NULL DEFAULT 0,
+	invoice_expires_at INTEGER NOT NULL DEFAULT 0,
+	melt_quote_id TEXT NOT NULL DEFAULT '',
+	melt_quote_amount_sats INTEGER NOT NULL DEFAULT 0,
+	melt_fee_reserve_sats INTEGER NOT NULL DEFAULT 0,
+	melt_state TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+INSERT INTO review_payments (
+	patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
+	token_hash, mint_url, token_amount_sats, expected_amount_sats, subscription_days,
+	invoice_id, invoice_request, invoice_amount_msats, invoice_expires_at,
+	melt_quote_id, melt_quote_amount_sats, melt_fee_reserve_sats, melt_state,
+	created_at, updated_at
+)
+SELECT
+	patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
+	token_hash, mint_url, token_amount_sats, expected_amount_sats, subscription_days,
+	invoice_id, invoice_request, invoice_amount_msats, invoice_expires_at,
+	melt_quote_id, melt_quote_amount_sats, melt_fee_reserve_sats, melt_state,
+	created_at, updated_at
+FROM review_payments_before_token_spent;
+DROP TABLE review_payments_before_token_spent;
+CREATE UNIQUE INDEX idx_review_payments_token_hash
+	ON review_payments(token_hash) WHERE token_hash IS NOT NULL;
+CREATE INDEX idx_review_payments_author_repo
+	ON review_payments(author_pubkey, repo_id);`
+			if _, err := tx.ExecContext(ctx, rebuildSQL); err != nil {
+				return fmt.Errorf("rebuild review_payments: %w", err)
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

@@ -75,6 +75,9 @@ func (e *Extractor) ExtractChanged(lang string, source []byte, changedLines []ui
 	return changed, nil
 }
 
+// TreeSitterAvailable reports whether this build includes CGO tree-sitter support.
+func TreeSitterAvailable() bool { return true }
+
 // SupportedLanguage returns true if the language has tree-sitter grammar support.
 func SupportedLanguage(lang string) bool {
 	_, ok := languages[lang]

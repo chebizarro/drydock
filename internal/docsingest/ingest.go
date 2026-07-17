@@ -104,7 +104,7 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 	}
 
 	// Ensure collection exists.
-	if err := ing.qdrant.EnsureCollection(ctx, vectorstore.CollectionProjectDocs, cfg.VectorDim); err != nil {
+	if err := ing.qdrant.EnsureCollection(ctx, ing.qdrant.CollectionNames().ProjectDocs, cfg.VectorDim); err != nil {
 		return 0, fmt.Errorf("ensure project_docs collection: %w", err)
 	}
 
@@ -196,7 +196,7 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 		}
 
 		if len(points) > 0 {
-			if err := ing.qdrant.Upsert(ctx, vectorstore.CollectionProjectDocs, points); err != nil {
+			if err := ing.qdrant.Upsert(ctx, ing.qdrant.CollectionNames().ProjectDocs, points); err != nil {
 				totalFailed += len(points)
 				chunkErrors = append(chunkErrors, fmt.Errorf("upsert %s (%d chunks): %w", relPath, len(points), err))
 				ing.logger.Warn("upsert failed", "file", relPath, "error", err)
@@ -380,7 +380,7 @@ func (ing *Ingester) fetchExistingHashes(ctx context.Context, repoID string) (ma
 	}
 
 	for {
-		points, next, err := ing.qdrant.Scroll(ctx, vectorstore.CollectionProjectDocs, 100, offset, filter)
+		points, next, err := ing.qdrant.Scroll(ctx, ing.qdrant.CollectionNames().ProjectDocs, 100, offset, filter)
 		if err != nil {
 			return hashes, err
 		}

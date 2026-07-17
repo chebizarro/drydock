@@ -12,15 +12,15 @@ import (
 )
 
 const (
-	layerName          = "symbols-related-code"
-	layerPriority      = 3
-	searchLimit        = 30
-	resultLimit        = 10
-	maxPerFile         = 2
-	scoreThreshold     = 0.6
-	maxQueryBytes      = 8 * 1024
-	maxSnippetBytes    = 1200
-	maxLayerBytes      = 12 * 1024
+	layerName       = "symbols-related-code"
+	layerPriority   = 3
+	searchLimit     = 30
+	resultLimit     = 10
+	maxPerFile      = 2
+	scoreThreshold  = 0.6
+	maxQueryBytes   = 8 * 1024
+	maxSnippetBytes = 1200
+	maxLayerBytes   = 12 * 1024
 )
 
 // Provider is a context builder provider that retrieves semantically related
@@ -81,7 +81,7 @@ func (p *Provider) Build(ctx context.Context, in contextbuilder.BuildInput) (str
 		},
 	}
 
-	results, err := p.qdrant.Search(ctx, vectorstore.CollectionCodeChunks, vec, searchLimit, filter)
+	results, err := p.qdrant.Search(ctx, p.qdrant.CollectionNames().CodeChunks, vec, searchLimit, filter)
 	if err != nil {
 		p.logger.Warn("code index search failed, skipping related-code layer",
 			"repo_id", in.RepoID, "error", err)

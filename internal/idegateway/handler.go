@@ -366,6 +366,12 @@ func (h *Handler) processReviewRequest(ctx context.Context, event nostr.Event, _
 		h.logger.Warn("context build failed", "request_id", req.RequestID, "error", err)
 		return ReviewResponse{}, fmt.Errorf("failed to build context: %w", err)
 	}
+	for _, status := range bundle.LayerStatuses {
+		metrics.ContextLayersByStatus.With(status.Status).Inc()
+		if status.Status != "used" {
+			h.logger.Warn("context layer not fully available", "request_id", req.RequestID, "layer", status.Layer, "status", status.Status, "message", status.Message)
+		}
+	}
 
 	// Run the review engine.
 	result, err := h.engine.Run(ctx, reviewengine.RunInput{

@@ -20,13 +20,14 @@ package idegateway
 import (
 	"encoding/json"
 
+	"drydock/internal/eventkind"
 	"drydock/internal/reviewengine"
 )
 
 // Event kinds for IDE integration.
 const (
-	KindIDESession = 30078 // NIP-78 app-specific workspace session
-	KindContextVM  = 25910 // ContextVM point-to-point IDE messages
+	KindIDESession = int(eventkind.IDESession) // NIP-78 app-specific workspace session
+	KindContextVM  = int(eventkind.ContextVM)  // ContextVM point-to-point IDE messages
 
 	// Compatibility aliases for code/tests that use request/response names.
 	KindIDECommand        = KindContextVM

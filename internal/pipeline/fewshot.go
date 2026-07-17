@@ -115,7 +115,7 @@ func (r *QdrantFewShotRetriever) RetrieveFewShots(ctx context.Context, query Few
 	// Fetch more results than needed to allow for post-filtering and re-ranking.
 	fetchLimit := query.Limit + searchOverfetch
 	filter := buildFewShotFilter(query)
-	results, err := r.qdrant.Search(ctx, vectorstore.CollectionFewShot, vec, fetchLimit, filter)
+	results, err := r.qdrant.Search(ctx, r.qdrant.CollectionNames().FewShot, vec, fetchLimit, filter)
 	if err != nil {
 		r.logger.Warn("Qdrant few-shot search failed, falling back to recency", "error", err)
 		return r.fallback(ctx, query.Limit)

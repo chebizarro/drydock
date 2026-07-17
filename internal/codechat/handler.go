@@ -372,7 +372,7 @@ func (h *Handler) queryCodeIndex(ctx context.Context, repoID, question string) (
 		},
 	}
 
-	results, err := h.qdrant.Search(ctx, vectorstore.CollectionCodeChunks, vec, maxQueryResults*2, filter)
+	results, err := h.qdrant.Search(ctx, h.qdrant.CollectionNames().CodeChunks, vec, maxQueryResults*2, filter)
 	if err != nil {
 		return "", fmt.Errorf("search code chunks: %w", err)
 	}

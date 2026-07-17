@@ -344,6 +344,12 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}); err != nil {
 		return fmt.Errorf("build context: %w", err)
 	}
+	for _, status := range bundle.LayerStatuses {
+		metrics.ContextLayersByStatus.With(status.Status).Inc()
+		if status.Status != "used" {
+			r.logger.Warn("context layer not fully available", "layer", status.Layer, "status", status.Status, "message", status.Message, "tokens", status.Tokens)
+		}
+	}
 
 	// 5. Extract changed files from the context bundle (used for few-shot, engine, etc.).
 	changedFiles := bundle.ChangedFiles

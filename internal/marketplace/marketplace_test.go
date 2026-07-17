@@ -285,8 +285,8 @@ func TestEventKinds(t *testing.T) {
 		name string
 		kind int
 	}{
-		{"KindReviewerProfile", KindReviewerProfile},
-		{"KindReviewFeedback", KindReviewFeedback},
+		{"KindReviewerProfile", int(KindReviewerProfile)},
+		{"KindReviewFeedback", int(KindReviewFeedback)},
 	}
 
 	expectedKinds := map[int]bool{

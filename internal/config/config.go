@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"drydock/internal/vectorstore"
+
 	_ "modernc.org/sqlite" // Register sqlite driver for validation
 )
 
@@ -42,64 +44,70 @@ type Config struct {
 	Production  bool
 	ExplicitEnv map[string]bool
 
-	DatabaseURL         string
-	RepoCacheDir        string
-	RepoCacheMaxCount   int
-	RepoCacheMaxSizeMB  int
-	Relays              []string
-	ReadRelays          []string
-	WriteRelays         []string
-	LogLevel            slog.Level
-	ListenerLookbackMin int
+	DatabaseURL           string
+	RepoCacheDir          string
+	RepoCacheMaxCount     int
+	RepoCacheMaxSizeMB    int
+	Relays                []string
+	ReadRelays            []string
+	WriteRelays           []string
+	LogLevel              slog.Level
+	ListenerLookbackMin   int
+	ListenerHWMOverlap    time.Duration
+	ListenerMaxFutureSkew time.Duration
+	ListenerMaxEventAge   time.Duration
 
-	PlannerBaseURL       string
-	PlannerModel         string
-	Coder32BBaseURL      string
-	Coder32BModel        string
-	LLM70BBaseURL        string
-	LLM70BModel          string
-	Coder14BBaseURL      string
-	Coder14BModel        string
-	LLMAPIKey            string
-	PlannerAPIKey        string
-	Coder32BAPIKey       string
-	LLM70BAPIKey         string
-	Coder14BAPIKey       string
-	MetaAPIKey           string
-	SignerBunkerURL      string
-	SignerNsec           string
-	SignerNsecFile       string
-	SignerSocketPath     string
-	SignerDBus           bool
-	DevMode              bool
-	ChartroomURL         string
-	ChartroomToken       string
-	ChartroomCorpusIDs   []string
-	ChartroomSourceIDs   []string
-	QdrantURL            string
-	QdrantAPIKey         string
-	EmbedBaseURL         string
-	EmbedModel           string
-	EmbedAPIKey          string
-	EmbedDimension       int
-	PaymentNWCURI        string
-	PaymentTrustedMints  []string
-	LSPBridgeURL         string
-	MetaBaseURL          string
-	MetaModel            string
-	EvalDatasetPath      string
-	HealthAddr           string
-	DashboardBearerToken string
-	PipelineWorkers      int
-	CodeChatLimit        int
-	CodeChatWindow       time.Duration
-	FeedbackLimit        int
-	FeedbackWindow       time.Duration
+	PlannerBaseURL             string
+	PlannerModel               string
+	Coder32BBaseURL            string
+	Coder32BModel              string
+	LLM70BBaseURL              string
+	LLM70BModel                string
+	Coder14BBaseURL            string
+	Coder14BModel              string
+	LLMAPIKey                  string
+	PlannerAPIKey              string
+	Coder32BAPIKey             string
+	LLM70BAPIKey               string
+	Coder14BAPIKey             string
+	MetaAPIKey                 string
+	SignerBunkerURL            string
+	SignerNsec                 string
+	SignerNsecFile             string
+	SignerSocketPath           string
+	SignerDBus                 bool
+	DevMode                    bool
+	ChartroomURL               string
+	ChartroomToken             string
+	ChartroomCorpusIDs         []string
+	ChartroomSourceIDs         []string
+	QdrantURL                  string
+	QdrantAPIKey               string
+	QdrantCollections          vectorstore.CollectionNames
+	QdrantResultsPerCollection int
+	EmbedBaseURL               string
+	EmbedModel                 string
+	EmbedAPIKey                string
+	EmbedDimension             int
+	PaymentNWCURI              string
+	PaymentTrustedMints        []string
+	LSPBridgeURL               string
+	MetaBaseURL                string
+	MetaModel                  string
+	EvalDatasetPath            string
+	HealthAddr                 string
+	DashboardBearerToken       string
+	PipelineWorkers            int
+	CodeChatLimit              int
+	CodeChatWindow             time.Duration
+	FeedbackLimit              int
+	FeedbackWindow             time.Duration
 }
 
 func FromEnv() Config {
 	environment := strings.ToLower(strings.TrimSpace(os.Getenv("DRYDOCK_ENV")))
 	production := isProductionMode(environment, os.Getenv("DRYDOCK_PRODUCTION"))
+	defaultCollections := vectorstore.DefaultCollectionNames()
 
 	signerNsec := envOrDefault("DRYDOCK_SIGNER_NSEC", "")
 	signerNsecFile := envOrDefault("DRYDOCK_SIGNER_NSEC_FILE", "")
@@ -126,53 +134,63 @@ func FromEnv() Config {
 				devDefault(production, defaultRelays),
 			),
 		),
-		ReadRelays:           splitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
-		WriteRelays:          splitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
-		LogLevel:             parseLogLevel(envOrDefault("DRYDOCK_LOG_LEVEL", "info")),
-		ListenerLookbackMin:  parseIntOrDefault(envOrDefault("DRYDOCK_LISTENER_LOOKBACK_MIN", "5"), 5),
-		PlannerBaseURL:       envOrDefault("DRYDOCK_PLANNER_BASE_URL", devDefault(production, defaultPlannerBaseURL)),
-		PlannerModel:         envOrDefault("DRYDOCK_PLANNER_MODEL", devDefault(production, defaultPlannerModel)),
-		Coder32BBaseURL:      envOrDefault("DRYDOCK_CODER32B_BASE_URL", devDefault(production, defaultCoder32BBaseURL)),
-		Coder32BModel:        envOrDefault("DRYDOCK_CODER32B_MODEL", devDefault(production, defaultCoder32BModel)),
-		LLM70BBaseURL:        envOrDefault("DRYDOCK_LLM70B_BASE_URL", devDefault(production, defaultLLM70BBaseURL)),
-		LLM70BModel:          envOrDefault("DRYDOCK_LLM70B_MODEL", devDefault(production, defaultLLM70BModel)),
-		Coder14BBaseURL:      envOrDefault("DRYDOCK_CODER14B_BASE_URL", devDefault(production, defaultCoder14BBaseURL)),
-		Coder14BModel:        envOrDefault("DRYDOCK_CODER14B_MODEL", devDefault(production, defaultCoder14BModel)),
-		LLMAPIKey:            envOrDefault("DRYDOCK_LLM_API_KEY", ""),
-		PlannerAPIKey:        envOrDefault("DRYDOCK_PLANNER_API_KEY", ""),
-		Coder32BAPIKey:       envOrDefault("DRYDOCK_CODER32B_API_KEY", ""),
-		LLM70BAPIKey:         envOrDefault("DRYDOCK_LLM70B_API_KEY", ""),
-		Coder14BAPIKey:       envOrDefault("DRYDOCK_CODER14B_API_KEY", ""),
-		MetaAPIKey:           envOrDefault("DRYDOCK_META_API_KEY", ""),
-		SignerBunkerURL:      envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
-		SignerNsec:           signerNsec,
-		SignerNsecFile:       signerNsecFile,
-		SignerSocketPath:     envOrDefault("DRYDOCK_SIGNER_SOCKET_PATH", ""),
-		SignerDBus:           parseBoolOrDefault(envOrDefault("DRYDOCK_SIGNER_DBUS", ""), false),
-		DevMode:              parseBoolOrDefault(envOrDefault("DEV_MODE", envOrDefault("DRYDOCK_DEV_MODE", "")), false),
-		ChartroomURL:         envOrDefault("DRYDOCK_CHARTROOM_URL", ""),
-		ChartroomToken:       envOrDefault("DRYDOCK_CHARTROOM_TOKEN", envOrDefault("CHARTROOM_HTTP_BEARER_TOKEN", "")),
-		ChartroomCorpusIDs:   splitCSV(envOrDefault("DRYDOCK_CHARTROOM_CORPUS_IDS", "")),
-		ChartroomSourceIDs:   splitCSV(envOrDefault("DRYDOCK_CHARTROOM_SOURCE_IDS", envOrDefault("DRYDOCK_CHARTROOM_SOURCES", ""))),
-		QdrantURL:            envOrDefault("DRYDOCK_QDRANT_URL", ""),
-		QdrantAPIKey:         envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
-		EmbedBaseURL:         envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
-		EmbedModel:           envOrDefault("DRYDOCK_EMBED_MODEL", devDefault(production, defaultEmbedModel)),
-		EmbedAPIKey:          envOrDefault("DRYDOCK_EMBED_API_KEY", ""),
-		EmbedDimension:       parseIntOrDefault(envOrDefault("DRYDOCK_EMBED_DIMENSION", "768"), 768),
-		PaymentNWCURI:        envOrDefault("DRYDOCK_NWC_CONNECTION_STRING", ""),
-		PaymentTrustedMints:  paymentTrustedMints(),
-		LSPBridgeURL:         envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
-		MetaBaseURL:          envOrDefault("DRYDOCK_META_BASE_URL", devDefault(production, defaultMetaBaseURL)),
-		MetaModel:            envOrDefault("DRYDOCK_META_MODEL", devDefault(production, defaultMetaModel)),
-		EvalDatasetPath:      envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
-		HealthAddr:           envOrDefault("DRYDOCK_HEALTH_ADDR", "127.0.0.1:8081"),
-		DashboardBearerToken: envOrDefault("DRYDOCK_DASHBOARD_BEARER_TOKEN", ""),
-		PipelineWorkers:      parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
-		CodeChatLimit:        parseIntOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "20"), 20),
-		CodeChatWindow:       parseDurationOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "1h"), time.Hour),
-		FeedbackLimit:        parseIntOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "100"), 100),
-		FeedbackWindow:       parseDurationOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW", "24h"), 24*time.Hour),
+		ReadRelays:            splitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
+		WriteRelays:           splitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
+		LogLevel:              parseLogLevel(envOrDefault("DRYDOCK_LOG_LEVEL", "info")),
+		ListenerLookbackMin:   parseIntOrDefault(envOrDefault("DRYDOCK_LISTENER_LOOKBACK_MIN", "5"), 5),
+		ListenerHWMOverlap:    parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_HWM_OVERLAP", "30s"), 30*time.Second),
+		ListenerMaxFutureSkew: parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_FUTURE_SKEW", "10m"), 10*time.Minute),
+		ListenerMaxEventAge:   parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_EVENT_AGE", "8760h"), 365*24*time.Hour),
+		PlannerBaseURL:        envOrDefault("DRYDOCK_PLANNER_BASE_URL", devDefault(production, defaultPlannerBaseURL)),
+		PlannerModel:          envOrDefault("DRYDOCK_PLANNER_MODEL", devDefault(production, defaultPlannerModel)),
+		Coder32BBaseURL:       envOrDefault("DRYDOCK_CODER32B_BASE_URL", devDefault(production, defaultCoder32BBaseURL)),
+		Coder32BModel:         envOrDefault("DRYDOCK_CODER32B_MODEL", devDefault(production, defaultCoder32BModel)),
+		LLM70BBaseURL:         envOrDefault("DRYDOCK_LLM70B_BASE_URL", devDefault(production, defaultLLM70BBaseURL)),
+		LLM70BModel:           envOrDefault("DRYDOCK_LLM70B_MODEL", devDefault(production, defaultLLM70BModel)),
+		Coder14BBaseURL:       envOrDefault("DRYDOCK_CODER14B_BASE_URL", devDefault(production, defaultCoder14BBaseURL)),
+		Coder14BModel:         envOrDefault("DRYDOCK_CODER14B_MODEL", devDefault(production, defaultCoder14BModel)),
+		LLMAPIKey:             envOrDefault("DRYDOCK_LLM_API_KEY", ""),
+		PlannerAPIKey:         envOrDefault("DRYDOCK_PLANNER_API_KEY", ""),
+		Coder32BAPIKey:        envOrDefault("DRYDOCK_CODER32B_API_KEY", ""),
+		LLM70BAPIKey:          envOrDefault("DRYDOCK_LLM70B_API_KEY", ""),
+		Coder14BAPIKey:        envOrDefault("DRYDOCK_CODER14B_API_KEY", ""),
+		MetaAPIKey:            envOrDefault("DRYDOCK_META_API_KEY", ""),
+		SignerBunkerURL:       envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
+		SignerNsec:            signerNsec,
+		SignerNsecFile:        signerNsecFile,
+		SignerSocketPath:      envOrDefault("DRYDOCK_SIGNER_SOCKET_PATH", ""),
+		SignerDBus:            parseBoolOrDefault(envOrDefault("DRYDOCK_SIGNER_DBUS", ""), false),
+		DevMode:               parseBoolOrDefault(envOrDefault("DEV_MODE", envOrDefault("DRYDOCK_DEV_MODE", "")), false),
+		ChartroomURL:          envOrDefault("DRYDOCK_CHARTROOM_URL", ""),
+		ChartroomToken:        envOrDefault("DRYDOCK_CHARTROOM_TOKEN", envOrDefault("CHARTROOM_HTTP_BEARER_TOKEN", "")),
+		ChartroomCorpusIDs:    splitCSV(envOrDefault("DRYDOCK_CHARTROOM_CORPUS_IDS", "")),
+		ChartroomSourceIDs:    splitCSV(envOrDefault("DRYDOCK_CHARTROOM_SOURCE_IDS", envOrDefault("DRYDOCK_CHARTROOM_SOURCES", ""))),
+		QdrantURL:             envOrDefault("DRYDOCK_QDRANT_URL", ""),
+		QdrantAPIKey:          envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
+		QdrantCollections: vectorstore.CollectionNames{
+			NIPSpecs:    envOrDefault("DRYDOCK_QDRANT_COLLECTION_NIP_SPECS", defaultCollections.NIPSpecs),
+			ProjectDocs: envOrDefault("DRYDOCK_QDRANT_COLLECTION_PROJECT_DOCS", defaultCollections.ProjectDocs),
+			FewShot:     envOrDefault("DRYDOCK_QDRANT_COLLECTION_FEW_SHOT", defaultCollections.FewShot),
+			CodeChunks:  envOrDefault("DRYDOCK_QDRANT_COLLECTION_CODE_CHUNKS", defaultCollections.CodeChunks),
+		},
+		QdrantResultsPerCollection: parseIntOrDefault(envOrDefault("DRYDOCK_QDRANT_RESULTS_PER_COLLECTION", "3"), 3),
+		EmbedBaseURL:               envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
+		EmbedModel:                 envOrDefault("DRYDOCK_EMBED_MODEL", devDefault(production, defaultEmbedModel)),
+		EmbedAPIKey:                envOrDefault("DRYDOCK_EMBED_API_KEY", ""),
+		EmbedDimension:             parseIntOrDefault(envOrDefault("DRYDOCK_EMBED_DIMENSION", "768"), 768),
+		PaymentNWCURI:              envOrDefault("DRYDOCK_NWC_CONNECTION_STRING", ""),
+		PaymentTrustedMints:        paymentTrustedMints(),
+		LSPBridgeURL:               envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
+		MetaBaseURL:                envOrDefault("DRYDOCK_META_BASE_URL", devDefault(production, defaultMetaBaseURL)),
+		MetaModel:                  envOrDefault("DRYDOCK_META_MODEL", devDefault(production, defaultMetaModel)),
+		EvalDatasetPath:            envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
+		HealthAddr:                 envOrDefault("DRYDOCK_HEALTH_ADDR", "127.0.0.1:8081"),
+		DashboardBearerToken:       envOrDefault("DRYDOCK_DASHBOARD_BEARER_TOKEN", ""),
+		PipelineWorkers:            parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
+		CodeChatLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "20"), 20),
+		CodeChatWindow:             parseDurationOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "1h"), time.Hour),
+		FeedbackLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "100"), 100),
+		FeedbackWindow:             parseDurationOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW", "24h"), 24*time.Hour),
 	}
 }
 
@@ -229,6 +247,18 @@ func configuredEnv() map[string]bool {
 		}
 	}
 	return configured
+}
+
+func validCollectionName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' && r != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func splitCSV(v string) []string {
@@ -399,6 +429,25 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 	if c.EmbedDimension <= 0 {
 		result.Errors = append(result.Errors, "DRYDOCK_EMBED_DIMENSION must be at least 1")
+	}
+	for key, name := range map[string]string{
+		"DRYDOCK_QDRANT_COLLECTION_NIP_SPECS":    c.QdrantCollections.NIPSpecs,
+		"DRYDOCK_QDRANT_COLLECTION_PROJECT_DOCS": c.QdrantCollections.ProjectDocs,
+		"DRYDOCK_QDRANT_COLLECTION_FEW_SHOT":     c.QdrantCollections.FewShot,
+		"DRYDOCK_QDRANT_COLLECTION_CODE_CHUNKS":  c.QdrantCollections.CodeChunks,
+	} {
+		if !validCollectionName(name) {
+			result.Errors = append(result.Errors, fmt.Sprintf("%s must contain only letters, numbers, underscore, or hyphen", key))
+		}
+	}
+	if c.QdrantResultsPerCollection < 1 {
+		result.Errors = append(result.Errors, "DRYDOCK_QDRANT_RESULTS_PER_COLLECTION must be at least 1")
+	}
+	if c.ListenerLookbackMin < 1 {
+		result.Errors = append(result.Errors, "DRYDOCK_LISTENER_LOOKBACK_MIN must be at least 1")
+	}
+	if c.ListenerHWMOverlap <= 0 || c.ListenerMaxFutureSkew <= 0 || c.ListenerMaxEventAge <= 0 {
+		result.Errors = append(result.Errors, "listener overlap, future skew, and max event age must be greater than 0")
 	}
 	if c.PaymentNWCURI != "" && len(c.PaymentTrustedMints) == 0 {
 		result.Warnings = append(result.Warnings, "DRYDOCK_NWC_CONNECTION_STRING set but no trusted Cashu mints configured (set DRYDOCK_CASHU_TRUSTED_MINTS or DRYDOCK_CASHU_MINT_URL)")

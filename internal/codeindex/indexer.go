@@ -48,10 +48,11 @@ type fileIndexResult struct {
 // Indexer manages semantic code indexing into Qdrant.
 // It is safe for concurrent use; per-repo serialisation is enforced internally.
 type Indexer struct {
-	qdrant    *vectorstore.Client
-	embedder  *embedding.Client
-	logger    *slog.Logger
-	vectorDim int
+	qdrant     *vectorstore.Client
+	embedder   *embedding.Client
+	logger     *slog.Logger
+	vectorDim  int
+	collection string
 
 	repoLocks sync.Map // keyed by repoID → *sync.Mutex
 }
@@ -66,10 +67,11 @@ func New(qdrant *vectorstore.Client, embedder *embedding.Client, logger *slog.Lo
 		vectorDim = vectorDims[0]
 	}
 	return &Indexer{
-		qdrant:    qdrant,
-		embedder:  embedder,
-		logger:    logger,
-		vectorDim: vectorDim,
+		qdrant:     qdrant,
+		embedder:   embedder,
+		logger:     logger,
+		vectorDim:  vectorDim,
+		collection: qdrant.CollectionNames().CodeChunks,
 	}
 }
 
@@ -96,7 +98,7 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 	}
 
 	// Ensure collection exists.
-	if err := idx.qdrant.EnsureCollection(ctx, vectorstore.CollectionCodeChunks, idx.vectorDim); err != nil {
+	if err := idx.qdrant.EnsureCollection(ctx, idx.collection, idx.vectorDim); err != nil {
 		return fmt.Errorf("ensure code_chunks collection: %w", err)
 	}
 
@@ -364,7 +366,7 @@ func (idx *Indexer) indexFile(
 
 		// Batch upsert when buffer is full.
 		if len(points) >= upsertBatch {
-			if err := idx.qdrant.Upsert(ctx, vectorstore.CollectionCodeChunks, points); err != nil {
+			if err := idx.qdrant.Upsert(ctx, idx.collection, points); err != nil {
 				return result, fmt.Errorf("upsert batch: %w", err)
 			}
 			result.upserted += len(points)
@@ -374,7 +376,7 @@ func (idx *Indexer) indexFile(
 
 	// Flush remaining points.
 	if len(points) > 0 {
-		if err := idx.qdrant.Upsert(ctx, vectorstore.CollectionCodeChunks, points); err != nil {
+		if err := idx.qdrant.Upsert(ctx, idx.collection, points); err != nil {
 			return result, fmt.Errorf("upsert remaining: %w", err)
 		}
 		result.upserted += len(points)
@@ -430,7 +432,7 @@ func (idx *Indexer) repoMutex(repoID string) *sync.Mutex {
 
 // countRepoPoints returns the number of code chunks for a repo in Qdrant.
 func (idx *Indexer) countRepoPoints(ctx context.Context, repoID string) (int64, error) {
-	return idx.qdrant.Count(ctx, vectorstore.CollectionCodeChunks, map[string]any{
+	return idx.qdrant.Count(ctx, idx.collection, map[string]any{
 		"must": []map[string]any{
 			{"key": "repo_id", "match": map[string]any{"value": repoID}},
 		},
@@ -460,7 +462,7 @@ func (idx *Indexer) deleteFilePoints(ctx context.Context, repoID, filePath strin
 func (idx *Indexer) scrollAndDelete(ctx context.Context, filter map[string]any) error {
 	var offset *string
 	for {
-		points, next, err := idx.qdrant.Scroll(ctx, vectorstore.CollectionCodeChunks, 100, offset, filter)
+		points, next, err := idx.qdrant.Scroll(ctx, idx.collection, 100, offset, filter)
 		if err != nil {
 			return err
 		}
@@ -471,7 +473,7 @@ func (idx *Indexer) scrollAndDelete(ctx context.Context, filter map[string]any) 
 		for i, p := range points {
 			ids[i] = p.ID
 		}
-		if err := idx.qdrant.Delete(ctx, vectorstore.CollectionCodeChunks, ids); err != nil {
+		if err := idx.qdrant.Delete(ctx, idx.collection, ids); err != nil {
 			return err
 		}
 		if next == nil {

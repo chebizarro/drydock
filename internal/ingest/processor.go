@@ -10,6 +10,7 @@ import (
 
 	"drydock/internal/contextvm"
 	"drydock/internal/db"
+	"drydock/internal/eventkind"
 	"drydock/internal/metrics"
 
 	"fiatjaf.com/nostr"
@@ -53,6 +54,20 @@ type Processor struct {
 	contextVMRouter    *contextvm.Router
 	contextVMResponder ContextVMResponder
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
+	maxEventFutureSkew time.Duration
+	maxEventPastAge    time.Duration
+}
+
+// WithTimingPolicy configures accepted event timestamp skew and age.
+func WithTimingPolicy(maxFutureSkew, maxPastAge time.Duration) func(*Processor) {
+	return func(p *Processor) {
+		if maxFutureSkew > 0 {
+			p.maxEventFutureSkew = maxFutureSkew
+		}
+		if maxPastAge > 0 {
+			p.maxEventPastAge = maxPastAge
+		}
+	}
 }
 
 // WithConversation sets the conversation handler for processing reply events.
@@ -105,9 +120,11 @@ func NewProcessor(store *db.Store, logger *slog.Logger, opts ...func(*Processor)
 		logger = slog.Default()
 	}
 	p := &Processor{
-		store:       store,
-		logger:      logger,
-		ReviewQueue: make(chan db.ReviewTask, 256),
+		store:              store,
+		logger:             logger,
+		ReviewQueue:        make(chan db.ReviewTask, 256),
+		maxEventFutureSkew: maxEventFutureSkew,
+		maxEventPastAge:    maxEventPastAge,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -139,13 +156,13 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 	}
 
 	switch event.Kind {
-	case nostr.KindRepositoryAnnouncement:
+	case eventkind.RepositoryAnnouncement:
 		return p.store.UpsertRepositoryAnnouncement(ctx, event)
-	case nostr.KindRepositoryState:
+	case eventkind.RepositoryState:
 		return p.store.UpsertRepositorySnapshot(ctx, event)
-	case 1630, 1631, 1632, 1633:
+	case eventkind.StatusOpen, eventkind.StatusApplied, eventkind.StatusClosed, eventkind.StatusDraft:
 		return p.store.UpsertRootStatus(ctx, event)
-	case 1617, 1618, 1619:
+	case eventkind.Patch, eventkind.GitPullRequest, eventkind.GitPullRequestUpdate:
 		if err := p.store.InsertPatchEvent(ctx, event); err != nil {
 			return err
 		}
@@ -211,7 +228,7 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			}
 		}
 		return nil
-	case nostr.KindComment:
+	case eventkind.Comment:
 		// Reply to one of our reviews? Route to conversation handler.
 		if p.conversation != nil && p.conversation.IsReplyToUs(ctx, event) {
 			if err := p.conversation.HandleReply(ctx, event, relayURL); err != nil {
@@ -224,7 +241,7 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			}
 		}
 		return nil
-	case nostr.KindEncryptedDirectMessage, 14: // NIP-04 kind 4 or NIP-17 kind 14
+	case eventkind.EncryptedDirectMessage, eventkind.SealedDirectMessage:
 		// Encrypted DM to us? Route to codechat handler.
 		if p.codeChat != nil && p.codeChat.IsDMToUs(ctx, event) {
 			if err := p.codeChat.HandleDM(ctx, event, relayURL); err != nil {
@@ -237,9 +254,9 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			}
 		}
 		return nil
-	case contextvm.KindContextVM:
+	case eventkind.ContextVM:
 		return p.handleContextVM(ctx, event, relayURL)
-	case 30078: // IDE session state
+	case eventkind.IDESession:
 		// Route to IDE gateway handler.
 		if p.ideGateway != nil {
 			if err := p.ideGateway.HandleEvent(ctx, event, relayURL); err != nil {
@@ -253,7 +270,7 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			}
 		}
 		return nil
-	case 31990, 7000: // Marketplace events
+	case eventkind.ReviewerProfile, eventkind.ReviewFeedback:
 		// Route to marketplace handler.
 		if p.marketplace != nil {
 			if err := p.marketplace.HandleEvent(ctx, event, relayURL); err != nil {
@@ -279,7 +296,7 @@ func (p *Processor) validateEventForIngest(event nostr.Event, relayURL string) b
 		reason = "id_mismatch"
 	case !event.VerifySignature():
 		reason = "invalid_signature"
-	case !eventTimestampPlausible(event.CreatedAt):
+	case !eventTimestampPlausible(event.CreatedAt, p.maxEventFutureSkew, p.maxEventPastAge):
 		reason = "implausible_timestamp"
 	}
 	if reason == "" {
@@ -329,20 +346,20 @@ func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, rela
 
 func isTrackedHandlerKind(kind nostr.Kind) bool {
 	switch kind {
-	case nostr.KindComment, nostr.KindEncryptedDirectMessage, 14, 30078, 31990, 7000:
+	case eventkind.Comment, eventkind.EncryptedDirectMessage, eventkind.SealedDirectMessage, eventkind.IDESession, eventkind.ReviewerProfile, eventkind.ReviewFeedback:
 		return true
 	default:
 		return false
 	}
 }
 
-func eventTimestampPlausible(ts nostr.Timestamp) bool {
+func eventTimestampPlausible(ts nostr.Timestamp, maxFutureSkew, maxPastAge time.Duration) bool {
 	now := time.Now()
 	createdAt := time.Unix(int64(ts), 0)
-	if createdAt.After(now.Add(maxEventFutureSkew)) {
+	if createdAt.After(now.Add(maxFutureSkew)) {
 		return false
 	}
-	if createdAt.Before(now.Add(-maxEventPastAge)) {
+	if createdAt.Before(now.Add(-maxPastAge)) {
 		return false
 	}
 	return true

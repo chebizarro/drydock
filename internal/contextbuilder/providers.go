@@ -3,6 +3,7 @@ package contextbuilder
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -83,7 +84,7 @@ func (fileContextProvider) Build(_ context.Context, in BuildInput) (string, erro
 	}
 	files, err := parsePatch(in.PatchEventContent)
 	if err != nil {
-		return "", nil
+		return "", &LayerWarning{Err: fmt.Errorf("parse patch: %w", err)}
 	}
 
 	var out strings.Builder
@@ -133,11 +134,14 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 
 	// Try tree-sitter extraction first for accurate, AST-based symbol detection.
 	// Falls back to regex for unsupported languages or when tree-sitter is unavailable.
-	syms := p.extractWithTreeSitter(in, extractor)
+	syms, extractionWarnings := p.extractWithTreeSitter(in, extractor)
 	if len(syms) == 0 {
 		syms = extractChangedSymbols(in.PatchEventContent)
 	}
 	if len(syms) == 0 {
+		if len(extractionWarnings) > 0 {
+			return "", &LayerWarning{Err: errors.Join(extractionWarnings...)}
+		}
 		return "", nil
 	}
 
@@ -153,7 +157,11 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 		lspResult := p.queryLSP(ctx, in, syms)
 		if lspResult.content != "" {
 			out.WriteString(lspResult.content)
-			return strings.TrimSpace(out.String()), nil
+			content := strings.TrimSpace(out.String())
+			if len(extractionWarnings) > 0 {
+				return content, &LayerWarning{Err: errors.Join(extractionWarnings...)}
+			}
+			return content, nil
 		}
 		if lspResult.status != "" {
 			out.WriteString("\n## LSP Status\n")
@@ -180,22 +188,27 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 		out.WriteString(lines)
 		out.WriteString("\n")
 	}
-	return strings.TrimSpace(out.String()), nil
+	content := strings.TrimSpace(out.String())
+	if len(extractionWarnings) > 0 {
+		return content, &LayerWarning{Err: errors.Join(extractionWarnings...)}
+	}
+	return content, nil
 }
 
 // extractWithTreeSitter parses changed files from the diff using tree-sitter
 // and returns symbol names that overlap with changed line ranges.
-func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput, extractor *symbols.Extractor) []string {
+func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput, extractor *symbols.Extractor) ([]string, []error) {
 	if extractor == nil {
-		return nil
+		return nil, []error{fmt.Errorf("tree-sitter extractor unavailable")}
 	}
 
 	files, err := parsePatch(in.PatchEventContent)
 	if err != nil {
-		return nil
+		return nil, []error{fmt.Errorf("parse patch for tree-sitter: %w", err)}
 	}
 
 	var names []string
+	var warnings []error
 	for _, f := range files {
 		path := pickPath(f)
 		if path == "" || isExcludedPath(path) {
@@ -217,6 +230,7 @@ func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput, extractor
 		changedLines := extractChangedLineNumbers(f)
 		result, err := extractor.ExtractChanged(lang, source, changedLines)
 		if err != nil {
+			warnings = append(warnings, fmt.Errorf("tree-sitter extract %s: %w", path, err))
 			continue
 		}
 
@@ -230,7 +244,7 @@ func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput, extractor
 	if len(names) > 12 {
 		names = names[:12]
 	}
-	return names
+	return names, warnings
 }
 
 type lspQueryResult struct {
@@ -439,7 +453,7 @@ func (commitHistoryProvider) Build(ctx context.Context, in BuildInput) (string, 
 	}
 	files, err := parsePatch(in.PatchEventContent)
 	if err != nil {
-		return "", nil
+		return "", &LayerWarning{Err: fmt.Errorf("parse patch: %w", err)}
 	}
 	paths := make([]string, 0, len(files))
 	for _, f := range files {
@@ -457,7 +471,7 @@ func (commitHistoryProvider) Build(ctx context.Context, in BuildInput) (string, 
 	args = append(args, paths...)
 	out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput()
 	if err != nil {
-		return "", nil
+		return "", &LayerWarning{Err: fmt.Errorf("git history: %w: %s", err, strings.TrimSpace(string(out)))}
 	}
 	return strings.TrimSpace(string(out)), nil
 }
