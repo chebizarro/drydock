@@ -14,6 +14,10 @@ import (
 	"drydock/internal/metrics"
 )
 
+// DefaultDimension is the default embedding vector size used when the central
+// embedding configuration does not override it.
+const DefaultDimension = 768
+
 // Client calls an OpenAI-compatible embedding endpoint.
 type Client struct {
 	baseURL    string

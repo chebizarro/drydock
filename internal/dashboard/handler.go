@@ -5,15 +5,19 @@ package dashboard
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"drydock/internal/metrics"
 )
 
 //go:embed assets
@@ -26,21 +30,34 @@ type DataStore interface {
 
 // Handler serves the analytics dashboard UI and API endpoints.
 type Handler struct {
-	store     DataStore
-	logger    *slog.Logger
-	startTime time.Time
+	store       DataStore
+	logger      *slog.Logger
+	startTime   time.Time
+	bearerToken string
+}
+
+// Option configures a dashboard handler.
+type Option func(*Handler)
+
+// WithBearerToken protects dashboard and API routes with a bearer token.
+func WithBearerToken(token string) Option {
+	return func(h *Handler) { h.bearerToken = strings.TrimSpace(token) }
 }
 
 // New creates a dashboard handler.
-func New(store DataStore, logger *slog.Logger) *Handler {
+func New(store DataStore, logger *slog.Logger, opts ...Option) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{
+	h := &Handler{
 		store:     store,
 		logger:    logger,
 		startTime: time.Now(),
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // Register mounts dashboard routes onto the given mux.
@@ -51,28 +68,28 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		h.logger.Error("failed to load embedded dashboard assets", "error", err)
 		return
 	}
-	mux.Handle("/dashboard/", http.StripPrefix("/dashboard/", http.FileServer(http.FS(sub))))
+	mux.Handle("/dashboard/", h.authorize(http.StripPrefix("/dashboard/", http.FileServer(http.FS(sub)))))
 
 	// API endpoints.
-	mux.HandleFunc("/api/stats", h.handleStats)
-	mux.HandleFunc("/api/reviews", h.handleReviews)
-	mux.HandleFunc("/api/repos", h.handleRepos)
-	mux.HandleFunc("/api/quality", h.handleQuality)
+	mux.Handle("/api/stats", h.authorize(http.HandlerFunc(h.handleStats)))
+	mux.Handle("/api/reviews", h.authorize(http.HandlerFunc(h.handleReviews)))
+	mux.Handle("/api/repos", h.authorize(http.HandlerFunc(h.handleRepos)))
+	mux.Handle("/api/quality", h.authorize(http.HandlerFunc(h.handleQuality)))
 }
 
 // --- Stats endpoint ---
 
 // StatsResponse contains aggregate dashboard statistics.
 type StatsResponse struct {
-	EventsIngested   int64  `json:"events_ingested"`
-	PatchesReceived  int64  `json:"patches_received"`
-	ReviewsPublished int64  `json:"reviews_published"`
-	ReviewsFailed    int64  `json:"reviews_failed"`
-	ReviewsPending   int64  `json:"reviews_pending"`
-	ReposTracked     int64  `json:"repos_tracked"`
-	MetaReviewsRun   int64  `json:"meta_reviews_run"`
-	Conversations    int64  `json:"conversations"`
-	UptimeSeconds    int64  `json:"uptime_seconds"`
+	EventsIngested   int64 `json:"events_ingested"`
+	PatchesReceived  int64 `json:"patches_received"`
+	ReviewsPublished int64 `json:"reviews_published"`
+	ReviewsFailed    int64 `json:"reviews_failed"`
+	ReviewsPending   int64 `json:"reviews_pending"`
+	ReposTracked     int64 `json:"repos_tracked"`
+	MetaReviewsRun   int64 `json:"meta_reviews_run"`
+	Conversations    int64 `json:"conversations"`
+	UptimeSeconds    int64 `json:"uptime_seconds"`
 }
 
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -86,29 +103,25 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	// Run count queries concurrently would be better but for simplicity
 	// and SQLite's write-serialized nature, sequential is fine.
-	row := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ingested_events")
-	row.Scan(&stats.EventsIngested)
-
-	row = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM patch_events")
-	row.Scan(&stats.PatchesReceived)
-
-	row = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM review_log WHERE status = 'published'")
-	row.Scan(&stats.ReviewsPublished)
-
-	row = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM review_log WHERE status = 'failed'")
-	row.Scan(&stats.ReviewsFailed)
-
-	row = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM review_log WHERE status IN ('pending', 'reviewing')")
-	row.Scan(&stats.ReviewsPending)
-
-	row = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM repositories")
-	row.Scan(&stats.ReposTracked)
-
-	row = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM meta_review_log")
-	row.Scan(&stats.MetaReviewsRun)
-
-	row = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM conversations")
-	row.Scan(&stats.Conversations)
+	queries := []struct {
+		query string
+		dest  *int64
+	}{
+		{"SELECT COUNT(*) FROM ingested_events", &stats.EventsIngested},
+		{"SELECT COUNT(*) FROM patch_events", &stats.PatchesReceived},
+		{"SELECT COUNT(*) FROM review_log WHERE status = 'published'", &stats.ReviewsPublished},
+		{"SELECT COUNT(*) FROM review_log WHERE status = 'failed'", &stats.ReviewsFailed},
+		{"SELECT COUNT(*) FROM review_log WHERE status IN ('pending', 'reviewing')", &stats.ReviewsPending},
+		{"SELECT COUNT(*) FROM repositories", &stats.ReposTracked},
+		{"SELECT COUNT(*) FROM meta_review_log", &stats.MetaReviewsRun},
+		{"SELECT COUNT(*) FROM conversations", &stats.Conversations},
+	}
+	for _, query := range queries {
+		if err := db.QueryRowContext(ctx, query.query).Scan(query.dest); err != nil {
+			h.writeFailure(w, "stats", err)
+			return
+		}
+	}
 
 	writeJSON(w, stats)
 }
@@ -173,17 +186,19 @@ func (h *Handler) handleReviews(w http.ResponseWriter, r *http.Request) {
 	// Total count.
 	var total int64
 	countQuery := "SELECT COUNT(*) FROM review_log" + where
-	db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
+	if err := db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		h.writeFailure(w, "reviews", err)
+		return
+	}
 
 	// Paginated results.
 	query := "SELECT patch_event_id, repo_id, status, COALESCE(review_event_id, ''), COALESCE(failure_reason, ''), created_at, updated_at FROM review_log" +
 		where + " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-	queryArgs := append(args, limit, offset)
+	queryArgs := append(append([]any{}, args...), limit, offset)
 
 	rows, err := db.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
-		h.logger.Warn("dashboard reviews query failed", "error", err)
-		writeJSON(w, ReviewsResponse{Reviews: []ReviewEntry{}, Total: 0, Page: page, Limit: limit})
+		h.writeFailure(w, "reviews", err)
 		return
 	}
 	defer rows.Close()
@@ -192,9 +207,14 @@ func (h *Handler) handleReviews(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var re ReviewEntry
 		if err := rows.Scan(&re.PatchEventID, &re.RepoID, &re.Status, &re.ReviewEventID, &re.FailureReason, &re.CreatedAt, &re.UpdatedAt); err != nil {
-			continue
+			h.writeFailure(w, "reviews", err)
+			return
 		}
 		reviews = append(reviews, re)
+	}
+	if err := rows.Err(); err != nil {
+		h.writeFailure(w, "reviews", err)
+		return
 	}
 	if reviews == nil {
 		reviews = []ReviewEntry{}
@@ -236,8 +256,7 @@ func (h *Handler) handleRepos(w http.ResponseWriter, r *http.Request) {
 		LIMIT 100
 	`)
 	if err != nil {
-		h.logger.Warn("dashboard repos query failed", "error", err)
-		writeJSON(w, []RepoEntry{})
+		h.writeFailure(w, "repos", err)
 		return
 	}
 	defer rows.Close()
@@ -246,9 +265,14 @@ func (h *Handler) handleRepos(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var re RepoEntry
 		if err := rows.Scan(&re.RepoID, &re.Name, &re.ReviewCount, &re.LastActivity); err != nil {
-			continue
+			h.writeFailure(w, "repos", err)
+			return
 		}
 		repos = append(repos, re)
+	}
+	if err := rows.Err(); err != nil {
+		h.writeFailure(w, "repos", err)
+		return
 	}
 	if repos == nil {
 		repos = []RepoEntry{}
@@ -281,8 +305,7 @@ func (h *Handler) handleQuality(w http.ResponseWriter, r *http.Request) {
 		LIMIT 50
 	`)
 	if err != nil {
-		h.logger.Warn("dashboard quality query failed", "error", err)
-		writeJSON(w, []QualityEntry{})
+		h.writeFailure(w, "quality", err)
 		return
 	}
 	defer rows.Close()
@@ -291,9 +314,14 @@ func (h *Handler) handleQuality(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var e QualityEntry
 		if err := rows.Scan(&e.ID, &e.DatasetID, &e.Recall, &e.FPR, &e.CalMAE, &e.CreatedAt); err != nil {
-			continue
+			h.writeFailure(w, "quality", err)
+			return
 		}
 		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		h.writeFailure(w, "quality", err)
+		return
 	}
 	if entries == nil {
 		entries = []QualityEntry{}
@@ -303,6 +331,47 @@ func (h *Handler) handleQuality(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- Helpers ---
+
+type errorResponse struct {
+	Error struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func newErrorResponse(code, message string) errorResponse {
+	var response errorResponse
+	response.Error.Code = code
+	response.Error.Message = message
+	return response
+}
+
+func (h *Handler) authorize(next http.Handler) http.Handler {
+	if h.bearerToken == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare([]byte(token), []byte(h.bearerToken)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="drydock-management"`)
+			writeJSONStatus(w, http.StatusUnauthorized, newErrorResponse("unauthorized", "valid bearer token required"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *Handler) writeFailure(w http.ResponseWriter, endpoint string, err error) {
+	metrics.DashboardFailures.With(endpoint).Inc()
+	h.logger.Error("dashboard request failed", "endpoint", endpoint, "error", err)
+	writeJSONStatus(w, http.StatusInternalServerError, newErrorResponse("database_error", fmt.Sprintf("dashboard %s data unavailable", endpoint)))
+}
+
+func writeJSONStatus(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")

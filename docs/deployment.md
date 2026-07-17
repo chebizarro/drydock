@@ -32,6 +32,19 @@ go run ./cmd/drydock
 
 The health endpoint is available at `http://localhost:8081/readyz`.
 
+### Management listener security
+
+The management listener defaults to `127.0.0.1:8081`. The dashboard and its APIs (`/dashboard/` and `/api/*`) are unauthenticated only when `DRYDOCK_DASHBOARD_BEARER_TOKEN` is empty, so keep the listener on loopback in that mode. If you deliberately expose `DRYDOCK_HEALTH_ADDR` on a non-loopback interface, configure a strong token:
+
+```bash
+DRYDOCK_HEALTH_ADDR=0.0.0.0:8081
+DRYDOCK_DASHBOARD_BEARER_TOKEN='replace-with-a-long-random-secret'
+curl -H 'Authorization: Bearer replace-with-a-long-random-secret' \
+  http://localhost:8081/api/stats
+```
+
+The bearer token protects only `/dashboard/` and `/api/*`; `/healthz`, `/readyz`, and `/metrics` remain available for probes and monitoring.
+
 ## Docker (Microservices)
 
 Drydock runs as a multi-service Docker Compose stack: drydock-core (always), Qdrant (always), and optionally the LSP bridge. Compose requires `DRYDOCK_SIGNER_BUNKER_URL` and fails configuration with a clear error when it is unset.

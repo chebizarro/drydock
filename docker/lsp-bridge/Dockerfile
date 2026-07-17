@@ -60,11 +60,11 @@ WORKDIR /app
 
 COPY --from=builder /out/lsp-bridge /usr/local/bin/lsp-bridge
 
-ENV LSP_BRIDGE_ADDR=:8082
+ENV LSP_BRIDGE_ADDR=0.0.0.0:8082
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
     CMD wget -qO- http://localhost:8082/healthz || exit 1
 
 EXPOSE 8082
 
-ENTRYPOINT ["lsp-bridge", "-addr", ":8082"]
+ENTRYPOINT ["lsp-bridge", "-addr", "0.0.0.0:8082"]

@@ -41,11 +41,17 @@ func (p *Provider) Build(ctx context.Context, in contextbuilder.BuildInput) (str
 	}
 
 	result := p.scanner.ScanFiles(ctx, in.RepoPath, changedFiles, in.PatchEventContent)
-	if len(result.Findings) == 0 {
+	if len(result.Findings) == 0 && result.FilesSkipped == 0 && result.FilesErrored == 0 {
 		return "", nil
 	}
 
 	var b strings.Builder
+	if result.FilesSkipped > 0 || result.FilesErrored > 0 {
+		b.WriteString(fmt.Sprintf("SECURITY SCAN INCOMPLETE: %d file(s) skipped and %d file(s) errored; do not treat this review as a complete security scan.\n\n", result.FilesSkipped, result.FilesErrored))
+	}
+	if len(result.Findings) == 0 {
+		return b.String(), nil
+	}
 	b.WriteString(fmt.Sprintf("SAST scanner found %d potential security issue(s) in changed files.\n", len(result.Findings)))
 	b.WriteString("These are deterministic pattern matches — review each in context:\n\n")
 

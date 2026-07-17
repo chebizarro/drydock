@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"drydock/internal/db"
@@ -15,6 +16,26 @@ import (
 type fakeLLM struct {
 	responses []string
 	calls     int
+}
+
+type failingPromptStore struct {
+	promptStore
+	activeErr error
+	parentErr error
+}
+
+func (s *failingPromptStore) GetActivePromptVersion(ctx context.Context, name string) (db.PromptVersion, error) {
+	if s.activeErr != nil {
+		return db.PromptVersion{}, s.activeErr
+	}
+	return s.promptStore.GetActivePromptVersion(ctx, name)
+}
+
+func (s *failingPromptStore) GetPromptVersionByNumber(ctx context.Context, name string, version int) (db.PromptVersion, error) {
+	if s.parentErr != nil {
+		return db.PromptVersion{}, s.parentErr
+	}
+	return s.promptStore.GetPromptVersionByNumber(ctx, name, version)
 }
 
 func (f *fakeLLM) ChatCompletion(_ context.Context, _ reviewengine.ChatRequest) (string, error) {
@@ -122,6 +143,21 @@ func TestCheckAndRefineTriggersAtThreshold(t *testing.T) {
 	}
 }
 
+func TestCheckAndRefinePropagatesActiveVersionLookupError(t *testing.T) {
+	ctx := context.Background()
+	store := setupStore(t)
+	if err := store.InsertPromptGap(ctx, "patch1", "repo1", "gap"); err != nil {
+		t.Fatalf("insert gap: %v", err)
+	}
+
+	svc := New(Config{Threshold: 1}, store, &fakeLLM{responses: []string{"refined"}}, slog.Default())
+	svc.store = &failingPromptStore{promptStore: store, activeErr: fmt.Errorf("database unavailable")}
+
+	if _, err := svc.CheckAndRefine(ctx); err == nil || !strings.Contains(err.Error(), "get active prompt version") {
+		t.Fatalf("expected active version lookup error, got %v", err)
+	}
+}
+
 func TestCheckAndRefineUsesActiveVersionAsBase(t *testing.T) {
 	ctx := context.Background()
 	store := setupStore(t)
@@ -179,6 +215,16 @@ func TestCheckAndRefineUsesActiveVersionAsBase(t *testing.T) {
 	}
 }
 
+func TestEvalAndMaybeRollbackPropagatesActiveVersionLookupError(t *testing.T) {
+	store := setupStore(t)
+	svc := New(Config{}, store, nil, slog.Default())
+	svc.store = &failingPromptStore{promptStore: store, activeErr: fmt.Errorf("database unavailable")}
+
+	if _, err := svc.EvalAndMaybeRollback(context.Background()); err == nil || !strings.Contains(err.Error(), "get active prompt version") {
+		t.Fatalf("expected active version lookup error, got %v", err)
+	}
+}
+
 func TestEvalAndMaybeRollbackNoRegression(t *testing.T) {
 	ctx := context.Background()
 	store := setupStore(t)
@@ -203,6 +249,24 @@ func TestEvalAndMaybeRollbackNoRegression(t *testing.T) {
 	}
 	if result.RolledBack {
 		t.Error("should not have rolled back — score improved")
+	}
+}
+
+func TestEvalAndMaybeRollbackPropagatesParentLookupError(t *testing.T) {
+	ctx := context.Background()
+	store := setupStore(t)
+	id1, _ := store.InsertPromptVersion(ctx, PromptNameReviewerSystem, "v1", 0, "")
+	store.ActivatePromptVersion(ctx, id1)
+	store.SetPromptVersionEvalScore(ctx, id1, 0.85)
+	id2, _ := store.InsertPromptVersion(ctx, PromptNameReviewerSystem, "v2", 1, "")
+	store.ActivatePromptVersion(ctx, id2)
+	store.InsertEvalRun(ctx, "ds1", 10, 10, 10, 5, 5, 5, 0.50, 0.5, 0.1, 0.6, "")
+
+	svc := New(Config{}, store, nil, slog.Default())
+	svc.store = &failingPromptStore{promptStore: store, parentErr: fmt.Errorf("database unavailable")}
+
+	if _, err := svc.EvalAndMaybeRollback(ctx); err == nil || !strings.Contains(err.Error(), "get parent eval score") {
+		t.Fatalf("expected parent lookup error, got %v", err)
 	}
 }
 

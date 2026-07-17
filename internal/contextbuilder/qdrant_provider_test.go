@@ -130,6 +130,38 @@ func TestQdrantProvider_NostrRelated(t *testing.T) {
 	}
 }
 
+func TestQdrantProvider_AllSearchesFailReturnsError(t *testing.T) {
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"embedding": []float32{0.1, 0.2, 0.3}, "index": 0}},
+		})
+	}))
+	defer embedSrv.Close()
+
+	qdrantSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "qdrant unavailable", http.StatusServiceUnavailable)
+	}))
+	defer qdrantSrv.Close()
+
+	p := NewQdrantProvider(
+		vectorstore.NewClient(qdrantSrv.URL, ""),
+		embedding.NewClient(embedSrv.URL, "", "test"),
+	)
+	result, err := p.Build(context.Background(), BuildInput{
+		PatchEventContent: "+import \"fiatjaf.com/nostr\"",
+	})
+	if err == nil {
+		t.Fatal("expected error when all Qdrant searches fail")
+	}
+	if result != "" {
+		t.Fatalf("expected no retrieved content, got %q", result)
+	}
+	if !strings.Contains(err.Error(), vectorstore.CollectionNIPSpecs) ||
+		!strings.Contains(err.Error(), vectorstore.CollectionProjectDocs) {
+		t.Fatalf("expected aggregate error to name both failed searches, got %v", err)
+	}
+}
+
 func TestQdrantProvider_NonNostr(t *testing.T) {
 	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{

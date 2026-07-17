@@ -2,6 +2,7 @@ package contextbuilder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -61,11 +62,14 @@ func (p *QdrantProvider) Build(ctx context.Context, in BuildInput) (string, erro
 	}
 
 	var out strings.Builder
+	var searchErrors []error
 
 	// Query nip_specs if the patch looks Nostr-related.
 	if looksNostrRelated(in.PatchEventContent) {
 		results, err := p.qdrant.Search(ctx, vectorstore.CollectionNIPSpecs, vec, resultsPerCollection, nil)
-		if err == nil && len(results) > 0 {
+		if err != nil {
+			searchErrors = append(searchErrors, fmt.Errorf("search %s: %w", vectorstore.CollectionNIPSpecs, err))
+		} else if len(results) > 0 {
 			out.WriteString("### NIP Specifications\n\n")
 			for _, r := range results {
 				nipID, _ := r.Payload["nip_id"].(string)
@@ -91,7 +95,9 @@ func (p *QdrantProvider) Build(ctx context.Context, in BuildInput) (string, erro
 		}
 	}
 	results, err := p.qdrant.Search(ctx, vectorstore.CollectionProjectDocs, vec, resultsPerCollection, docsFilter)
-	if err == nil && len(results) > 0 {
+	if err != nil {
+		searchErrors = append(searchErrors, fmt.Errorf("search %s: %w", vectorstore.CollectionProjectDocs, err))
+	} else if len(results) > 0 {
 		out.WriteString("### Retrieved Project Documentation\n\n")
 		for _, r := range results {
 			title, _ := r.Payload["section_title"].(string)
@@ -107,7 +113,11 @@ func (p *QdrantProvider) Build(ctx context.Context, in BuildInput) (string, erro
 		}
 	}
 
-	return strings.TrimSpace(out.String()), nil
+	content := strings.TrimSpace(out.String())
+	if len(searchErrors) > 0 {
+		return content, fmt.Errorf("qdrant retrieval degraded: %w", errors.Join(searchErrors...))
+	}
+	return content, nil
 }
 
 // nostrKeywords are terms that suggest the patch touches Nostr-related code.

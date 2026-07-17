@@ -2,6 +2,8 @@ package promptrefine
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -44,18 +46,31 @@ type Config struct {
 
 // RefineResult describes the outcome of a refinement cycle.
 type RefineResult struct {
-	Triggered       bool
-	GapsProcessed   int
-	NewVersionID    int64
-	Activated       bool
-	RolledBack      bool
-	RollbackReason  string
+	Triggered      bool
+	GapsProcessed  int
+	NewVersionID   int64
+	Activated      bool
+	RolledBack     bool
+	RollbackReason string
+}
+
+type promptStore interface {
+	CountUnconsumedPromptGaps(context.Context) (int64, error)
+	FetchUnconsumedPromptGaps(context.Context, int) ([]db.PromptGapRecord, error)
+	GetActivePromptVersion(context.Context, string) (db.PromptVersion, error)
+	InsertPromptVersion(context.Context, string, string, int, string) (int64, error)
+	MarkPromptGapsConsumed(context.Context, []int64) error
+	ActivatePromptVersion(context.Context, int64) error
+	GetLatestEvalRecall(context.Context) (float64, error)
+	SetPromptVersionEvalScore(context.Context, int64, float64) error
+	RollbackPromptVersion(context.Context, int64) error
+	GetPromptVersionByNumber(context.Context, string, int) (db.PromptVersion, error)
 }
 
 // Service implements the automated prompt refinement loop.
 type Service struct {
 	cfg    Config
-	store  *db.Store
+	store  promptStore
 	client LLMClient
 	logger *slog.Logger
 }
@@ -101,8 +116,10 @@ func (s *Service) CheckAndRefine(ctx context.Context) (RefineResult, error) {
 	if err == nil {
 		currentContent = active.Content
 		parentVersion = active.Version
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return RefineResult{}, fmt.Errorf("get active prompt version: %w", err)
 	}
-	// If err != nil (no active version), we use the default.
+	// If no active version exists, use the default.
 
 	// Build the refinement request.
 	gapTexts := make([]string, len(gaps))
@@ -160,8 +177,11 @@ func (s *Service) CheckAndRefine(ctx context.Context) (RefineResult, error) {
 func (s *Service) EvalAndMaybeRollback(ctx context.Context) (RefineResult, error) {
 	active, err := s.store.GetActivePromptVersion(ctx, PromptNameReviewerSystem)
 	if err != nil {
-		// No active version — nothing to roll back.
-		return RefineResult{}, nil
+		if errors.Is(err, sql.ErrNoRows) {
+			// No active version — nothing to roll back.
+			return RefineResult{}, nil
+		}
+		return RefineResult{}, fmt.Errorf("get active prompt version: %w", err)
 	}
 	if active.EvalScore != nil {
 		// Already evaluated — no action needed.
@@ -188,11 +208,11 @@ func (s *Service) EvalAndMaybeRollback(ctx context.Context) (RefineResult, error
 		return RefineResult{}, nil
 	}
 
-	parent, err := s.store.GetActivePromptVersion(ctx, PromptNameReviewerSystem)
-	// Re-fetch won't work since active is still active. Instead look up the parent directly.
-	_ = parent
 	parentScore, err := s.getParentEvalScore(ctx, active.PromptName, active.ParentVersion)
-	if err != nil || parentScore == 0 {
+	if err != nil {
+		return RefineResult{}, fmt.Errorf("get parent eval score: %w", err)
+	}
+	if parentScore == 0 {
 		// No parent score to compare — keep the new version.
 		return RefineResult{}, nil
 	}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -505,36 +506,94 @@ func main() {
 	}
 
 	// --- Analytics dashboard ---
-	dash := dashboard.New(store, logger)
+	dash := dashboard.New(store, logger, dashboard.WithBearerToken(cfg.DashboardBearerToken))
 	dash.Register(healthSrv.Mux())
-	logger.Info("analytics dashboard enabled", "path", "/dashboard/")
+	logger.Info("analytics dashboard enabled", "path", "/dashboard/", "auth_enabled", cfg.DashboardBearerToken != "")
 
-	go func() {
-		if err := healthSrv.ListenAndServe(healthAddr); err != nil {
-			logger.Error("health server error", "error", err)
-		}
-	}()
+	managementListener, err := healthSrv.Listen(healthAddr)
+	if err != nil {
+		logger.Error("failed to bind health server", "addr", healthAddr, "error", err)
+		os.Exit(1)
+	}
 
 	// --- Run ---
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
+	var listenerRunning atomic.Bool
+	var pipelineRunning atomic.Bool
+	if err := healthSrv.AddReadinessFunc("listener", func(context.Context) error {
+		if !listenerRunning.Load() {
+			return fmt.Errorf("listener is not running")
+		}
+		return nil
+	}); err != nil {
+		logger.Error("failed to register listener readiness check", "error", err)
+		os.Exit(1)
+	}
+	if pipelineRunner != nil {
+		if err := healthSrv.AddReadinessFunc("pipeline", func(context.Context) error {
+			if !pipelineRunning.Load() {
+				return fmt.Errorf("pipeline is not running")
+			}
+			return nil
+		}); err != nil {
+			logger.Error("failed to register pipeline readiness check", "error", err)
+			os.Exit(1)
+		}
+	}
 
-	listenerDone := make(chan struct{})
 	go func() {
-		defer close(listenerDone)
-		if err := svc.Run(ctx); err != nil {
-			errCh <- err
+		if err := healthSrv.Serve(managementListener); err != nil {
+			errCh <- fmt.Errorf("health server: %w", err)
+			return
+		}
+		if ctx.Err() == nil {
+			errCh <- fmt.Errorf("health server stopped unexpectedly")
 		}
 	}()
 
+	heartbeatStarted := make(chan struct{})
+	go func() {
+		close(heartbeatStarted)
+		healthSrv.RunHeartbeat(ctx, 10*time.Second)
+	}()
+
+	listenerStarted := make(chan struct{})
+	listenerDone := make(chan struct{})
+	go func() {
+		listenerRunning.Store(true)
+		close(listenerStarted)
+		defer listenerRunning.Store(false)
+		defer close(listenerDone)
+		if err := svc.Run(ctx); err != nil {
+			errCh <- fmt.Errorf("listener: %w", err)
+			return
+		}
+		if ctx.Err() == nil {
+			errCh <- fmt.Errorf("listener stopped unexpectedly")
+		}
+	}()
+
+	pipelineStarted := make(chan struct{})
 	pipelineDone := make(chan struct{})
 	if pipelineRunner != nil {
 		go func() {
+			pipelineRunning.Store(true)
+			close(pipelineStarted)
+			defer pipelineRunning.Store(false)
 			defer close(pipelineDone)
 			pipelineRunner.Run(ctx)
+			if ctx.Err() == nil {
+				errCh <- fmt.Errorf("pipeline stopped unexpectedly")
+			}
 		}()
 	} else {
+		close(pipelineStarted)
 		close(pipelineDone)
 	}
+
+	<-heartbeatStarted
+	<-listenerStarted
+	<-pipelineStarted
 
 	// --- Background prompt refinement loop (checks every 5 minutes) ---
 	go func() {
@@ -597,10 +656,11 @@ func main() {
 
 	healthSrv.SetReady(true)
 
+	var fatalErr error
 	select {
-	case err := <-errCh:
-		logger.Error("service exited with error", "error", err)
-		os.Exit(1)
+	case fatalErr = <-errCh:
+		logger.Error("service exited with error", "error", fatalErr)
+		cancel()
 	case <-ctx.Done():
 		logger.Info("shutting down, waiting for in-flight work to drain")
 	}
@@ -630,6 +690,9 @@ func main() {
 	// Shut down the health server after draining work.
 	if err := healthSrv.Shutdown(drainCtx); err != nil {
 		logger.Warn("health server shutdown error", "error", err)
+	}
+	if fatalErr != nil {
+		os.Exit(1)
 	}
 }
 

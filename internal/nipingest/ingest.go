@@ -9,6 +9,7 @@ package nipingest
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -23,11 +24,11 @@ import (
 
 // Chunk represents a single section extracted from a NIP markdown file.
 type Chunk struct {
-	NIPID        string   // e.g. "01", "46", "5F"
-	SectionTitle string   // e.g. "Protocol Overview", "Event Kinds"
-	Content      string   // full text of the section
-	EventKinds   []int    // event kinds mentioned (e.g. 1617, 30617)
-	ContentHash  string   // sha256 hex of content for dedup
+	NIPID        string // e.g. "01", "46", "5F"
+	SectionTitle string // e.g. "Protocol Overview", "Event Kinds"
+	Content      string // full text of the section
+	EventKinds   []int  // event kinds mentioned (e.g. 1617, 30617)
+	ContentHash  string // sha256 hex of content for dedup
 }
 
 // Ingester orchestrates NIP spec ingestion into Qdrant.
@@ -62,7 +63,7 @@ func NewIngester(qdrant *vectorstore.Client, embedder *embedding.Client, logger 
 // Returns the number of chunks upserted and any error.
 func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 	if cfg.VectorDim <= 0 {
-		cfg.VectorDim = 768 // default for nomic-embed
+		cfg.VectorDim = embedding.DefaultDimension
 	}
 
 	// Ensure collection exists.
@@ -89,7 +90,10 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 		existingHashes = make(map[string]string)
 	}
 
+	var totalIntended int
 	var totalUpserted int
+	var totalFailed int
+	var chunkErrors []error
 
 	for _, file := range files {
 		select {
@@ -125,12 +129,15 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 			ing.logger.Debug("no changes", "nip", nipID)
 			continue
 		}
+		totalIntended += len(toUpsert)
 
 		// Embed and upsert.
 		points := make([]vectorstore.Point, 0, len(toUpsert))
 		for _, c := range toUpsert {
 			vec, err := ing.embedder.Embed(ctx, c.Content)
 			if err != nil {
+				totalFailed++
+				chunkErrors = append(chunkErrors, fmt.Errorf("embed NIP-%s section %q: %w", c.NIPID, c.SectionTitle, err))
 				ing.logger.Warn("embed failed, skip chunk", "nip", c.NIPID, "section", c.SectionTitle, "error", err)
 				continue
 			}
@@ -150,6 +157,8 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 
 		if len(points) > 0 {
 			if err := ing.qdrant.Upsert(ctx, vectorstore.CollectionNIPSpecs, points); err != nil {
+				totalFailed += len(points)
+				chunkErrors = append(chunkErrors, fmt.Errorf("upsert NIP-%s (%d chunks): %w", nipID, len(points), err))
 				ing.logger.Warn("upsert failed", "nip", nipID, "error", err)
 				continue
 			}
@@ -158,7 +167,16 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 		}
 	}
 
-	ing.logger.Info("NIP ingestion complete", "total_upserted", totalUpserted)
+	ing.logger.Info("NIP ingestion complete",
+		"chunks_intended", totalIntended,
+		"chunks_upserted", totalUpserted,
+		"chunks_failed", totalFailed)
+	if totalFailed > 0 {
+		return totalUpserted, fmt.Errorf(
+			"NIP ingestion incomplete: intended_chunks=%d upserted_chunks=%d failed_chunks=%d: %w",
+			totalIntended, totalUpserted, totalFailed, errors.Join(chunkErrors...),
+		)
+	}
 	return totalUpserted, nil
 }
 

@@ -11,6 +11,7 @@ package docsingest
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -99,7 +100,7 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 		return 0, fmt.Errorf("docsingest: RepoID is required")
 	}
 	if cfg.VectorDim <= 0 {
-		cfg.VectorDim = 768
+		cfg.VectorDim = embedding.DefaultDimension
 	}
 
 	// Ensure collection exists.
@@ -123,7 +124,10 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 		existingHashes = make(map[string]string)
 	}
 
+	var totalIntended int
 	var totalUpserted int
+	var totalFailed int
+	var chunkErrors []error
 
 	for _, relPath := range files {
 		select {
@@ -164,12 +168,15 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 			ing.logger.Debug("no changes", "file", relPath)
 			continue
 		}
+		totalIntended += len(toUpsert)
 
 		// Embed and upsert.
 		points := make([]vectorstore.Point, 0, len(toUpsert))
 		for _, c := range toUpsert {
 			vec, err := ing.embedder.Embed(ctx, c.Content)
 			if err != nil {
+				totalFailed++
+				chunkErrors = append(chunkErrors, fmt.Errorf("embed %s section %q: %w", c.FilePath, c.SectionTitle, err))
 				ing.logger.Warn("embed failed, skip chunk",
 					"file", c.FilePath, "section", c.SectionTitle, "error", err)
 				continue
@@ -190,6 +197,8 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 
 		if len(points) > 0 {
 			if err := ing.qdrant.Upsert(ctx, vectorstore.CollectionProjectDocs, points); err != nil {
+				totalFailed += len(points)
+				chunkErrors = append(chunkErrors, fmt.Errorf("upsert %s (%d chunks): %w", relPath, len(points), err))
 				ing.logger.Warn("upsert failed", "file", relPath, "error", err)
 				continue
 			}
@@ -199,7 +208,16 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 	}
 
 	ing.logger.Info("project docs ingestion complete",
-		"repo_id", cfg.RepoID, "total_upserted", totalUpserted)
+		"repo_id", cfg.RepoID,
+		"chunks_intended", totalIntended,
+		"chunks_upserted", totalUpserted,
+		"chunks_failed", totalFailed)
+	if totalFailed > 0 {
+		return totalUpserted, fmt.Errorf(
+			"project docs ingestion incomplete: intended_chunks=%d upserted_chunks=%d failed_chunks=%d: %w",
+			totalIntended, totalUpserted, totalFailed, errors.Join(chunkErrors...),
+		)
+	}
 	return totalUpserted, nil
 }
 

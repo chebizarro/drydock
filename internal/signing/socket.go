@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"fiatjaf.com/nostr"
@@ -92,7 +93,10 @@ func (e *rpcError) Error() string {
 // NewSocketSigner creates a socket signer client and performs the NIP-5F handshake.
 // Returns the connected signer or an error if the socket is unreachable.
 func NewSocketSigner(ctx context.Context, cfg SocketSignerConfig) (*SocketSigner, error) {
-	path := resolveSocketPath(cfg.SocketPath)
+	path, err := resolveSocketPath(cfg.SocketPath)
+	if err != nil {
+		return nil, err
+	}
 	clientName := cfg.ClientName
 	if clientName == "" {
 		clientName = "drydock"
@@ -233,6 +237,9 @@ func (s *SocketSigner) call(ctx context.Context, method string, params []any) (j
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
+	if resp.ID != req.ID {
+		return nil, fmt.Errorf("response ID mismatch: got %q, want %q", resp.ID, req.ID)
+	}
 	if resp.Error != nil {
 		return nil, resp.Error
 	}
@@ -247,6 +254,10 @@ func (s *SocketSigner) connect(ctx context.Context) error {
 }
 
 func (s *SocketSigner) connectLocked(ctx context.Context) error {
+	if err := validateSocket(s.socketPath); err != nil {
+		return err
+	}
+
 	dialer := net.Dialer{Timeout: dialTimeout}
 	conn, err := dialer.DialContext(ctx, "unix", s.socketPath)
 	if err != nil {
@@ -340,17 +351,38 @@ func (s *SocketSigner) readFrame(v any) error {
 	return nil
 }
 
+func validateSocket(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect signer socket %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("signer socket path %s is not a Unix socket", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot determine owner of signer socket %s", path)
+	}
+	if int(stat.Uid) != os.Geteuid() {
+		return fmt.Errorf("signer socket %s is owned by uid %d, current uid is %d", path, stat.Uid, os.Geteuid())
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("signer socket %s has unsafe mode %04o; group and other permissions must be disabled", path, info.Mode().Perm())
+	}
+	return nil
+}
+
 // resolveSocketPath determines the socket path from config, env, or default.
-func resolveSocketPath(configured string) string {
+func resolveSocketPath(configured string) (string, error) {
 	if configured != "" {
-		return configured
+		return configured, nil
 	}
 	if env := os.Getenv("NOSTR_SIGNER_SOCK"); env != "" {
-		return env
+		return env, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join("/tmp", "nostr-signer.sock")
+		return "", fmt.Errorf("determine signer socket path: %w; configure SocketPath or NOSTR_SIGNER_SOCK", err)
 	}
-	return filepath.Join(home, defaultSocketRel)
+	return filepath.Join(home, defaultSocketRel), nil
 }

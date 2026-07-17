@@ -3,8 +3,10 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,15 +34,16 @@ type namedCheck struct {
 
 // Server provides /healthz and /readyz HTTP endpoints.
 type Server struct {
-	mux              *http.ServeMux
-	srv              *http.Server
-	logger           *slog.Logger
-	db               Checker
-	ready            atomic.Bool
-	lastActivityUnix atomic.Int64
-	heartbeatTimeout time.Duration
-	checksMu         sync.RWMutex
-	readinessChecks  []namedCheck
+	mux               *http.ServeMux
+	srv               *http.Server
+	logger            *slog.Logger
+	db                Checker
+	ready             atomic.Bool
+	lastActivityUnix  atomic.Int64
+	lastHeartbeatUnix atomic.Int64
+	heartbeatTimeout  time.Duration
+	checksMu          sync.RWMutex
+	readinessChecks   []namedCheck
 }
 
 // New creates a health check server.
@@ -52,6 +55,7 @@ func New(db Checker, logger *slog.Logger) *Server {
 		heartbeatTimeout: 60 * time.Second,
 	}
 	s.RecordActivity()
+	s.recordHeartbeat()
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.mux.HandleFunc("/readyz", s.handleReadyz)
 	s.mux.Handle("/metrics", metrics.Handler())
@@ -96,16 +100,79 @@ func (s *Server) RecordActivity() {
 	s.lastActivityUnix.Store(time.Now().UnixNano())
 }
 
+func (s *Server) newHTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+}
+
+// Listen binds the management listener synchronously so startup failures can be
+// handled before the service reports readiness.
+func (s *Server) Listen(addr string) (net.Listener, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	s.srv = s.newHTTPServer(addr)
+	s.logger.Info("health server listening", "addr", listener.Addr().String())
+	return listener, nil
+}
+
+// Serve serves requests on an already-bound listener. A graceful server close
+// is a normal shutdown and returns nil.
+func (s *Server) Serve(listener net.Listener) error {
+	if s.srv == nil {
+		return fmt.Errorf("health server listener was not initialized")
+	}
+	if err := s.srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
 // ListenAndServe starts the health check server on the given address.
 func (s *Server) ListenAndServe(addr string) error {
-	s.srv = &http.Server{
-		Addr:         addr,
-		Handler:      s.mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
+	listener, err := s.Listen(addr)
+	if err != nil {
+		return err
 	}
-	s.logger.Info("health server listening", "addr", addr)
-	return s.srv.ListenAndServe()
+	return s.Serve(listener)
+}
+
+// RunHeartbeat maintains the internal service heartbeat independently of
+// workload arrivals. It blocks until ctx is cancelled.
+func (s *Server) RunHeartbeat(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	s.recordHeartbeat()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.recordHeartbeat()
+		}
+	}
+}
+
+func (s *Server) recordHeartbeat() {
+	now := time.Now()
+	s.lastHeartbeatUnix.Store(now.UnixNano())
+	lastActivity := time.Unix(0, s.lastActivityUnix.Load())
+	inactivity := int64(now.Sub(lastActivity).Seconds())
+	if inactivity < 0 {
+		inactivity = 0
+	}
+	metrics.WorkloadInactivitySeconds.Set(inactivity)
 }
 
 // Shutdown gracefully shuts down the health server, waiting for in-flight
@@ -166,8 +233,8 @@ func degradedComponents(components []componentStatus) []string {
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	lastActivity := time.Unix(0, s.lastActivityUnix.Load())
-	if time.Since(lastActivity) > s.heartbeatTimeout {
+	lastHeartbeat := time.Unix(0, s.lastHeartbeatUnix.Load())
+	if time.Since(lastHeartbeat) > s.heartbeatTimeout {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(healthResponse{Status: "unhealthy", Error: "heartbeat stale"})
 		return

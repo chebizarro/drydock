@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -41,10 +42,18 @@ type managedProcess struct {
 	lastUsed time.Time
 }
 
+type processStart struct {
+	done chan struct{}
+	conn *lspConn
+	err  error
+}
+
 // Manager manages language server processes.
 type Manager struct {
 	mu             sync.Mutex
 	processes      map[processKey]*managedProcess
+	starts         map[processKey]*processStart
+	stopped        bool
 	logger         *slog.Logger
 	cancel         context.CancelFunc
 	commandConfigs map[string]lspbridge.LSPCommandConfig
@@ -78,6 +87,7 @@ func NewManager(logger *slog.Logger, opts ...ManagerOption) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
 		processes:      make(map[processKey]*managedProcess),
+		starts:         make(map[processKey]*processStart),
 		logger:         logger,
 		cancel:         cancel,
 		commandConfigs: options.commandConfigs,
@@ -91,70 +101,96 @@ func (m *Manager) GetOrStart(ctx context.Context, lang, repoPath string) (*lspCo
 	key := processKey{lang: lang, repoPath: repoPath}
 
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return nil, errors.New("language server manager is shut down")
+	}
 	if proc, ok := m.processes[key]; ok {
 		proc.lastUsed = time.Now()
 		m.mu.Unlock()
 		return proc.conn, nil
 	}
+	if start, ok := m.starts[key]; ok {
+		m.mu.Unlock()
+		select {
+		case <-start.done:
+			return start.conn, start.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	start := &processStart{done: make(chan struct{})}
+	m.starts[key] = start
 	m.mu.Unlock()
 
-	// Start new process.
-	commandConfig, err := m.commandConfig(lang)
+	proc, cmdName, err := m.startProcess(ctx, lang, repoPath)
+
+	m.mu.Lock()
+	delete(m.starts, key)
+	if err == nil && !m.stopped {
+		m.processes[key] = proc
+		start.conn = proc.conn
+	} else if err == nil {
+		err = errors.New("language server manager is shut down")
+	}
+	start.err = err
+	close(start.done)
+	m.mu.Unlock()
+
+	if proc != nil && err != nil {
+		stopProcess(proc)
+	}
 	if err != nil {
 		return nil, err
 	}
-	cmdName := commandConfig.Command
 
-	// Check if the command exists.
+	m.logger.Info("started language server", "lang", lang, "cmd", cmdName, "repo", repoPath)
+	return proc.conn, nil
+}
+
+func (m *Manager) startProcess(ctx context.Context, lang, repoPath string) (*managedProcess, string, error) {
+	commandConfig, err := m.commandConfig(lang)
+	if err != nil {
+		return nil, "", err
+	}
+	cmdName := commandConfig.Command
 	if _, err := exec.LookPath(cmdName); err != nil {
-		return nil, fmt.Errorf("language server %q not found: %w", cmdName, err)
+		return nil, cmdName, fmt.Errorf("language server %q not found: %w", cmdName, err)
 	}
 
 	args := append([]string(nil), commandConfig.Args...)
 	cmd := exec.CommandContext(ctx, cmdName, args...)
 	cmd.Dir = repoPath
-	cmd.Stderr = os.Stderr // forward LSP server errors for debugging
+	cmd.Stderr = os.Stderr
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, fmt.Errorf("stdin pipe: %w", err)
+		return nil, cmdName, fmt.Errorf("stdin pipe: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
+		return nil, cmdName, fmt.Errorf("stdout pipe: %w", err)
 	}
-
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start %s: %w", cmdName, err)
+		return nil, cmdName, fmt.Errorf("start %s: %w", cmdName, err)
 	}
 
 	conn := newLSPConn(stdin, stdout)
-
-	// Initialize the LSP connection.
 	initCtx, initCancel := context.WithTimeout(ctx, initTimeout)
 	defer initCancel()
-
 	if err := initializeLSP(initCtx, conn, repoPath); err != nil {
-		conn.close()
-		cmd.Process.Kill()
-		cmd.Wait()
-		return nil, fmt.Errorf("initialize %s: %w", cmdName, err)
+		proc := &managedProcess{cmd: cmd, conn: conn, lang: lang, repoPath: repoPath}
+		killProcess(proc)
+		return nil, cmdName, fmt.Errorf("initialize %s: %w", cmdName, err)
 	}
 
-	proc := &managedProcess{
+	return &managedProcess{
 		cmd:      cmd,
 		conn:     conn,
 		lang:     lang,
 		repoPath: repoPath,
 		lastUsed: time.Now(),
-	}
-
-	m.mu.Lock()
-	m.processes[key] = proc
-	m.mu.Unlock()
-
-	m.logger.Info("started language server", "lang", lang, "cmd", cmdName, "repo", repoPath)
-	return conn, nil
+	}, cmdName, nil
 }
 
 // ProcessStatus returns the status of all managed processes.
@@ -175,15 +211,13 @@ func (m *Manager) Shutdown() {
 	m.cancel()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stopped = true
+	processes := m.detachProcessesLocked(func(*managedProcess) bool { return true })
+	m.mu.Unlock()
 
-	for key, proc := range m.processes {
-		m.logger.Info("shutting down language server", "lang", key.lang, "repo", key.repoPath)
-		shutdownLSP(proc.conn)
-		proc.conn.close()
-		proc.cmd.Process.Kill()
-		proc.cmd.Wait()
-		delete(m.processes, key)
+	for _, proc := range processes {
+		m.logger.Info("shutting down language server", "lang", proc.lang, "repo", proc.repoPath)
+		stopProcess(proc)
 	}
 }
 
@@ -203,20 +237,41 @@ func (m *Manager) reapLoop(ctx context.Context) {
 }
 
 func (m *Manager) reapIdle() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	now := time.Now()
+	m.mu.Lock()
+	processes := m.detachProcessesLocked(func(proc *managedProcess) bool {
+		return now.Sub(proc.lastUsed) > idleTTL
+	})
+	m.mu.Unlock()
+
+	for _, proc := range processes {
+		m.logger.Info("reaping idle language server", "lang", proc.lang, "repo", proc.repoPath)
+		stopProcess(proc)
+	}
+}
+
+func (m *Manager) detachProcessesLocked(match func(*managedProcess) bool) []*managedProcess {
+	var processes []*managedProcess
 	for key, proc := range m.processes {
-		if now.Sub(proc.lastUsed) > idleTTL {
-			m.logger.Info("reaping idle language server", "lang", key.lang, "repo", key.repoPath)
-			shutdownLSP(proc.conn)
-			proc.conn.close()
-			proc.cmd.Process.Kill()
-			proc.cmd.Wait()
+		if match(proc) {
 			delete(m.processes, key)
+			processes = append(processes, proc)
 		}
 	}
+	return processes
+}
+
+func stopProcess(proc *managedProcess) {
+	shutdownLSP(proc.conn)
+	killProcess(proc)
+}
+
+func killProcess(proc *managedProcess) {
+	proc.conn.close()
+	if proc.cmd.Process != nil {
+		_ = proc.cmd.Process.Kill()
+	}
+	_ = proc.cmd.Wait()
 }
 
 // initializeLSP sends the LSP initialize/initialized handshake.

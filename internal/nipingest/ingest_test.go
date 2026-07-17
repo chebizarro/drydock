@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"drydock/internal/embedding"
@@ -219,6 +220,55 @@ func TestRun_Integration(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("expected 3 chunks upserted, got %d", n)
+	}
+}
+
+func TestRun_AllUpsertsFailReturnsErrorWithZeroCount(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "34.md"), []byte("## Repository Announcements\n\nKind 30617.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"embedding": []float32{0.1, 0.2, 0.3}, "index": 0}},
+		})
+	}))
+	defer embedSrv.Close()
+
+	qdrantSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(map[string]any{
+				"result": map[string]any{"status": "green", "points_count": 0,
+					"config": map[string]any{"params": map[string]any{"vectors": map[string]any{"size": 3}}}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/collections/nip_specs/points/scroll":
+			json.NewEncoder(w).Encode(map[string]any{
+				"result": map[string]any{"points": []any{}, "next_page_offset": nil},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/collections/nip_specs/points":
+			http.Error(w, "upsert unavailable", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer qdrantSrv.Close()
+
+	ingester := NewIngester(
+		vectorstore.NewClient(qdrantSrv.URL, ""),
+		embedding.NewClient(embedSrv.URL, "", "test-model"),
+		nil,
+	)
+	n, err := ingester.Run(context.Background(), Config{NIPsDir: dir, VectorDim: 3})
+	if err == nil {
+		t.Fatal("expected error when every upsert fails")
+	}
+	if n != 0 {
+		t.Fatalf("expected zero successful upserts, got %d", n)
+	}
+	if !strings.Contains(err.Error(), "upserted_chunks=0") || !strings.Contains(err.Error(), "failed_chunks=1") {
+		t.Fatalf("expected aggregate chunk counts, got %v", err)
 	}
 }
 

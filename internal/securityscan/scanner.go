@@ -3,6 +3,9 @@ package securityscan
 import (
 	"bufio"
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +28,8 @@ type SecurityFinding struct {
 type ScanResult struct {
 	Findings     []SecurityFinding
 	FilesScanned int
+	FilesSkipped int
+	FilesErrored int
 	RulesChecked int
 }
 
@@ -72,14 +77,22 @@ func (s *Scanner) ScanFiles(ctx context.Context, repoPath string, changedFiles [
 				// Diff is present but this file has no added lines
 				// (rename-only, mode change, binary, etc.) — skip scanning
 				// to avoid surfacing pre-existing issues.
-				result.FilesScanned++
+				result.FilesSkipped++
 				continue
 			}
 			lineFilter = fileLines
 		}
 		// If hasDiff is false (no diff provided), lineFilter stays nil → scan whole file.
 
-		findings := s.scanFile(ctx, relPath, absPath, lineFilter)
+		findings, err := s.scanFile(ctx, relPath, absPath, lineFilter)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				result.FilesSkipped++
+			} else {
+				result.FilesErrored++
+			}
+			continue
+		}
 		result.Findings = append(result.Findings, findings...)
 		result.FilesScanned++
 	}
@@ -89,10 +102,10 @@ func (s *Scanner) ScanFiles(ctx context.Context, repoPath string, changedFiles [
 
 // scanFile scans a single file against all applicable rules.
 // If addedLineNums is non-nil, only those line numbers are checked (diff-aware).
-func (s *Scanner) scanFile(_ context.Context, relPath, absPath string, addedLineNums map[int]bool) []SecurityFinding {
+func (s *Scanner) scanFile(_ context.Context, relPath, absPath string, addedLineNums map[int]bool) ([]SecurityFinding, error) {
 	f, err := os.Open(absPath)
 	if err != nil {
-		return nil // file may have been deleted
+		return nil, fmt.Errorf("open %s: %w", relPath, err)
 	}
 	defer f.Close()
 
@@ -137,7 +150,10 @@ func (s *Scanner) scanFile(_ context.Context, relPath, absPath string, addedLine
 		}
 	}
 
-	return findings
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan %s: %w", relPath, err)
+	}
+	return findings, nil
 }
 
 // parseDiffAddedLines extracts a map of file → {lineNumber: true} for all lines

@@ -370,6 +370,54 @@ func TestRun_Dedup(t *testing.T) {
 	}
 }
 
+func TestRun_AllUpsertsFailReturnsErrorWithZeroCount(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/collections/project_docs", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{"status": "green", "points_count": 0,
+				"config": map[string]any{"params": map[string]any{"vectors": map[string]any{"size": 4}}}},
+		})
+	})
+	mux.HandleFunc("/collections/project_docs/points/scroll", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{"points": []any{}, "next_page_offset": nil},
+		})
+	})
+	mux.HandleFunc("/collections/project_docs/points", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upsert unavailable", http.StatusServiceUnavailable)
+	})
+	qdrantSrv := httptest.NewServer(mux)
+	defer qdrantSrv.Close()
+
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"embedding": []float32{0.1, 0.2, 0.3, 0.4}, "index": 0}},
+		})
+	}))
+	defer embedSrv.Close()
+
+	repoDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("## Usage\n\nUse it.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ingester := NewIngester(
+		vectorstore.NewClient(qdrantSrv.URL, ""),
+		embedding.NewClient(embedSrv.URL, "", "test-model"),
+		nopLogger(),
+	)
+
+	n, err := ingester.Run(context.Background(), Config{RepoPath: repoDir, RepoID: "test-repo", VectorDim: 4})
+	if err == nil {
+		t.Fatal("expected error when every upsert fails")
+	}
+	if n != 0 {
+		t.Fatalf("expected zero successful upserts, got %d", n)
+	}
+	if !strings.Contains(err.Error(), "upserted_chunks=0") || !strings.Contains(err.Error(), "failed_chunks=1") {
+		t.Fatalf("expected aggregate chunk counts, got %v", err)
+	}
+}
+
 func nopLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

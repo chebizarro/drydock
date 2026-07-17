@@ -92,14 +92,14 @@ func TestAnalyzeEndpoint_NoSupportedLanguages(t *testing.T) {
 
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", w.Code)
 	}
 
 	var resp lspbridge.AnalyzeResponse
 	json.NewDecoder(w.Body).Decode(&resp)
-	if resp.Error == "" {
-		t.Error("expected error about no supported languages")
+	if resp.Status != "error" || resp.Error == "" {
+		t.Fatalf("expected error status about no supported languages, got %+v", resp)
 	}
 }
 
@@ -125,6 +125,86 @@ func TestAnalyzeEndpoint_LanguageServerFailureReturnsStructuredBadGateway(t *tes
 	}
 	if len(resp.LanguageErrors) != 1 || resp.LanguageErrors[0].Language != lspbridge.LangGo {
 		t.Fatalf("expected per-language go error, got %+v", resp.LanguageErrors)
+	}
+}
+
+func TestAnalyzeEndpoint_SubrequestFailuresReturnDegradedReasons(t *testing.T) {
+	repo := t.TempDir()
+	writeFile(t, filepath.Join(repo, "main.go"), "package main\nfunc Target() {}\n")
+
+	conn := newFakeLSPConn(t, func(method string, _ json.RawMessage) (any, *jsonRPCError) {
+		switch method {
+		case "textDocument/diagnostic":
+			return nil, &jsonRPCError{Code: -32601, Message: "diagnostic unsupported"}
+		case "workspace/symbol":
+			return []map[string]any{{
+				"name": "Target",
+				"kind": 12,
+				"location": map[string]any{
+					"uri":   fileURI(filepath.Join(repo, "main.go")),
+					"range": map[string]any{"start": map[string]any{"line": 1, "character": 5}},
+				},
+			}}, nil
+		case "textDocument/references":
+			return nil, &jsonRPCError{Code: -32603, Message: "reference lookup failed"}
+		default:
+			return nil, &jsonRPCError{Code: -32601, Message: "method not found"}
+		}
+	})
+	defer conn.close()
+
+	h := NewHandlerWithOptions(fakeManager{conn: conn}, nil, HandlerOptions{AllowedRepoRoots: []string{repo}})
+	body := fmt.Sprintf(`{"repo_path":%q,"changed_files":["main.go"],"symbols":["Target"]}`, repo)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/analyze", strings.NewReader(body)))
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 for degraded analysis, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp lspbridge.AnalyzeResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "degraded" {
+		t.Fatalf("expected degraded status, got %+v", resp)
+	}
+	codes := make(map[string]bool)
+	for _, operationErr := range resp.LanguageErrors {
+		codes[operationErr.Code] = true
+	}
+	for _, code := range []string{"diagnostics_failed", "references_failed"} {
+		if !codes[code] {
+			t.Fatalf("expected %s degradation reason, got %+v", code, resp.LanguageErrors)
+		}
+	}
+}
+
+func TestAnalyzeEndpoint_WorkspaceSymbolFailureIsSurfaced(t *testing.T) {
+	repo := t.TempDir()
+	writeFile(t, filepath.Join(repo, "main.go"), "package main\n")
+	conn := newFakeLSPConn(t, func(method string, _ json.RawMessage) (any, *jsonRPCError) {
+		switch method {
+		case "textDocument/diagnostic":
+			return map[string]any{"kind": "full", "items": []any{}}, nil
+		case "workspace/symbol":
+			return nil, &jsonRPCError{Code: -32603, Message: "symbol lookup failed"}
+		default:
+			return nil, &jsonRPCError{Code: -32601, Message: "method not found"}
+		}
+	})
+	defer conn.close()
+
+	h := NewHandlerWithOptions(fakeManager{conn: conn}, nil, HandlerOptions{AllowedRepoRoots: []string{repo}})
+	body := fmt.Sprintf(`{"repo_path":%q,"changed_files":["main.go"],"symbols":["Target"]}`, repo)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/analyze", strings.NewReader(body)))
+
+	var resp lspbridge.AnalyzeResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if w.Code != http.StatusBadGateway || resp.Status != "degraded" || len(resp.LanguageErrors) != 1 || resp.LanguageErrors[0].Code != "workspace_symbol_failed" {
+		t.Fatalf("expected surfaced workspace symbol degradation, code=%d response=%+v", w.Code, resp)
 	}
 }
 

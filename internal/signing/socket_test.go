@@ -32,6 +32,10 @@ func mockSocketSigner(t *testing.T, handler func(conn net.Conn)) (string, func()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	if err := os.Chmod(sockPath, 0o600); err != nil {
+		ln.Close()
+		t.Fatalf("secure socket mode: %v", err)
+	}
 
 	go func() {
 		for {
@@ -469,26 +473,87 @@ func TestSocketSigner_ConnectionRefused(t *testing.T) {
 
 func TestResolveSocketPath(t *testing.T) {
 	// Configured path takes precedence.
-	got := resolveSocketPath("/custom/path.sock")
-	if got != "/custom/path.sock" {
-		t.Errorf("expected /custom/path.sock, got %s", got)
+	got, err := resolveSocketPath("/custom/path.sock")
+	if err != nil || got != "/custom/path.sock" {
+		t.Fatalf("resolve configured path = %q, %v", got, err)
 	}
 
 	// Environment variable fallback.
-	os.Setenv("NOSTR_SIGNER_SOCK", "/env/path.sock")
-	defer os.Unsetenv("NOSTR_SIGNER_SOCK")
-	got = resolveSocketPath("")
-	if got != "/env/path.sock" {
-		t.Errorf("expected /env/path.sock, got %s", got)
+	t.Setenv("NOSTR_SIGNER_SOCK", "/env/path.sock")
+	got, err = resolveSocketPath("")
+	if err != nil || got != "/env/path.sock" {
+		t.Fatalf("resolve environment path = %q, %v", got, err)
 	}
 
 	// Default path.
-	os.Unsetenv("NOSTR_SIGNER_SOCK")
-	got = resolveSocketPath("")
+	t.Setenv("NOSTR_SIGNER_SOCK", "")
+	got, err = resolveSocketPath("")
+	if err != nil {
+		t.Fatalf("resolve default path: %v", err)
+	}
 	home, _ := os.UserHomeDir()
 	expected := filepath.Join(home, ".local/share/nostr/signer.sock")
 	if got != expected {
 		t.Errorf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestResolveSocketPathFailsClosedWithoutHome(t *testing.T) {
+	t.Setenv("NOSTR_SIGNER_SOCK", "")
+	t.Setenv("HOME", "")
+
+	path, err := resolveSocketPath("")
+	if err == nil {
+		t.Fatalf("expected path resolution error, got %q", path)
+	}
+	if !strings.Contains(err.Error(), "configure SocketPath or NOSTR_SIGNER_SOCK") {
+		t.Fatalf("expected configuration guidance, got %v", err)
+	}
+}
+
+func TestSocketSignerRejectsUnsafeSocketMode(t *testing.T) {
+	sockPath, cleanup := mockSocketSigner(t, basicSignerHandler(t))
+	defer cleanup()
+	if err := os.Chmod(sockPath, 0o666); err != nil {
+		t.Fatalf("set unsafe mode: %v", err)
+	}
+
+	_, err := NewSocketSigner(context.Background(), SocketSignerConfig{SocketPath: sockPath})
+	if err == nil || !strings.Contains(err.Error(), "unsafe mode") {
+		t.Fatalf("expected unsafe mode error, got %v", err)
+	}
+}
+
+func TestSocketSignerRejectsNonSocketPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "signer.sock")
+	if err := os.WriteFile(path, []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := NewSocketSigner(context.Background(), SocketSignerConfig{SocketPath: path})
+	if err == nil || !strings.Contains(err.Error(), "not a Unix socket") {
+		t.Fatalf("expected non-socket error, got %v", err)
+	}
+}
+
+func TestSocketSignerRejectsMismatchedResponseID(t *testing.T) {
+	sockPath, cleanup := mockSocketSigner(t, func(conn net.Conn) {
+		defer conn.Close()
+		writeFrameTo(conn, handshakeMsg{Name: "test-signer", SupportedMethods: []string{"get_public_key"}})
+		var hello clientHello
+		readFrameFrom(conn, &hello)
+		var req rpcRequest
+		readFrameFrom(conn, &req)
+		writeFrameTo(conn, rpcResponse{
+			ID:     "wrong-id",
+			Result: json.RawMessage(`"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"`),
+		})
+	})
+	defer cleanup()
+
+	_, err := NewSocketSigner(context.Background(), SocketSignerConfig{SocketPath: sockPath})
+	if err == nil || !strings.Contains(err.Error(), "response ID mismatch") {
+		t.Fatalf("expected response ID mismatch error, got %v", err)
 	}
 }
 

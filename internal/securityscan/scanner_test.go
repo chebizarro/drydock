@@ -252,8 +252,36 @@ func TestScanDeletedFileNoError(t *testing.T) {
 	if len(result.Findings) != 0 {
 		t.Error("should produce no findings for nonexistent file")
 	}
-	if result.FilesScanned != 1 {
-		t.Errorf("expected 1 file attempted, got %d", result.FilesScanned)
+	if result.FilesScanned != 0 {
+		t.Errorf("expected deleted file not to count as scanned, got %d", result.FilesScanned)
+	}
+	if result.FilesSkipped != 1 {
+		t.Errorf("expected 1 skipped file, got %d", result.FilesSkipped)
+	}
+	if result.FilesErrored != 0 {
+		t.Errorf("expected 0 errored files, got %d", result.FilesErrored)
+	}
+}
+
+func TestScanRecordsOpenErrors(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "not-a-directory", "content")
+
+	result := New().ScanFiles(context.Background(), dir, []string{"not-a-directory/file.go"}, "")
+
+	if result.FilesScanned != 0 || result.FilesSkipped != 0 || result.FilesErrored != 1 {
+		t.Fatalf("unexpected counts: scanned=%d skipped=%d errored=%d", result.FilesScanned, result.FilesSkipped, result.FilesErrored)
+	}
+}
+
+func TestScanRecordsScannerErrors(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "oversized.go", strings.Repeat("a", 1024*1024+1))
+
+	result := New().ScanFiles(context.Background(), dir, []string{"oversized.go"}, "")
+
+	if result.FilesScanned != 0 || result.FilesSkipped != 0 || result.FilesErrored != 1 {
+		t.Fatalf("unexpected counts: scanned=%d skipped=%d errored=%d", result.FilesScanned, result.FilesSkipped, result.FilesErrored)
 	}
 }
 

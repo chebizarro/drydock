@@ -61,7 +61,7 @@ func New(qdrant *vectorstore.Client, embedder *embedding.Client, logger *slog.Lo
 	if logger == nil {
 		logger = slog.Default()
 	}
-	vectorDim := 768
+	vectorDim := embedding.DefaultDimension
 	if len(vectorDims) > 0 && vectorDims[0] > 0 {
 		vectorDim = vectorDims[0]
 	}
@@ -222,6 +222,7 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 		// Delete any stale points for this repo.
 		if err := idx.deleteRepoPoints(ctx, repoID); err != nil {
 			idx.logger.Warn("failed to clean stale points", "repo_id", repoID, "error", err)
+			hadErrors = true
 		}
 
 		files, err := gitListFiles(ctx, repoPath, currentCommit)

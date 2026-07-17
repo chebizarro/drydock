@@ -202,6 +202,10 @@ var (
 	// Security scan
 	SecurityScanFindings = &Counter{}
 
+	// Management endpoints
+	DashboardFailures         = NewCounterVec() // label: endpoint
+	WorkloadInactivitySeconds = &Gauge{}
+
 	// Conversations
 	ConversationRepliesReceived = &Counter{}
 	ConversationResponsesSent   = &Counter{}
@@ -386,6 +390,12 @@ func writeMetrics(w io.Writer) {
 	// Security scan
 	writeCounter(w, "drydock_security_scan_findings_total",
 		"Security findings from deterministic SAST scanner.", SecurityScanFindings)
+
+	// Management endpoints
+	writeCounterVec(w, "drydock_dashboard_failures_total",
+		"Dashboard API failures by endpoint.", "endpoint", DashboardFailures)
+	writeGauge(w, "drydock_workload_inactivity_seconds",
+		"Seconds since the last workload activity.", WorkloadInactivitySeconds)
 
 	// Conversations
 	writeCounter(w, "drydock_conversation_replies_received_total",

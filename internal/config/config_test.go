@@ -6,6 +6,21 @@ import (
 	"time"
 )
 
+func TestFromEnvManagementDefaults(t *testing.T) {
+	t.Setenv("DRYDOCK_HEALTH_ADDR", "")
+	t.Setenv("DRYDOCK_DASHBOARD_BEARER_TOKEN", "")
+	cfg := FromEnv()
+	if cfg.HealthAddr != "127.0.0.1:8081" {
+		t.Fatalf("expected loopback management default, got %q", cfg.HealthAddr)
+	}
+
+	t.Setenv("DRYDOCK_DASHBOARD_BEARER_TOKEN", "secret-token")
+	cfg = FromEnv()
+	if cfg.DashboardBearerToken != "secret-token" {
+		t.Fatalf("expected dashboard bearer token from environment, got %q", cfg.DashboardBearerToken)
+	}
+}
+
 func TestValidate_NoRelays(t *testing.T) {
 	cfg := Config{
 		Relays:          []string{},

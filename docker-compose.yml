@@ -89,6 +89,8 @@ services:
     restart: unless-stopped
     profiles:
       - lsp
+    environment:
+      LSP_BRIDGE_AUTH_TOKEN: ${LSP_BRIDGE_AUTH_TOKEN:?Set LSP_BRIDGE_AUTH_TOKEN in .env before starting the LSP bridge}
     volumes:
       - drydock_data:/data:ro  # read-only access to repo cache
     ports:

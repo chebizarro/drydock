@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"drydock/internal/db"
+	"drydock/internal/metrics"
 )
 
 func mustOpenStore(t *testing.T) *db.Store {
@@ -274,6 +275,70 @@ func TestQualityEndpointWithData(t *testing.T) {
 	}
 	if entries[0].DatasetID != "ds1" {
 		t.Errorf("expected dataset ds1, got %s", entries[0].DatasetID)
+	}
+}
+
+func TestDashboardRoutesRequireBearerToken(t *testing.T) {
+	h, _ := newTestHandler(t)
+	mux := http.NewServeMux()
+	New(h.store, nil, WithBearerToken("secret-token")).Register(mux)
+
+	for _, path := range []string{"/dashboard/", "/api/stats", "/api/reviews", "/api/repos", "/api/quality"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 without bearer token, got %d", w.Code)
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected authorized request to succeed, got %d", w.Code)
+	}
+}
+
+func TestDashboardDatabaseErrorsReturnStructured500(t *testing.T) {
+	for _, test := range []struct {
+		path     string
+		endpoint string
+	}{
+		{"/api/stats", "stats"},
+		{"/api/reviews", "reviews"},
+		{"/api/repos", "repos"},
+		{"/api/quality", "quality"},
+	} {
+		t.Run(test.endpoint, func(t *testing.T) {
+			h, store := newTestHandler(t)
+			mux := http.NewServeMux()
+			h.Register(mux)
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+			before := metrics.DashboardFailures.With(test.endpoint).Value()
+
+			req := httptest.NewRequest(http.MethodGet, test.path, nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+			}
+			var response errorResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if response.Error.Code != "database_error" || response.Error.Message == "" {
+				t.Fatalf("unexpected error response: %#v", response)
+			}
+			if got := metrics.DashboardFailures.With(test.endpoint).Value(); got != before+1 {
+				t.Fatalf("expected failure metric to increment, got %d before and %d after", before, got)
+			}
+		})
 	}
 }
 

@@ -119,7 +119,7 @@ func (h *Handler) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	resp := h.analyze(ctx, req)
-	if len(resp.LanguageErrors) > 0 {
+	if resp.Status == analyzeStatusError || len(resp.LanguageErrors) > 0 {
 		statusJSON(w, http.StatusBadGateway, resp)
 		return
 	}
@@ -164,7 +164,7 @@ func (h *Handler) analyze(ctx context.Context, req lspbridge.AnalyzeRequest) lsp
 		for _, f := range files {
 			absPath := filepath.Join(req.RepoPath, f)
 			if err := didOpen(conn, absPath, lang); err != nil {
-				h.logger.Debug("didOpen failed", "file", f, "error", err)
+				h.logger.Warn("didOpen failed", "lang", lang, "file", f, "error", err)
 				resp.LanguageErrors = append(resp.LanguageErrors, lspbridge.LanguageError{
 					Language: lang,
 					Code:     "did_open_failed",
@@ -175,13 +175,16 @@ func (h *Handler) analyze(ctx context.Context, req lspbridge.AnalyzeRequest) lsp
 			openedFiles = append(openedFiles, f)
 		}
 
-		resp.Diagnostics = append(resp.Diagnostics, h.collectDiagnostics(ctx, conn, req.RepoPath, openedFiles)...)
+		diagnostics, diagnosticErrors := h.collectDiagnostics(ctx, conn, lang, req.RepoPath, openedFiles)
+		resp.Diagnostics = append(resp.Diagnostics, diagnostics...)
+		resp.LanguageErrors = append(resp.LanguageErrors, diagnosticErrors...)
 
 		// Search for requested symbols.
 		for _, sym := range req.Symbols {
-			defs, refs := h.lookupSymbol(ctx, conn, lang, req.RepoPath, sym)
+			defs, refs, lookupErrors := h.lookupSymbol(ctx, conn, lang, req.RepoPath, sym)
 			resp.Definitions = append(resp.Definitions, defs...)
 			resp.References = append(resp.References, refs...)
+			resp.LanguageErrors = append(resp.LanguageErrors, lookupErrors...)
 		}
 	}
 
@@ -197,15 +200,21 @@ func (h *Handler) analyze(ctx context.Context, req lspbridge.AnalyzeRequest) lsp
 }
 
 // lookupSymbol queries the language server for symbol definitions and references.
-func (h *Handler) lookupSymbol(ctx context.Context, conn *lspConn, lang, repoPath, symbol string) ([]lspbridge.SymbolInfo, []lspbridge.Reference) {
+func (h *Handler) lookupSymbol(ctx context.Context, conn *lspConn, lang, repoPath, symbol string) ([]lspbridge.SymbolInfo, []lspbridge.Reference, []lspbridge.LanguageError) {
 	var defs []lspbridge.SymbolInfo
 	var refs []lspbridge.Reference
+	var operationErrors []lspbridge.LanguageError
 
 	// workspace/symbol to find definitions.
 	rawSymbols, err := workspaceSymbol(ctx, conn, symbol)
 	if err != nil {
-		h.logger.Debug("workspace/symbol failed", "symbol", symbol, "error", err)
-		return defs, refs
+		h.logger.Warn("workspace/symbol failed", "lang", lang, "symbol", symbol, "error", err)
+		operationErrors = append(operationErrors, lspbridge.LanguageError{
+			Language: lang,
+			Code:     "workspace_symbol_failed",
+			Message:  fmt.Sprintf("%s: %v", symbol, err),
+		})
+		return defs, refs, operationErrors
 	}
 
 	for _, raw := range rawSymbols {
@@ -248,17 +257,25 @@ func (h *Handler) lookupSymbol(ctx context.Context, conn *lspConn, lang, repoPat
 		defs = append(defs, info)
 
 		// textDocument/references for this definition.
-		refResults := h.findReferences(ctx, conn, sym.Location.URI,
-			sym.Location.Range.Start.Line, sym.Location.Range.Start.Character,
-			repoPath, symbol)
+		refResults, err := h.findReferences(ctx, conn, sym.Location.URI,
+			sym.Location.Range.Start.Line, sym.Location.Range.Start.Character, repoPath, symbol)
+		if err != nil {
+			h.logger.Warn("references failed", "lang", lang, "symbol", symbol, "error", err)
+			operationErrors = append(operationErrors, lspbridge.LanguageError{
+				Language: lang,
+				Code:     "references_failed",
+				Message:  fmt.Sprintf("%s: %v", symbol, err),
+			})
+			continue
+		}
 		refs = append(refs, refResults...)
 	}
 
-	return defs, refs
+	return defs, refs, operationErrors
 }
 
 // findReferences sends textDocument/references for a specific location.
-func (h *Handler) findReferences(ctx context.Context, conn *lspConn, uri string, line, col int, repoPath, symbol string) []lspbridge.Reference {
+func (h *Handler) findReferences(ctx context.Context, conn *lspConn, uri string, line, col int, repoPath, symbol string) ([]lspbridge.Reference, error) {
 	params := map[string]any{
 		"textDocument": map[string]any{"uri": uri},
 		"position":     map[string]any{"line": line, "character": col},
@@ -267,8 +284,7 @@ func (h *Handler) findReferences(ctx context.Context, conn *lspConn, uri string,
 
 	result, err := conn.call(ctx, "textDocument/references", params)
 	if err != nil {
-		h.logger.Debug("references failed", "symbol", symbol, "error", err)
-		return nil
+		return nil, err
 	}
 
 	var locations []struct {
@@ -281,7 +297,7 @@ func (h *Handler) findReferences(ctx context.Context, conn *lspConn, uri string,
 		} `json:"range"`
 	}
 	if err := json.Unmarshal(result, &locations); err != nil {
-		return nil
+		return nil, err
 	}
 
 	refs := make([]lspbridge.Reference, 0, len(locations))
@@ -294,21 +310,27 @@ func (h *Handler) findReferences(ctx context.Context, conn *lspConn, uri string,
 			Column: loc.Range.Start.Character + 1,
 		})
 	}
-	return refs
+	return refs, nil
 }
 
-func (h *Handler) collectDiagnostics(ctx context.Context, conn *lspConn, repoPath string, files []string) []lspbridge.Diagnostic {
+func (h *Handler) collectDiagnostics(ctx context.Context, conn *lspConn, lang, repoPath string, files []string) ([]lspbridge.Diagnostic, []lspbridge.LanguageError) {
 	var diagnostics []lspbridge.Diagnostic
+	var operationErrors []lspbridge.LanguageError
 	for _, f := range files {
 		absPath := filepath.Join(repoPath, f)
 		diags, err := pullDiagnostics(ctx, conn, absPath, repoPath)
 		if err != nil {
-			h.logger.Debug("textDocument/diagnostic failed, using published diagnostics", "file", f, "error", err)
+			h.logger.Warn("textDocument/diagnostic failed, using published diagnostics", "lang", lang, "file", f, "error", err)
+			operationErrors = append(operationErrors, lspbridge.LanguageError{
+				Language: lang,
+				Code:     "diagnostics_failed",
+				Message:  fmt.Sprintf("%s: %v", f, err),
+			})
 			diags = conn.publishedDiagnostics(absPath, repoPath)
 		}
 		diagnostics = append(diagnostics, diags...)
 	}
-	return diagnostics
+	return diagnostics, operationErrors
 }
 
 func pullDiagnostics(ctx context.Context, conn *lspConn, absPath, repoPath string) ([]lspbridge.Diagnostic, error) {
@@ -430,9 +452,13 @@ func (h *Handler) authorized(r *http.Request) bool {
 
 func configuredAuthTokens(tokens []string) map[string]struct{} {
 	if len(tokens) == 0 {
-		tokens = append(tokens, splitConfigList(os.Getenv("DRYDOCK_LSP_BRIDGE_TOKENS"))...)
-		if single := strings.TrimSpace(os.Getenv("DRYDOCK_LSP_BRIDGE_TOKEN")); single != "" {
-			tokens = append(tokens, single)
+		for _, key := range []string{"LSP_BRIDGE_AUTH_TOKENS", "DRYDOCK_LSP_BRIDGE_TOKENS"} {
+			tokens = append(tokens, splitTokenList(os.Getenv(key))...)
+		}
+		for _, key := range []string{"LSP_BRIDGE_AUTH_TOKEN", "DRYDOCK_LSP_BRIDGE_TOKEN"} {
+			if single := strings.TrimSpace(os.Getenv(key)); single != "" {
+				tokens = append(tokens, single)
+			}
 		}
 	}
 	out := make(map[string]struct{}, len(tokens))
@@ -442,6 +468,16 @@ func configuredAuthTokens(tokens []string) map[string]struct{} {
 		}
 	}
 	return out
+}
+
+func splitTokenList(value string) []string {
+	var tokens []string
+	for _, token := range strings.Split(value, ",") {
+		if token = strings.TrimSpace(token); token != "" {
+			tokens = append(tokens, token)
+		}
+	}
+	return tokens
 }
 
 func configuredAllowedRoots(roots []string, logger *slog.Logger) []string {

@@ -105,8 +105,9 @@ func failingEmbedServer() *httptest.Server {
 // fakeQdrantServer returns an httptest server that simulates Qdrant.
 // It tracks upserted points and supports search/count/scroll/delete.
 type fakeQdrant struct {
-	server *httptest.Server
-	points map[string][]vectorstore.Point // collection → points
+	server      *httptest.Server
+	points      map[string][]vectorstore.Point // collection → points
+	deleteFails bool
 }
 
 func newFakeQdrant() *fakeQdrant {
@@ -220,6 +221,10 @@ func (fq *fakeQdrant) handle(w http.ResponseWriter, r *http.Request) {
 
 	// POST /collections/<name>/points/delete → delete
 	if r.Method == http.MethodPost && strings.HasSuffix(path, "/points/delete") {
+		if fq.deleteFails {
+			http.Error(w, "delete unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		col := extractCollection(path)
 		body, _ := io.ReadAll(r.Body)
 		var req struct {
@@ -382,6 +387,41 @@ func Goodbye() string {
 	state := readState(repoPath)
 	if state.Commit == "" {
 		t.Error("expected state file to be written with commit hash")
+	}
+}
+
+func TestIndexRepoCleanupFailureReturnsErrorAndDoesNotAdvanceState(t *testing.T) {
+	repoPath := initTestRepo(t, map[string]string{
+		"main.go": "package main\n\nfunc Hello() {}\n",
+	})
+
+	fq := newFakeQdrant()
+	defer fq.server.Close()
+	fq.points[vectorstore.CollectionCodeChunks] = []vectorstore.Point{{
+		ID: "stale-point",
+		Payload: map[string]any{
+			"repo_id":   "test-repo",
+			"file_path": "stale.go",
+		},
+	}}
+	fq.deleteFails = true
+	embedSrv := fakeEmbedServer()
+	defer embedSrv.Close()
+
+	indexer := New(
+		vectorstore.NewClient(fq.server.URL, ""),
+		embedding.NewClient(embedSrv.URL, "", "test-model"),
+		testLogger(),
+	)
+	err := indexer.IndexRepo(context.Background(), repoPath, "test-repo")
+	if err == nil {
+		t.Fatal("expected error when stale-point cleanup fails")
+	}
+	if !strings.Contains(err.Error(), "code index incomplete") {
+		t.Fatalf("expected incomplete index error, got %v", err)
+	}
+	if state := readState(repoPath); state.Commit != "" {
+		t.Fatalf("state advanced despite cleanup failure: %+v", state)
 	}
 }
 
