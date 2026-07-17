@@ -105,7 +105,7 @@ func New(cfg Config, processor EventProcessor, logger *slog.Logger, opts ...Opti
 		opt(s)
 	}
 	if s.pool == nil {
-		s.pool = nostr.NewPool(nostr.PoolOptions{})
+		s.pool = nostr.NewPool()
 	}
 	return s
 }

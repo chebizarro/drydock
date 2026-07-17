@@ -166,14 +166,13 @@ func main() {
 	}
 
 	// --- Shared Nostr pool (with NIP-42 AUTH if signer available) ---
-	poolOpts := nostr.PoolOptions{}
+	pool := nostr.NewPool()
 	if signer != nil {
-		poolOpts.AuthRequiredHandler = func(authCtx context.Context, evt *nostr.Event) error {
+		pool.AuthRequiredHandler = func(authCtx context.Context, evt *nostr.Event) error {
 			return signer.SignEvent(authCtx, evt)
 		}
 		logger.Info("NIP-42 relay auth handler enabled")
 	}
-	pool := nostr.NewPool(poolOpts)
 
 	// --- NIP-11 relay capability probe (non-blocking, log-only) ---
 	allRelays := make(map[string]struct{})

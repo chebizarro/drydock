@@ -121,7 +121,7 @@ func TestRunReturnsErrorWhenNoRelays(t *testing.T) {
 
 func TestNewAppliesOptions(t *testing.T) {
 	proc := &fakeProcessor{}
-	pool := nostr.NewPool(nostr.PoolOptions{})
+	pool := nostr.NewPool()
 
 	svc := New(Config{
 		Relays:          []string{"wss://test.relay"},

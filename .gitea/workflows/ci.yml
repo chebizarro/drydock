@@ -53,7 +53,11 @@ jobs:
         run: CGO_ENABLED=1 go vet ./...
 
       - name: Run tests with race detector (CGO/tree-sitter)
-        run: CGO_ENABLED=1 go test -race -count=1 -timeout=10m ./...
+        # checkptr is disabled because upstream fiatjaf.com/nostr uses uintptr
+        # pointer arithmetic in its JSON-string fast path (event.go writeJSONString),
+        # which trips -race's checkptr instrumentation on every event Sign/SetID.
+        # Data-race detection remains fully enabled. Tracked in DRYDOCK-2h1.
+        run: CGO_ENABLED=1 go test -race -gcflags=all=-d=checkptr=0 -count=1 -timeout=10m ./...
 
   docker:
     runs-on: ubuntu-latest

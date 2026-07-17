@@ -187,7 +187,7 @@ func NewNWCInvoiceProvider(cfg NWCConfig) (*NWCInvoiceProvider, error) {
 	return &NWCInvoiceProvider{
 		cfg:   cfg,
 		conn:  conn,
-		pool:  nostr.NewPool(nostr.PoolOptions{}),
+		pool:  nostr.NewPool(),
 		keyer: k,
 	}, nil
 }

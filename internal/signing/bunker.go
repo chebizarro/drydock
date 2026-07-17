@@ -21,7 +21,7 @@ func NewBunkerSigner(ctx context.Context, cfg BunkerSignerConfig) (nostr.Signer,
 		return nil, errors.New("bunker signer requires bunker:// URL or NIP-05 bunker identifier")
 	}
 
-	pool := nostr.NewPool(nostr.PoolOptions{})
+	pool := nostr.NewPool()
 	k, err := keyer.New(ctx, pool, cfg.BunkerURL, &keyer.SignerOptions{
 		BunkerAuthHandler: cfg.OnAuthURL,
 	})

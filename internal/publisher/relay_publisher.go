@@ -50,7 +50,7 @@ func withPublishMany(fn publishManyFunc) RelayPublisherOption {
 // NewNostrRelayPublisher creates a publisher. If pool is nil, a new pool is created.
 func NewNostrRelayPublisher(pool *nostr.Pool, logger *slog.Logger, opts ...RelayPublisherOption) *NostrRelayPublisher {
 	if pool == nil {
-		pool = nostr.NewPool(nostr.PoolOptions{})
+		pool = nostr.NewPool()
 	}
 	if logger == nil {
 		logger = slog.Default()
