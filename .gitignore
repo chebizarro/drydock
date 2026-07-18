@@ -37,3 +37,6 @@ extensions/vscode-drydock/out/
 # Beads / Dolt files (added by bd init)
 .dolt/
 .beads-credential-key
+
+# Preserved full-res logo original (kept on disk, out of history)
+docs/assets/logo-original.png
