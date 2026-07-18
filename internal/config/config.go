@@ -74,8 +74,6 @@ type Config struct {
 	SignerBunkerURL            string
 	SignerNsec                 string
 	SignerNsecFile             string
-	SignerSocketPath           string
-	SignerDBus                 bool
 	DevMode                    bool
 	ChartroomURL               string
 	ChartroomToken             string
@@ -158,8 +156,6 @@ func FromEnv() Config {
 		SignerBunkerURL:       envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
 		SignerNsec:            signerNsec,
 		SignerNsecFile:        signerNsecFile,
-		SignerSocketPath:      envOrDefault("DRYDOCK_SIGNER_SOCKET_PATH", ""),
-		SignerDBus:            parseBoolOrDefault(envOrDefault("DRYDOCK_SIGNER_DBUS", ""), false),
 		DevMode:               parseBoolOrDefault(envOrDefault("DEV_MODE", envOrDefault("DRYDOCK_DEV_MODE", "")), false),
 		ChartroomURL:          envOrDefault("DRYDOCK_CHARTROOM_URL", ""),
 		ChartroomToken:        envOrDefault("DRYDOCK_CHARTROOM_TOKEN", envOrDefault("CHARTROOM_HTTP_BEARER_TOKEN", "")),
@@ -386,9 +382,9 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 
 	// --- Signer configuration ---
-	hasSignerConfig := c.SignerBunkerURL != "" || c.SignerNsec != "" || c.SignerNsecFile != "" || c.SignerSocketPath != "" || c.SignerDBus
+	hasSignerConfig := c.SignerBunkerURL != "" || c.SignerNsec != "" || c.SignerNsecFile != ""
 	if !hasSignerConfig {
-		result.Warnings = append(result.Warnings, "no signer configured: review publishing will be disabled (set DRYDOCK_SIGNER_BUNKER_URL, DRYDOCK_SIGNER_NSEC, or enable DRYDOCK_SIGNER_DBUS)")
+		result.Warnings = append(result.Warnings, "no signer configured: review publishing will be disabled (set DRYDOCK_SIGNER_BUNKER_URL or DRYDOCK_SIGNER_NSEC)")
 	}
 
 	// --- Database connectivity ---

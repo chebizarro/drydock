@@ -1,7 +1,7 @@
 fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026 h1:5XJN60vWCPP0bcVbhCsjhohiB5gVdCNmXJn3lEx+QxQ=
 fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026/go.mod h1:b1EIUDnd133Ie8Pg8O/biaKdFyCMz28aD4n64g1GqvM=
-git.sharegap.net/cascadia/cascadia-go v0.8.0 h1:paQp+xX6HAcZVeZQ95r/3VculssQw/O/OWDiN5ZKKO8=
-git.sharegap.net/cascadia/cascadia-go v0.8.0/go.mod h1:n5xKlFGGfAbkiHczIT0a0YtVB8fMs2eRCLCYAkkwCaQ=
+git.sharegap.net/cascadia/cascadia-go v1.0.2 h1:fhmiBi37BeorboQlpGlw0goUMIcaWoIpj51bO1h4sXA=
+git.sharegap.net/cascadia/cascadia-go v1.0.2/go.mod h1:4gZR4rS9vec7ufmq7Bb9U7T175COytwDirgJu3+NqCM=
 github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 h1:ClzzXMDDuUbWfNNZqGeYq4PnYOlwlOVIvSyNaIy0ykg=
 github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3/go.mod h1:we0YA5CsBbH5+/NUzC/AlMmxaDtWlXeNsqrwXjTzmzA=
 github.com/aead/siphash v1.0.1/go.mod h1:Nywa3cDsYNNK3gaciGTWPwHt0wlpNV15vwmswBAUSII=
@@ -51,8 +51,6 @@ github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+m
 github.com/dvyukov/go-fuzz v0.0.0-20200318091601-be3528f3a813/go.mod h1:11Gm+ccJnvAhCNLlf5+cS9KjtbaD5I5zaZpFMsTHWTw=
 github.com/fsnotify/fsnotify v1.4.7/go.mod h1:jwhsz4b93w/PPRr/qN1Yymfu8t87LnFCMoQvtojpjFo=
 github.com/fsnotify/fsnotify v1.4.9/go.mod h1:znqG4EE+3YCdAaPaxE2ZRY/06pZUdp0tY4IgpuI1SZQ=
-github.com/godbus/dbus/v5 v5.2.2 h1:TUR3TgtSVDmjiXOgAAyaZbYmIeP3DPkld3jgKGV8mXQ=
-github.com/godbus/dbus/v5 v5.2.2/go.mod h1:3AAv2+hPq5rdnr5txxxRwiGjPXamgoIHgz9FPBfOp3c=
 github.com/golang/protobuf v1.2.0/go.mod h1:6lQm79b+lXiMfvg/cZm0SGofjICqVBUtrP5yJMmIC1U=
 github.com/golang/protobuf v1.4.0-rc.1/go.mod h1:ceaxUfeHdC40wWswd/P6IGgMaK3YpKi5j83Wpe3EHw8=
 github.com/golang/protobuf v1.4.0-rc.1.0.20200221234624-67d41d38c208/go.mod h1:xKAWHe0F5eneWXFV3EuXVDTCmh+JuBKY0li0aMyXATA=

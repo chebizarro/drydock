@@ -6,7 +6,7 @@
 - **Git** in `$PATH` (used at runtime for clone, fetch, grep, log)
 - **ripgrep** (`rg`) recommended for faster symbol callsite search (falls back to git grep)
 - **Ollama** or any OpenAI-compatible inference server
-- A **Nostr signing identity** — NIP-46 bunker, NIP-5F socket signer (Signet), or nsec key
+- A **Nostr signing identity** — preferably a Signet NIP-46 bunker, or an nsec key for local development
 
 ## Native (Development)
 
@@ -128,31 +128,7 @@ The bunker keeps your private key on a separate device or service. Drydock never
 DRYDOCK_SIGNER_BUNKER_URL=bunker://relay.example.com/npub1abc...?secret=xyz
 ```
 
-On first connection, the bunker may require interactive authorization. Drydock logs the auth URL:
-
-```
-{"level":"INFO","msg":"bunker auth required","url":"https://..."}
-```
-
-### 2. NIP-5F Unix Socket (Signet)
-
-If a Signet-compatible signer is running, Drydock auto-detects the socket at `~/.local/share/nostr/signer.sock`, or you can set a custom path:
-
-```bash
-DRYDOCK_SIGNER_SOCKET_PATH=/path/to/signer.sock
-```
-
-The socket uses NIP-5F JSON-RPC framing (4-byte big-endian length prefix).
-
-### 3. NIP-55L DBus (Linux Only)
-
-On Linux, Drydock can use the `org.nostr.Signer` DBus session bus interface:
-
-```bash
-DRYDOCK_SIGNER_DBUS=true
-```
-
-### 4. Local nsec (Development Only)
+### 2. Local nsec (Development Only)
 
 ```bash
 DRYDOCK_SIGNER_NSEC=nsec1your_key_here
@@ -240,7 +216,7 @@ docker compose up --build -d
 
 ## Production Hardening Checklist
 
-- [ ] **Signing**: Use NIP-46 bunker or NIP-5F socket signer, not local nsec
+- [ ] **Signing**: Use the shared NIP-46 Signet path, not local nsec
 - [ ] **Secrets**: Never commit `.env` files. Use Docker secrets, Vault, or environment injection
 - [ ] **Database backups**: Back up both `drydock_data` and `qdrant_storage` volumes regularly
 - [ ] **Repo cache sizing**: Set `DRYDOCK_REPO_CACHE_MAX_SIZE_MB` based on available disk. Repos range from 10 MB to 2 GB each

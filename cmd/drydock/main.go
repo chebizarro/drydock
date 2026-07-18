@@ -44,11 +44,11 @@ import (
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip11"
+	cascadiasignet "git.sharegap.net/cascadia/cascadia-go/signet"
 )
 
 func main() {
 	cfg := config.FromEnv()
-	cfg.DevMode = cfg.DevMode || devFlagEnabled(os.Args[1:])
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	if symbols.TreeSitterAvailable() {
 		metrics.TreeSitterAvailable.Set(1)
@@ -109,60 +109,28 @@ func main() {
 		logger.Info("reset stuck reviews to pending", "count", n)
 	}
 
-	// --- Signer (production: bunker required; dev mode allows local fallbacks) ---
+	// --- Signer (shared NIP-46 client, with local nsec for development only) ---
 	var signer publisher.Signer
 	if cfg.SignerBunkerURL != "" {
-		s, err := signing.NewBunkerSigner(ctx, signing.BunkerSignerConfig{
-			BunkerURL: cfg.SignerBunkerURL,
-			OnAuthURL: func(url string) {
-				logger.Info("bunker auth required", "url", url)
-			},
-		})
+		s, err := cascadiasignet.NewBunkerSigner(ctx, cfg.SignerBunkerURL, cfg.Relays...)
 		if err != nil {
-			if !cfg.DevMode {
-				logger.Error("failed to create required bunker signer", "error", err)
-				os.Exit(1)
-			}
-			logger.Warn("bunker signer failed; dev mode fallback enabled", "error", err)
-		} else {
-			signer = s
-			logger.Info("NIP-46 bunker signer ready")
+			logger.Error("failed to create bunker signer", "error", err)
+			os.Exit(1)
 		}
-	} else if !cfg.DevMode {
-		logger.Error("NIP-46 bunker signer required in non-dev mode; set DRYDOCK_SIGNER_BUNKER_URL or run with --dev / DEV_MODE=true for local fallback")
-		os.Exit(1)
+		signer = s
+		logger.Info("NIP-46 bunker signer ready")
 	}
-	if cfg.DevMode && signer == nil && (cfg.SignerSocketPath != "" || socketSignerAvailable()) {
-		s, err := signing.NewSocketSigner(ctx, signing.SocketSignerConfig{
-			SocketPath: cfg.SignerSocketPath,
-		})
-		if err != nil {
-			logger.Warn("NIP-5F socket signer not available", "error", err)
-		} else {
-			signer = s
-			logger.Info("NIP-5F socket signer ready", "dev_mode", true)
-		}
-	}
-	if cfg.DevMode && signer == nil && cfg.SignerDBus {
-		s, err := signing.NewDBusSigner(ctx, signing.DBusSignerConfig{})
-		if err != nil {
-			logger.Warn("NIP-55L DBus signer not available", "error", err)
-		} else {
-			signer = s
-			logger.Info("NIP-55L DBus signer ready", "dev_mode", true)
-		}
-	}
-	if cfg.DevMode && signer == nil && cfg.SignerNsec != "" {
+	if signer == nil && cfg.SignerNsec != "" {
 		s, err := signing.NewLocalSigner(cfg.SignerNsec)
 		if err != nil {
 			logger.Error("failed to create local signer", "error", err)
 			os.Exit(1)
 		}
 		signer = s
-		logger.Info("local nsec signer ready", "dev_mode", true)
+		logger.Info("local nsec signer ready")
 	}
 	if signer == nil {
-		logger.Warn("no signer configured — review publishing disabled", "dev_mode", cfg.DevMode)
+		logger.Warn("no signer configured — review publishing disabled")
 	}
 
 	// --- Shared Nostr pool (with NIP-42 AUTH if signer available) ---
@@ -774,23 +742,4 @@ func runDriftGuard(cfg config.Config, logger *slog.Logger) {
 		logger.Error("unknown drift-guard subcommand", "cmd", args[0], "valid", "export, flag, list")
 		os.Exit(1)
 	}
-}
-
-func devFlagEnabled(args []string) bool {
-	for _, arg := range args {
-		if arg == "--dev" {
-			return true
-		}
-	}
-	return false
-}
-
-// socketSignerAvailable checks if the default NIP-5F socket path exists.
-func socketSignerAvailable() bool {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return false
-	}
-	_, err = os.Stat(home + "/.local/share/nostr/signer.sock")
-	return err == nil
 }

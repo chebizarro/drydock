@@ -6,9 +6,8 @@ toolchain go1.26.0
 
 require (
 	fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026
-	git.sharegap.net/cascadia/cascadia-go v0.8.0
+	git.sharegap.net/cascadia/cascadia-go v1.0.2
 	github.com/bluekeyes/go-gitdiff v0.7.1
-	github.com/godbus/dbus/v5 v5.2.2
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
 	golang.org/x/sync v0.16.0
