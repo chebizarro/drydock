@@ -6,11 +6,12 @@ toolchain go1.26.0
 
 require (
 	fiatjaf.com/nostr v0.0.0
+	git.sharegap.net/cascadia/cascadia-go v1.0.2
 	github.com/bluekeyes/go-gitdiff v0.7.1
-	github.com/godbus/dbus/v5 v5.2.2
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
 	golang.org/x/sync v0.16.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.39.1
 )
 
@@ -43,7 +44,6 @@ require (
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/text v0.26.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.66.10 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

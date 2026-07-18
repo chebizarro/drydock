@@ -41,6 +41,7 @@ import (
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip11"
+	cascadiasignet "git.sharegap.net/cascadia/cascadia-go/signet"
 )
 
 func main() {
@@ -92,41 +93,16 @@ func main() {
 		logger.Info("reset stuck reviews to pending", "count", n)
 	}
 
-	// --- Signer (chain: bunker → socket → DBus → nsec) ---
+	// --- Signer (shared NIP-46 client, with local nsec for development only) ---
 	var signer publisher.Signer
 	if cfg.SignerBunkerURL != "" {
-		s, err := signing.NewBunkerSigner(ctx, signing.BunkerSignerConfig{
-			BunkerURL: cfg.SignerBunkerURL,
-			OnAuthURL: func(url string) {
-				logger.Info("bunker auth required", "url", url)
-			},
-		})
+		s, err := cascadiasignet.NewBunkerSigner(ctx, cfg.SignerBunkerURL, cfg.Relays...)
 		if err != nil {
 			logger.Error("failed to create bunker signer", "error", err)
 			os.Exit(1)
 		}
 		signer = s
 		logger.Info("NIP-46 bunker signer ready")
-	}
-	if signer == nil && (cfg.SignerSocketPath != "" || socketSignerAvailable()) {
-		s, err := signing.NewSocketSigner(ctx, signing.SocketSignerConfig{
-			SocketPath: cfg.SignerSocketPath,
-		})
-		if err != nil {
-			logger.Warn("NIP-5F socket signer not available", "error", err)
-		} else {
-			signer = s
-			logger.Info("NIP-5F socket signer ready")
-		}
-	}
-	if signer == nil && cfg.SignerDBus {
-		s, err := signing.NewDBusSigner(ctx, signing.DBusSignerConfig{})
-		if err != nil {
-			logger.Warn("NIP-55L DBus signer not available", "error", err)
-		} else {
-			signer = s
-			logger.Info("NIP-55L DBus signer ready")
-		}
 	}
 	if signer == nil && cfg.SignerNsec != "" {
 		s, err := signing.NewLocalSigner(cfg.SignerNsec)
@@ -676,14 +652,4 @@ func runNIPIngest(cfg config.Config, logger *slog.Logger) {
 		os.Exit(1)
 	}
 	logger.Info("NIP ingest complete", "chunks_upserted", n)
-}
-
-// socketSignerAvailable checks if the default NIP-5F socket path exists.
-func socketSignerAvailable() bool {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return false
-	}
-	_, err = os.Stat(home + "/.local/share/nostr/signer.sock")
-	return err == nil
 }

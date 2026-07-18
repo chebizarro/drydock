@@ -23,7 +23,7 @@ Drydock is a fully automated NIP-34 code review agent. It listens for patch and 
 | **LLM review pipeline** | Two-stage planner → reviewer with model routing (14B/32B/70B) | ✅ Production |
 | **Structured findings** | JSON schema with severity, category, file, line, evidence, confidence | ✅ Production |
 | **Review publishing** | Kind 1111 (NIP-22) comments with NIP-40 expiration, relay fanout | ✅ Production |
-| **Signer chain** | NIP-46 bunker → NIP-5F socket → NIP-55L DBus → local nsec | ✅ Production |
+| **Signer chain** | Shared `cascadia-go/signet` NIP-46 client → local nsec development fallback | ✅ Production |
 | **Meta-review** | Self-improvement loop: quality evaluation, false positive detection | ✅ Production |
 | **Few-shot management** | Positive/negative example extraction from meta-reviews | ✅ Production |
 | **Prompt refinement** | Automated prompt versioning with eval-gated rollback | ✅ Production |
@@ -61,8 +61,6 @@ Review published
 | Review comments | NIP-22 | Kind 1111 threaded comments |
 | Relay auth | NIP-42 | Automatic AUTH challenge response |
 | Remote signing | NIP-46 | Bunker-based key isolation |
-| Socket signing | NIP-5F | Unix domain socket signer (Signet) |
-| DBus signing | NIP-55L | Linux session bus signer |
 | Event expiration | NIP-40 | TTL on review comments (90d default, 7d superseded) |
 | Relay probing | NIP-11 | Capability detection at startup |
 

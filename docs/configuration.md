@@ -40,20 +40,16 @@ Drydock supports separate relay lists for reading (subscribing to events) and wr
 
 ## Signing
 
-Drydock needs a Nostr identity to sign review comments. Four signing methods are supported, checked in priority order:
+Drydock needs a Nostr identity to sign review comments. Two signing methods are supported, checked in priority order:
 
 1. **NIP-46 Bunker** (recommended for production) — key never touches disk
-2. **NIP-5F Unix socket** (Signet) — JSON-RPC over local socket
-3. **NIP-55L DBus** (Linux only) — session bus signer
-4. **Local nsec** — for development and testing only
+2. **Local nsec** — for development and testing only
 
 If none is configured, the listener and ingest pipeline still run, but the review pipeline is disabled (no reviews are published).
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_SIGNER_BUNKER_URL` | string | *(empty)* | NIP-46 bunker URL (`bunker://...`) or NIP-05 bunker identifier. Checked first. |
-| `DRYDOCK_SIGNER_SOCKET_PATH` | path | *(empty)* | Path to a NIP-5F Unix domain socket signer. Auto-detected at `~/.local/share/nostr/signer.sock` if not set. Checked second. |
-| `DRYDOCK_SIGNER_DBUS` | `true`/`false` | `false` | Enable NIP-55L DBus session bus signer (Linux only, `org.nostr.Signer` interface). Checked third. |
 | `DRYDOCK_SIGNER_NSEC` | string | *(empty)* | Raw nsec bech32 key or 64-character hex private key. **Warning**: this is a plaintext secret. Use Docker secrets or a secrets manager in production. Checked last. |
 
 ## LLM Endpoints

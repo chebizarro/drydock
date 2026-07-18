@@ -83,7 +83,7 @@ Drydock is a Go-based NIP-34 automated code review agent. The core review pipeli
 | `metareview` | Self-improvement loop: evaluates review quality and routes feedback for prompt tuning |
 | `promptrefine` | Automated prompt versioning: batches prompt gaps, refines via LLM, activates with eval-gated rollback |
 | `repo` | Clones/fetches git repositories with URL validation and LRU cache eviction |
-| `signing` | Signer chain: NIP-46 bunker → NIP-5F Unix socket (Signet) → NIP-55L DBus (Linux) → local nsec |
+| `signing` | Shared `cascadia-go/signet` NIP-46 client → local nsec development fallback |
 | `vectorstore` | Qdrant REST API client — CRUD, search, scroll, collection management |
 | `embedding` | HTTP client for OpenAI-compatible embedding endpoints |
 | `nipingest` | Markdown NIP spec ingestion: chunk by heading, embed, upsert to Qdrant with content-hash dedup |
@@ -140,19 +140,13 @@ When the 64K token budget is reached, the current layer and all lower-priority l
 Drydock tries signers in priority order. The first successful signer wins:
 
 ```
-1. NIP-46 Bunker     (DRYDOCK_SIGNER_BUNKER_URL set)
+1. Shared NIP-46 client (DRYDOCK_SIGNER_BUNKER_URL set)
         │ fail/skip
         ▼
-2. NIP-5F Socket     (DRYDOCK_SIGNER_SOCKET_PATH set, or ~/.local/share/nostr/signer.sock exists)
+2. Local nsec        (DRYDOCK_SIGNER_NSEC set; development only)
         │ fail/skip
         ▼
-3. NIP-55L DBus      (Linux only, DRYDOCK_SIGNER_DBUS=true)
-        │ fail/skip
-        ▼
-4. Local nsec        (DRYDOCK_SIGNER_NSEC set)
-        │ fail/skip
-        ▼
-5. No signer → listen-only mode (warning logged)
+3. No signer → listen-only mode (warning logged)
 ```
 
 ## Docker Compose Topology
