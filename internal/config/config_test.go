@@ -29,6 +29,7 @@ func TestFromEnvNormalizesRepositoryScopeNpubs(t *testing.T) {
 	npub := nip19.EncodeNpub(owner)
 	t.Setenv("DRYDOCK_REPO_ALLOWLIST", npub+":repo-one")
 	t.Setenv("DRYDOCK_REPO_OWNER_ALLOWLIST", npub)
+	t.Setenv("DRYDOCK_FREE_PUBKEYS", npub)
 
 	cfg := FromEnv()
 	if len(cfg.RepoAllowlist) != 1 || cfg.RepoAllowlist[0] != owner.Hex()+":repo-one" {
@@ -36,6 +37,9 @@ func TestFromEnvNormalizesRepositoryScopeNpubs(t *testing.T) {
 	}
 	if len(cfg.RepoOwnerAllowlist) != 1 || cfg.RepoOwnerAllowlist[0] != owner.Hex() {
 		t.Fatalf("unexpected repository owner allowlist: %#v", cfg.RepoOwnerAllowlist)
+	}
+	if len(cfg.FreePubkeys) != 1 || cfg.FreePubkeys[0] != owner.Hex() {
+		t.Fatalf("unexpected free pubkey allowlist: %#v", cfg.FreePubkeys)
 	}
 }
 

@@ -3,6 +3,9 @@ package repoconfig
 import (
 	"strings"
 	"testing"
+
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 )
 
 func TestDefaultsOnEmptyInput(t *testing.T) {
@@ -387,6 +390,36 @@ func TestPaymentsConfigDefaults(t *testing.T) {
 	cfg := Default()
 	if cfg.Payments.Enabled {
 		t.Error("payments should be disabled by default")
+	}
+}
+
+func TestPaymentsConfigFreeAccessDefaults(t *testing.T) {
+	cfg := Default()
+	if !cfg.Payments.MaintainersAreFree() {
+		t.Fatal("repository maintainers should be free by default")
+	}
+}
+
+func TestPaymentsConfigNormalizesFreePubkeys(t *testing.T) {
+	pubkey := nostr.GetPublicKey(nostr.Generate())
+	npub := nip19.EncodeNpub(pubkey)
+	yml := "version: 1\npayments:\n  free_pubkeys:\n    - " + npub + "\n    - " + pubkey.Hex() + "\n  free_for_maintainers: false\n"
+	cfg, err := Parse([]byte(yml))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Payments.FreePubkeys) != 1 || cfg.Payments.FreePubkeys[0] != pubkey.Hex() {
+		t.Fatalf("unexpected normalized free pubkeys: %#v", cfg.Payments.FreePubkeys)
+	}
+	if cfg.Payments.MaintainersAreFree() {
+		t.Fatal("free_for_maintainers=false should be preserved")
+	}
+}
+
+func TestPaymentsConfigRejectsInvalidFreePubkey(t *testing.T) {
+	_, err := Parse([]byte("version: 1\npayments:\n  free_pubkeys: [not-a-pubkey]\n"))
+	if err == nil || !strings.Contains(err.Error(), "invalid payments.free_pubkeys") {
+		t.Fatalf("expected invalid free_pubkeys error, got %v", err)
 	}
 }
 

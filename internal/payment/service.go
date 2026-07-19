@@ -1,6 +1,7 @@
 // Package payment implements Cashu ecash payment gating for review access.
 //
 // The payment service gates reviews based on:
+// - Configured free pubkeys and repository maintainers
 // - Active subscription (author+repo)
 // - Free-tier daily quota
 // - One-off Cashu token payment attached to patch event
@@ -20,6 +21,7 @@ import (
 
 	"drydock/internal/db"
 	"drydock/internal/repoconfig"
+	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )
@@ -126,6 +128,7 @@ func meltMayHaveBeenSubmitted(err error) bool {
 // Config configures the payment service.
 type Config struct {
 	TrustedMints  []string
+	FreePubkeys   []string
 	Timeout       time.Duration
 	InvoiceExpiry time.Duration
 }
@@ -174,7 +177,7 @@ func (s *Service) ReconcilePayout(ctx context.Context, destination string, amoun
 // AuthorizeResult describes the outcome of a payment authorization attempt.
 type AuthorizeResult struct {
 	Allowed    bool
-	AccessKind string // free_tier, subscription, cashu_review, cashu_subscription
+	AccessKind string // free_pubkey, free_maintainer, free_tier, subscription, cashu_review, cashu_subscription
 	Reason     string // machine-readable denial reason
 }
 
@@ -207,17 +210,39 @@ func (s *Service) AuthorizePatch(
 		return allow(existing.AccessKind)
 	}
 
-	// 3. Extract payment tag from patch event.
+	// 3. Configured pubkeys bypass subscription, Cashu, and free-tier paths.
+	if containsPubkey(policy.FreePubkeys, authorPubkey) || containsPubkey(s.cfg.FreePubkeys, authorPubkey) {
+		s.logger.Info("review authorized via free pubkey allowlist",
+			"patch_event_id", patchEventID,
+			"author", authorPubkey)
+		return allow("free_pubkey")
+	}
+
+	// 4. Repository owners and maintainers are free by default.
+	if policy.MaintainersAreFree() {
+		maintainer, err := s.store.CanMaintainRepository(ctx, repoID, patchEvent.PubKey)
+		if err != nil {
+			return AuthorizeResult{}, fmt.Errorf("check repository maintainer: %w", err)
+		}
+		if maintainer {
+			s.logger.Info("review authorized for repository maintainer",
+				"patch_event_id", patchEventID,
+				"author", authorPubkey)
+			return allow("free_maintainer")
+		}
+	}
+
+	// 5. Extract payment tag from patch event.
 	token, mode, tagErr := extractPaymentTag(patchEvent)
 
-	// 4. If explicit subscription mode, require subscription config.
+	// 6. If explicit subscription mode, require subscription config.
 	if mode == "subscription" && tagErr == nil {
 		if policy.SubscriptionPriceSats <= 0 || policy.SubscriptionDays <= 0 {
 			return deny("subscription_not_configured")
 		}
 	}
 
-	// 5. Check active subscription (unless explicitly requesting subscription renewal).
+	// 7. Check active subscription (unless explicitly requesting subscription renewal).
 	if mode != "subscription" {
 		sub, hasActive, err := s.store.GetActiveSubscription(ctx, authorPubkey, repoID, time.Now().Unix())
 		if err != nil {
@@ -235,12 +260,12 @@ func (s *Service) AuthorizePatch(
 		}
 	}
 
-	// 6. Process Cashu token if present.
+	// 8. Process Cashu token if present.
 	if tagErr == nil && token != "" {
 		return s.processTokenPayment(ctx, patchEventID, repoID, authorPubkey, token, mode, policy)
 	}
 
-	// 7. Try free tier.
+	// 9. Try free tier.
 	if policy.FreeReviewsPerDay > 0 {
 		usageDay := time.Now().UTC().Format("2006-01-02")
 		authorized, err := s.store.TryAuthorizeFreeReview(ctx, patchEventID, repoID, authorPubkey, policy.FreeReviewsPerDay, usageDay)
@@ -256,11 +281,21 @@ func (s *Service) AuthorizePatch(
 		}
 	}
 
-	// 8. No payment, no free tier quota.
+	// 10. No payment, no free tier quota.
 	if tagErr != nil {
 		return deny(tagErr.Error())
 	}
 	return deny("no_payment")
+}
+
+func containsPubkey(configured []string, author string) bool {
+	author = scope.NormalizePubkey(author)
+	for _, pubkey := range configured {
+		if scope.NormalizePubkey(pubkey) == author {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) processTokenPayment(

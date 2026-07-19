@@ -1,6 +1,6 @@
 # Payments: NWC and Cashu Integration
 
-> **Status**: This is a forward-looking architectural proposal. Payment gating is not yet implemented in Drydock. This document describes how NWC (Nostr Wallet Connect) and Cashu ecash could be integrated for paid code reviews.
+> **Status**: Payment gating supports free access, daily quota, subscriptions, and Cashu tokens settled through NWC-created Lightning invoices.
 
 ## Motivation
 
@@ -13,22 +13,30 @@ Paid reviews create alignment between submitters and the review service:
 
 ## Integration Point
 
-Both payment options intercept at the same point in the pipeline — inside `ingest.Processor.ProcessEvent`, between the staleness/closed checks and the `store.BeginReview` call:
+Payment authorization runs in the review pipeline after repository configuration and the stored patch event are loaded. When `payments.enabled` is true, authorization checks existing authorization, configured free access, repository maintainership, subscriptions, attached Cashu payment, and daily free quota before review execution.
 
-```
-ProcessEvent
-  ├── Signature verification
-  ├── Idempotent insert
-  ├── Staleness check (repository snapshots)
-  ├── Closed/applied root check
-  │
-  ├── ★ Payment verification ← NEW
-  │
-  ├── BeginReview (acquire review slot)
-  └── Enqueue to ReviewQueue
+## Free Access
+
+Free authorization is evaluated before subscription, Cashu, and daily-quota paths:
+
+1. `payments.free_pubkeys` in the repository's `.drydock.yaml` grants unlimited reviews to listed patch authors. Entries may be npub or 64-character hex and are strictly validated and normalized to hex.
+2. `DRYDOCK_FREE_PUBKEYS` grants the same access operator-wide across repositories.
+3. The repository announcement owner and `maintainers` are free by default. Set `payments.free_for_maintainers: false` to disable this default.
+
+Configured pubkeys use access kind `free_pubkey`; repository owners and maintainers use `free_maintainer`. These paths do not consume `free_reviews_per_day` quota.
+
+```yaml
+payments:
+  enabled: true
+  price_sats: 100
+  free_pubkeys:
+    - npub1...
+  free_for_maintainers: true
 ```
 
-This keeps payment logic out of the pipeline layer and allows the existing queue, retry, and publishing machinery to remain unchanged.
+```bash
+DRYDOCK_FREE_PUBKEYS=npub1...,0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
 
 ## Option A: NWC (Nostr Wallet Connect, NIP-47)
 

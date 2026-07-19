@@ -40,8 +40,14 @@ ensemble:
   consensus_boost: 0.10
   require_consensus: false
 
-payments:                       # Cashu ecash payment gating (see docs/payments.md)
+payments:                       # payment gating (see docs/payments.md)
   enabled: false
+  price_sats: 0                  # set to a positive value when enabled
+  free_reviews_per_day: 0        # per-author daily quota
+  free_pubkeys: []               # npub or 64-character hex; normalized to hex
+  free_for_maintainers: true     # repository owner/maintainers review free
+  subscription_price_sats: 0
+  subscription_days: 0
 
 instructions: |                 # appended to the reviewer system prompt (max 4 KiB)
   Focus on concurrency and error handling.
@@ -69,6 +75,8 @@ arrives as a new event and reviews normally.
 - `version` must be `1` (or omitted).
 - `severity_floor` / `detail_severity_floor` must be valid severities.
 - `review.statuses` values must be `open` or `draft`.
+- `payments.free_pubkeys` entries must be valid npub or 64-character hex public keys.
+- `payments.free_for_maintainers` defaults to `true`; set it to `false` to require payment from the repository announcement owner and maintainers.
 - `instructions` above 4096 bytes is a parse error (defaults apply).
 - Unknown fields are rejected (strict parsing), so typos fail loudly in the
   logs rather than being silently ignored.

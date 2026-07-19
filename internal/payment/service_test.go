@@ -177,6 +177,97 @@ func TestAuthorizePatch_PaymentsDisabled(t *testing.T) {
 	}
 }
 
+func TestAuthorizePatch_FreePubkeyAllowlists(t *testing.T) {
+	const authorHex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	tests := []struct {
+		name      string
+		configure func(*Service, *repoconfig.PaymentsConfig)
+	}{
+		{
+			name: "repository",
+			configure: func(_ *Service, policy *repoconfig.PaymentsConfig) {
+				policy.FreePubkeys = []string{authorHex}
+			},
+		},
+		{
+			name: "operator",
+			configure: func(svc *Service, _ *repoconfig.PaymentsConfig) {
+				svc.cfg.FreePubkeys = []string{authorHex}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, store := setupTestService(t)
+			defer store.Close()
+			policy := repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100}
+			tt.configure(svc, &policy)
+			event := nostr.Event{
+				ID:     mustParseID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+				PubKey: mustParsePubKey(authorHex),
+			}
+
+			result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
+			if err != nil {
+				t.Fatalf("AuthorizePatch: %v", err)
+			}
+			if !result.Allowed || result.AccessKind != "free_pubkey" {
+				t.Fatalf("expected free_pubkey authorization, got allowed=%v kind=%q reason=%q", result.Allowed, result.AccessKind, result.Reason)
+			}
+		})
+	}
+}
+
+func TestAuthorizePatch_MaintainerFreeByDefault(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+	ctx := context.Background()
+	ownerKey := nostr.Generate()
+	owner := nostr.GetPublicKey(ownerKey)
+	maintainer := nostr.GetPublicKey(nostr.Generate())
+	repoID := owner.Hex() + ":free-repo"
+	repoEvent := nostr.Event{
+		Kind:      30617,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"d", "free-repo"},
+			{"maintainers", maintainer.Hex()},
+		},
+	}
+	if err := repoEvent.Sign(ownerKey); err != nil {
+		t.Fatalf("sign repository announcement: %v", err)
+	}
+	if err := store.UpsertRepositoryAnnouncement(ctx, repoEvent); err != nil {
+		t.Fatalf("seed repository announcement: %v", err)
+	}
+
+	policy := repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100}
+	event := nostr.Event{
+		ID:     mustParseID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		PubKey: maintainer,
+	}
+	result, err := svc.AuthorizePatch(ctx, event, repoID, policy)
+	if err != nil {
+		t.Fatalf("AuthorizePatch: %v", err)
+	}
+	if !result.Allowed || result.AccessKind != "free_maintainer" {
+		t.Fatalf("expected free_maintainer authorization, got allowed=%v kind=%q reason=%q", result.Allowed, result.AccessKind, result.Reason)
+	}
+
+	freeForMaintainers := false
+	policy.FreeForMaintainers = &freeForMaintainers
+	event.ID = mustParseID("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	result, err = svc.AuthorizePatch(ctx, event, repoID, policy)
+	if err != nil {
+		t.Fatalf("AuthorizePatch with maintainer access disabled: %v", err)
+	}
+	if result.Allowed || result.Reason != "no_payment" {
+		t.Fatalf("expected payment denial when maintainer access is disabled, got allowed=%v reason=%q", result.Allowed, result.Reason)
+	}
+}
+
 func TestAuthorizePatch_FreeTier(t *testing.T) {
 	svc, store := setupTestService(t)
 	defer store.Close()

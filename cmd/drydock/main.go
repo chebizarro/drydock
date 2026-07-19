@@ -300,6 +300,7 @@ func main() {
 	mintClient := payment.NewCashuMintClient(10 * time.Second)
 	paymentSvc := payment.New(payment.Config{
 		TrustedMints: cfg.PaymentTrustedMints,
+		FreePubkeys:  cfg.FreePubkeys,
 	}, store, invoiceProvider, mintClient, logger)
 	logger.Info("payment service configured", "nwc_configured", invoiceProvider != nil, "trusted_mints", len(cfg.PaymentTrustedMints))
 

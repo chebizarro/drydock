@@ -575,6 +575,37 @@ func (s *Store) GetRepositoryOwnerPubkey(ctx context.Context, repoID string) (st
 	return pubkey, nil
 }
 
+// CanMaintainRepository reports whether author owns the repository announcement
+// or appears in its maintainers tag.
+func (s *Store) CanMaintainRepository(ctx context.Context, repoID string, author nostr.PubKey) (bool, error) {
+	if strings.TrimSpace(repoID) == "" {
+		return false, nil
+	}
+
+	var rawRepo string
+	err := s.db.QueryRowContext(ctx, `SELECT raw_event_json FROM repositories WHERE repo_id=? LIMIT 1`, repoID).Scan(&rawRepo)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lookup repository announcement for maintainer: %w", err)
+	}
+
+	var repoEvt nostr.Event
+	if err := json.Unmarshal([]byte(rawRepo), &repoEvt); err != nil {
+		return false, fmt.Errorf("decode repository announcement for maintainer: %w", err)
+	}
+	if repoEvt.PubKey == author {
+		return true, nil
+	}
+	for _, maintainer := range nip34.ParseRepository(repoEvt).Maintainers {
+		if maintainer == author {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *Store) GetRepositoryCloneURLs(ctx context.Context, repoID string) ([]string, error) {
 	var cloneURLsCSV string
 	err := s.db.QueryRowContext(

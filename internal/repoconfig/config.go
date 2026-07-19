@@ -8,7 +8,9 @@ import (
 	"strings"
 
 	"drydock/internal/reviewengine"
+	"drydock/internal/scope"
 
+	"fiatjaf.com/nostr"
 	"gopkg.in/yaml.v3"
 )
 
@@ -56,14 +58,21 @@ type ContextConfig struct {
 }
 
 // PaymentsConfig controls Cashu ecash payment gating for review access.
-// When enabled, reviews require either an active subscription, a Cashu token
-// attached to the patch event, or available free-tier quota.
+// When enabled, reviews require configured free access, repository maintainership,
+// an active subscription, a Cashu token, or available free-tier quota.
 type PaymentsConfig struct {
-	Enabled               bool  `yaml:"enabled"`
-	PriceSats             int64 `yaml:"price_sats"`              // per-review price in sats
-	FreeReviewsPerDay     int   `yaml:"free_reviews_per_day"`    // free reviews per author per day
-	SubscriptionPriceSats int64 `yaml:"subscription_price_sats"` // subscription price in sats
-	SubscriptionDays      int   `yaml:"subscription_days"`       // subscription duration in days
+	Enabled               bool     `yaml:"enabled"`
+	PriceSats             int64    `yaml:"price_sats"`              // per-review price in sats
+	FreeReviewsPerDay     int      `yaml:"free_reviews_per_day"`    // free reviews per author per day
+	FreePubkeys           []string `yaml:"free_pubkeys"`            // pubkeys with unlimited free reviews
+	FreeForMaintainers    *bool    `yaml:"free_for_maintainers"`    // nil means enabled by default
+	SubscriptionPriceSats int64    `yaml:"subscription_price_sats"` // subscription price in sats
+	SubscriptionDays      int      `yaml:"subscription_days"`       // subscription duration in days
+}
+
+// MaintainersAreFree reports whether repository owners and maintainers bypass payment gating.
+func (c PaymentsConfig) MaintainersAreFree() bool {
+	return c.FreeForMaintainers == nil || *c.FreeForMaintainers
 }
 
 // EnsembleConfig controls multi-model ensemble review mode.
@@ -99,6 +108,7 @@ type StatusConfig struct {
 func Default() RepoConfig {
 	includeDocs := true
 	walkthrough := true
+	freeForMaintainers := true
 	return RepoConfig{
 		Version: currentVersion,
 		Review: ReviewConfig{
@@ -121,8 +131,9 @@ func Default() RepoConfig {
 			MaxFindings:   3,
 		},
 		Payments: PaymentsConfig{
-			Enabled:           false,
-			FreeReviewsPerDay: 0,
+			Enabled:            false,
+			FreeReviewsPerDay:  0,
+			FreeForMaintainers: &freeForMaintainers,
 		},
 		Ensemble: EnsembleConfig{
 			Enabled:          false,
@@ -278,6 +289,24 @@ func Parse(data []byte) (RepoConfig, error) {
 	}
 
 	// Validate payments config.
+	if raw.Payments.FreeForMaintainers == nil {
+		raw.Payments.FreeForMaintainers = defaults.Payments.FreeForMaintainers
+	}
+	if len(raw.Payments.FreePubkeys) > 0 {
+		seen := make(map[string]struct{}, len(raw.Payments.FreePubkeys))
+		normalized := make([]string, 0, len(raw.Payments.FreePubkeys))
+		for _, configured := range raw.Payments.FreePubkeys {
+			pubkey := scope.NormalizePubkey(configured)
+			if _, err := nostr.PubKeyFromHex(pubkey); err != nil {
+				return Default(), fmt.Errorf(".drydock.yaml: invalid payments.free_pubkeys entry %q", configured)
+			}
+			if _, exists := seen[pubkey]; !exists {
+				seen[pubkey] = struct{}{}
+				normalized = append(normalized, pubkey)
+			}
+		}
+		raw.Payments.FreePubkeys = normalized
+	}
 	if raw.Payments.Enabled {
 		if raw.Payments.PriceSats <= 0 {
 			return Default(), fmt.Errorf(".drydock.yaml: payments.price_sats must be > 0 when payments enabled")

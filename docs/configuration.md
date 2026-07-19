@@ -31,6 +31,14 @@ cp .env.example .env
 
 When both allowlists are empty, Drydock reviews all repositories. Otherwise, a patch is reviewed when either its repository ID or the owner from its stored repository announcement is allowlisted.
 
+## Payment Service
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_FREE_PUBKEYS` | comma-separated public keys | *(empty)* | Patch authors that bypass payment gating for every repository. Accepts npub or 64-character hex public keys and normalizes npub values to hex. |
+
+Repository-specific payment policy, free pubkeys, maintainer access, pricing, quota, and subscriptions are configured under `payments` in `.drydock.yaml`; see [Payments](payments.md) and [Per-Repository Configuration](repo-config.md).
+
 ## Nostr Relays
 
 Drydock supports separate relay lists for reading (subscribing to events) and writing (publishing reviews). If read/write-specific lists are not set, `DRYDOCK_RELAYS` is used for both.

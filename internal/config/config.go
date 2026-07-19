@@ -51,6 +51,7 @@ type Config struct {
 	RepoCacheMaxSizeMB    int
 	RepoAllowlist         []string
 	RepoOwnerAllowlist    []string
+	FreePubkeys           []string
 	Relays                []string
 	ReadRelays            []string
 	WriteRelays           []string
@@ -142,6 +143,7 @@ func FromEnv() Config {
 		RepoCacheMaxSizeMB: parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_SIZE_MB", "10240"), 10240),
 		RepoAllowlist:      normalizeRepositoryAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_ALLOWLIST", ""))),
 		RepoOwnerAllowlist: normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_OWNER_ALLOWLIST", ""))),
+		FreePubkeys:        normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_FREE_PUBKEYS", ""))),
 		Relays: splitCSV(
 			envOrDefault(
 				"DRYDOCK_RELAYS",
