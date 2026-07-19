@@ -135,6 +135,17 @@ func (e *Engine) generateWalkthrough(ctx context.Context, in RunInput) (Walkthro
 	return walkthrough, StepStatus{State: StepStateSucceeded}
 }
 
+// ModelForRoute returns the model identifier configured for the given
+// route's endpoint (e.g. the value served under that route), falling back to
+// the route alias when the route is unknown or no model is configured.
+func (e *Engine) ModelForRoute(route ModelRoute) string {
+	endpoint, err := e.routeEndpoint(route)
+	if err != nil || strings.TrimSpace(endpoint.Model) == "" {
+		return string(route)
+	}
+	return endpoint.Model
+}
+
 func (e *Engine) routeEndpoint(route ModelRoute) (ModelEndpoint, error) {
 	switch route {
 	case RouteCoder32B:

@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"drydock/internal/db"
@@ -32,14 +33,18 @@ func TestPreparePRTipReadsConfigFromCanonicalCache(t *testing.T) {
 	mgr := NewManager(t.TempDir(), testLogger())
 	forkPath := mgr.repoPath(repoID)
 	initWorkRepo(t, forkPath)
+
+	// The fork's origin shares history with the fork: the initial commit is
+	// the default branch head, and the PR tip adds one commit on top of it.
+	forkOrigin := filepath.Join(t.TempDir(), "fork-origin")
+	run(t, "", "git", "init", "--bare", forkOrigin)
+	run(t, forkPath, "git", "remote", "add", "origin", forkOrigin)
+	run(t, forkPath, "git", "push", "origin", "HEAD:refs/heads/main")
+
 	writeFile(t, filepath.Join(forkPath, ".drydock.yaml"), "policy: fork\n")
 	run(t, forkPath, "git", "add", ".drydock.yaml")
 	run(t, forkPath, "git", "commit", "-m", "fork policy")
 	forkTip := run(t, forkPath, "git", "rev-parse", "HEAD")
-
-	forkOrigin := filepath.Join(t.TempDir(), "fork-origin")
-	initWorkRepo(t, forkOrigin)
-	run(t, forkPath, "git", "remote", "add", "origin", forkOrigin)
 
 	canonicalPath := mgr.canonicalRepoPath(repoID)
 	initWorkRepo(t, canonicalPath)
@@ -56,7 +61,9 @@ func TestPreparePRTipReadsConfigFromCanonicalCache(t *testing.T) {
 		ID:   nostr.MustIDFromHex("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
 		Kind: 1618,
 		Tags: nostr.Tags{
-			{"clone", "https://fork.example/repo.git"},
+			// Local path is rejected by isSafeCloneURL, so no fetch from the
+			// fork URL is ever attempted in this test (no network access).
+			{"clone", filepath.Join(t.TempDir(), "nonexistent-fork.git")},
 			{"c", forkTip},
 		},
 	}
@@ -71,6 +78,9 @@ func TestPreparePRTipReadsConfigFromCanonicalCache(t *testing.T) {
 	}
 	if result.RepoPath != forkPath {
 		t.Fatalf("expected PR checkout to use fork cache path %s, got %s", forkPath, result.RepoPath)
+	}
+	if !strings.Contains(result.Diff, "diff --git") || !strings.Contains(result.Diff, ".drydock.yaml") {
+		t.Fatalf("expected PR prepare to produce a unified diff of the tip, got %q", result.Diff)
 	}
 }
 

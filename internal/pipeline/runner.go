@@ -319,9 +319,16 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return err
 	}
 
-	// 2. Extract actual diff content from the raw event.
-	// The context builder expects unified diff content, not the JSON envelope.
+	// 2. Determine the unified diff for review. Kind 1617 patch events carry
+	// the diff in the event content; PR-style events (kind 1618/1619) carry a
+	// cover letter there, so we use the git diff computed by repo prepare
+	// (PR tip vs merge-base with the default branch) instead.
 	patchDiffContent := patchEvent.Content
+	if strings.TrimSpace(prep.Diff) != "" {
+		patchDiffContent = prep.Diff
+	} else if patchRec.Kind != 1617 {
+		return fmt.Errorf("PR event %s (kind %d) produced no diff against its base", task.PatchEventID, patchRec.Kind)
+	}
 
 	// 3b. Validate that the patch diff is non-empty to avoid wasting an LLM call.
 	if strings.TrimSpace(patchDiffContent) == "" {
@@ -785,7 +792,13 @@ func meanConfidence(findings []reviewengine.Finding) float64 {
 	return sum / float64(len(findings))
 }
 
-func modelName(route reviewengine.ModelRoute, _ *reviewengine.Engine) string {
+// modelName resolves a planner route to the model identifier configured for
+// that route's endpoint, so published reviews report the model that actually
+// served the request rather than the internal route alias.
+func modelName(route reviewengine.ModelRoute, engine *reviewengine.Engine) string {
+	if engine != nil {
+		return engine.ModelForRoute(route)
+	}
 	return string(route)
 }
 

@@ -237,10 +237,24 @@ func TestPipelinePureHelpers(t *testing.T) {
 		}
 	})
 
-	t.Run("modelName", func(t *testing.T) {
+	t.Run("modelName_nilEngineFallsBackToRoute", func(t *testing.T) {
 		name := modelName(reviewengine.RouteCoder32B, nil)
 		if name != "coder32b" {
 			t.Fatalf("expected 'coder32b', got %s", name)
+		}
+	})
+
+	t.Run("modelName_resolvesConfiguredModel", func(t *testing.T) {
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		engine := reviewengine.New(reviewengine.Config{
+			Coder32B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "qwen2.5-coder-32b-instruct"},
+		}, nil, logger)
+		if name := modelName(reviewengine.RouteCoder32B, engine); name != "qwen2.5-coder-32b-instruct" {
+			t.Fatalf("expected configured model name, got %s", name)
+		}
+		// Route with no configured model falls back to the route alias.
+		if name := modelName(reviewengine.RouteLLM70B, engine); name != "llm70b" {
+			t.Fatalf("expected route alias fallback, got %s", name)
 		}
 	})
 }

@@ -394,3 +394,34 @@ func TestTouchAccessAndRepoAccessTime(t *testing.T) {
 		t.Fatalf("access time %v not in expected range [%v, %v]", at, before, after)
 	}
 }
+
+func TestDiffAgainstDefaultBranch(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewManager(t.TempDir(), testLogger())
+	repoPath := initWorkRepo(t, mgr.repoPath("owner:diffrepo"))
+
+	origin := filepath.Join(t.TempDir(), "origin")
+	run(t, "", "git", "init", "--bare", origin)
+	run(t, repoPath, "git", "remote", "add", "origin", origin)
+	run(t, repoPath, "git", "push", "origin", "HEAD:refs/heads/main")
+	run(t, repoPath, "git", "fetch", "origin")
+	baseTip := run(t, repoPath, "git", "rev-parse", "HEAD")
+
+	writeFile(t, filepath.Join(repoPath, "feature.go"), "package feature\n")
+	run(t, repoPath, "git", "add", "feature.go")
+	run(t, repoPath, "git", "commit", "-m", "add feature")
+	tip := run(t, repoPath, "git", "rev-parse", "HEAD")
+
+	diff, err := mgr.DiffAgainstDefaultBranch(ctx, repoPath, tip)
+	if err != nil {
+		t.Fatalf("diff against default branch: %v", err)
+	}
+	if !strings.Contains(diff, "diff --git") || !strings.Contains(diff, "feature.go") {
+		t.Fatalf("expected unified diff containing feature.go, got %q", diff)
+	}
+
+	// A tip already contained in the default branch has nothing to review.
+	if _, err := mgr.DiffAgainstDefaultBranch(ctx, repoPath, baseTip); err == nil {
+		t.Fatal("expected error when tip is already contained in the default branch")
+	}
+}

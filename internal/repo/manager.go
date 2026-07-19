@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -233,6 +234,44 @@ func (m *Manager) CheckoutCommitOnBranch(ctx context.Context, repoPath, branch, 
 	return nil
 }
 
+// DiffAgainstDefaultBranch returns a unified diff of tip relative to its
+// merge-base with the repository's default branch. Exactly one authoritative
+// default ref is used (origin/HEAD, falling back to origin/main then
+// origin/master only when the earlier refs do not exist) so a stale secondary
+// branch can never substitute for the real default. Errors are returned when
+// no default ref exists, when the histories are unrelated, or when the
+// default branch already contains tip (nothing to review).
+func (m *Manager) DiffAgainstDefaultBranch(ctx context.Context, repoPath, tip string) (string, error) {
+	mu := m.getRepoLock(repoPath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	var defaultRef string
+	for _, ref := range []string{"refs/remotes/origin/HEAD", "origin/main", "origin/master"} {
+		if _, err := m.runGit(ctx, repoPath, "rev-parse", "--verify", ref+"^{commit}"); err == nil {
+			defaultRef = ref
+			break
+		}
+	}
+	if defaultRef == "" {
+		return "", fmt.Errorf("no default branch ref found for diff base of %s", tip)
+	}
+
+	base, err := m.runGit(ctx, repoPath, "merge-base", defaultRef, tip)
+	if err != nil {
+		return "", fmt.Errorf("no merge-base between %s and %s (unrelated histories?): %w", defaultRef, tip, err)
+	}
+	if strings.EqualFold(base, tip) {
+		return "", fmt.Errorf("commit %s is already contained in %s; nothing to review", tip, defaultRef)
+	}
+
+	diff, err := m.runGitStdout(ctx, repoPath, "diff", base, tip)
+	if err != nil {
+		return "", fmt.Errorf("diff %s..%s: %w", base, tip, err)
+	}
+	return diff, nil
+}
+
 // ReadFileAtRef reads a file from the repository at the specified git ref
 // without touching the working tree. Returns the file content, or an error.
 // ErrNotFound is returned if the file doesn't exist at that ref.
@@ -341,6 +380,25 @@ func (m *Manager) runGit(ctx context.Context, repoPath string, args ...string) (
 		return "", fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// runGitStdout runs a git command and returns stdout only, preserving the
+// output verbatim. Use this for commands whose output is content (e.g. diff)
+// rather than a short value, so stderr warnings never contaminate it.
+func (m *Manager) runGitStdout(ctx context.Context, repoPath string, args ...string) (string, error) {
+	validatedPath, err := m.validateRepoPath(repoPath)
+	if err != nil {
+		return "", err
+	}
+	fullArgs := append([]string{"-C", validatedPath}, args...)
+	cmd := exec.CommandContext(ctx, "git", fullArgs...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
 }
 
 func (m *Manager) repoPath(repoID string) string {
