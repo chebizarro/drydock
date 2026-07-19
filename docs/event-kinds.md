@@ -6,18 +6,19 @@ This document is the Drydock reference for Nostr event kinds and tag conventions
 
 | Kind | Standard | Name | Drydock Use |
 |------|----------|------|-------------|
+| 0 | NIP-01 | Profile metadata | Published/refreshed at startup for the Drydock identity (name, about, picture, banner) |
 | 13 | NIP-59 | Seal | Sender-signed encrypted seal inside codechat gift wraps; never published directly |
 | 14 | NIP-17 | Private direct message | Plaintext unsigned codechat rumor inside a seal; never published directly |
 | 1059 | NIP-59 | Gift wrap | Ephemerally signed encrypted envelope for private Drydock events |
 | 1111 | NIP-22 | Comment | Published code review comments and thread replies |
 | 1617 | NIP-34 | Patch | Primary automated review trigger |
-| 1618 | NIP-34 | Pull request | PR tip review trigger |
+| 1618 | NIP-34 | Pull request | PR tip review trigger — reviewed diff computed from git merge-base, not event content |
 | 1619 | NIP-34 | Pull request update | PR update review trigger and comment-thread parent |
 | 1621 | NIP-34 | Pull request revision | Monitored and stored for PR history |
-| 1630 | NIP-34 | Status: open | Root status tracking |
-| 1631 | NIP-34 | Status: applied/merged | Root status tracking; suppresses duplicate review |
-| 1632 | NIP-34 | Status: closed | Root status tracking; suppresses duplicate review |
-| 1633 | NIP-34 | Status: draft | Root status tracking |
+| 1630 | NIP-34 | Status: open | Root status tracking; auto-reviewed by default |
+| 1631 | NIP-34 | Status: applied/merged | Root status tracking; never auto-reviewed |
+| 1632 | NIP-34 | Status: closed | Root status tracking; never auto-reviewed |
+| 1633 | NIP-34 | Status: draft | Root status tracking; auto-reviewed only when the repo opts in (`review.statuses`) |
 | 1985 | NIP-32 | Label | Labels ingested for context and routing |
 | 7000 | NIP-90 | Job feedback | Marketplace feedback and completion feedback |
 | 25910 | ContextVM | JSON-RPC transport | Review, fix, assignment, accept, and reject methods |
@@ -26,6 +27,7 @@ This document is the Drydock reference for Nostr event kinds and tag conventions
 | 30618 | NIP-34 | Repository state snapshot | Repository state and staleness gate |
 | 31990 | NIP-89 | Handler/reviewer profile | Reviewer discovery and capability advertisement |
 | 22242 | NIP-42 | AUTH event | Relay authentication challenge response |
+| 24242 | Blossom BUD-01 | Media authorization | Signed upload authorization for profile icon/banner pushes; sent as an HTTP header, never published to relays |
 | 10002 | NIP-65 | Relay list metadata | User relay discovery when available |
 
 ## Deprecated Drydock Kinds

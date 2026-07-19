@@ -9,20 +9,66 @@ Drydock integrates with Nostr as both a consumer and producer of signed events. 
 | 30617 | NIP-34 | Repository announcement | Repository registry — extracts clone URLs, relay hints, and metadata |
 | 30618 | NIP-34 | Repository state snapshot | Staleness gate — if a patch's tip commit is already in the latest snapshot, the review is skipped |
 | 1617 | NIP-34 | Patch event | **Primary review trigger** — contains unified diff in `content` |
-| 1618 | NIP-34 | PR (pull request) event | PR tip review trigger |
-| 1619 | NIP-34 | PR update event | Review trigger — uses `E` tag to find root PR for comment threading |
+| 1618 | NIP-34 | PR (pull request) event | PR tip review trigger — `content` is a cover letter; the reviewed diff is computed from git (see below) |
+| 1619 | NIP-34 | PR update event | Review trigger — diff computed like 1618; uses `E` tag to find root PR for comment threading |
 | 1621 | NIP-34 | PR revision | Monitored and stored; not directly reviewed |
 | 1111 | NIP-22 | Comment | Review output kind; also ingested for thread cache |
-| 1630 | NIP-34 | Status: open | Root status tracking |
-| 1631 | NIP-34 | Status: applied/merged | Root status tracking — patches with applied roots are not reviewed |
-| 1632 | NIP-34 | Status: closed | Root status tracking — patches with closed roots are not reviewed |
-| 1633 | NIP-34 | Status: draft | Root status tracking |
+| 1630 | NIP-34 | Status: open | Root status tracking — reviewed automatically (default) |
+| 1631 | NIP-34 | Status: applied/merged | Root status tracking — never auto-reviewed |
+| 1632 | NIP-34 | Status: closed | Root status tracking — never auto-reviewed |
+| 1633 | NIP-34 | Status: draft | Root status tracking — auto-reviewed only when the repo opts in via `review.statuses` |
 | 1985 | NIP-32 | Label | Monitored and stored |
 | 30078 | NIP-78 | Application data | IDE session state and replaceable Drydock client state |
 | 31990 | NIP-89 | Handler/reviewer profile | Reviewer capability profiles for marketplace discovery |
 | 25910 | ContextVM | JSON-RPC transport | Review, fix, assignment, accept, and reject commands |
 | 7000 | NIP-90 | Job feedback | Marketplace feedback and review completion feedback |
 | 1059 | NIP-59 | Gift wrap | Encrypted wrapper for private Drydock events |
+
+## Review Diff Derivation
+
+What Drydock actually reviews depends on the trigger kind:
+
+- **Kind 1617 (patch)**: the event `content` *is* the unified diff and is used
+  directly, after applying the whole patch series on a throwaway branch.
+- **Kind 1618/1619 (PR / PR update)**: the event `content` is a cover letter,
+  not a diff. Drydock fetches the `c`-tag tip commit, checks it out on a
+  review branch, and computes `git diff <merge-base(default, tip)>..tip`.
+  The diff is computed in the **canonical** clone whenever possible so a
+  fork-controlled `origin` cannot choose the diff base and hide changes.
+  A PR whose tip is already contained in the default branch, or whose
+  history is unrelated, fails closed with no review.
+
+The changed-file set parsed deterministically from this diff is authoritative
+downstream: reviews refuse to run when it is empty, and findings or
+walkthrough file summaries referencing paths outside it are dropped before
+publication (the model also sees contextual layers such as project docs and
+must not present them as modified files).
+
+## Status Gating
+
+Automatic reviews respect the root's current NIP-34 status at review time
+(re-checked after ingest to avoid racing late-arriving status events):
+
+| Root status | Auto-reviewed? |
+|-------------|----------------|
+| none / kind 1630 (open) | Yes (default) |
+| kind 1633 (draft) | Only when the repo config opts in (`review.statuses: [open, draft]`) |
+| kind 1631 (applied/merged) | Never |
+| kind 1632 (closed) | Never |
+
+Status-gated skips are permanent (not retried by the failed-review sweep); a
+later status change back to open triggers reviews normally. See
+[Per-Repository Configuration](repo-config.md).
+
+## Kind 0 Profile
+
+On startup Drydock ensures its signing identity has a kind 0 profile: it
+fetches the newest kind 0 from the read relays and publishes a fresh one when
+none exists or when the configured metadata (name, about, website, picture,
+banner) has changed. Unmanaged fields already present in the profile are
+preserved. The icon and banner images are pushed to a Blossom media server
+(BUD-01/BUD-02) and referenced by content-addressed URLs. See
+[Configuration — Kind 0 Profile & Media](configuration.md#kind-0-profile--media).
 
 ## Nostr-Native Event Strategy
 
@@ -150,7 +196,7 @@ Every review comment includes a plaintext footer:
 
 ```text
 ---
-model: coder32b
+model: qwen2.5-coder-32b-instruct-q4_k_m
 context-hash: a1b2c3...
 patch-event-id: abc123...
 repo-id: npub1...:reponame
@@ -161,6 +207,13 @@ context-layers-dropped: commit-history, project-docs
 ```
 
 The `context-layers-dropped` field is always present (even when empty) for auditability.
+
+The `model` field names the model that **actually served** the reviewer
+request: preferentially the identifier reported in the endpoint's
+chat-completion response for that specific run, falling back to the served-model
+registry (seeded by a startup `/v1/models` probe) and then the configured
+model name. Internal route aliases (`coder32b`, `llm70b`, `coder14b`) are
+never published when better information exists.
 
 ## Comment Scope Derivation
 

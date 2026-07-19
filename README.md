@@ -21,7 +21,7 @@ IDE clients ──kind 30078 session + kind 25910 ContextVM──▶ IDE Gateway
 Review marketplace ──kind 31990 profiles + kind 25910 assignments──▶ Reviewers
 ```
 
-Drydock subscribes to NIP-34 event kinds (patches, PRs, repository announcements, status updates). When a new patch arrives, it clones the referenced repository, builds a deterministic context bundle within a 64K token budget, routes the patch through a planner→reviewer LLM pipeline, and publishes structured kind 1111 review comments. IDE and marketplace flows use ContextVM JSON-RPC over kind 25910 events for review requests, fix requests, assignments, accepts, and rejects. A meta-review loop evaluates review quality and feeds improvements back into the system.
+Drydock subscribes to NIP-34 event kinds (patches, PRs, repository announcements, status updates). When a new patch arrives, it clones the referenced repository, builds a deterministic context bundle within a 64K token budget, routes the patch through a planner→reviewer LLM pipeline, and publishes structured kind 1111 review comments. Kind 1617 patches are reviewed from the diff in the event content; kind 1618/1619 pull requests are reviewed from a real `git diff` of the PR tip against its merge-base with the default branch — computed in the canonical clone, never trusting a fork's view of history. Findings and walkthrough entries are validated against the deterministically parsed changed-file set before publication, and automatic reviews respect the root's NIP-34 status (open by default, drafts opt-in, merged/closed never). IDE and marketplace flows use ContextVM JSON-RPC over kind 25910 events for review requests, fix requests, assignments, accepts, and rejects. A meta-review loop evaluates review quality and feeds improvements back into the system.
 
 All inference runs locally via OpenAI-compatible endpoints (Ollama, llama.cpp, vLLM). No code leaves your infrastructure.
 
@@ -45,6 +45,8 @@ go run ./cmd/drydock
 ```
 
 See [Deployment](docs/deployment.md) for Docker, multi-GPU, and production setups.
+
+On startup, Drydock also maintains a kind 0 profile for its signing identity — publishing name, about text, and an icon/banner pushed to a Blossom media server — and refreshes it whenever the configured metadata changes. Repositories can tune review behavior (severity floor, reviewed statuses, custom instructions, auto-fix, ensemble mode) by committing a [`.drydock.yaml`](docs/repo-config.md).
 
 ## Prerequisites
 
@@ -76,6 +78,7 @@ Key settings:
 | [Nostr Event Kinds](docs/event-kinds.md) | Current Nostr-native event kinds, tag conventions, deprecated kind replacements |
 | [ContextVM Integration](docs/contextvm-integration.md) | Kind 25910 JSON-RPC methods for review, fix, and marketplace commands |
 | [Review Engine](docs/review-engine.md) | Two-stage planner→reviewer pipeline, model routing, finding schema |
+| [Per-Repository Configuration](docs/repo-config.md) | `.drydock.yaml` reference: severity floors, reviewed statuses, auto-fix, ensemble, custom instructions |
 | [Context Builder](docs/context-builder.md) | 7-layer priority system, token budget, exclusion rules |
 | [Meta-Review](docs/meta-review.md) | Self-improvement loop, gating logic, feedback routing |
 | [Evaluation](docs/eval.md) | Held-out eval harness, metrics, dataset format |

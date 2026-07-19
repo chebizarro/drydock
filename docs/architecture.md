@@ -144,10 +144,11 @@ Trace of a single patch event from relay to published review:
    - Sends a `ReviewTask` to the pipeline channel (buffer: 256)
 
 3. **Pipeline** — `pipeline.Runner.work` picks up the task:
-   - `repo.Service.PreparePatchSeries` — clones or fetches the repository, applies the patch series to a throwaway branch
-   - `contextbuilder.Builder.Build` — detects workspace boundaries, assembles context layers within token budget
-   - `reviewengine.Engine.Run` — planner call → model route selection → reviewer call with checklist injection
-   - `publisher.Service.PublishReview` — builds kind 1111 events, signs them, fans out to relays
+   - `repo.Service.PreparePatchSeries` — clones or fetches the repository; for kind 1617 applies the patch series to a throwaway branch, for kind 1618/1619 checks out the PR tip and computes the diff against its merge-base with the default branch (in the canonical clone, so a fork cannot pick the diff base)
+   - **Status gate** — re-checks the root's current NIP-34 status against the repo's `review.statuses` config (open by default, drafts opt-in, merged/closed never); status skips are permanent
+   - `contextbuilder.Builder.Build` — detects workspace boundaries, assembles context layers within token budget; the pipeline fails closed if the deterministic changed-file set is empty
+   - `reviewengine.Engine.Run` — planner call → model route selection → reviewer call with checklist injection; findings and walkthrough file summaries are filtered to the changed-file set
+   - `publisher.Service.PublishReview` — builds kind 1111 events (labeled with the model the endpoint actually served), signs them, fans out to relays
    - `metareview.Service.RunAsync` — asynchronous quality evaluation (non-blocking)
 
 4. **Publish** — The publisher resolves target relays (patch-seen relays + repo announcement relays + defaults), constructs summary and detail comment events, signs each, and publishes.

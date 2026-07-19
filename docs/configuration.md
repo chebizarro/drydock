@@ -70,6 +70,16 @@ Drydock uses OpenAI-compatible `/chat/completions` endpoints. Five model slots a
 | `DRYDOCK_META_BASE_URL` | URL | `http://127.0.0.1:11436/v1` | Base URL for the meta-review model. |
 | `DRYDOCK_META_MODEL` | string | `llama-3.3-70b-instruct-q4_k_m` | Model name for meta-review requests. |
 
+### Model name verification
+
+Configured model names are deployment metadata and can go stale. At startup
+Drydock probes each endpoint's `/v1/models` listing and logs a warning when a
+configured `*_MODEL` value is not among the served models. Published reviews
+are labeled with the model identifier the endpoint **actually reported
+serving** for that request (from the chat-completion response), falling back
+to the served-model registry and then the configured name — so a stale env
+value produces warnings, not mislabeled reviews.
+
 ### Single-Endpoint Pattern
 
 For development or single-GPU deployments, point all endpoints to the same Ollama instance:
@@ -121,6 +131,30 @@ The LSP bridge is a separate HTTP service that manages language servers for type
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_PIPELINE_WORKERS` | integer | `2` | Number of concurrent review pipeline workers. Increase only if your LLM endpoints support concurrent requests. |
+
+## Kind 0 Profile & Media
+
+At startup Drydock checks the read relays for a kind 0 profile belonging to
+its signing identity and publishes one when missing — or republishes when the
+configured metadata below has changed. Fields Drydock does not manage (e.g. a
+`lud16` set by another tool) are preserved across republishes.
+
+The icon and banner images are pushed to a Blossom media server (BUD-01/
+BUD-02) and referenced by their content-addressed URLs. Explicit `*_URL`
+values skip the upload; with no Blossom server configured the image fields
+are omitted with a warning.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_PROFILE_ENABLED` | boolean | `true` | Publish/refresh the kind 0 profile at startup. |
+| `DRYDOCK_PROFILE_NAME` | string | `Drydock` | Profile display name. |
+| `DRYDOCK_PROFILE_ABOUT` | string | *(summary of what Drydock does)* | Profile about text. |
+| `DRYDOCK_PROFILE_WEBSITE` | URL | *(empty)* | Profile website field. |
+| `DRYDOCK_PROFILE_PICTURE_URL` | URL | *(empty)* | Explicit picture URL; overrides the icon upload. |
+| `DRYDOCK_PROFILE_BANNER_URL` | URL | *(empty)* | Explicit banner URL; overrides the banner upload. |
+| `DRYDOCK_PROFILE_ICON_PATH` | path | `assets/drydock-icon.png` | Local icon pushed to Blossom for the `picture` field. |
+| `DRYDOCK_PROFILE_BANNER_PATH` | path | `assets/drydock-banner.png` | Local banner pushed to Blossom for the `banner` field. |
+| `DRYDOCK_BLOSSOM_SERVERS` | comma-separated URLs | *(empty)* | Blossom media servers tried in order for image uploads. |
 
 ## Health & Monitoring
 

@@ -64,6 +64,12 @@ The planner selects one of three model routes based on patch complexity:
 
 Each route maps to independently configurable endpoint and model name via environment variables. See [Configuration](configuration.md#llm-endpoints).
 
+Route aliases are internal. Published reviews are labeled with the model the
+endpoint **actually reported serving** for that run: every chat-completion
+response's `model` field is carried through `RunOutput.ServedModel`, with a
+fallback to the served-model registry (seeded by a startup `/v1/models`
+probe of each endpoint) and finally the configured model name.
+
 ## Reviewer Stage
 
 The reviewer receives the context bundle, the planner's analysis, an auto-generated checklist, and optional few-shot examples. It outputs structured findings:
@@ -107,6 +113,20 @@ The reviewer receives the context bundle, the planner's analysis, an auto-genera
 - `file` must be non-empty and `line` must be positive
 - `confidence` must be in [0, 1]
 - If any finding has `confidence < 0.6`, the `needs_more_context` array must be non-empty
+
+### Changed-File Anchoring
+
+The reviewer sees contextual layers (project docs, related code) alongside
+the diff, and can hallucinate findings against files the change never
+touched. Two deterministic guards run outside the LLM:
+
+- The pipeline **fails closed before any LLM call** when the changed-file
+  set parsed from the diff is empty — a review anchored to nothing but
+  context would be baseless.
+- After the reviewer (and after ensemble merging), findings and walkthrough
+  `file_summaries` whose paths are not in the deterministic changed-file set
+  are dropped and logged. Only the parsed diff is authoritative for what
+  changed.
 
 ## Checklist Injection
 
