@@ -38,6 +38,7 @@ func TestSubscribedKindsSet(t *testing.T) {
 		25910: true, // ContextVM IDE/marketplace intents/responses
 		31990: true, // Marketplace: reviewer profile (NIP-89 app handler)
 		7000:  true, // Marketplace: NIP-90 review feedback
+		9735:  true, // NIP-57 zap receipt
 	}
 
 	if len(kinds) != len(expected) {

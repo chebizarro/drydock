@@ -23,4 +23,5 @@ const (
 	ContextVM              nostr.Kind = 25910
 	ReviewerProfile                   = nostr.KindHandlerInformation
 	ReviewFeedback                    = nostr.KindJobFeedback
+	ZapReceipt             nostr.Kind = 9735
 )

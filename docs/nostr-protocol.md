@@ -22,7 +22,14 @@ Drydock integrates with Nostr as both a consumer and producer of signed events. 
 | 31990 | NIP-89 | Handler/reviewer profile | Reviewer capability profiles for marketplace discovery |
 | 25910 | ContextVM | JSON-RPC transport | Review, fix, assignment, accept, and reject commands |
 | 7000 | NIP-90 | Job feedback | Marketplace feedback and review completion feedback |
+| 9735 | NIP-57 | Zap receipt | Payment proof addressed to Drydock and linked to a patch/PR event |
 | 1059 | NIP-59 | Gift wrap | Encrypted wrapper for private Drydock events |
+
+## NIP-57 Zap Payment Receipts
+
+Kind `9735` receipts are public payment proofs. Drydock requires a `p` tag matching its signer pubkey, an `e` tag naming the patch/PR event, a positive amount from `amount` or `bolt11`, and—when configured—a receipt author in `DRYDOCK_TRUSTED_ZAPPERS`. Repository policy compares the receipt millisatoshis with `payments.price_sats * 1000` and can disable this path with `payments.accept_zaps: false`.
+
+A receipt received after a review was recorded as `payment_blocked` clears that failure and re-enqueues the review. Receipts received before the patch remain stored for authorization when the patch reaches the pipeline.
 
 ## Review Diff Derivation
 

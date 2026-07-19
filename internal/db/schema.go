@@ -55,6 +55,19 @@ CREATE TABLE IF NOT EXISTS patch_event_relays (
 );
 CREATE INDEX IF NOT EXISTS idx_patch_event_relays_patch ON patch_event_relays(patch_event_id);
 
+CREATE TABLE IF NOT EXISTS zap_receipts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  patch_event_id TEXT NOT NULL,
+  payer_pubkey TEXT NOT NULL DEFAULT '',
+  receipt_author TEXT NOT NULL,
+  amount_msat INTEGER NOT NULL CHECK (amount_msat > 0),
+  created_at INTEGER NOT NULL,
+  seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_zap_receipts_patch_amount
+  ON zap_receipts(patch_event_id, amount_msat);
+
 CREATE TABLE IF NOT EXISTS review_events (
   event_id TEXT PRIMARY KEY,
   patch_event_id TEXT NOT NULL,

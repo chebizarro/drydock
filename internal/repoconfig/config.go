@@ -4,6 +4,7 @@ package repoconfig
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 
@@ -66,6 +67,7 @@ type PaymentsConfig struct {
 	FreeReviewsPerDay     int      `yaml:"free_reviews_per_day"`    // free reviews per author per day
 	FreePubkeys           []string `yaml:"free_pubkeys"`            // pubkeys with unlimited free reviews
 	FreeForMaintainers    *bool    `yaml:"free_for_maintainers"`    // nil means enabled by default
+	AcceptZaps            *bool    `yaml:"accept_zaps"`             // nil means enabled when payments are enabled
 	SubscriptionPriceSats int64    `yaml:"subscription_price_sats"` // subscription price in sats
 	SubscriptionDays      int      `yaml:"subscription_days"`       // subscription duration in days
 }
@@ -73,6 +75,11 @@ type PaymentsConfig struct {
 // MaintainersAreFree reports whether repository owners and maintainers bypass payment gating.
 func (c PaymentsConfig) MaintainersAreFree() bool {
 	return c.FreeForMaintainers == nil || *c.FreeForMaintainers
+}
+
+// AcceptsZaps reports whether NIP-57 zap receipts may authorize reviews.
+func (c PaymentsConfig) AcceptsZaps() bool {
+	return c.Enabled && (c.AcceptZaps == nil || *c.AcceptZaps)
 }
 
 // EnsembleConfig controls multi-model ensemble review mode.
@@ -109,6 +116,7 @@ func Default() RepoConfig {
 	includeDocs := true
 	walkthrough := true
 	freeForMaintainers := true
+	acceptZaps := true
 	return RepoConfig{
 		Version: currentVersion,
 		Review: ReviewConfig{
@@ -134,6 +142,7 @@ func Default() RepoConfig {
 			Enabled:            false,
 			FreeReviewsPerDay:  0,
 			FreeForMaintainers: &freeForMaintainers,
+			AcceptZaps:         &acceptZaps,
 		},
 		Ensemble: EnsembleConfig{
 			Enabled:          false,
@@ -292,6 +301,9 @@ func Parse(data []byte) (RepoConfig, error) {
 	if raw.Payments.FreeForMaintainers == nil {
 		raw.Payments.FreeForMaintainers = defaults.Payments.FreeForMaintainers
 	}
+	if raw.Payments.AcceptZaps == nil {
+		raw.Payments.AcceptZaps = defaults.Payments.AcceptZaps
+	}
 	if len(raw.Payments.FreePubkeys) > 0 {
 		seen := make(map[string]struct{}, len(raw.Payments.FreePubkeys))
 		normalized := make([]string, 0, len(raw.Payments.FreePubkeys))
@@ -310,6 +322,9 @@ func Parse(data []byte) (RepoConfig, error) {
 	if raw.Payments.Enabled {
 		if raw.Payments.PriceSats <= 0 {
 			return Default(), fmt.Errorf(".drydock.yaml: payments.price_sats must be > 0 when payments enabled")
+		}
+		if raw.Payments.PriceSats > math.MaxInt64/1000 {
+			return Default(), fmt.Errorf(".drydock.yaml: payments.price_sats is too large")
 		}
 		if raw.Payments.FreeReviewsPerDay < 0 {
 			raw.Payments.FreeReviewsPerDay = 0

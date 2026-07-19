@@ -52,6 +52,7 @@ type Config struct {
 	RepoAllowlist         []string
 	RepoOwnerAllowlist    []string
 	FreePubkeys           []string
+	TrustedZappers        []string
 	Relays                []string
 	ReadRelays            []string
 	WriteRelays           []string
@@ -144,6 +145,7 @@ func FromEnv() Config {
 		RepoAllowlist:      normalizeRepositoryAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_ALLOWLIST", ""))),
 		RepoOwnerAllowlist: normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_OWNER_ALLOWLIST", ""))),
 		FreePubkeys:        normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_FREE_PUBKEYS", ""))),
+		TrustedZappers:     normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_TRUSTED_ZAPPERS", ""))),
 		Relays: splitCSV(
 			envOrDefault(
 				"DRYDOCK_RELAYS",

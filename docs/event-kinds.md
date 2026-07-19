@@ -21,6 +21,7 @@ This document is the Drydock reference for Nostr event kinds and tag conventions
 | 1633 | NIP-34 | Status: draft | Root status tracking; auto-reviewed only when the repo opts in (`review.statuses`) |
 | 1985 | NIP-32 | Label | Labels ingested for context and routing |
 | 7000 | NIP-90 | Job feedback | Marketplace feedback and completion feedback |
+| 9735 | NIP-57 | Zap receipt | Payment authorization for the patch/PR identified by the `e` tag |
 | 25910 | ContextVM | JSON-RPC transport | Review, fix, assignment, accept, and reject methods |
 | 30078 | NIP-78 | Application data | IDE session state and replaceable app state |
 | 30617 | NIP-34 | Repository announcement | Repository metadata, clone URL, relay hints |
@@ -56,6 +57,10 @@ Drydock publishes review summaries and detail comments as kind `1111`. Comments 
 ### NIP-34 Repository and Patch Events (`1617`, `1618`, `1619`, `1621`, `1630`-`1633`, `30617`, `30618`)
 
 Drydock consumes NIP-34 repository, patch, pull request, update, revision, and status events. Patch and PR events are the review inputs; status events decide whether work should be skipped.
+
+### NIP-57 Zap Receipt (`9735`)
+
+Drydock ingests receipts addressed to its service pubkey with a `p` tag and linked to a patch or PR with an `e` tag. The positive millisatoshi amount comes from an `amount` tag or a fixed-amount `bolt11` invoice. Qualifying receipts authorize payment-gated reviews and late receipts re-enqueue reviews blocked for payment.
 
 ### NIP-78 Application Data (`30078`)
 
@@ -106,6 +111,8 @@ Other private Drydock payloads should also be gift-wrapped. This includes source
 | `rating` | Kind `7000` | Marketplace rating value, typically `1` through `5` |
 | `expiration` | Ephemeral/private workflows | Unix timestamp for relay discard eligibility |
 | `client` | Kind `30078` | IDE client identifier and version |
+| `amount` | Kind `9735` | Paid amount in millisatoshis |
+| `bolt11` | Kind `9735` | Checksummed fixed-amount Lightning invoice |
 
 ## Addressable References
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -46,6 +47,8 @@ type DocIngester interface {
 type CodeIndexer interface {
 	IndexRepo(ctx context.Context, repoPath, repoID string) error
 }
+
+var errPaymentBlockPersisted = errors.New("review payment blocked")
 
 // PaymentAuthorizer gates reviews according to the repository payment policy.
 type PaymentAuthorizer interface {
@@ -220,8 +223,10 @@ func (r *Runner) work(ctx context.Context, id int) {
 				taskLog.Error("review pipeline failed",
 					"error", err,
 					"elapsed_ms", tracing.Elapsed(taskCtx).Milliseconds())
-				if markErr := r.store.MarkReviewFailed(ctx, task.PatchEventID, task.RepoID, err.Error()); markErr != nil {
-					taskLog.Error("failed to mark review as failed", "error", markErr)
+				if !errors.Is(err, errPaymentBlockPersisted) {
+					if markErr := r.store.MarkReviewFailed(ctx, task.PatchEventID, task.RepoID, err.Error()); markErr != nil {
+						taskLog.Error("failed to mark review as failed", "error", markErr)
+					}
 				}
 			} else {
 				metrics.ReviewsFinished.With("published").Inc()
@@ -304,17 +309,34 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		if r.paymentAuth == nil {
 			return fmt.Errorf("payment_blocked:payment_service_not_configured")
 		}
-		auth, err := r.paymentAuth.AuthorizePatch(ctx, patchEvent, task.RepoID, repoCfg.Payments)
-		if err != nil {
-			return fmt.Errorf("authorize payment: %w", err)
+		paymentAuthorized := false
+		for attempt := 0; attempt < 3; attempt++ {
+			auth, err := r.paymentAuth.AuthorizePatch(ctx, patchEvent, task.RepoID, repoCfg.Payments)
+			if err != nil {
+				return fmt.Errorf("authorize payment: %w", err)
+			}
+			if auth.Allowed {
+				log.Info("review payment authorized",
+					"patch_event_id", task.PatchEventID,
+					"repo_id", task.RepoID,
+					"access_kind", auth.AccessKind)
+				paymentAuthorized = true
+				break
+			}
+			advanced, err := r.store.MarkReviewPaymentBlocked(ctx, task.PatchEventID, task.RepoID, auth.Reason, auth.ZapReceiptCursor)
+			if err != nil {
+				return fmt.Errorf("persist payment block: %w", err)
+			}
+			if !advanced {
+				return fmt.Errorf("%w: %s", errPaymentBlockPersisted, auth.Reason)
+			}
+			log.Info("zap receipt arrived during payment authorization; retrying",
+				"patch_event_id", task.PatchEventID,
+				"repo_id", task.RepoID)
 		}
-		if !auth.Allowed {
-			return fmt.Errorf("payment_blocked:%s", auth.Reason)
+		if !paymentAuthorized {
+			return errors.New("payment receipt churn")
 		}
-		log.Info("review payment authorized",
-			"patch_event_id", task.PatchEventID,
-			"repo_id", task.RepoID,
-			"access_kind", auth.AccessKind)
 	}
 
 	// 1e. Index project documentation (non-fatal; skip if repo config disables docs).

@@ -43,6 +43,7 @@ ensemble:
 payments:                       # payment gating (see docs/payments.md)
   enabled: false
   price_sats: 0                  # set to a positive value when enabled
+  accept_zaps: true                # NIP-57 receipts may cover price_sats
   free_reviews_per_day: 0        # per-author daily quota
   free_pubkeys: []               # npub or 64-character hex; normalized to hex
   free_for_maintainers: true     # repository owner/maintainers review free
@@ -77,6 +78,7 @@ arrives as a new event and reviews normally.
 - `review.statuses` values must be `open` or `draft`.
 - `payments.free_pubkeys` entries must be valid npub or 64-character hex public keys.
 - `payments.free_for_maintainers` defaults to `true`; set it to `false` to require payment from the repository announcement owner and maintainers.
+- `payments.accept_zaps` defaults to `true` when payments are enabled. A kind 9735 receipt must target the patch and cover `payments.price_sats * 1000` millisatoshis.
 - `instructions` above 4096 bytes is a parse error (defaults apply).
 - Unknown fields are rejected (strict parsing), so typos fail loudly in the
   logs rather than being silently ignored.

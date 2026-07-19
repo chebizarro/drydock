@@ -4,6 +4,7 @@
 // - Configured free pubkeys and repository maintainers
 // - Active subscription (author+repo)
 // - Free-tier daily quota
+// - NIP-57 zap receipt covering the repository price
 // - One-off Cashu token payment attached to patch event
 package payment
 
@@ -176,9 +177,10 @@ func (s *Service) ReconcilePayout(ctx context.Context, destination string, amoun
 
 // AuthorizeResult describes the outcome of a payment authorization attempt.
 type AuthorizeResult struct {
-	Allowed    bool
-	AccessKind string // free_pubkey, free_maintainer, free_tier, subscription, cashu_review, cashu_subscription
-	Reason     string // machine-readable denial reason
+	Allowed          bool
+	AccessKind       string // free_pubkey, free_maintainer, free_tier, subscription, zap, cashu_review, cashu_subscription
+	Reason           string // machine-readable denial reason
+	ZapReceiptCursor int64  // latest receipt row observed for race-safe payment blocking
 }
 
 // AuthorizePatch checks if a patch event is authorized for review based on
@@ -189,11 +191,12 @@ func (s *Service) AuthorizePatch(
 	repoID string,
 	policy repoconfig.PaymentsConfig,
 ) (AuthorizeResult, error) {
+	var zapReceiptCursor int64
 	allow := func(kind string) (AuthorizeResult, error) {
 		return AuthorizeResult{Allowed: true, AccessKind: kind}, nil
 	}
 	deny := func(reason string) (AuthorizeResult, error) {
-		return AuthorizeResult{Allowed: false, Reason: reason}, nil
+		return AuthorizeResult{Allowed: false, Reason: reason, ZapReceiptCursor: zapReceiptCursor}, nil
 	}
 
 	// 1. If payments disabled, allow immediately.
@@ -260,12 +263,29 @@ func (s *Service) AuthorizePatch(
 		}
 	}
 
-	// 8. Process Cashu token if present.
+	// 8. A per-review NIP-57 zap may cover the configured repository price.
+	if mode != "subscription" && policy.AcceptsZaps() {
+		minimumMSat := policy.PriceSats * 1000
+		receipt, found, cursor, err := s.store.FindZapReceiptAtLeast(ctx, patchEventID, minimumMSat)
+		zapReceiptCursor = cursor
+		if err != nil {
+			return AuthorizeResult{}, fmt.Errorf("check zap receipts: %w", err)
+		}
+		if found {
+			s.logger.Info("review authorized via zap",
+				"patch_event_id", patchEventID,
+				"receipt_event_id", receipt.EventID,
+				"amount_msat", receipt.AmountMSat)
+			return allow("zap")
+		}
+	}
+
+	// 9. Process Cashu token if present.
 	if tagErr == nil && token != "" {
 		return s.processTokenPayment(ctx, patchEventID, repoID, authorPubkey, token, mode, policy)
 	}
 
-	// 9. Try free tier.
+	// 10. Try free tier.
 	if policy.FreeReviewsPerDay > 0 {
 		usageDay := time.Now().UTC().Format("2006-01-02")
 		authorized, err := s.store.TryAuthorizeFreeReview(ctx, patchEventID, repoID, authorPubkey, policy.FreeReviewsPerDay, usageDay)
@@ -281,7 +301,7 @@ func (s *Service) AuthorizePatch(
 		}
 	}
 
-	// 10. No payment, no free tier quota.
+	// 11. No payment, no free tier quota.
 	if tagErr != nil {
 		return deny(tagErr.Error())
 	}

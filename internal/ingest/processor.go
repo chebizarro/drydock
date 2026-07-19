@@ -56,6 +56,8 @@ type Processor struct {
 	contextVMResponder ContextVMResponder
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
 	repositoryScope    scope.Matcher
+	servicePubkey      string
+	trustedZappers     map[string]struct{}
 	maxEventFutureSkew time.Duration
 	maxEventPastAge    time.Duration
 }
@@ -92,6 +94,17 @@ func WithLocalAutofixAuthor(pubkey string) func(*Processor) {
 func WithRepositoryScope(matcher scope.Matcher) func(*Processor) {
 	return func(p *Processor) {
 		p.repositoryScope = matcher
+	}
+}
+
+// WithZapReceipts configures NIP-57 receipt validation for the service identity.
+func WithZapReceipts(servicePubkey string, trustedZappers []string) func(*Processor) {
+	return func(p *Processor) {
+		p.servicePubkey = scope.NormalizePubkey(servicePubkey)
+		p.trustedZappers = make(map[string]struct{}, len(trustedZappers))
+		for _, zapper := range trustedZappers {
+			p.trustedZappers[scope.NormalizePubkey(zapper)] = struct{}{}
+		}
 	}
 }
 
@@ -228,22 +241,28 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			return err
 		}
 		if acquired {
-			task := db.ReviewTask{PatchEventID: event.ID.Hex(), RepoID: repoID}
-			select {
-			case p.ReviewQueue <- task:
-				metrics.ReviewQueuePushed.Inc()
-				metrics.ReviewQueueDepth.Inc()
-				p.logger.Info("queued patch review", "event_id", event.ID.Hex(), "repo_id", repoID, "kind", int(event.Kind))
-			default:
-				// Queue is full — mark task back to failed so it can be retried
-				// by the next startup's ResetStuckReviews or a future re-enqueue sweep.
-				metrics.ReviewQueueFull.Inc()
-				queueErr := errors.New("review queue full")
-				p.logger.Warn("review queue full, marking task for retry", "event_id", event.ID.Hex(), "repo_id", repoID)
-				if err := p.store.MarkReviewFailed(ctx, event.ID.Hex(), repoID, queueErr.Error()); err != nil {
-					return errors.Join(queueErr, fmt.Errorf("mark review failed: %w", err))
-				}
-				return queueErr
+			return p.enqueueReview(ctx, db.ReviewTask{PatchEventID: event.ID.Hex(), RepoID: repoID}, "patch")
+		}
+		return nil
+	case eventkind.ZapReceipt:
+		if p.servicePubkey == "" {
+			return nil
+		}
+		receipt, err := p.validateZapReceipt(event)
+		if err != nil {
+			p.logger.Warn("rejected zap receipt", "event_id", event.ID.Hex(), "author", event.PubKey.Hex(), "relay", relayURL, "reason", err.Error())
+			return nil
+		}
+		inserted, tasks, err := p.store.InsertZapReceiptAndClaimBlockedReviews(ctx, receipt)
+		if err != nil {
+			return err
+		}
+		if inserted {
+			p.logger.Info("accepted zap receipt", "event_id", receipt.EventID, "patch_event_id", receipt.PatchEventID, "amount_msat", receipt.AmountMSat, "trusted_zapper_allowlist", len(p.trustedZappers) > 0)
+		}
+		for _, task := range tasks {
+			if err := p.enqueueReview(ctx, task, "zap_receipt"); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -308,6 +327,24 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 	}
 }
 
+func (p *Processor) enqueueReview(ctx context.Context, task db.ReviewTask, source string) error {
+	select {
+	case p.ReviewQueue <- task:
+		metrics.ReviewQueuePushed.Inc()
+		metrics.ReviewQueueDepth.Inc()
+		p.logger.Info("queued patch review", "event_id", task.PatchEventID, "repo_id", task.RepoID, "source", source)
+		return nil
+	default:
+		metrics.ReviewQueueFull.Inc()
+		queueErr := errors.New("review queue full")
+		p.logger.Warn("review queue full, marking task for retry", "event_id", task.PatchEventID, "repo_id", task.RepoID, "source", source)
+		if err := p.store.MarkReviewFailed(ctx, task.PatchEventID, task.RepoID, queueErr.Error()); err != nil {
+			return errors.Join(queueErr, fmt.Errorf("mark review failed: %w", err))
+		}
+		return queueErr
+	}
+}
+
 func (p *Processor) validateEventForIngest(event nostr.Event, relayURL string) bool {
 	reason := ""
 	switch {
@@ -365,7 +402,7 @@ func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, rela
 
 func isTrackedHandlerKind(kind nostr.Kind) bool {
 	switch kind {
-	case eventkind.Comment, eventkind.EncryptedDirectMessage, eventkind.SealedDirectMessage, eventkind.IDESession, eventkind.ReviewerProfile, eventkind.ReviewFeedback:
+	case eventkind.Comment, eventkind.EncryptedDirectMessage, eventkind.SealedDirectMessage, eventkind.IDESession, eventkind.ReviewerProfile, eventkind.ReviewFeedback, eventkind.ZapReceipt:
 		return true
 	default:
 		return false

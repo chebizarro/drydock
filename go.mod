@@ -8,6 +8,7 @@ require (
 	fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026
 	git.sharegap.net/cascadia/cascadia-go v1.0.2
 	github.com/bluekeyes/go-gitdiff v0.7.1
+	github.com/btcsuite/btcd/btcutil v1.1.5
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
 	golang.org/x/sync v0.16.0
@@ -18,7 +19,6 @@ require (
 require (
 	github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 // indirect
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4 // indirect
-	github.com/btcsuite/btcd/btcutil v1.1.5 // indirect
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
 	github.com/coder/websocket v1.8.13 // indirect
 	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect

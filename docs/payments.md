@@ -1,184 +1,107 @@
-# Payments: NWC and Cashu Integration
+# Payments: Free Access, Zap Receipts, and Cashu
 
-> **Status**: Payment gating supports free access, daily quota, subscriptions, and Cashu tokens settled through NWC-created Lightning invoices.
+> **Status**: Payment gating supports configured free access, maintainer access, daily quota, subscriptions, NIP-57 zap receipts, and one-off Cashu tokens settled through NWC-created Lightning invoices.
 
-## Motivation
+## Integration point
 
-Paid reviews create alignment between submitters and the review service:
+Payment authorization runs after Drydock has prepared the canonical repository,
+loaded its base-branch `.drydock.yaml`, and loaded the stored patch event. When
+`payments.enabled` is true, the service checks these paths in order:
 
-- **Rate limiting**: Payment acts as a natural spam filter, preventing abuse from automated patch flooding
-- **Sustainability**: Operators running GPU infrastructure can recoup costs
-- **Quality signaling**: A willingness to pay indicates the submitter values a thorough review
-- **Priority lanes**: Paid reviews can be prioritized over free-tier reviews
+1. Existing payment authorization
+2. Repository or operator free-pubkey allowlists
+3. Repository owner/maintainer access when enabled
+4. Active subscription
+5. A qualifying NIP-57 zap receipt
+6. An attached Cashu payment
+7. Daily free-review quota
 
-## Integration Point
+A denial is stored as `payment_blocked:<reason>` and is excluded from the
+normal failed-review retry sweep.
 
-Payment authorization runs in the review pipeline after repository configuration and the stored patch event are loaded. When `payments.enabled` is true, authorization checks existing authorization, configured free access, repository maintainership, subscriptions, attached Cashu payment, and daily free quota before review execution.
+## Free access
 
-## Free Access
+- `payments.free_pubkeys` grants unlimited access for listed patch authors.
+- `DRYDOCK_FREE_PUBKEYS` grants the same access operator-wide.
+- Repository owners and maintainers are free by default; set
+  `payments.free_for_maintainers: false` to disable this exemption.
 
-Free authorization is evaluated before subscription, Cashu, and daily-quota paths:
+Both lists accept npub or 64-character hex keys and normalize them to hex.
+Access kinds are `free_pubkey` and `free_maintainer`.
 
-1. `payments.free_pubkeys` in the repository's `.drydock.yaml` grants unlimited reviews to listed patch authors. Entries may be npub or 64-character hex and are strictly validated and normalized to hex.
-2. `DRYDOCK_FREE_PUBKEYS` grants the same access operator-wide across repositories.
-3. The repository announcement owner and `maintainers` are free by default. Set `payments.free_for_maintainers: false` to disable this default.
+## NIP-57 zap receipts
 
-Configured pubkeys use access kind `free_pubkey`; repository owners and maintainers use `free_maintainer`. These paths do not consume `free_reviews_per_day` quota.
+Drydock subscribes to kind `9735` receipts. A receipt is accepted for storage
+only when:
+
+- its signature, event ID, and timestamp pass normal ingest validation;
+- its `p` tag equals the Drydock signer/service pubkey;
+- its `e` tag is a valid event ID identifying the patch or PR event;
+- its amount is a positive millisatoshi value from `amount` or a
+  checksummed fixed-amount `bolt11` invoice (both must agree when present);
+- its author appears in `DRYDOCK_TRUSTED_ZAPPERS`, when that allowlist is set.
+
+`DRYDOCK_TRUSTED_ZAPPERS` is a comma-separated npub/hex allowlist of LNURL
+receipt-signing providers. An empty list accepts any valid receipt author and
+logs that the weaker accept-any mode is active.
+
+The repository policy performs the final price check because it is loaded
+later in the pipeline:
 
 ```yaml
 payments:
   enabled: true
   price_sats: 100
+  accept_zaps: true
+```
+
+`accept_zaps` defaults to `true` whenever payments are enabled. A stored
+receipt authorizes only its tagged patch when
+`amount_msat >= price_sats * 1000`, and the authorization result uses access
+kind `zap`.
+
+Receipts may arrive before or after the patch. If a receipt arrives after the
+review reached `payment_blocked`, receipt persistence atomically clears that
+failure, claims the review, and re-enqueues it. Duplicate receipt event IDs are
+idempotent.
+
+## Cashu and NWC
+
+A submitter can attach a one-off Cashu token to the patch:
+
+```json
+["cashu", "cashuA..."]
+```
+
+Drydock accepts tokens only from configured trusted mints, creates and checks
+the settlement invoice through NWC, and persists recovery evidence before
+authorizing the review. Relevant operator settings are:
+
+| Variable | Purpose |
+|----------|---------|
+| `DRYDOCK_NWC_CONNECTION_STRING` | NIP-47 wallet connection used for Lightning invoice operations |
+| `DRYDOCK_CASHU_TRUSTED_MINTS` | Comma-separated trusted Cashu mint URLs |
+| `DRYDOCK_CASHU_MINT_URL` | Backward-compatible single-mint setting |
+| `DRYDOCK_TRUSTED_ZAPPERS` | Optional comma-separated receipt-author allowlist |
+
+Cashu review and subscription authorizations use access kinds
+`cashu_review` and `cashu_subscription`; active subscriptions use
+`subscription`.
+
+## Repository example
+
+```yaml
+payments:
+  enabled: true
+  price_sats: 100
+  accept_zaps: true
+  free_reviews_per_day: 1
   free_pubkeys:
     - npub1...
   free_for_maintainers: true
+  subscription_price_sats: 2000
+  subscription_days: 30
 ```
 
-```bash
-DRYDOCK_FREE_PUBKEYS=npub1...,0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-```
-
-## Option A: NWC (Nostr Wallet Connect, NIP-47)
-
-### How It Works
-
-1. The patch submitter includes a payment proof — either a zap receipt (kind 9735) referencing the patch event, or a dedicated payment tag
-2. Drydock verifies the payment by checking:
-   - The zap receipt references the patch event ID
-   - The payment amount meets the minimum price
-   - The receipt is signed by a trusted wallet service
-3. If valid, the patch proceeds to review. If not, it is logged and dropped (or a rejection comment is published)
-
-### Architecture
-
-```
-New package: internal/payment/nwc
-
-NWCVerifier
-  ├── VerifyPayment(ctx, event) (bool, error)
-  │   ├── Look for zap receipt in related events
-  │   ├── Verify receipt signature and amount
-  │   └── Check against minimum price
-  └── Config
-      ├── NWCConnectionString (NIP-47 connection)
-      └── MinAmountMsats
-```
-
-### Configuration
-
-```bash
-DRYDOCK_PAYMENT_MODE=nwc
-DRYDOCK_NWC_CONNECTION_STRING=nostr+walletconnect://...
-DRYDOCK_REVIEW_PRICE_MSATS=1000  # 1 sat minimum
-```
-
-### Pros and Cons
-
-| ✅ Pros | ❌ Cons |
-|---------|---------|
-| Fully on-protocol (Nostr-native) | Requires submitter to have a Lightning wallet |
-| Uses existing Nostr infrastructure | Payment confirmation latency |
-| Zap receipts are publicly auditable | NWC connection management complexity |
-| Works with any NIP-47 wallet | Depends on Lightning network availability |
-
-## Option B: Cashu Ecash (NUT Protocol)
-
-### How It Works
-
-1. The patch submitter attaches a Cashu token in a dedicated tag on the patch event:
-   ```json
-   ["cashu", "cashuA...base64token..."]
-   ```
-2. Drydock extracts the token and redeems it against a configured mint
-3. If redemption succeeds and the amount meets the minimum, the patch proceeds to review
-4. If redemption fails (invalid, already spent, insufficient amount), the patch is dropped
-
-### Architecture
-
-```
-New package: internal/payment/cashu
-
-CashuVerifier
-  ├── VerifyPayment(ctx, event) (bool, error)
-  │   ├── Extract "cashu" tag from event
-  │   ├── Decode token
-  │   ├── Redeem against mint (HTTP POST to /v1/melt or /v1/swap)
-  │   └── Check amount against minimum
-  └── Config
-      ├── MintURL
-      └── MinAmountMsats
-```
-
-### Token Redemption Atomicity
-
-The redemption must be atomic with the `BeginReview` database insert. If the token is redeemed but the review slot fails to acquire, the payment is lost. Wrapping both operations in a transaction:
-
-```go
-tx := store.BeginTx(ctx)
-ok, err := cashuVerifier.Redeem(ctx, token)
-if !ok { tx.Rollback(); return nil }
-acquired, err := store.BeginReviewTx(tx, eventID, repoID)
-if !acquired { tx.Rollback(); return nil }
-tx.Commit()
-```
-
-### Configuration
-
-```bash
-DRYDOCK_PAYMENT_MODE=cashu
-DRYDOCK_CASHU_MINT_URL=https://mint.example.com
-DRYDOCK_REVIEW_PRICE_MSATS=1000
-```
-
-### Pros and Cons
-
-| ✅ Pros | ❌ Cons |
-|---------|---------|
-| Privacy-preserving (ecash is bearer) | Requires trust in the mint operator |
-| No wallet UX required on submitter side | Token expiry management |
-| Offline-verifiable token structure | Double-spend prevention requires mint call |
-| Low latency (single HTTP call) | Less ecosystem tooling than Lightning |
-
-## Recommended Approach
-
-**Start with Cashu** for the initial implementation:
-
-1. Simpler integration (one HTTP call vs. NWC connection management)
-2. Better UX for submitters (token in a tag, no wallet setup)
-3. Lower latency (synchronous redemption)
-4. Natural fit for the "attach proof to event" pattern
-
-Add NWC as a second option once the payment gate interface is established.
-
-## Common Configuration
-
-Both options share these config fields:
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `DRYDOCK_PAYMENT_MODE` | `disabled` \| `nwc` \| `cashu` | `disabled` | Payment verification mode |
-| `DRYDOCK_REVIEW_PRICE_MSATS` | integer | `0` | Minimum payment in millisatoshis |
-| `DRYDOCK_NWC_CONNECTION_STRING` | string | *(empty)* | NIP-47 wallet connect string (NWC mode) |
-| `DRYDOCK_CASHU_MINT_URL` | URL | *(empty)* | Cashu mint URL (Cashu mode) |
-
-## Payment Receipt Publishing
-
-After a successful paid review, Drydock can optionally publish a receipt event as a kind 1111 comment with a payment confirmation footer:
-
-```
----
-payment-mode: cashu
-payment-amount-msats: 1000
-payment-mint: https://mint.example.com
-payment-verified: true
-```
-
-This makes the payment auditable on-protocol without revealing the token itself.
-
-## Open Questions
-
-- **Dynamic pricing**: Should the price vary based on diff size, repo complexity, or model route? A simple formula: `base_price + (token_count × per_token_rate)`
-- **Refunds**: If a review fails (LLM error, repo unavailable), should the token be refunded? Cashu tokens are bearer instruments — refund would require a new token issuance
-- **Multi-mint support**: Should Drydock accept tokens from multiple mints? Would require a list of trusted mint URLs
-- **Free tier**: Allow a configurable number of free reviews per pubkey per day before requiring payment
-- **Subscription model**: NIP-47 supports recurring payments — could enable monthly subscriptions for unlimited reviews
+Payment policy is always read from the canonical repository base branch, so an
+incoming patch cannot reduce its own price or enable another access path.

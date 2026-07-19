@@ -47,6 +47,7 @@ var subscribedKinds = []nostr.Kind{
 	eventkind.ContextVM,
 	eventkind.ReviewerProfile,
 	eventkind.ReviewFeedback,
+	eventkind.ZapReceipt,
 }
 
 func SubscribedKinds() []nostr.Kind {

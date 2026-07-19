@@ -268,14 +268,24 @@ func main() {
 	if convHandler != nil {
 		processorOpts = append(processorOpts, ingest.WithConversation(convHandler))
 	}
-	// Loop suppression: resolve our own signer pubkey so the processor can
-	// skip auto-fix patches we publish (preventing recursive self-review).
+	// Resolve our own signer pubkey once for autofix loop suppression and
+	// NIP-57 receipt recipient validation.
+	servicePubkey := ""
 	if signer != nil {
 		if signerPubKey, err := signer.GetPublicKey(ctx); err == nil {
-			processorOpts = append(processorOpts, ingest.WithLocalAutofixAuthor(signerPubKey.Hex()))
-			logger.Info("autofix loop suppression enabled", "signer_pubkey", signerPubKey.Hex())
+			servicePubkey = signerPubKey.Hex()
+			processorOpts = append(processorOpts,
+				ingest.WithLocalAutofixAuthor(servicePubkey),
+				ingest.WithZapReceipts(servicePubkey, cfg.TrustedZappers),
+			)
+			logger.Info("autofix loop suppression enabled", "signer_pubkey", servicePubkey)
+			if len(cfg.TrustedZappers) == 0 {
+				logger.Warn("zap receipts accept any valid receipt author; configure DRYDOCK_TRUSTED_ZAPPERS to restrict providers")
+			} else {
+				logger.Info("trusted zap receipt providers configured", "count", len(cfg.TrustedZappers))
+			}
 		} else {
-			logger.Warn("failed to resolve signer pubkey for autofix loop suppression", "error", err)
+			logger.Warn("failed to resolve signer pubkey; autofix loop suppression and zap receipt validation disabled", "error", err)
 		}
 	}
 	// --- Repo service ---

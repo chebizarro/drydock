@@ -411,6 +411,30 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 7,
+		name:    "nip57_zap_receipts",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			for _, ddl := range []string{
+				`CREATE TABLE IF NOT EXISTS zap_receipts (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					event_id TEXT NOT NULL UNIQUE,
+					patch_event_id TEXT NOT NULL,
+					payer_pubkey TEXT NOT NULL DEFAULT '',
+					receipt_author TEXT NOT NULL,
+					amount_msat INTEGER NOT NULL CHECK (amount_msat > 0),
+					created_at INTEGER NOT NULL,
+					seen_at INTEGER NOT NULL)`,
+				`CREATE INDEX IF NOT EXISTS idx_zap_receipts_patch_amount
+					ON zap_receipts(patch_event_id, amount_msat)`,
+			} {
+				if _, err := tx.ExecContext(ctx, ddl); err != nil {
+					return fmt.Errorf("apply zap receipt ddl: %w", err)
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
