@@ -360,6 +360,13 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 
 	// 5. Extract changed files from the context bundle (used for few-shot, engine, etc.).
 	changedFiles := bundle.ChangedFiles
+	if len(changedFiles) == 0 {
+		// Fail closed: with no deterministic changed-file set, the reviewer
+		// would be anchored to nothing but contextual layers and can present
+		// documentation as modified files (seen when a kind-1618 cover letter
+		// was parsed as a diff). A baseless review is worse than none.
+		return fmt.Errorf("no changed files parsed from diff of patch event %s; refusing to review without a deterministic change set", task.PatchEventID)
+	}
 
 	// 5b. Retrieve few-shot examples for reviewer prompt injection
 	var fewShot []string

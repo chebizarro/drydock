@@ -145,6 +145,7 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 
 	// Merge findings with consensus scoring
 	merged := mergeFindings(reviews, cfg, e.logger)
+	merged = filterFindingsToChangedFiles(merged, in.ChangedFiles, e.logger, "ensemble")
 
 	// Use first successful review's summary (or synthesize one)
 	summary := reviews[0].Review.Summary

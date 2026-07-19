@@ -104,6 +104,7 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	if err != nil {
 		return RunOutput{}, err
 	}
+	review.Findings = filterFindingsToChangedFiles(review.Findings, in.ChangedFiles, e.logger, "reviewer")
 
 	// Generate walkthrough (using planner model — lightweight 14B)
 	walkthrough, walkthroughStatus := e.generateWalkthrough(ctx, in)
@@ -139,6 +140,10 @@ func (e *Engine) generateWalkthrough(ctx context.Context, in RunInput) (Walkthro
 		}
 		return WalkthroughOutput{}, StepStatus{State: StepStateFailed, Error: err.Error()}
 	}
+	// The walkthrough prompt asks for changed files, but the model sees
+	// contextual layers too — only summaries for deterministically changed
+	// files are trustworthy.
+	walkthrough = filterWalkthroughToChangedFiles(walkthrough, in.ChangedFiles, e.logger)
 	return walkthrough, StepStatus{State: StepStateSucceeded}
 }
 
