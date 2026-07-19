@@ -11,6 +11,7 @@ import (
 
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
+	"drydock/internal/eventkind"
 	"drydock/internal/metareview"
 	"drydock/internal/metrics"
 	"drydock/internal/payment"
@@ -281,6 +282,21 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	var patchEvent nostr.Event
 	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
 		return fmt.Errorf("decode patch event: %w", err)
+	}
+
+	// 1c2. Status gate: reviews run automatically only for roots whose
+	// current NIP-34 status is allowed by repo config (default: open only;
+	// a root with no status event counts as open). Applied/merged and closed
+	// roots are never auto-reviewed. The status_skipped: prefix marks this
+	// as permanent so the failed-review sweep does not retry it.
+	statusKind, _, _, hasStatus, err := r.store.GetRootStatus(ctx, patchRec.RootID, task.RepoID)
+	if err != nil {
+		return fmt.Errorf("get root status: %w", err)
+	}
+	if reason, allowed := reviewStatusAllowed(statusKind, hasStatus, repoCfg.Review.Statuses); !allowed {
+		r.logger.Info("skipping review for root status",
+			"patch_event_id", task.PatchEventID, "repo_id", task.RepoID, "reason", reason)
+		return fmt.Errorf("status_skipped:%s", reason)
 	}
 
 	// 1d. Authorize payment-gated repositories before documentation/code indexing, context building, or LLM calls.
@@ -797,6 +813,34 @@ func meanConfidence(findings []reviewengine.Finding) float64 {
 		sum += f.Confidence
 	}
 	return sum / float64(len(findings))
+}
+
+// reviewStatusAllowed reports whether a root with the given NIP-34 status may
+// be reviewed automatically under the configured allowed statuses. A root
+// with no status event counts as open. Applied/merged (1631) and closed
+// (1632) roots are never allowed regardless of configuration.
+func reviewStatusAllowed(statusKind int, hasStatus bool, allowedStatuses []string) (reason string, allowed bool) {
+	status := "open"
+	if hasStatus {
+		switch nostr.Kind(statusKind) {
+		case eventkind.StatusOpen:
+			status = "open"
+		case eventkind.StatusApplied:
+			return "root status is applied/merged (1631)", false
+		case eventkind.StatusClosed:
+			return "root status is closed (1632)", false
+		case eventkind.StatusDraft:
+			status = "draft"
+		default:
+			return fmt.Sprintf("root has unknown status kind %d", statusKind), false
+		}
+	}
+	for _, a := range allowedStatuses {
+		if a == status {
+			return "", true
+		}
+	}
+	return fmt.Sprintf("root status %q is not in configured review statuses %v", status, allowedStatuses), false
 }
 
 // modelName returns the label for a published review: the model the reviewer

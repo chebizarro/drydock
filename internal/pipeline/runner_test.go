@@ -237,6 +237,34 @@ func TestPipelinePureHelpers(t *testing.T) {
 		}
 	})
 
+	t.Run("reviewStatusAllowed", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			kind      int
+			hasStatus bool
+			allowed   []string
+			want      bool
+		}{
+			{"no status counts as open", 0, false, []string{"open"}, true},
+			{"open allowed", 1630, true, []string{"open"}, true},
+			{"draft not allowed by default", 1633, true, []string{"open"}, false},
+			{"draft allowed when configured", 1633, true, []string{"open", "draft"}, true},
+			{"merged never allowed", 1631, true, []string{"open", "draft"}, false},
+			{"closed never allowed", 1632, true, []string{"open", "draft"}, false},
+			{"no status but only draft configured", 0, false, []string{"draft"}, false},
+			{"unknown status kind rejected", 9999, true, []string{"open", "draft"}, false},
+		}
+		for _, tc := range cases {
+			reason, got := reviewStatusAllowed(tc.kind, tc.hasStatus, tc.allowed)
+			if got != tc.want {
+				t.Fatalf("%s: allowed=%v (reason %q), want %v", tc.name, got, reason, tc.want)
+			}
+			if !got && reason == "" {
+				t.Fatalf("%s: disallowed result must carry a reason", tc.name)
+			}
+		}
+	})
+
 	t.Run("modelName_nilEngineFallsBackToRoute", func(t *testing.T) {
 		name := modelName(reviewengine.RunOutput{Route: reviewengine.RouteCoder32B}, nil)
 		if name != "coder32b" {

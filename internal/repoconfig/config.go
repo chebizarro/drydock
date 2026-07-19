@@ -41,6 +41,11 @@ type ReviewConfig struct {
 	Categories          []string `yaml:"categories"`
 	DetailSeverityFloor string   `yaml:"detail_severity_floor"`
 	Walkthrough         *bool    `yaml:"walkthrough"` // pointer to distinguish missing from false
+	// Statuses lists the NIP-34 root statuses for which reviews run
+	// automatically. Allowed values: "open", "draft". Defaults to ["open"].
+	// A root with no status event counts as open. Applied/merged and closed
+	// roots are never reviewed automatically and cannot be enabled here.
+	Statuses []string `yaml:"statuses"`
 }
 
 // ContextConfig controls context builder behavior.
@@ -100,6 +105,7 @@ func Default() RepoConfig {
 			SeverityFloor:       "info",
 			DetailSeverityFloor: "high",
 			Walkthrough:         &walkthrough,
+			Statuses:            []string{"open"},
 		},
 		Context: ContextConfig{
 			IncludeDocs: &includeDocs,
@@ -163,6 +169,23 @@ func Parse(data []byte) (RepoConfig, error) {
 	}
 	if raw.Review.Walkthrough == nil {
 		raw.Review.Walkthrough = defaults.Review.Walkthrough
+	}
+	if len(raw.Review.Statuses) == 0 {
+		raw.Review.Statuses = defaults.Review.Statuses
+	} else {
+		normalized := make([]string, 0, len(raw.Review.Statuses))
+		for _, s := range raw.Review.Statuses {
+			s = strings.ToLower(strings.TrimSpace(s))
+			switch s {
+			case "open", "draft":
+				normalized = append(normalized, s)
+			case "applied", "merged", "closed":
+				return Default(), fmt.Errorf(".drydock.yaml: review status %q cannot be auto-reviewed (only \"open\" and \"draft\" are allowed)", s)
+			default:
+				return Default(), fmt.Errorf(".drydock.yaml: invalid review status %q (allowed: \"open\", \"draft\")", s)
+			}
+		}
+		raw.Review.Statuses = normalized
 	}
 
 	// Normalize and validate severity floors.

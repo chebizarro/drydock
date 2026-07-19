@@ -570,3 +570,39 @@ func TestEnsembleToReviewEngineConfig(t *testing.T) {
 		t.Error("expected require_consensus")
 	}
 }
+
+func TestParseReviewStatuses(t *testing.T) {
+	t.Run("default is open only", func(t *testing.T) {
+		cfg, err := Parse([]byte("version: 1\n"))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(cfg.Review.Statuses) != 1 || cfg.Review.Statuses[0] != "open" {
+			t.Fatalf("expected default statuses [open], got %v", cfg.Review.Statuses)
+		}
+	})
+
+	t.Run("draft opt-in", func(t *testing.T) {
+		cfg, err := Parse([]byte("version: 1\nreview:\n  statuses: [Open, DRAFT]\n"))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(cfg.Review.Statuses) != 2 || cfg.Review.Statuses[0] != "open" || cfg.Review.Statuses[1] != "draft" {
+			t.Fatalf("expected normalized [open draft], got %v", cfg.Review.Statuses)
+		}
+	})
+
+	t.Run("merged and closed rejected", func(t *testing.T) {
+		for _, s := range []string{"merged", "applied", "closed"} {
+			if _, err := Parse([]byte("version: 1\nreview:\n  statuses: [" + s + "]\n")); err == nil {
+				t.Fatalf("expected error for status %q", s)
+			}
+		}
+	})
+
+	t.Run("unknown status rejected", func(t *testing.T) {
+		if _, err := Parse([]byte("version: 1\nreview:\n  statuses: [wip]\n")); err == nil {
+			t.Fatal("expected error for unknown status")
+		}
+	})
+}
