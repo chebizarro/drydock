@@ -16,9 +16,9 @@ type fakeClient struct {
 	resp  string
 }
 
-func (f *fakeClient) ChatCompletion(context.Context, reviewengine.ChatRequest) (string, error) {
+func (f *fakeClient) ChatCompletion(context.Context, reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
 	f.calls++
-	return f.resp, nil
+	return reviewengine.ChatResult{Content: f.resp}, nil
 }
 
 func TestMetaReviewTriggersOnLowConfidenceAndStoresLog(t *testing.T) {

@@ -494,7 +494,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			RepoID:               task.RepoID,
 			Summary:              filteredReview.Summary,
 			Findings:             filteredReview.Findings,
-			Model:                modelName(result.Route, r.engine),
+			Model:                modelName(result, r.engine),
 			ContextHash:          ctxHash,
 			Confidence:           confidence,
 			ContextLayersUsed:    bundle.LayersUsed,
@@ -526,7 +526,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 				ReviewEventID: reviewEventID,
 				Summary:       filteredReview.Summary,
 				Findings:      filteredReview.Findings,
-				Model:         modelName(result.Route, r.engine),
+				Model:         modelName(result, r.engine),
 				Confidence:    confidence,
 				Superseded:    superseded,
 				Policy: publisher.StatusPolicy{
@@ -553,7 +553,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 
 	// 11c. Auto-fix patch generation (best-effort, non-fatal).
 	if r.pubSvc != nil && repoCfg.AutoFix.Enabled {
-		fixResult := r.tryAutoFix(ctx, task, prep, filteredReview, repoCfg, reviewEventID, modelName(result.Route, r.engine))
+		fixResult := r.tryAutoFix(ctx, task, prep, filteredReview, repoCfg, reviewEventID, modelName(result, r.engine))
 		if fixResult != nil && fixResult.Published {
 			r.logger.Info("auto-fix patch published",
 				"patch_event_id", task.PatchEventID,
@@ -792,14 +792,18 @@ func meanConfidence(findings []reviewengine.Finding) float64 {
 	return sum / float64(len(findings))
 }
 
-// modelName resolves a planner route to the model identifier configured for
-// that route's endpoint, so published reviews report the model that actually
-// served the request rather than the internal route alias.
-func modelName(route reviewengine.ModelRoute, engine *reviewengine.Engine) string {
-	if engine != nil {
-		return engine.ModelForRoute(route)
+// modelName returns the label for a published review: the model the reviewer
+// endpoint reported serving for this specific run when known, otherwise the
+// served-model registry / configured model for the route, otherwise the route
+// alias. Never the internal route alias when better information exists.
+func modelName(result reviewengine.RunOutput, engine *reviewengine.Engine) string {
+	if served := strings.TrimSpace(result.ServedModel); served != "" {
+		return served
 	}
-	return string(route)
+	if engine != nil {
+		return engine.ModelForRoute(result.Route)
+	}
+	return string(result.Route)
 }
 
 // applyReviewPolicy filters findings by the repo-config severity floor and

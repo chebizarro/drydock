@@ -12,12 +12,12 @@ type FakeLLMForTest struct {
 	Requests  []ChatRequest
 }
 
-func (f *FakeLLMForTest) ChatCompletion(_ context.Context, req ChatRequest) (string, error) {
+func (f *FakeLLMForTest) ChatCompletion(_ context.Context, req ChatRequest) (ChatResult, error) {
 	f.Requests = append(f.Requests, req)
 	if len(f.Responses) == 0 {
-		return "{}", nil
+		return ChatResult{Content: "{}"}, nil
 	}
 	r := f.Responses[0]
 	f.Responses = f.Responses[1:]
-	return r, nil
+	return ChatResult{Content: r}, nil
 }

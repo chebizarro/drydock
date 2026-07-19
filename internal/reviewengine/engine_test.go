@@ -13,18 +13,19 @@ import (
 )
 
 type fakeLLM struct {
-	responses []string
-	requests  []ChatRequest
+	responses   []string
+	requests    []ChatRequest
+	servedModel string
 }
 
-func (f *fakeLLM) ChatCompletion(_ context.Context, req ChatRequest) (string, error) {
+func (f *fakeLLM) ChatCompletion(_ context.Context, req ChatRequest) (ChatResult, error) {
 	f.requests = append(f.requests, req)
 	if len(f.responses) == 0 {
-		return "{}", nil
+		return ChatResult{Content: "{}"}, nil
 	}
 	r := f.responses[0]
 	f.responses = f.responses[1:]
-	return r, nil
+	return ChatResult{Content: r, Model: f.servedModel}, nil
 }
 
 func TestEngineRoutesPlannerToLLM70B(t *testing.T) {
@@ -60,6 +61,34 @@ func TestEngineRoutesPlannerToLLM70B(t *testing.T) {
 	}
 	if len(out.Checklist) == 0 {
 		t.Fatalf("expected non-empty checklist for auth file")
+	}
+}
+
+func TestEngineRunPropagatesServedModel(t *testing.T) {
+	fake := &fakeLLM{
+		servedModel: "gemma-4-26b",
+		responses: []string{
+			`{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
+			`{"summary":"ok","findings":[],"needs_more_context":[]}`,
+		},
+	}
+	engine := New(Config{
+		Planner:  ModelEndpoint{BaseURL: "http://planner", Model: "planner-model"},
+		Coder32B: ModelEndpoint{BaseURL: "http://32b", Model: "32b-model"},
+		LLM70B:   ModelEndpoint{BaseURL: "http://70b", Model: "70b-model"},
+		Coder14B: ModelEndpoint{BaseURL: "http://14b", Model: "14b-model"},
+	}, fake, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	out, err := engine.Run(context.Background(), RunInput{
+		ContextBundle:   "ctx",
+		ChangedFiles:    []string{"a.go"},
+		SkipWalkthrough: true,
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.ServedModel != "gemma-4-26b" {
+		t.Fatalf("expected served model from reviewer response, got %q", out.ServedModel)
 	}
 }
 
@@ -383,14 +412,14 @@ type failingLLM struct {
 	calls  int
 }
 
-func (f *failingLLM) ChatCompletion(_ context.Context, _ ChatRequest) (string, error) {
+func (f *failingLLM) ChatCompletion(_ context.Context, _ ChatRequest) (ChatResult, error) {
 	f.calls++
 	if len(f.errors) > 0 {
 		err := f.errors[0]
 		f.errors = f.errors[1:]
-		return "", err
+		return ChatResult{}, err
 	}
-	return `{"ok":true}`, nil
+	return ChatResult{Content: `{"ok":true}`}, nil
 }
 
 func TestRetryingClientRetriesTransientErrors(t *testing.T) {
@@ -410,8 +439,8 @@ func TestRetryingClientRetriesTransientErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success after retries, got: %v", err)
 	}
-	if result != `{"ok":true}` {
-		t.Fatalf("unexpected result: %s", result)
+	if result.Content != `{"ok":true}` {
+		t.Fatalf("unexpected result: %s", result.Content)
 	}
 	if inner.calls != 3 {
 		t.Fatalf("expected 3 attempts (2 transient + 1 success), got %d", inner.calls)

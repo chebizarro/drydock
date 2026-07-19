@@ -31,7 +31,7 @@ const (
 )
 
 type LLMClient interface {
-	ChatCompletion(ctx context.Context, req reviewengine.ChatRequest) (string, error)
+	ChatCompletion(ctx context.Context, req reviewengine.ChatRequest) (reviewengine.ChatResult, error)
 }
 
 type Config struct {
@@ -155,10 +155,11 @@ func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
 		System:      metaReviewSystemPrompt(),
 		User:        metaReviewUserPrompt(in),
 	}
-	raw, err := s.client.ChatCompletion(ctx, req)
+	res, err := s.client.ChatCompletion(ctx, req)
 	if err != nil {
 		return Result{}, fmt.Errorf("meta-review completion failed: %w", err)
 	}
+	raw := res.Content
 	parsed, err = ParseMetaReviewOutputForFindings(llmutil.ExtractJSON(raw), len(in.LocalReview.Findings))
 	if err != nil {
 		return Result{}, err

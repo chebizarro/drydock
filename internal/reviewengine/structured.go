@@ -13,32 +13,37 @@ const maxStructuredRepairAttempts = 2
 type structuredParser[T any] func(string) (T, error)
 
 func (e *Engine) completeStructured(ctx context.Context, req ChatRequest, label string, parse structuredParser[PlannerOutput]) (PlannerOutput, error) {
-	return completeStructuredWithParser(ctx, e, req, label, parse)
+	out, _, err := completeStructuredWithParser(ctx, e, req, label, parse)
+	return out, err
 }
 
-func (e *Engine) completeStructuredReviewer(ctx context.Context, req ChatRequest, label string) (ReviewerOutput, error) {
+// completeStructuredReviewer also returns the model identifier the endpoint
+// reported serving for the successful completion, so review output can be
+// labeled with the exact model that produced it.
+func (e *Engine) completeStructuredReviewer(ctx context.Context, req ChatRequest, label string) (ReviewerOutput, string, error) {
 	return completeStructuredWithParser(ctx, e, req, label, ParseReviewerOutput)
 }
 
 func (e *Engine) completeStructuredWalkthrough(ctx context.Context, req ChatRequest, label string) (WalkthroughOutput, error) {
-	return completeStructuredWithParser(ctx, e, req, label, ParseWalkthroughOutput)
+	out, _, err := completeStructuredWithParser(ctx, e, req, label, ParseWalkthroughOutput)
+	return out, err
 }
 
-func completeStructuredWithParser[T any](ctx context.Context, e *Engine, req ChatRequest, label string, parse structuredParser[T]) (T, error) {
+func completeStructuredWithParser[T any](ctx context.Context, e *Engine, req ChatRequest, label string, parse structuredParser[T]) (T, string, error) {
 	req.JSONMode = true
-	raw, err := e.client.ChatCompletion(ctx, req)
+	res, err := e.client.ChatCompletion(ctx, req)
 	if err != nil {
 		var zero T
-		return zero, fmt.Errorf("%s completion: %w", label, err)
+		return zero, "", fmt.Errorf("%s completion: %w", label, err)
 	}
 
-	out, parseErr := parseExtracted(raw, parse)
+	out, parseErr := parseExtracted(res.Content, parse)
 	if parseErr == nil {
-		return out, nil
+		return out, res.Model, nil
 	}
 
 	originalErr := parseErr
-	lastRaw := raw
+	lastRaw := res.Content
 	lastErr := parseErr
 	for attempt := 1; attempt <= maxStructuredRepairAttempts; attempt++ {
 		if e.logger != nil {
@@ -56,22 +61,22 @@ func completeStructuredWithParser[T any](ctx context.Context, e *Engine, req Cha
 		repairReq.User = jsonRepairUserPrompt(label, lastRaw, lastErr)
 		repairReq.JSONMode = true
 
-		repairedRaw, repairErr := e.client.ChatCompletion(ctx, repairReq)
+		repaired, repairErr := e.client.ChatCompletion(ctx, repairReq)
 		if repairErr != nil {
 			var zero T
-			return zero, fmt.Errorf("%s repair completion attempt %d: %w (original parse/validation error: %v)", label, attempt, repairErr, originalErr)
+			return zero, "", fmt.Errorf("%s repair completion attempt %d: %w (original parse/validation error: %v)", label, attempt, repairErr, originalErr)
 		}
 
-		out, parseErr = parseExtracted(repairedRaw, parse)
+		out, parseErr = parseExtracted(repaired.Content, parse)
 		if parseErr == nil {
-			return out, nil
+			return out, repaired.Model, nil
 		}
-		lastRaw = repairedRaw
+		lastRaw = repaired.Content
 		lastErr = parseErr
 	}
 
 	var zero T
-	return zero, fmt.Errorf("%s output invalid after %d repair attempt(s): %w", label, maxStructuredRepairAttempts, lastErr)
+	return zero, "", fmt.Errorf("%s output invalid after %d repair attempt(s): %w", label, maxStructuredRepairAttempts, lastErr)
 }
 
 func parseExtracted[T any](raw string, parse structuredParser[T]) (T, error) {

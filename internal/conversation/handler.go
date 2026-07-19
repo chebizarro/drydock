@@ -195,7 +195,7 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 	system := conversationSystemPrompt()
 	user := conversationUserPrompt(reviewContent, patchDiff, turns, replyEvent.Content)
 
-	responseText, err := h.client.ChatCompletion(ctx, reviewengine.ChatRequest{
+	llmRes, err := h.client.ChatCompletion(ctx, reviewengine.ChatRequest{
 		BaseURL:     h.cfg.Endpoint.BaseURL,
 		APIKey:      h.cfg.Endpoint.APIKey,
 		Model:       h.cfg.Endpoint.Model,
@@ -208,7 +208,7 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
 		return fmt.Errorf("conversation LLM call: %w", err)
 	}
-	responseText = strings.TrimSpace(responseText)
+	responseText := strings.TrimSpace(llmRes.Content)
 
 	// 9. Build and publish the response event (kind 1111 / NIP-22 comment).
 	relays, err := h.resolveRelays(ctx, patchEventID, repoID, relayURL)

@@ -39,6 +39,7 @@ func DefaultEnsembleConfig() EnsembleConfig {
 type modelResult struct {
 	Route  ModelRoute
 	Review ReviewerOutput
+	Served string // model identifier the endpoint reported serving
 	Err    error
 }
 
@@ -87,7 +88,7 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 				results <- modelResult{Route: r, Err: err}
 				return
 			}
-			review, err := e.completeStructuredReviewer(ctx, ChatRequest{
+			review, served, err := e.completeStructuredReviewer(ctx, ChatRequest{
 				BaseURL:     endpoint.BaseURL,
 				APIKey:      endpoint.APIKey,
 				Model:       endpoint.Model,
@@ -99,7 +100,7 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 				results <- modelResult{Route: r, Err: err}
 				return
 			}
-			results <- modelResult{Route: r, Review: review}
+			results <- modelResult{Route: r, Review: review, Served: served}
 		}(route)
 	}
 
@@ -184,10 +185,21 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 		"walkthrough_status", walkthroughStatus.State,
 		"has_walkthrough", walkthrough.Walkthrough != "")
 
+	// Label the output with the served model of the planner's primary route
+	// when that reviewer participated, otherwise the first successful one.
+	servedModel := reviews[0].Served
+	for _, r := range reviews {
+		if r.Route == planner.ModelRoute {
+			servedModel = r.Served
+			break
+		}
+	}
+
 	return RunOutput{
 		Planner:           planner,
 		Review:            review,
 		Route:             planner.ModelRoute, // Primary route from planner
+		ServedModel:       servedModel,
 		Checklist:         checklist,
 		Walkthrough:       walkthrough,
 		WalkthroughStatus: walkthroughStatus,

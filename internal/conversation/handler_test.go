@@ -44,14 +44,14 @@ type fakeLLM struct {
 	requests  []reviewengine.ChatRequest
 }
 
-func (f *fakeLLM) ChatCompletion(_ context.Context, req reviewengine.ChatRequest) (string, error) {
+func (f *fakeLLM) ChatCompletion(_ context.Context, req reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
 	f.requests = append(f.requests, req)
 	if len(f.responses) == 0 {
-		return "Thanks for the feedback!", nil
+		return reviewengine.ChatResult{Content: "Thanks for the feedback!"}, nil
 	}
 	r := f.responses[0]
 	f.responses = f.responses[1:]
-	return r, nil
+	return reviewengine.ChatResult{Content: r}, nil
 }
 
 // --- helpers ---

@@ -38,13 +38,13 @@ func (s *failingPromptStore) GetPromptVersionByNumber(ctx context.Context, name 
 	return s.promptStore.GetPromptVersionByNumber(ctx, name, version)
 }
 
-func (f *fakeLLM) ChatCompletion(_ context.Context, _ reviewengine.ChatRequest) (string, error) {
+func (f *fakeLLM) ChatCompletion(_ context.Context, _ reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
 	if f.calls >= len(f.responses) {
-		return "", fmt.Errorf("no more responses")
+		return reviewengine.ChatResult{}, fmt.Errorf("no more responses")
 	}
 	resp := f.responses[f.calls]
 	f.calls++
-	return resp, nil
+	return reviewengine.ChatResult{Content: resp}, nil
 }
 
 func setupStore(t *testing.T) *db.Store {
@@ -469,7 +469,7 @@ type capturingLLM struct {
 	captured *string
 }
 
-func (c *capturingLLM) ChatCompletion(ctx context.Context, req reviewengine.ChatRequest) (string, error) {
+func (c *capturingLLM) ChatCompletion(ctx context.Context, req reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
 	*c.captured = req.User
 	return c.inner.ChatCompletion(ctx, req)
 }

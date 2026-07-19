@@ -238,9 +238,16 @@ func TestPipelinePureHelpers(t *testing.T) {
 	})
 
 	t.Run("modelName_nilEngineFallsBackToRoute", func(t *testing.T) {
-		name := modelName(reviewengine.RouteCoder32B, nil)
+		name := modelName(reviewengine.RunOutput{Route: reviewengine.RouteCoder32B}, nil)
 		if name != "coder32b" {
 			t.Fatalf("expected 'coder32b', got %s", name)
+		}
+	})
+
+	t.Run("modelName_prefersServedModel", func(t *testing.T) {
+		out := reviewengine.RunOutput{Route: reviewengine.RouteCoder32B, ServedModel: "gemma-4-26b"}
+		if name := modelName(out, nil); name != "gemma-4-26b" {
+			t.Fatalf("expected per-run served model, got %s", name)
 		}
 	})
 
@@ -249,11 +256,12 @@ func TestPipelinePureHelpers(t *testing.T) {
 		engine := reviewengine.New(reviewengine.Config{
 			Coder32B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "qwen2.5-coder-32b-instruct"},
 		}, nil, logger)
-		if name := modelName(reviewengine.RouteCoder32B, engine); name != "qwen2.5-coder-32b-instruct" {
+		out := reviewengine.RunOutput{Route: reviewengine.RouteCoder32B}
+		if name := modelName(out, engine); name != "qwen2.5-coder-32b-instruct" {
 			t.Fatalf("expected configured model name, got %s", name)
 		}
 		// Route with no configured model falls back to the route alias.
-		if name := modelName(reviewengine.RouteLLM70B, engine); name != "llm70b" {
+		if name := modelName(reviewengine.RunOutput{Route: reviewengine.RouteLLM70B}, engine); name != "llm70b" {
 			t.Fatalf("expected route alias fallback, got %s", name)
 		}
 	})

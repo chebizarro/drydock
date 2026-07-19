@@ -66,8 +66,11 @@ func TestOpenAICompatClientObservesServedModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chat completion: %v", err)
 	}
-	if out != "ok" {
-		t.Fatalf("unexpected content %q", out)
+	if out.Content != "ok" {
+		t.Fatalf("unexpected content %q", out.Content)
+	}
+	if out.Model != "gemma-4-26b" {
+		t.Fatalf("expected served model in result, got %q", out.Model)
 	}
 	if got := mi.Resolve(srv.URL, "", "llama-3.3-70b-instruct"); got != "gemma-4-26b" {
 		t.Fatalf("expected observed served model, got %q", got)

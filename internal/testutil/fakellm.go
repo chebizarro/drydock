@@ -12,14 +12,17 @@ import (
 type FakeLLM struct {
 	Responses []string
 	Requests  []reviewengine.ChatRequest
+	// ServedModel, when set, is reported as the model that served every
+	// completion (mirrors the `model` field of real provider responses).
+	ServedModel string
 }
 
-func (f *FakeLLM) ChatCompletion(_ context.Context, req reviewengine.ChatRequest) (string, error) {
+func (f *FakeLLM) ChatCompletion(_ context.Context, req reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
 	f.Requests = append(f.Requests, req)
 	if len(f.Responses) == 0 {
-		return "{}", nil
+		return reviewengine.ChatResult{Content: "{}", Model: f.ServedModel}, nil
 	}
 	r := f.Responses[0]
 	f.Responses = f.Responses[1:]
-	return r, nil
+	return reviewengine.ChatResult{Content: r, Model: f.ServedModel}, nil
 }

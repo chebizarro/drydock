@@ -46,6 +46,10 @@ type RunOutput struct {
 	Planner           PlannerOutput
 	Review            ReviewerOutput
 	Route             ModelRoute
+	// ServedModel is the model identifier the reviewer endpoint reported
+	// serving for this specific review. Empty when the provider omitted it;
+	// callers should fall back to ModelForRoute(Route).
+	ServedModel       string
 	Checklist         []string
 	Walkthrough       WalkthroughOutput
 	WalkthroughStatus StepStatus
@@ -89,7 +93,7 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	if err != nil {
 		return RunOutput{}, err
 	}
-	review, err := e.completeStructuredReviewer(ctx, ChatRequest{
+	review, servedModel, err := e.completeStructuredReviewer(ctx, ChatRequest{
 		BaseURL:     endpoint.BaseURL,
 		APIKey:      endpoint.APIKey,
 		Model:       endpoint.Model,
@@ -109,6 +113,7 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 		Planner:           planner,
 		Review:            review,
 		Route:             planner.ModelRoute,
+		ServedModel:       servedModel,
 		Checklist:         checklist,
 		Walkthrough:       walkthrough,
 		WalkthroughStatus: walkthroughStatus,

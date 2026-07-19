@@ -83,8 +83,8 @@ func (responseKeyer) Decrypt(context.Context, string, nostr.PubKey) (string, err
 
 type responseLLM struct{}
 
-func (responseLLM) ChatCompletion(context.Context, reviewengine.ChatRequest) (string, error) {
-	return "main starts the service", nil
+func (responseLLM) ChatCompletion(context.Context, reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
+	return reviewengine.ChatResult{Content: "main starts the service"}, nil
 }
 
 type recordingPublisher struct{ events []nostr.Event }

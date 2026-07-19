@@ -19,24 +19,28 @@ type mockEnsembleClient struct {
 	callCount       int
 }
 
-func (m *mockEnsembleClient) ChatCompletion(_ context.Context, req ChatRequest) (string, error) {
+func (m *mockEnsembleClient) ChatCompletion(_ context.Context, req ChatRequest) (ChatResult, error) {
 	m.callCount++
+
+	// Every response reports a served model derived from the requested one,
+	// mirroring the `model` field of real provider responses.
+	served := "served-" + req.Model
 
 	// Planner call (first call or model matches planner)
 	if strings.Contains(req.System, "route the review") || strings.Contains(req.System, "planner") {
-		return m.plannerResp, nil
+		return ChatResult{Content: m.plannerResp, Model: served}, nil
 	}
 
 	// Walkthrough call
 	if strings.Contains(req.System, "walkthrough") {
-		return m.walkthroughResp, nil
+		return ChatResult{Content: m.walkthroughResp, Model: served}, nil
 	}
 
 	// Reviewer calls - alternate between model responses
 	if m.model2Resp != "" && m.callCount > 2 {
-		return m.model2Resp, nil
+		return ChatResult{Content: m.model2Resp, Model: served}, nil
 	}
-	return m.model1Resp, nil
+	return ChatResult{Content: m.model1Resp, Model: served}, nil
 }
 
 func TestMergeFindings_Deduplication(t *testing.T) {
@@ -272,14 +276,14 @@ func TestFindingKey(t *testing.T) {
 
 type failingEnsembleReviewerClient struct{}
 
-func (f *failingEnsembleReviewerClient) ChatCompletion(_ context.Context, req ChatRequest) (string, error) {
+func (f *failingEnsembleReviewerClient) ChatCompletion(_ context.Context, req ChatRequest) (ChatResult, error) {
 	if strings.Contains(req.System, "planner") {
-		return `{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`, nil
+		return ChatResult{Content: `{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`}, nil
 	}
 	if req.Model == "llm70b" {
-		return `{"summary":`, nil
+		return ChatResult{Content: `{"summary":`}, nil
 	}
-	return `{"summary":"single model success","findings":[],"needs_more_context":[]}`, nil
+	return ChatResult{Content: `{"summary":"single model success","findings":[],"needs_more_context":[]}`}, nil
 }
 
 func TestRunEnsembleFailsClosedWhenRequiredReviewerFails(t *testing.T) {

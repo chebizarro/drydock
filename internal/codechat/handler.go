@@ -226,7 +226,7 @@ func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL stri
 	system := codeChatSystemPrompt(repoID)
 	user := codeChatUserPrompt(codeContext, history, parsed.question)
 
-	responseText, err := h.client.ChatCompletion(ctx, reviewengine.ChatRequest{
+	llmRes, err := h.client.ChatCompletion(ctx, reviewengine.ChatRequest{
 		BaseURL:     h.cfg.Endpoint.BaseURL,
 		APIKey:      h.cfg.Endpoint.APIKey,
 		Model:       h.cfg.Endpoint.Model,
@@ -239,7 +239,7 @@ func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL stri
 		h.store.MarkCodeChatFailed(ctx, event.ID.Hex())
 		return fmt.Errorf("codechat LLM call: %w", err)
 	}
-	responseText = strings.TrimSpace(responseText)
+	responseText := strings.TrimSpace(llmRes.Content)
 
 	// 8-9. Durably stage the response, publish it, then mark it published.
 	if err := h.publishStoredResponse(ctx, event, responseText, relayURL); err != nil {

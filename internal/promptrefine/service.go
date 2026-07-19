@@ -24,7 +24,7 @@ const (
 
 // LLMClient abstracts the LLM call needed for prompt refinement.
 type LLMClient interface {
-	ChatCompletion(ctx context.Context, req reviewengine.ChatRequest) (string, error)
+	ChatCompletion(ctx context.Context, req reviewengine.ChatRequest) (reviewengine.ChatResult, error)
 }
 
 // Config controls the prompt refinement service.
@@ -269,7 +269,7 @@ func (s *Service) callRefinementLLM(ctx context.Context, currentPrompt string, g
 	system := refinementSystemPrompt()
 	user := refinementUserPrompt(currentPrompt, gaps)
 
-	raw, err := s.client.ChatCompletion(ctx, reviewengine.ChatRequest{
+	res, err := s.client.ChatCompletion(ctx, reviewengine.ChatRequest{
 		BaseURL:     s.cfg.Endpoint.BaseURL,
 		APIKey:      s.cfg.Endpoint.APIKey,
 		Model:       s.cfg.Endpoint.Model,
@@ -283,7 +283,7 @@ func (s *Service) callRefinementLLM(ctx context.Context, currentPrompt string, g
 
 	// The LLM should return the full revised prompt text.
 	// Strip any markdown fences if present.
-	refined := strings.TrimSpace(raw)
+	refined := strings.TrimSpace(res.Content)
 	refined = stripCodeFences(refined)
 	if refined == "" {
 		return "", fmt.Errorf("refinement LLM returned empty response")

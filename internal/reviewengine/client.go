@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +19,16 @@ import (
 )
 
 type LLMClient interface {
-	ChatCompletion(ctx context.Context, req ChatRequest) (string, error)
+	ChatCompletion(ctx context.Context, req ChatRequest) (ChatResult, error)
+}
+
+// ChatResult is the outcome of a chat completion.
+type ChatResult struct {
+	// Content is the assistant message content.
+	Content string
+	// Model is the model identifier the endpoint reported serving for this
+	// request. Empty when the provider omits it.
+	Model string
 }
 
 type ChatRequest struct {
@@ -77,7 +87,7 @@ func NewOpenAICompatClient() *OpenAICompatClient {
 	}
 }
 
-func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest) (string, error) {
+func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatResult, error) {
 	metrics.LLMRequests.With(req.Model).Inc()
 	done := metrics.TimerVec(metrics.LLMDuration, req.Model)
 	defer done()
@@ -96,7 +106,7 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 	body, _ := json.Marshal(payload)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return ChatResult{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if req.APIKey != "" {
@@ -105,14 +115,14 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 
 	res, err := c.HTTP.Do(httpReq)
 	if err != nil {
-		return "", err
+		return ChatResult{}, err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		metrics.LLMErrors.With(req.Model).Inc()
 		respBody, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
-		return "", &LLMHTTPError{
+		return ChatResult{}, &LLMHTTPError{
 			StatusCode: res.StatusCode,
 			Status:     res.Status,
 			Body:       string(respBody),
@@ -128,15 +138,15 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&decoded); err != nil {
-		return "", fmt.Errorf("decode llm response: %w", err)
+		return ChatResult{}, fmt.Errorf("decode llm response: %w", err)
 	}
 	if len(decoded.Choices) == 0 {
-		return "", fmt.Errorf("llm response has no choices (model=%s)", req.Model)
+		return ChatResult{}, fmt.Errorf("llm response has no choices (model=%s)", req.Model)
 	}
 	// Ground truth for the served model: the response reports what actually
 	// handled the request, regardless of configured deployment names.
 	c.Identity.Observe(req.BaseURL, req.APIKey, req.Model, decoded.Model)
-	return decoded.Choices[0].Message.Content, nil
+	return ChatResult{Content: decoded.Choices[0].Message.Content, Model: strings.TrimSpace(decoded.Model)}, nil
 }
 
 // RetryConfig controls retry behavior for the RetryingClient.
@@ -172,9 +182,9 @@ func NewCircuitBreakingClient(inner LLMClient, cfg circuitbreaker.Config, logger
 	}
 }
 
-func (c *CircuitBreakingClient) ChatCompletion(ctx context.Context, req ChatRequest) (string, error) {
+func (c *CircuitBreakingClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatResult, error) {
 	breaker := c.getBreaker(req)
-	var result string
+	var result ChatResult
 	err := breaker.Execute(ctx, func(ctx context.Context) error {
 		var callErr error
 		result, callErr = c.Inner.ChatCompletion(ctx, req)
@@ -187,7 +197,7 @@ func (c *CircuitBreakingClient) ChatCompletion(ctx context.Context, req ChatRequ
 				"model", req.Model,
 			)
 		}
-		return "", err
+		return ChatResult{}, err
 	}
 	return result, nil
 }
@@ -217,7 +227,7 @@ func NewRetryingClient(inner LLMClient, cfg RetryConfig, logger *slog.Logger) *R
 	return &RetryingClient{Inner: inner, Config: cfg, Logger: logger}
 }
 
-func (c *RetryingClient) ChatCompletion(ctx context.Context, req ChatRequest) (string, error) {
+func (c *RetryingClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatResult, error) {
 	var lastErr error
 	for attempt := 0; attempt < c.Config.MaxAttempts; attempt++ {
 		result, err := c.Inner.ChatCompletion(ctx, req)
@@ -227,7 +237,7 @@ func (c *RetryingClient) ChatCompletion(ctx context.Context, req ChatRequest) (s
 		lastErr = err
 
 		if !IsTransient(err) {
-			return "", err // non-transient: fail immediately
+			return ChatResult{}, err // non-transient: fail immediately
 		}
 
 		if attempt+1 >= c.Config.MaxAttempts {
@@ -250,9 +260,9 @@ func (c *RetryingClient) ChatCompletion(ctx context.Context, req ChatRequest) (s
 
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return ChatResult{}, ctx.Err()
 		case <-time.After(delay):
 		}
 	}
-	return "", fmt.Errorf("llm request failed after %d attempts: %w", c.Config.MaxAttempts, lastErr)
+	return ChatResult{}, fmt.Errorf("llm request failed after %d attempts: %w", c.Config.MaxAttempts, lastErr)
 }
