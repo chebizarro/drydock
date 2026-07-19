@@ -206,12 +206,23 @@ func main() {
 	healthAddr := cfg.HealthAddr
 	healthSrv := health.New(store, logger)
 
+	// --- Served-model identity registry ---
+	// Tracks the model identifier each LLM endpoint actually serves (fed by
+	// per-response observation plus a startup probe) so published reviews
+	// name the real model even when deployment env vars go stale.
+	modelIdentity := reviewengine.NewModelIdentity()
+	newCompatClient := func() *reviewengine.OpenAICompatClient {
+		c := reviewengine.NewOpenAICompatClient()
+		c.Identity = modelIdentity
+		return c
+	}
+
 	// --- Conversation handler ---
 	var convHandler *conversation.Handler
 	if signer != nil {
 		convClient := reviewengine.NewCircuitBreakingClient(
 			reviewengine.NewRetryingClient(
-				reviewengine.NewOpenAICompatClient(),
+				newCompatClient(),
 				reviewengine.RetryConfig{MaxAttempts: 2},
 				logger,
 			),
@@ -344,7 +355,7 @@ func main() {
 	// --- Review engine (with retry + circuit breaker for transient LLM failures) ---
 	llmClient := reviewengine.NewCircuitBreakingClient(
 		reviewengine.NewRetryingClient(
-			reviewengine.NewOpenAICompatClient(),
+			newCompatClient(),
 			reviewengine.RetryConfig{MaxAttempts: 3},
 			logger,
 		),
@@ -359,6 +370,22 @@ func main() {
 		PlannerTemp:  0.1,
 		ReviewerTemp: 0.2,
 	}, llmClient, logger)
+	engine.UseModelIdentity(modelIdentity)
+
+	// Verify configured model names against what each endpoint actually
+	// serves; mismatches are logged and the registry is seeded with the
+	// served identifier. Non-fatal, bounded, runs in the background.
+	go func() {
+		verifyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		modelIdentity.VerifyEndpoints(verifyCtx, nil, logger,
+			reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel},
+			reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey), Model: cfg.Coder32BModel},
+			reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.LLM70BAPIKey), Model: cfg.LLM70BModel},
+			reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder14BAPIKey), Model: cfg.Coder14BModel},
+			reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.MetaAPIKey), Model: cfg.MetaModel},
+		)
+	}()
 
 	// --- Publisher ---
 	var pubSvc *publisher.Service
@@ -375,7 +402,7 @@ func main() {
 	// --- Meta-review (with retry + circuit breaker) ---
 	metaClient := reviewengine.NewCircuitBreakingClient(
 		reviewengine.NewRetryingClient(
-			reviewengine.NewOpenAICompatClient(),
+			newCompatClient(),
 			reviewengine.RetryConfig{MaxAttempts: 3},
 			logger,
 		),

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 )
 
 type ModelEndpoint struct {
@@ -52,9 +53,10 @@ type RunOutput struct {
 }
 
 type Engine struct {
-	cfg    Config
-	client LLMClient
-	logger *slog.Logger
+	cfg      Config
+	client   LLMClient
+	logger   *slog.Logger
+	identity atomic.Pointer[ModelIdentity]
 }
 
 func New(cfg Config, client LLMClient, logger *slog.Logger) *Engine {
@@ -135,15 +137,23 @@ func (e *Engine) generateWalkthrough(ctx context.Context, in RunInput) (Walkthro
 	return walkthrough, StepStatus{State: StepStateSucceeded}
 }
 
-// ModelForRoute returns the model identifier configured for the given
-// route's endpoint (e.g. the value served under that route), falling back to
-// the route alias when the route is unknown or no model is configured.
+// UseModelIdentity attaches a served-model registry. When set, ModelForRoute
+// prefers the model identifier actually observed from the endpoint over the
+// configured deployment name. Safe to call concurrently with ModelForRoute,
+// though it is intended to be wired once at startup.
+func (e *Engine) UseModelIdentity(mi *ModelIdentity) {
+	e.identity.Store(mi)
+}
+
+// ModelForRoute returns the model identifier for the given route: the served
+// model observed from the route's endpoint when known, otherwise the
+// configured endpoint model, otherwise the route alias.
 func (e *Engine) ModelForRoute(route ModelRoute) string {
 	endpoint, err := e.routeEndpoint(route)
 	if err != nil || strings.TrimSpace(endpoint.Model) == "" {
 		return string(route)
 	}
-	return endpoint.Model
+	return e.identity.Load().Resolve(endpoint.BaseURL, endpoint.APIKey, endpoint.Model)
 }
 
 func (e *Engine) routeEndpoint(route ModelRoute) (ModelEndpoint, error) {

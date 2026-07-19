@@ -65,6 +65,10 @@ func IsTransient(err error) bool {
 // OpenAICompatClient is a simple, non-retrying LLM client.
 type OpenAICompatClient struct {
 	HTTP *http.Client
+	// Identity, when set, records the model identifier each endpoint reports
+	// serving so published reviews can name the model that actually handled
+	// the request. Safe to leave nil.
+	Identity *ModelIdentity
 }
 
 func NewOpenAICompatClient() *OpenAICompatClient {
@@ -116,6 +120,7 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 	}
 
 	var decoded struct {
+		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
@@ -128,6 +133,9 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 	if len(decoded.Choices) == 0 {
 		return "", fmt.Errorf("llm response has no choices (model=%s)", req.Model)
 	}
+	// Ground truth for the served model: the response reports what actually
+	// handled the request, regardless of configured deployment names.
+	c.Identity.Observe(req.BaseURL, req.APIKey, req.Model, decoded.Model)
 	return decoded.Choices[0].Message.Content, nil
 }
 
