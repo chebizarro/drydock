@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"drydock/internal/scope"
 	"drydock/internal/vectorstore"
 
 	_ "modernc.org/sqlite" // Register sqlite driver for validation
@@ -48,6 +49,8 @@ type Config struct {
 	RepoCacheDir          string
 	RepoCacheMaxCount     int
 	RepoCacheMaxSizeMB    int
+	RepoAllowlist         []string
+	RepoOwnerAllowlist    []string
 	Relays                []string
 	ReadRelays            []string
 	WriteRelays           []string
@@ -137,6 +140,8 @@ func FromEnv() Config {
 		RepoCacheDir:       envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
 		RepoCacheMaxCount:  parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_COUNT", "50"), 50),
 		RepoCacheMaxSizeMB: parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_SIZE_MB", "10240"), 10240),
+		RepoAllowlist:      normalizeRepositoryAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_ALLOWLIST", ""))),
+		RepoOwnerAllowlist: normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_OWNER_ALLOWLIST", ""))),
 		Relays: splitCSV(
 			envOrDefault(
 				"DRYDOCK_RELAYS",
@@ -154,36 +159,36 @@ func FromEnv() Config {
 		ProfileName:           envOrDefault("DRYDOCK_PROFILE_NAME", "Drydock"),
 		ProfileAbout: envOrDefault("DRYDOCK_PROFILE_ABOUT",
 			"Automated code review for git on Nostr. Drydock watches NIP-34 patch and pull-request events, checks out the proposed changes, and publishes structured reviews with findings, per-file walkthroughs, and status updates — powered by local LLMs."),
-		ProfileWebsite:        envOrDefault("DRYDOCK_PROFILE_WEBSITE", ""),
-		ProfilePictureURL:     envOrDefault("DRYDOCK_PROFILE_PICTURE_URL", ""),
-		ProfileBannerURL:      envOrDefault("DRYDOCK_PROFILE_BANNER_URL", ""),
-		ProfileIconPath:       envOrDefault("DRYDOCK_PROFILE_ICON_PATH", "assets/drydock-icon.png"),
-		ProfileBannerPath:     envOrDefault("DRYDOCK_PROFILE_BANNER_PATH", "assets/drydock-banner.png"),
-		BlossomServers:        splitCSV(envOrDefault("DRYDOCK_BLOSSOM_SERVERS", "")),
-		PlannerBaseURL:        envOrDefault("DRYDOCK_PLANNER_BASE_URL", devDefault(production, defaultPlannerBaseURL)),
-		PlannerModel:          envOrDefault("DRYDOCK_PLANNER_MODEL", devDefault(production, defaultPlannerModel)),
-		Coder32BBaseURL:       envOrDefault("DRYDOCK_CODER32B_BASE_URL", devDefault(production, defaultCoder32BBaseURL)),
-		Coder32BModel:         envOrDefault("DRYDOCK_CODER32B_MODEL", devDefault(production, defaultCoder32BModel)),
-		LLM70BBaseURL:         envOrDefault("DRYDOCK_LLM70B_BASE_URL", devDefault(production, defaultLLM70BBaseURL)),
-		LLM70BModel:           envOrDefault("DRYDOCK_LLM70B_MODEL", devDefault(production, defaultLLM70BModel)),
-		Coder14BBaseURL:       envOrDefault("DRYDOCK_CODER14B_BASE_URL", devDefault(production, defaultCoder14BBaseURL)),
-		Coder14BModel:         envOrDefault("DRYDOCK_CODER14B_MODEL", devDefault(production, defaultCoder14BModel)),
-		LLMAPIKey:             envOrDefault("DRYDOCK_LLM_API_KEY", ""),
-		PlannerAPIKey:         envOrDefault("DRYDOCK_PLANNER_API_KEY", ""),
-		Coder32BAPIKey:        envOrDefault("DRYDOCK_CODER32B_API_KEY", ""),
-		LLM70BAPIKey:          envOrDefault("DRYDOCK_LLM70B_API_KEY", ""),
-		Coder14BAPIKey:        envOrDefault("DRYDOCK_CODER14B_API_KEY", ""),
-		MetaAPIKey:            envOrDefault("DRYDOCK_META_API_KEY", ""),
-		SignerBunkerURL:       envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
-		SignerNsec:            signerNsec,
-		SignerNsecFile:        signerNsecFile,
-		DevMode:               parseBoolOrDefault(envOrDefault("DEV_MODE", envOrDefault("DRYDOCK_DEV_MODE", "")), false),
-		ChartroomURL:          envOrDefault("DRYDOCK_CHARTROOM_URL", ""),
-		ChartroomToken:        envOrDefault("DRYDOCK_CHARTROOM_TOKEN", envOrDefault("CHARTROOM_HTTP_BEARER_TOKEN", "")),
-		ChartroomCorpusIDs:    splitCSV(envOrDefault("DRYDOCK_CHARTROOM_CORPUS_IDS", "")),
-		ChartroomSourceIDs:    splitCSV(envOrDefault("DRYDOCK_CHARTROOM_SOURCE_IDS", envOrDefault("DRYDOCK_CHARTROOM_SOURCES", ""))),
-		QdrantURL:             envOrDefault("DRYDOCK_QDRANT_URL", ""),
-		QdrantAPIKey:          envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
+		ProfileWebsite:     envOrDefault("DRYDOCK_PROFILE_WEBSITE", ""),
+		ProfilePictureURL:  envOrDefault("DRYDOCK_PROFILE_PICTURE_URL", ""),
+		ProfileBannerURL:   envOrDefault("DRYDOCK_PROFILE_BANNER_URL", ""),
+		ProfileIconPath:    envOrDefault("DRYDOCK_PROFILE_ICON_PATH", "assets/drydock-icon.png"),
+		ProfileBannerPath:  envOrDefault("DRYDOCK_PROFILE_BANNER_PATH", "assets/drydock-banner.png"),
+		BlossomServers:     splitCSV(envOrDefault("DRYDOCK_BLOSSOM_SERVERS", "")),
+		PlannerBaseURL:     envOrDefault("DRYDOCK_PLANNER_BASE_URL", devDefault(production, defaultPlannerBaseURL)),
+		PlannerModel:       envOrDefault("DRYDOCK_PLANNER_MODEL", devDefault(production, defaultPlannerModel)),
+		Coder32BBaseURL:    envOrDefault("DRYDOCK_CODER32B_BASE_URL", devDefault(production, defaultCoder32BBaseURL)),
+		Coder32BModel:      envOrDefault("DRYDOCK_CODER32B_MODEL", devDefault(production, defaultCoder32BModel)),
+		LLM70BBaseURL:      envOrDefault("DRYDOCK_LLM70B_BASE_URL", devDefault(production, defaultLLM70BBaseURL)),
+		LLM70BModel:        envOrDefault("DRYDOCK_LLM70B_MODEL", devDefault(production, defaultLLM70BModel)),
+		Coder14BBaseURL:    envOrDefault("DRYDOCK_CODER14B_BASE_URL", devDefault(production, defaultCoder14BBaseURL)),
+		Coder14BModel:      envOrDefault("DRYDOCK_CODER14B_MODEL", devDefault(production, defaultCoder14BModel)),
+		LLMAPIKey:          envOrDefault("DRYDOCK_LLM_API_KEY", ""),
+		PlannerAPIKey:      envOrDefault("DRYDOCK_PLANNER_API_KEY", ""),
+		Coder32BAPIKey:     envOrDefault("DRYDOCK_CODER32B_API_KEY", ""),
+		LLM70BAPIKey:       envOrDefault("DRYDOCK_LLM70B_API_KEY", ""),
+		Coder14BAPIKey:     envOrDefault("DRYDOCK_CODER14B_API_KEY", ""),
+		MetaAPIKey:         envOrDefault("DRYDOCK_META_API_KEY", ""),
+		SignerBunkerURL:    envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
+		SignerNsec:         signerNsec,
+		SignerNsecFile:     signerNsecFile,
+		DevMode:            parseBoolOrDefault(envOrDefault("DEV_MODE", envOrDefault("DRYDOCK_DEV_MODE", "")), false),
+		ChartroomURL:       envOrDefault("DRYDOCK_CHARTROOM_URL", ""),
+		ChartroomToken:     envOrDefault("DRYDOCK_CHARTROOM_TOKEN", envOrDefault("CHARTROOM_HTTP_BEARER_TOKEN", "")),
+		ChartroomCorpusIDs: splitCSV(envOrDefault("DRYDOCK_CHARTROOM_CORPUS_IDS", "")),
+		ChartroomSourceIDs: splitCSV(envOrDefault("DRYDOCK_CHARTROOM_SOURCE_IDS", envOrDefault("DRYDOCK_CHARTROOM_SOURCES", ""))),
+		QdrantURL:          envOrDefault("DRYDOCK_QDRANT_URL", ""),
+		QdrantAPIKey:       envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
 		QdrantCollections: vectorstore.CollectionNames{
 			NIPSpecs:    envOrDefault("DRYDOCK_QDRANT_COLLECTION_NIP_SPECS", defaultCollections.NIPSpecs),
 			ProjectDocs: envOrDefault("DRYDOCK_QDRANT_COLLECTION_PROJECT_DOCS", defaultCollections.ProjectDocs),
@@ -288,6 +293,20 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+func normalizeRepositoryAllowlist(values []string) []string {
+	for i := range values {
+		values[i] = scope.NormalizeRepositoryID(values[i])
+	}
+	return values
+}
+
+func normalizePubkeyAllowlist(values []string) []string {
+	for i := range values {
+		values[i] = scope.NormalizePubkey(values[i])
+	}
+	return values
 }
 
 func paymentTrustedMints() []string {

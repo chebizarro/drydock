@@ -12,6 +12,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/eventkind"
 	"drydock/internal/metrics"
+	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )
@@ -54,6 +55,7 @@ type Processor struct {
 	contextVMRouter    *contextvm.Router
 	contextVMResponder ContextVMResponder
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
+	repositoryScope    scope.Matcher
 	maxEventFutureSkew time.Duration
 	maxEventPastAge    time.Duration
 }
@@ -83,6 +85,13 @@ func WithConversation(ch ConversationHandler) func(*Processor) {
 func WithLocalAutofixAuthor(pubkey string) func(*Processor) {
 	return func(p *Processor) {
 		p.localAutofixPubKey = pubkey
+	}
+}
+
+// WithRepositoryScope configures operator repository and owner allowlists.
+func WithRepositoryScope(matcher scope.Matcher) func(*Processor) {
+	return func(p *Processor) {
+		p.repositoryScope = matcher
 	}
 }
 
@@ -182,6 +191,16 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 		if repoID == "" {
 			p.logger.Warn("patch event missing resolvable repository pointer", "event_id", event.ID.Hex(), "kind", int(event.Kind))
 			return nil
+		}
+		if p.repositoryScope.Enabled() {
+			ownerPubkey, err := p.store.GetRepositoryOwnerPubkey(ctx, repoID)
+			if err != nil {
+				return err
+			}
+			if !p.repositoryScope.Allows(repoID, ownerPubkey) {
+				p.logger.Debug("skipping patch outside repository scope", "event_id", event.ID.Hex(), "repo_id", repoID, "owner_pubkey", ownerPubkey)
+				return nil
+			}
 		}
 		stale, reason, err := p.store.IsPatchStaleBySnapshot(ctx, event)
 		if err != nil {

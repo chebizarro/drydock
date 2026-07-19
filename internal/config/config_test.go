@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 )
 
 func TestFromEnvManagementDefaults(t *testing.T) {
@@ -18,6 +21,21 @@ func TestFromEnvManagementDefaults(t *testing.T) {
 	cfg = FromEnv()
 	if cfg.DashboardBearerToken != "secret-token" {
 		t.Fatalf("expected dashboard bearer token from environment, got %q", cfg.DashboardBearerToken)
+	}
+}
+
+func TestFromEnvNormalizesRepositoryScopeNpubs(t *testing.T) {
+	owner := nostr.GetPublicKey(nostr.Generate())
+	npub := nip19.EncodeNpub(owner)
+	t.Setenv("DRYDOCK_REPO_ALLOWLIST", npub+":repo-one")
+	t.Setenv("DRYDOCK_REPO_OWNER_ALLOWLIST", npub)
+
+	cfg := FromEnv()
+	if len(cfg.RepoAllowlist) != 1 || cfg.RepoAllowlist[0] != owner.Hex()+":repo-one" {
+		t.Fatalf("unexpected repository allowlist: %#v", cfg.RepoAllowlist)
+	}
+	if len(cfg.RepoOwnerAllowlist) != 1 || cfg.RepoOwnerAllowlist[0] != owner.Hex() {
+		t.Fatalf("unexpected repository owner allowlist: %#v", cfg.RepoOwnerAllowlist)
 	}
 }
 
@@ -363,6 +381,8 @@ func clearConfigEnv(t *testing.T) {
 		"DRYDOCK_RELAYS",
 		"DRYDOCK_READ_RELAYS",
 		"DRYDOCK_WRITE_RELAYS",
+		"DRYDOCK_REPO_ALLOWLIST",
+		"DRYDOCK_REPO_OWNER_ALLOWLIST",
 		"DRYDOCK_LLM_API_KEY",
 		"DRYDOCK_PLANNER_BASE_URL",
 		"DRYDOCK_PLANNER_MODEL",

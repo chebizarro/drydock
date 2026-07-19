@@ -22,6 +22,15 @@ cp .env.example .env
 | `DRYDOCK_REPO_CACHE_MAX_COUNT` | integer | `50` | Maximum number of cached repositories before LRU eviction. Set to `0` to disable count-based eviction. |
 | `DRYDOCK_REPO_CACHE_MAX_SIZE_MB` | integer | `10240` | Maximum total cache size in MB (default 10 GB). Set to `0` to disable size-based eviction. |
 
+## Repository Scoping
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_REPO_ALLOWLIST` | comma-separated repository IDs | *(empty)* | Repositories eligible for review, as `npub:identifier` or `64-character-hex-pubkey:identifier`. |
+| `DRYDOCK_REPO_OWNER_ALLOWLIST` | comma-separated public keys | *(empty)* | Repository announcement owners whose repositories are eligible for review. Accepts npub or 64-character hex public keys. |
+
+When both allowlists are empty, Drydock reviews all repositories. Otherwise, a patch is reviewed when either its repository ID or the owner from its stored repository announcement is allowlisted.
+
 ## Nostr Relays
 
 Drydock supports separate relay lists for reading (subscribing to events) and writing (publishing reviews). If read/write-specific lists are not set, `DRYDOCK_RELAYS` is used for both.

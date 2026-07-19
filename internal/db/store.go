@@ -563,6 +563,18 @@ func (s *Store) UpsertRepositoryAnnouncement(ctx context.Context, event nostr.Ev
 	return nil
 }
 
+func (s *Store) GetRepositoryOwnerPubkey(ctx context.Context, repoID string) (string, error) {
+	var pubkey string
+	err := s.db.QueryRowContext(ctx, `SELECT pubkey FROM repositories WHERE repo_id=?`, repoID).Scan(&pubkey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("lookup repository owner pubkey: %w", err)
+	}
+	return pubkey, nil
+}
+
 func (s *Store) GetRepositoryCloneURLs(ctx context.Context, repoID string) ([]string, error) {
 	var cloneURLsCSV string
 	err := s.db.QueryRowContext(

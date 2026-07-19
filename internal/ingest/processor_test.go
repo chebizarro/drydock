@@ -10,6 +10,7 @@ import (
 
 	"drydock/internal/db"
 	"drydock/internal/ingest"
+	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )
@@ -262,6 +263,81 @@ func TestProcessorCreatesPatchReviewGateOnce(t *testing.T) {
 	}
 	if reviewRows != 1 {
 		t.Fatalf("expected 1 review_log row, got %d", reviewRows)
+	}
+}
+
+func TestProcessorAppliesRepositoryOwnerScopeBeforeReview(t *testing.T) {
+	tests := []struct {
+		name    string
+		allowed bool
+	}{
+		{name: "allowed owner", allowed: true},
+		{name: "denied owner", allowed: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := mustOpenStore(t, ctx)
+			repoSK := nostr.Generate()
+			repoOwner := nostr.GetPublicKey(repoSK).Hex()
+			allowedOwner := repoOwner
+			if !test.allowed {
+				allowedOwner = nostr.GetPublicKey(nostr.Generate()).Hex()
+			}
+			processor := ingest.NewProcessor(
+				store,
+				slog.New(slog.NewJSONHandler(io.Discard, nil)),
+				ingest.WithRepositoryScope(scope.NewMatcher(nil, []string{allowedOwner})),
+			)
+
+			repoEvt := nostr.Event{
+				Kind:      30617,
+				CreatedAt: nostr.Now(),
+				Tags:      nostr.Tags{{"d", "repo-1"}, {"clone", "https://example.com/repo-1.git"}},
+			}
+			signEvent(t, repoSK, &repoEvt)
+			if err := processor.ProcessEvent(ctx, repoEvt, "wss://relay.test"); err != nil {
+				t.Fatalf("process repo: %v", err)
+			}
+
+			patch := nostr.Event{
+				Kind:      1617,
+				CreatedAt: nostr.Now(),
+				Tags: nostr.Tags{
+					{"a", "30617:" + repoOwner + ":repo-1"},
+					{"e", "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "", "root"},
+				},
+				Content: "diff --git a/main.go b/main.go\n+package main\n",
+			}
+			signEvent(t, nostr.Generate(), &patch)
+			if err := processor.ProcessEvent(ctx, patch, "wss://relay.test"); err != nil {
+				t.Fatalf("process patch: %v", err)
+			}
+
+			reviewRows, err := store.CountReviewLog(ctx)
+			if err != nil {
+				t.Fatalf("count review log: %v", err)
+			}
+			if test.allowed {
+				if reviewRows != 1 {
+					t.Fatalf("expected allowed patch to begin review, got %d review rows", reviewRows)
+				}
+				select {
+				case <-processor.ReviewQueue:
+				default:
+					t.Fatal("expected allowed patch in review queue")
+				}
+			} else {
+				if reviewRows != 0 {
+					t.Fatalf("expected denied patch to skip BeginReview, got %d review rows", reviewRows)
+				}
+				select {
+				case task := <-processor.ReviewQueue:
+					t.Fatalf("denied patch was queued: %+v", task)
+				default:
+				}
+			}
+		})
 	}
 }
 

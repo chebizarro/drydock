@@ -32,12 +32,13 @@ import (
 	"drydock/internal/metrics"
 	"drydock/internal/payment"
 	"drydock/internal/pipeline"
-	"drydock/internal/promptrefine"
 	"drydock/internal/profile"
+	"drydock/internal/promptrefine"
 	"drydock/internal/publisher"
 	"drydock/internal/ratelimit"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
+	"drydock/internal/scope"
 	"drydock/internal/securityscan"
 	"drydock/internal/signing"
 	"drydock/internal/symbols"
@@ -495,7 +496,10 @@ func main() {
 		logger.Warn("IDE gateway and marketplace handlers disabled", "requires", "signer")
 	}
 
-	processorOpts = append(processorOpts, ingest.WithTimingPolicy(cfg.ListenerMaxFutureSkew, cfg.ListenerMaxEventAge))
+	processorOpts = append(processorOpts,
+		ingest.WithRepositoryScope(scope.NewMatcher(cfg.RepoAllowlist, cfg.RepoOwnerAllowlist)),
+		ingest.WithTimingPolicy(cfg.ListenerMaxFutureSkew, cfg.ListenerMaxEventAge),
+	)
 	processor := ingest.NewProcessor(store, logger, processorOpts...)
 	svc := listener.New(listener.Config{
 		Relays:               readRelays,
