@@ -57,6 +57,17 @@ type Config struct {
 	ListenerMaxFutureSkew time.Duration
 	ListenerMaxEventAge   time.Duration
 
+	// Kind 0 profile metadata published for the signer identity at startup.
+	ProfileEnabled    bool
+	ProfileName       string
+	ProfileAbout      string
+	ProfileWebsite    string
+	ProfilePictureURL string // explicit URL; overrides icon upload
+	ProfileBannerURL  string // explicit URL; overrides banner upload
+	ProfileIconPath   string
+	ProfileBannerPath string
+	BlossomServers    []string // media servers for profile image uploads
+
 	PlannerBaseURL             string
 	PlannerModel               string
 	Coder32BBaseURL            string
@@ -139,6 +150,16 @@ func FromEnv() Config {
 		ListenerHWMOverlap:    parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_HWM_OVERLAP", "30s"), 30*time.Second),
 		ListenerMaxFutureSkew: parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_FUTURE_SKEW", "10m"), 10*time.Minute),
 		ListenerMaxEventAge:   parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_EVENT_AGE", "8760h"), 365*24*time.Hour),
+		ProfileEnabled:        parseBoolOrDefault(envOrDefault("DRYDOCK_PROFILE_ENABLED", "true"), true),
+		ProfileName:           envOrDefault("DRYDOCK_PROFILE_NAME", "Drydock"),
+		ProfileAbout: envOrDefault("DRYDOCK_PROFILE_ABOUT",
+			"Automated code review for git on Nostr. Drydock watches NIP-34 patch and pull-request events, checks out the proposed changes, and publishes structured reviews with findings, per-file walkthroughs, and status updates — powered by local LLMs."),
+		ProfileWebsite:        envOrDefault("DRYDOCK_PROFILE_WEBSITE", ""),
+		ProfilePictureURL:     envOrDefault("DRYDOCK_PROFILE_PICTURE_URL", ""),
+		ProfileBannerURL:      envOrDefault("DRYDOCK_PROFILE_BANNER_URL", ""),
+		ProfileIconPath:       envOrDefault("DRYDOCK_PROFILE_ICON_PATH", "assets/drydock-icon.png"),
+		ProfileBannerPath:     envOrDefault("DRYDOCK_PROFILE_BANNER_PATH", "assets/drydock-banner.png"),
+		BlossomServers:        splitCSV(envOrDefault("DRYDOCK_BLOSSOM_SERVERS", "")),
 		PlannerBaseURL:        envOrDefault("DRYDOCK_PLANNER_BASE_URL", devDefault(production, defaultPlannerBaseURL)),
 		PlannerModel:          envOrDefault("DRYDOCK_PLANNER_MODEL", devDefault(production, defaultPlannerModel)),
 		Coder32BBaseURL:       envOrDefault("DRYDOCK_CODER32B_BASE_URL", devDefault(production, defaultCoder32BBaseURL)),

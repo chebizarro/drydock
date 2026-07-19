@@ -33,6 +33,7 @@ import (
 	"drydock/internal/payment"
 	"drydock/internal/pipeline"
 	"drydock/internal/promptrefine"
+	"drydock/internal/profile"
 	"drydock/internal/publisher"
 	"drydock/internal/ratelimit"
 	"drydock/internal/repo"
@@ -191,6 +192,30 @@ func main() {
 	if signer != nil {
 		auditPub = publisher.NewAuditPublisher(signer, relayPub, writeRelays, logger)
 		signer = publisher.NewAuditedSigner(signer, auditPub, logger)
+	}
+
+	// --- Kind 0 profile (published if missing, refreshed when config changes) ---
+	if signer != nil && cfg.ProfileEnabled {
+		profileSvc := profile.New(profile.Config{
+			Enabled:        true,
+			Name:           cfg.ProfileName,
+			About:          cfg.ProfileAbout,
+			Website:        cfg.ProfileWebsite,
+			PictureURL:     cfg.ProfilePictureURL,
+			BannerURL:      cfg.ProfileBannerURL,
+			IconPath:       cfg.ProfileIconPath,
+			BannerPath:     cfg.ProfileBannerPath,
+			BlossomServers: cfg.BlossomServers,
+			ReadRelays:     readRelays,
+			WriteRelays:    writeRelays,
+		}, signer, pool, relayPub, logger)
+		go func() {
+			profCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			defer cancel()
+			if err := profileSvc.EnsureProfile(profCtx); err != nil {
+				logger.Warn("kind 0 profile publish failed", "error", err)
+			}
+		}()
 	}
 
 	// --- ContextVM transport (MCP-over-Nostr JSON-RPC foundation) ---
