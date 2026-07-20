@@ -37,6 +37,25 @@ func TestOpenEnforcesForeignKeys(t *testing.T) {
 	}
 }
 
+func TestResetListenerHighWaterMarkCanRecoverFromFutureValue(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	if err := store.UpdateListenerHighWaterMark(ctx, 2_000_000_000); err != nil {
+		t.Fatalf("seed future high-water mark: %v", err)
+	}
+	if err := store.ResetListenerHighWaterMark(ctx, 1_700_000_000); err != nil {
+		t.Fatalf("reset high-water mark: %v", err)
+	}
+	got, err := store.GetListenerHighWaterMark(ctx)
+	if err != nil {
+		t.Fatalf("get reset high-water mark: %v", err)
+	}
+	if got != 1_700_000_000 {
+		t.Fatalf("reset high-water mark = %d, want %d", got, int64(1_700_000_000))
+	}
+}
+
 func TestMigrateAppliesVersionedMigrationsIdempotently(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)

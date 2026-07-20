@@ -1897,6 +1897,23 @@ func (s *Store) UpdateListenerHighWaterMark(ctx context.Context, ts int64) error
 	return nil
 }
 
+// ResetListenerHighWaterMark replaces a known-invalid checkpoint with a safe
+// recovery timestamp. Normal event processing must use the monotonic update
+// method above.
+func (s *Store) ResetListenerHighWaterMark(ctx context.Context, ts int64) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO listener_state(key, value, updated_at)
+		VALUES ('high_water_mark', ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		fmt.Sprintf("%d", ts), now,
+	)
+	if err != nil {
+		return fmt.Errorf("reset listener high water mark: %w", err)
+	}
+	return nil
+}
+
 // ReviewTask is a queued patch/repo pair ready for pipeline execution.
 type ReviewTask struct {
 	PatchEventID string

@@ -25,6 +25,7 @@ type GiftWrapOpener interface {
 type highWaterStore interface {
 	GetListenerHighWaterMark(ctx context.Context) (int64, error)
 	UpdateListenerHighWaterMark(ctx context.Context, ts int64) error
+	ResetListenerHighWaterMark(ctx context.Context, ts int64) error
 }
 
 var ListenerCheckpointPersistFailures = &metrics.Counter{}
@@ -150,6 +151,18 @@ func (s *Service) Run(ctx context.Context) error {
 					"max_allowed", now.Add(maxFutureSkew).Unix(),
 					"since", since,
 				)
+				if err := s.store.ResetListenerHighWaterMark(ctx, since); err != nil {
+					s.logger.Error("failed to reset implausible future listener high-water-mark",
+						"high_water_mark", hwm,
+						"reset_to", since,
+						"error", err,
+					)
+				} else {
+					s.logger.Info("reset implausible future listener high-water-mark",
+						"previous", hwm,
+						"high_water_mark", since,
+					)
+				}
 			}
 		}
 	}

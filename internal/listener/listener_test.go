@@ -82,6 +82,7 @@ func (f *fakeProcessor) ProcessEvent(_ context.Context, event nostr.Event, _ str
 type fakeHighWaterStore struct {
 	mark        int64
 	updates     []int64
+	resets      []int64
 	updateErr   error
 	updateCalls int
 }
@@ -97,6 +98,12 @@ func (f *fakeHighWaterStore) UpdateListenerHighWaterMark(_ context.Context, ts i
 	}
 	f.mark = ts
 	f.updates = append(f.updates, ts)
+	return nil
+}
+
+func (f *fakeHighWaterStore) ResetListenerHighWaterMark(_ context.Context, ts int64) error {
+	f.mark = ts
+	f.resets = append(f.resets, ts)
 	return nil
 }
 

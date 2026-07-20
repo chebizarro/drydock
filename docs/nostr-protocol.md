@@ -266,7 +266,8 @@ The listener tracks the most recent event timestamp in the `listener_state` SQLi
 
 Only timestamps within `DRYDOCK_LISTENER_MAX_FUTURE_SKEW` may advance the
 cursor. If an older deployment persisted an implausible future cursor, Drydock
-ignores it on startup and recovers from the configured lookback window.
+resets it to the configured lookback boundary on startup and resumes from
+there.
 
 This means:
 - No events are missed across restarts
