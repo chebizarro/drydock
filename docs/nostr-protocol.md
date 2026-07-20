@@ -64,7 +64,10 @@ Automatic reviews respect the root's current NIP-34 status at review time
 | kind 1632 (closed) | Never |
 
 Status-gated skips are permanent (not retried by the failed-review sweep); a
-later status change back to open triggers reviews normally. See
+later status change back to open triggers reviews normally. An authorized
+ContextVM `review/request` with `force: true` can explicitly bypass this status
+gate, including for a prior `status_skipped:` target, while scope and payment
+gates still apply. See [ContextVM Integration](contextvm-integration.md) and
 [Per-Repository Configuration](repo-config.md).
 
 ## Kind 0 Profile

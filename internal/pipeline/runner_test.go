@@ -205,6 +205,34 @@ func TestProcessEndToEndPersistsAndPublishesReview(t *testing.T) {
 	}
 }
 
+func TestCheckReviewStatusForceBypassesDraftAndClosed(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	runner := &Runner{store: store, logger: testLogger()}
+	const rootID = "root"
+	const repoID = "owner:repo"
+
+	for _, kind := range []int{int(nostr.KindStatusDraft), int(nostr.KindStatusClosed)} {
+		if _, err := store.DB().ExecContext(ctx, `DELETE FROM root_statuses`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().ExecContext(ctx, `INSERT INTO root_statuses
+			(root_event_id, repo_id, status_kind, status_event_id, author_pubkey, created_at, updated_at)
+			VALUES (?, ?, ?, 'status-event', 'author', 1, 1)`, rootID, repoID, kind); err != nil {
+			t.Fatal(err)
+		}
+
+		forced := db.ReviewTask{PatchEventID: "patch", RepoID: repoID, Force: true}
+		if err := runner.checkReviewStatus(ctx, forced, rootID, []string{"open"}); err != nil {
+			t.Fatalf("forced status %d was denied: %v", kind, err)
+		}
+		normal := db.ReviewTask{PatchEventID: "patch", RepoID: repoID}
+		if err := runner.checkReviewStatus(ctx, normal, rootID, []string{"open"}); err == nil || !strings.HasPrefix(err.Error(), "status_skipped:") {
+			t.Fatalf("ordinary status %d error = %v, want status_skipped", kind, err)
+		}
+	}
+}
+
 func TestPipelinePureHelpers(t *testing.T) {
 	t.Run("changedFilesFromBundle", func(t *testing.T) {
 		bundle := contextbuilder.ContextBundle{

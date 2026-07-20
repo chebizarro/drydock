@@ -287,22 +287,45 @@ func (m *Manager) ReadFileAtRef(ctx context.Context, repoPath, ref, relPath stri
 	return []byte(out), nil
 }
 
-// ReadFileAtDefaultRef reads a file from the canonical default branch.
-// Tries refs/remotes/origin/HEAD first, falls back to HEAD.
-// Returns nil, nil if the file doesn't exist.
-func (m *Manager) ReadFileAtDefaultRef(ctx context.Context, repoPath, relPath string) ([]byte, error) {
-	// Try origin/HEAD first (canonical upstream ref).
-	data, err := m.ReadFileAtRef(ctx, repoPath, "refs/remotes/origin/HEAD", relPath)
-	if err == nil {
-		return data, nil
-	}
-	// Fallback to HEAD.
-	data, err = m.ReadFileAtRef(ctx, repoPath, "HEAD", relPath)
+// ReadOptionalFileAtDefaultRef reads an optional file from the canonical
+// default branch while distinguishing a confirmed absent path from operational
+// Git failures.
+func (m *Manager) ReadOptionalFileAtDefaultRef(ctx context.Context, repoPath, relPath string) ([]byte, bool, error) {
+	refs := make([]string, 0, 2)
+	originRef, err := m.runGit(ctx, repoPath, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/HEAD")
 	if err != nil {
-		// File doesn't exist at HEAD either — not an error for optional config.
-		return nil, nil
+		return nil, false, fmt.Errorf("inspect canonical origin default ref: %w", err)
 	}
-	return data, nil
+	if strings.TrimSpace(originRef) != "" {
+		refs = append(refs, "refs/remotes/origin/HEAD")
+	}
+	refs = append(refs, "HEAD")
+
+	for _, ref := range refs {
+		if _, err := m.runGit(ctx, repoPath, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
+			return nil, false, fmt.Errorf("resolve canonical default ref %s: %w", ref, err)
+		}
+		listed, err := m.runGit(ctx, repoPath, "ls-tree", "--name-only", ref, "--", relPath)
+		if err != nil {
+			return nil, false, fmt.Errorf("check optional file %s at %s: %w", relPath, ref, err)
+		}
+		if strings.TrimSpace(listed) == "" {
+			continue
+		}
+		data, err := m.ReadFileAtRef(ctx, repoPath, ref, relPath)
+		if err != nil {
+			return nil, false, err
+		}
+		return data, true, nil
+	}
+	return nil, false, nil
+}
+
+// ReadFileAtDefaultRef reads a file from the canonical default branch and
+// returns nil only when the path is confirmed absent.
+func (m *Manager) ReadFileAtDefaultRef(ctx context.Context, repoPath, relPath string) ([]byte, error) {
+	data, _, err := m.ReadOptionalFileAtDefaultRef(ctx, repoPath, relPath)
+	return data, err
 }
 
 func (m *Manager) CleanupReviewBranch(ctx context.Context, repoPath, branch string) error {

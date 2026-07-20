@@ -232,7 +232,7 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			return nil
 		}
 
-		acquired, err := p.store.BeginReview(ctx, event.ID.Hex(), repoID)
+		acquired, err := p.store.BeginReview(ctx, event.ID.Hex(), repoID, false)
 		if err != nil {
 			if errors.Is(err, db.ErrReviewAlreadyPublished) {
 				p.logger.Debug("skipping already-published review target", "event_id", event.ID.Hex(), "repo_id", repoID)
@@ -241,7 +241,7 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			return err
 		}
 		if acquired {
-			return p.enqueueReview(ctx, db.ReviewTask{PatchEventID: event.ID.Hex(), RepoID: repoID}, "patch")
+			return p.EnqueueReview(ctx, db.ReviewTask{PatchEventID: event.ID.Hex(), RepoID: repoID}, "patch")
 		}
 		return nil
 	case eventkind.ZapReceipt:
@@ -261,7 +261,7 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 			p.logger.Info("accepted zap receipt", "event_id", receipt.EventID, "patch_event_id", receipt.PatchEventID, "amount_msat", receipt.AmountMSat, "trusted_zapper_allowlist", len(p.trustedZappers) > 0)
 		}
 		for _, task := range tasks {
-			if err := p.enqueueReview(ctx, task, "zap_receipt"); err != nil {
+			if err := p.EnqueueReview(ctx, task, "zap_receipt"); err != nil {
 				return err
 			}
 		}
@@ -327,7 +327,9 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 	}
 }
 
-func (p *Processor) enqueueReview(ctx context.Context, task db.ReviewTask, source string) error {
+// EnqueueReview submits an already-claimed review task and preserves queue-full
+// failures for the durable retry sweep.
+func (p *Processor) EnqueueReview(ctx context.Context, task db.ReviewTask, source string) error {
 	select {
 	case p.ReviewQueue <- task:
 		metrics.ReviewQueuePushed.Inc()

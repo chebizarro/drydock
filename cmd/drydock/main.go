@@ -466,6 +466,8 @@ func main() {
 	}, store, metaClient, logger)
 
 	// --- Event handlers registered before subscribing ---
+	repositoryScope := scope.NewMatcher(cfg.RepoAllowlist, cfg.RepoOwnerAllowlist)
+	var ideHandler *idegateway.Handler
 	if signer != nil && qdrantClient != nil && embedClient != nil {
 		if keyer, ok := signer.(codechat.Keyer); ok {
 			codeChatHandler := codechat.New(codechat.Config{
@@ -484,7 +486,12 @@ func main() {
 	}
 
 	if signer != nil {
-		ideHandler := idegateway.New(idegateway.Config{DefaultRelays: writeRelays}, store, ctxBuilder, engine, signer, relayPub, logger)
+		ideHandler = idegateway.New(
+			idegateway.Config{DefaultRelays: writeRelays}, store, ctxBuilder, engine, signer, relayPub, logger,
+			idegateway.WithRepositoryScope(repositoryScope),
+			idegateway.WithRepositoryConfigLoader(repoSvc),
+			idegateway.WithPaymentAuthorizer(paymentSvc),
+		)
 		processorOpts = append(processorOpts, ingest.WithIDEGateway(ideHandler))
 		if err := contextvm.RegisterIDEMethods(contextVMRouter, ideHandler); err != nil {
 			logger.Error("failed to register IDE ContextVM handlers", "error", err)
@@ -508,10 +515,13 @@ func main() {
 	}
 
 	processorOpts = append(processorOpts,
-		ingest.WithRepositoryScope(scope.NewMatcher(cfg.RepoAllowlist, cfg.RepoOwnerAllowlist)),
+		ingest.WithRepositoryScope(repositoryScope),
 		ingest.WithTimingPolicy(cfg.ListenerMaxFutureSkew, cfg.ListenerMaxEventAge),
 	)
 	processor := ingest.NewProcessor(store, logger, processorOpts...)
+	if ideHandler != nil {
+		ideHandler.SetReviewEnqueuer(processor)
+	}
 	svc := listener.New(listener.Config{
 		Relays:               readRelays,
 		LookbackMinutes:      cfg.ListenerLookbackMin,

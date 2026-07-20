@@ -10,6 +10,9 @@ import (
 
 	"drydock/internal/contextvm"
 	"drydock/internal/db"
+	"drydock/internal/payment"
+	"drydock/internal/repoconfig"
+	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )
@@ -33,6 +36,35 @@ func (m *mockPublisher) Publish(_ context.Context, _ []string, event nostr.Event
 	return nil
 }
 
+type fakeConfigLoader struct {
+	config []byte
+	calls  int
+}
+
+func (f *fakeConfigLoader) LoadBaseRepoConfig(context.Context, string) ([]byte, error) {
+	f.calls++
+	return f.config, nil
+}
+
+type fakePaymentAuthorizer struct {
+	result payment.AuthorizeResult
+	calls  int
+}
+
+func (f *fakePaymentAuthorizer) AuthorizePatch(context.Context, nostr.Event, string, repoconfig.PaymentsConfig) (payment.AuthorizeResult, error) {
+	f.calls++
+	return f.result, nil
+}
+
+type collectingReviewEnqueuer struct {
+	tasks []db.ReviewTask
+}
+
+func (e *collectingReviewEnqueuer) EnqueueReview(_ context.Context, task db.ReviewTask, _ string) error {
+	e.tasks = append(e.tasks, task)
+	return nil
+}
+
 func newTestHandler(pub *mockPublisher) *Handler {
 	return &Handler{
 		cfg:       Config{},
@@ -44,6 +76,53 @@ func newTestHandler(pub *mockPublisher) *Handler {
 		sessions:  make(map[string]*activeSession),
 		fixTTL:    time.Minute,
 	}
+}
+
+func seedPatchReviewTarget(t *testing.T, store *db.Store, ownerSK, patchSK nostr.SecretKey) (nostr.Event, string) {
+	t.Helper()
+	ctx := context.Background()
+	repo := nostr.Event{
+		Kind: nostr.Kind(30617), CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{{"d", "test-repo"}, {"clone", "https://example.com/repo.git"}},
+	}
+	if err := repo.Sign(ownerSK); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertRepositoryAnnouncement(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+	repoID := nostr.GetPublicKey(ownerSK).Hex() + ":test-repo"
+	patch := nostr.Event{
+		Kind: nostr.Kind(1617), CreatedAt: nostr.Now(),
+		Tags:    nostr.Tags{{"a", "30617:" + repoID}},
+		Content: "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -0,0 +1 @@\n+package main\n",
+	}
+	if err := patch.Sign(patchSK); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertPatchEvent(ctx, patch); err != nil {
+		t.Fatal(err)
+	}
+	return patch, repoID
+}
+
+func newPatchRequestHandler(t *testing.T, requester nostr.PubKey, loader RepositoryConfigLoader, authorizer PaymentAuthorizer, enqueuer ReviewEnqueuer) (*Handler, *db.Store) {
+	t.Helper()
+	store, err := db.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler(&mockPublisher{})
+	h.store = store
+	h.configLoader = loader
+	h.paymentAuth = authorizer
+	h.reviewEnqueuer = enqueuer
+	h.sessions["sess-1"] = &activeSession{PubKey: requester.Hex()}
+	return h, store
 }
 
 func TestSessionKindIsNIP78(t *testing.T) {
@@ -157,6 +236,115 @@ func hasTag(tags nostr.Tags, name, value string) bool {
 		}
 	}
 	return false
+}
+
+func TestPatchReviewRequestForcedMaintainerReopensStatusSkipped(t *testing.T) {
+	ownerSK := nostr.Generate()
+	patchSK := nostr.Generate()
+	requester := nostr.GetPublicKey(ownerSK)
+	loader := &fakeConfigLoader{}
+	queue := &collectingReviewEnqueuer{}
+	h, store := newPatchRequestHandler(t, requester, loader, nil, queue)
+	patch, repoID := seedPatchReviewTarget(t, store, ownerSK, patchSK)
+
+	acquired, err := store.BeginReview(context.Background(), patch.ID.Hex(), repoID, false)
+	if err != nil || !acquired {
+		t.Fatalf("BeginReview = %v, %v", acquired, err)
+	}
+	if err := store.MarkReviewFailed(context.Background(), patch.ID.Hex(), repoID, "status_skipped:root status is draft"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
+		SessionID: "sess-1", RequestID: "req-1", PatchEventID: patch.ID.Hex(), Force: true,
+	})
+	if rpcErr != nil {
+		t.Fatalf("forced patch request failed: %s", rpcErr.Message)
+	}
+	if !resp.Queued || !resp.Forced || len(queue.tasks) != 1 || !queue.tasks[0].Force {
+		t.Fatalf("forced response/task mismatch: resp=%+v tasks=%+v", resp, queue.tasks)
+	}
+}
+
+func TestPatchReviewRequestRejectsUnauthorizedForce(t *testing.T) {
+	ownerSK := nostr.Generate()
+	patchSK := nostr.Generate()
+	requester := nostr.GetPublicKey(nostr.Generate())
+	queue := &collectingReviewEnqueuer{}
+	h, store := newPatchRequestHandler(t, requester, &fakeConfigLoader{}, nil, queue)
+	patch, _ := seedPatchReviewTarget(t, store, ownerSK, patchSK)
+
+	_, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
+		SessionID: "sess-1", RequestID: "req-1", PatchEventID: patch.ID.Hex(), Force: true,
+	})
+	if rpcErr == nil || rpcErr.Code != contextvm.ErrorUnauthorized {
+		t.Fatalf("unauthorized force error = %+v", rpcErr)
+	}
+	if len(queue.tasks) != 0 {
+		t.Fatalf("unauthorized force enqueued tasks: %+v", queue.tasks)
+	}
+}
+
+func TestPatchReviewRequestPaidAccessAuthorizesForce(t *testing.T) {
+	ownerSK := nostr.Generate()
+	patchSK := nostr.Generate()
+	requester := nostr.GetPublicKey(nostr.Generate())
+	loader := &fakeConfigLoader{config: []byte("payments:\n  enabled: true\n  price_sats: 100\n")}
+	authorizer := &fakePaymentAuthorizer{result: payment.AuthorizeResult{Allowed: true, AccessKind: payment.AccessZap}}
+	queue := &collectingReviewEnqueuer{}
+	h, store := newPatchRequestHandler(t, requester, loader, authorizer, queue)
+	patch, _ := seedPatchReviewTarget(t, store, ownerSK, patchSK)
+
+	_, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
+		SessionID: "sess-1", RequestID: "req-1", PatchEventID: patch.ID.Hex(), Force: true,
+	})
+	if rpcErr != nil {
+		t.Fatalf("paid force failed: %s", rpcErr.Message)
+	}
+	if authorizer.calls != 1 || len(queue.tasks) != 1 || !queue.tasks[0].Force {
+		t.Fatalf("paid force did not enqueue forced task: calls=%d tasks=%+v", authorizer.calls, queue.tasks)
+	}
+}
+
+func TestPatchReviewRequestDeniesUnpaidTargetBeforeEnqueue(t *testing.T) {
+	ownerSK := nostr.Generate()
+	requester := nostr.GetPublicKey(ownerSK)
+	loader := &fakeConfigLoader{config: []byte("payments:\n  enabled: true\n  price_sats: 100\n")}
+	authorizer := &fakePaymentAuthorizer{result: payment.AuthorizeResult{Allowed: false, Reason: "no_payment"}}
+	queue := &collectingReviewEnqueuer{}
+	h, store := newPatchRequestHandler(t, requester, loader, authorizer, queue)
+	patch, _ := seedPatchReviewTarget(t, store, ownerSK, nostr.Generate())
+
+	_, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
+		SessionID: "sess-1", RequestID: "req-1", PatchEventID: patch.ID.Hex(),
+	})
+	if rpcErr == nil || rpcErr.Code != contextvm.ErrorUnauthorized {
+		t.Fatalf("payment denial error = %+v", rpcErr)
+	}
+	if authorizer.calls != 1 || len(queue.tasks) != 0 {
+		t.Fatalf("payment denial did not stop enqueue: calls=%d tasks=%+v", authorizer.calls, queue.tasks)
+	}
+}
+
+func TestPatchReviewRequestAppliesRepositoryScopeBeforePayment(t *testing.T) {
+	ownerSK := nostr.Generate()
+	requester := nostr.GetPublicKey(ownerSK)
+	loader := &fakeConfigLoader{config: []byte("payments:\n  enabled: true\n  price_sats: 100\n")}
+	authorizer := &fakePaymentAuthorizer{result: payment.AuthorizeResult{Allowed: true, AccessKind: payment.AccessZap}}
+	queue := &collectingReviewEnqueuer{}
+	h, store := newPatchRequestHandler(t, requester, loader, authorizer, queue)
+	h.repositoryScope = scope.NewMatcher([]string{"another-owner:another-repo"}, nil)
+	patch, _ := seedPatchReviewTarget(t, store, ownerSK, nostr.Generate())
+
+	_, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
+		SessionID: "sess-1", RequestID: "req-1", PatchEventID: patch.ID.Hex(),
+	})
+	if rpcErr == nil || rpcErr.Code != contextvm.ErrorUnauthorized {
+		t.Fatalf("scope denial error = %+v", rpcErr)
+	}
+	if loader.calls != 0 || authorizer.calls != 0 || len(queue.tasks) != 0 {
+		t.Fatalf("scope denial ran later gates: loader=%d payment=%d tasks=%d", loader.calls, authorizer.calls, len(queue.tasks))
+	}
 }
 
 func TestHandleFixRequestReturnsStoredFix(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -14,7 +15,10 @@ import (
 	"drydock/internal/contextvm"
 	"drydock/internal/db"
 	"drydock/internal/metrics"
+	"drydock/internal/payment"
+	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
+	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )
@@ -41,6 +45,21 @@ type RelayPublisher interface {
 	Publish(ctx context.Context, relays []string, event nostr.Event) error
 }
 
+// RepositoryConfigLoader reads policy from the canonical repository base.
+type RepositoryConfigLoader interface {
+	LoadBaseRepoConfig(ctx context.Context, repoID string) ([]byte, error)
+}
+
+// PaymentAuthorizer applies the shared patch payment policy.
+type PaymentAuthorizer interface {
+	AuthorizePatch(ctx context.Context, patchEvent nostr.Event, repoID string, policy repoconfig.PaymentsConfig) (payment.AuthorizeResult, error)
+}
+
+// ReviewEnqueuer submits an already-claimed task to the normal review pipeline.
+type ReviewEnqueuer interface {
+	EnqueueReview(ctx context.Context, task db.ReviewTask, source string) error
+}
+
 // Config holds IDE gateway configuration.
 type Config struct {
 	DefaultRelays []string
@@ -57,6 +76,11 @@ type Handler struct {
 	logger     *slog.Logger
 	ourPubKey  string
 	sem        chan struct{}
+
+	repositoryScope scope.Matcher
+	configLoader    RepositoryConfigLoader
+	paymentAuth     PaymentAuthorizer
+	reviewEnqueuer  ReviewEnqueuer
 
 	// Track active sessions for routing responses
 	mu       sync.RWMutex
@@ -93,6 +117,7 @@ func New(
 	signer Signer,
 	relayPub RelayPublisher,
 	logger *slog.Logger,
+	opts ...func(*Handler),
 ) *Handler {
 	var ourPubKey string
 	if signer != nil {
@@ -103,7 +128,7 @@ func New(
 		}
 	}
 
-	return &Handler{
+	h := &Handler{
 		cfg:        cfg,
 		store:      store,
 		ctxBuilder: ctxBuilder,
@@ -116,6 +141,32 @@ func New(
 		sessions:   make(map[string]*activeSession),
 		fixTTL:     fixTTL,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
+}
+
+// WithRepositoryScope applies the operator repository and owner allowlists to
+// ContextVM patch-target requests.
+func WithRepositoryScope(matcher scope.Matcher) func(*Handler) {
+	return func(h *Handler) { h.repositoryScope = matcher }
+}
+
+// WithRepositoryConfigLoader configures canonical repository policy loading.
+func WithRepositoryConfigLoader(loader RepositoryConfigLoader) func(*Handler) {
+	return func(h *Handler) { h.configLoader = loader }
+}
+
+// WithPaymentAuthorizer configures the shared payment gate.
+func WithPaymentAuthorizer(authorizer PaymentAuthorizer) func(*Handler) {
+	return func(h *Handler) { h.paymentAuth = authorizer }
+}
+
+// SetReviewEnqueuer completes startup wiring after the ingest processor exists.
+// It must be called before the listener starts.
+func (h *Handler) SetReviewEnqueuer(enqueuer ReviewEnqueuer) {
+	h.reviewEnqueuer = enqueuer
 }
 
 // HandleEvent processes an IDE-related event.
@@ -286,6 +337,16 @@ func (h *Handler) HandleReviewRequest(ctx context.Context, rpcReq contextvm.Requ
 	if !h.validateRequestEnvelope(rpcReq.Event, req.SessionID, req.RequestID) {
 		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: "request is not addressed to this IDE session/gateway"}
 	}
+	if req.PatchEventID != "" {
+		resp, patchErr := h.processPatchReviewRequest(ctx, rpcReq.Event, req)
+		if patchErr != nil {
+			return nil, patchErr
+		}
+		return resp, nil
+	}
+	if req.Force {
+		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "force requires patch_event_id"}
+	}
 	resp, err := h.processReviewRequest(ctx, rpcReq.Event, rpcReq.Relay, req)
 	if err != nil {
 		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
@@ -319,6 +380,106 @@ func (h *Handler) HandleApplyFixRequest(ctx context.Context, rpcReq contextvm.Re
 	}
 	h.logger.Info("IDE fix response created", "request_id", req.RequestID, "fix_id", req.FixID, "success", resp.Success)
 	return resp, nil
+}
+
+// processPatchReviewRequest gates and enqueues a stored NIP-34 patch review.
+func (h *Handler) processPatchReviewRequest(ctx context.Context, event nostr.Event, req ReviewRequest) (ReviewResponse, *contextvm.Error) {
+	metrics.IDEReviewRequestsReceived.Inc()
+
+	// The request sender must own the referenced IDE session.
+	h.mu.Lock()
+	session, ok := h.sessions[req.SessionID]
+	if !ok || session.PubKey == "" || !strings.EqualFold(session.PubKey, event.PubKey.Hex()) {
+		h.mu.Unlock()
+		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "unauthorized IDE session sender"}
+	}
+	session.LastSeen = time.Now()
+	h.mu.Unlock()
+
+	patchRec, err := h.store.GetPatchEvent(ctx, req.PatchEventID)
+	if err != nil {
+		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorNotFound, Message: err.Error()}
+	}
+	var patchEvent nostr.Event
+	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
+		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: "decode stored patch event"}
+	}
+
+	if h.repositoryScope.Enabled() {
+		ownerPubkey, err := h.store.GetRepositoryOwnerPubkey(ctx, patchRec.RepoID)
+		if err != nil {
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+		}
+		if !h.repositoryScope.Allows(patchRec.RepoID, ownerPubkey) {
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "repository is outside operator scope"}
+		}
+	}
+	if h.configLoader == nil || h.reviewEnqueuer == nil {
+		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: "patch review gateway is not configured"}
+	}
+
+	rawConfig, err := h.configLoader.LoadBaseRepoConfig(ctx, patchRec.RepoID)
+	if err != nil {
+		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: fmt.Sprintf("load repository policy: %v", err)}
+	}
+	repoCfg := repoconfig.Default()
+	if len(rawConfig) > 0 {
+		parsed, parseErr := repoconfig.Parse(rawConfig)
+		if parseErr != nil {
+			if repoconfig.ContainsPaymentsConfig(rawConfig) {
+				return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "payment denied: invalid_repo_payment_policy"}
+			}
+			h.logger.Warn("failed to parse .drydock.yaml for ContextVM request, using defaults",
+				"patch_event_id", req.PatchEventID, "repo_id", patchRec.RepoID, "error", parseErr)
+		} else {
+			repoCfg = parsed
+		}
+	}
+
+	var authorization payment.AuthorizeResult
+	if repoCfg.Payments.Enabled {
+		if h.paymentAuth == nil {
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "payment denied: payment_service_not_configured"}
+		}
+		authorization, err = h.paymentAuth.AuthorizePatch(ctx, patchEvent, patchRec.RepoID, repoCfg.Payments)
+		if err != nil {
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: fmt.Sprintf("authorize payment: %v", err)}
+		}
+		if !authorization.Allowed {
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "payment denied: " + authorization.Reason}
+		}
+	}
+
+	if req.Force {
+		statusAuthor, err := h.store.CanStatusAuthor(ctx, patchRec.RootID, patchRec.RepoID, event.PubKey)
+		if err != nil {
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: fmt.Sprintf("authorize force: %v", err)}
+		}
+		if !statusAuthor && !payment.IsPaidAccessKind(authorization.AccessKind) {
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "force requires repository maintainer or paid access"}
+		}
+	}
+
+	acquired, err := h.store.BeginReview(ctx, patchRec.EventID, patchRec.RepoID, req.Force)
+	if errors.Is(err, db.ErrReviewAlreadyPublished) {
+		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorConflict, Message: "review target was already published"}
+	}
+	if err != nil {
+		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+	}
+	if !acquired {
+		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorConflict, Message: "review target is already in progress or permanently skipped"}
+	}
+	task := db.ReviewTask{PatchEventID: patchRec.EventID, RepoID: patchRec.RepoID, Force: req.Force}
+	if err := h.reviewEnqueuer.EnqueueReview(ctx, task, "contextvm_review_request"); err != nil {
+		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: fmt.Sprintf("enqueue review: %v", err)}
+	}
+
+	return ReviewResponse{
+		RequestID: req.RequestID, SessionID: req.SessionID,
+		PatchEventID: patchRec.EventID, Queued: true, Forced: req.Force,
+		Summary: "Patch review queued for asynchronous processing.",
+	}, nil
 }
 
 // processReviewRequest processes an IDE review request.

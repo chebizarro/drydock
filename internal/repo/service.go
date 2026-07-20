@@ -39,6 +39,23 @@ func NewService(store *db.Store, manager *Manager, logger *slog.Logger) *Service
 	return &Service{store: store, manager: manager, logger: logger}
 }
 
+// LoadBaseRepoConfig reads .drydock.yaml from the canonical repository's
+// default ref without applying a patch or creating a review branch.
+func (s *Service) LoadBaseRepoConfig(ctx context.Context, repoID string) ([]byte, error) {
+	cloneURLs, err := s.store.GetRepositoryCloneURLs(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	if len(cloneURLs) == 0 {
+		return nil, fmt.Errorf("no canonical clone URLs for repository %s", repoID)
+	}
+	repoPath, err := s.manager.EnsureCanonicalRepo(ctx, repoID, cloneURLs)
+	if err != nil {
+		return nil, err
+	}
+	return s.manager.ReadFileAtDefaultRef(ctx, repoPath, ".drydock.yaml")
+}
+
 func (s *Service) PreparePatchSeries(ctx context.Context, patchEventID string) (PrepareResult, error) {
 	rec, err := s.store.GetPatchEvent(ctx, patchEventID)
 	if err != nil {
@@ -73,8 +90,8 @@ func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecor
 	// Read .drydock.yaml from the canonical base ref BEFORE applying patches.
 	baseConfig, cfgErr := s.manager.ReadFileAtDefaultRef(ctx, repoPath, ".drydock.yaml")
 	if cfgErr != nil {
-		s.logger.Warn("failed to read .drydock.yaml from base ref",
-			"repo_id", rec.RepoID, "error", cfgErr)
+		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
+			fmt.Errorf("read canonical .drydock.yaml: %w", cfgErr)
 	}
 
 	threadEvents, err := s.store.ListPatchThreadEvents(ctx, rec.RootID, rec.RepoID)
@@ -119,23 +136,26 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 	// from the canonical repository to prevent a fork/PR from influencing
 	// its own review policy.
 	var baseConfig []byte
-	var canonPath string
 	canonicalURLs, canonErr := s.store.GetRepositoryCloneURLs(ctx, rec.RepoID)
-	if canonErr == nil && len(canonicalURLs) > 0 {
-		// Ensure the canonical repo is available in a cache entry that is
-		// distinct from any PR/fork clone for this repo ID.
-		ensuredPath, ensureErr := s.manager.EnsureCanonicalRepo(ctx, rec.RepoID, canonicalURLs)
-		if ensureErr == nil {
-			canonPath = ensuredPath
-			baseConfig, _ = s.manager.ReadFileAtDefaultRef(ctx, canonPath, ".drydock.yaml")
-		} else {
-			s.logger.Warn("failed to ensure canonical repo for config read",
-				"repo_id", rec.RepoID, "error", ensureErr)
-		}
-	} else {
-		// No canonical URLs — skip config rather than trust PR URLs.
-		s.logger.Warn("no canonical clone URLs for repo, skipping .drydock.yaml",
-			"repo_id", rec.RepoID)
+	if canonErr != nil {
+		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
+			fmt.Errorf("load canonical repository URLs: %w", canonErr)
+	}
+	if len(canonicalURLs) == 0 {
+		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
+			fmt.Errorf("no canonical clone URLs for repository %s", rec.RepoID)
+	}
+	// Ensure the canonical repo is available in a cache entry that is
+	// distinct from any PR/fork clone for this repo ID.
+	canonPath, ensureErr := s.manager.EnsureCanonicalRepo(ctx, rec.RepoID, canonicalURLs)
+	if ensureErr != nil {
+		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
+			fmt.Errorf("ensure canonical repo for config read: %w", ensureErr)
+	}
+	baseConfig, canonErr = s.manager.ReadFileAtDefaultRef(ctx, canonPath, ".drydock.yaml")
+	if canonErr != nil {
+		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
+			fmt.Errorf("read canonical .drydock.yaml: %w", canonErr)
 	}
 
 	tip, err := prTipCommit(target)

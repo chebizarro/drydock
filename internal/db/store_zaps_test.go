@@ -12,7 +12,7 @@ func TestInsertZapReceiptClaimsPaymentBlockedReview(t *testing.T) {
 	const patchID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const repoID = "owner:repo"
 
-	acquired, err := store.BeginReview(ctx, patchID, repoID)
+	acquired, err := store.BeginReview(ctx, patchID, repoID, true)
 	if err != nil || !acquired {
 		t.Fatalf("BeginReview = %v, %v", acquired, err)
 	}
@@ -34,6 +34,9 @@ func TestInsertZapReceiptClaimsPaymentBlockedReview(t *testing.T) {
 	}
 	if !inserted || len(tasks) != 1 || tasks[0].PatchEventID != patchID || tasks[0].RepoID != repoID {
 		t.Fatalf("unexpected insert result: inserted=%v tasks=%+v", inserted, tasks)
+	}
+	if !tasks[0].Force {
+		t.Fatal("zap requeue lost persisted Force flag")
 	}
 	status, err := store.GetReviewStatus(ctx, patchID, repoID)
 	if err != nil {

@@ -31,14 +31,15 @@ Private ContextVM payloads should be transported through NIP-59 gift-wrap. In th
     "method": "review/request",
     "params": {
       "session_id": "session-uuid",
-      "file": "src/auth.go",
-      "selection": {"start": 10, "end": 25},
-      "trigger": "save"
+      "request_id": "req-01HZX...",
+      "patch_event_id": "<nip-34-event-id>",
+      "force": true
     }
   },
   "tags": [
     ["p", "<recipient-pubkey>"],
-    ["t", "drydock"],
+    ["session", "session-uuid"],
+    ["request", "req-01HZX..."],
     ["method", "review/request"]
   ]
 }
@@ -50,7 +51,7 @@ Rules:
 - `content.id` MUST be present for requests that expect a response.
 - `content.method` MUST be one of the supported methods.
 - `content.params` MUST be an object.
-- The event SHOULD include a `p` tag for the recipient and a `method` tag for subscription routing.
+- `review/request` MUST include `p`, `session`, and `request` tags matching its parameters/envelope; `method` is recommended for subscription routing.
 
 ## JSON-RPC Response Format
 
@@ -105,16 +106,29 @@ Error responses use `error` and the same `id` when available:
 
 ### `review/request`
 
-Common params:
+`review/request` has two modes. Inline IDE mode reviews the supplied diff synchronously and returns diagnostics. Patch-target mode names a stored NIP-34 patch/PR and queues the normal asynchronous review pipeline.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `session_id` | string | optional | IDE or requester session ID |
-| `file` | string | optional | Relative file path under review |
-| `content` | string | optional | File or selection content when needed |
-| `selection` | object | optional | Source range for selection-based review |
-| `patch_event_id` | string | optional | NIP-34 patch or PR event ID |
-| `trigger` | string | optional | `save`, `manual`, `patch`, or other caller trigger |
+| `session_id` | string | yes | Active IDE/requester session owned by the event signer |
+| `request_id` | string | optional | Correlation ID; defaults to the JSON-RPC `id` |
+| `diff` | string | inline mode | Unified diff of uncommitted changes |
+| `changed_files` | string[] | optional | Changed paths used by inline diagnostics |
+| `full_review` | boolean | optional | Inline review preference |
+| `patch_event_id` | string | patch mode | Stored NIP-34 patch or PR event ID |
+| `force` | boolean | optional | Request an authorized bypass of the root-status gate; valid only in patch mode |
+
+Patch-target requests use the stored patch event as authoritative and ignore inline diff fields. Before `BeginReview` and enqueue, Drydock:
+
+1. verifies the requester owns the referenced session;
+2. applies the operator repository/repository-owner scope matcher;
+3. loads `.drydock.yaml` from the canonical repository base and applies its payment policy;
+4. authorizes `force`, when requested; and
+5. durably records the task, including `Force`, before enqueueing it.
+
+A forced request is allowed when the requester can author repository status (`CanStatusAuthor`: root author, repository owner, or maintainer) **or** the target has paid access. Paid access kinds are `subscription`, `zap`, `cashu_review`, and `cashu_subscription`; free pubkeys, free-maintainer access, and free-tier quota do not authorize force. Payment is currently an entitlement attached to the target patch, not proof that the ContextVM sender personally paid.
+
+`force` bypasses only the pipeline root-status gate. Scope, payment, repository preparation, and all review/publication policies still apply. It permits explicit reviews of draft, applied/merged, or closed roots and can reopen a prior `status_skipped:` target. Already reviewing or published targets return conflict. A successful patch-mode response is a queued acknowledgement (`queued: true`, `patch_event_id`, and `forced`); review results are published asynchronously through the normal NIP-34 flow.
 
 ### `review/apply-fix`
 

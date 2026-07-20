@@ -53,6 +53,32 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
+func TestReadOptionalFileAtDefaultRefDistinguishesMissingAndErrors(t *testing.T) {
+	cacheDir := t.TempDir()
+	mgr := NewManager(cacheDir, testLogger())
+	repoPath := mgr.repoPath("test:config")
+	initWorkRepo(t, repoPath)
+
+	data, found, err := mgr.ReadOptionalFileAtDefaultRef(context.Background(), repoPath, ".drydock.yaml")
+	if err != nil || found || data != nil {
+		t.Fatalf("missing optional file = data %q found %v err %v", data, found, err)
+	}
+
+	writeFile(t, filepath.Join(repoPath, ".drydock.yaml"), "payments:\n  enabled: false\n")
+	run(t, repoPath, "git", "add", ".drydock.yaml")
+	run(t, repoPath, "git", "commit", "-m", "add config")
+	data, found, err = mgr.ReadOptionalFileAtDefaultRef(context.Background(), repoPath, ".drydock.yaml")
+	if err != nil || !found || !strings.Contains(string(data), "enabled: false") {
+		t.Fatalf("existing optional file = data %q found %v err %v", data, found, err)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := mgr.ReadOptionalFileAtDefaultRef(cancelled, repoPath, ".drydock.yaml"); err == nil {
+		t.Fatal("cancelled optional read was treated as a missing file")
+	}
+}
+
 func TestEnsureRepoRejectsNoURLs(t *testing.T) {
 	cacheDir := filepath.Join(t.TempDir(), "cache")
 	mgr := NewManager(cacheDir, testLogger())

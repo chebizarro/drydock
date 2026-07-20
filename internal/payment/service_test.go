@@ -158,6 +158,25 @@ func setupTestService(t *testing.T) (*Service, *db.Store) {
 	return svc, store
 }
 
+func TestIsPaidAccessKind(t *testing.T) {
+	cases := map[string]bool{
+		"":                      false,
+		AccessFreePubkey:        false,
+		AccessFreeMaintainer:    false,
+		AccessFreeTier:          false,
+		AccessSubscription:      true,
+		AccessZap:               true,
+		AccessCashuReview:       true,
+		AccessCashuSubscription: true,
+		"future_unknown":        false,
+	}
+	for kind, want := range cases {
+		if got := IsPaidAccessKind(kind); got != want {
+			t.Fatalf("IsPaidAccessKind(%q) = %v, want %v", kind, got, want)
+		}
+	}
+}
+
 func TestAuthorizePatch_PaymentsDisabled(t *testing.T) {
 	svc, store := setupTestService(t)
 	defer store.Close()

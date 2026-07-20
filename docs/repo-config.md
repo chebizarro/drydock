@@ -69,7 +69,10 @@ Applied/merged (kind 1631) and closed (kind 1632) roots are **never** reviewed
 automatically and cannot be enabled here — configuring `applied`, `merged`, or
 `closed` is a parse error. A status-gated skip is recorded permanently and is
 not retried by the failed-review sweep; a later status change back to open
-arrives as a new event and reviews normally.
+arrives as a new event and reviews normally. An authorized ContextVM
+`review/request` with `patch_event_id` and `force: true` may explicitly review
+any status (including a previously `status_skipped:` target); it bypasses only
+this status gate, not operator scope or payment policy.
 
 ## Validation rules
 

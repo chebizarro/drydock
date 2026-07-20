@@ -175,6 +175,27 @@ func (s *Service) ReconcilePayout(ctx context.Context, destination string, amoun
 	return payer.LookupPayment(ctx, destination, amountSats)
 }
 
+const (
+	AccessFreePubkey        = "free_pubkey"
+	AccessFreeMaintainer    = "free_maintainer"
+	AccessFreeTier          = "free_tier"
+	AccessSubscription      = "subscription"
+	AccessZap               = "zap"
+	AccessCashuReview       = "cashu_review"
+	AccessCashuSubscription = "cashu_subscription"
+)
+
+// IsPaidAccessKind reports whether an authorization reflects settled value
+// rather than a free policy exemption or quota.
+func IsPaidAccessKind(kind string) bool {
+	switch kind {
+	case AccessSubscription, AccessZap, AccessCashuReview, AccessCashuSubscription:
+		return true
+	default:
+		return false
+	}
+}
+
 // AuthorizeResult describes the outcome of a payment authorization attempt.
 type AuthorizeResult struct {
 	Allowed          bool
@@ -218,7 +239,7 @@ func (s *Service) AuthorizePatch(
 		s.logger.Info("review authorized via free pubkey allowlist",
 			"patch_event_id", patchEventID,
 			"author", authorPubkey)
-		return allow("free_pubkey")
+		return allow(AccessFreePubkey)
 	}
 
 	// 4. Repository owners and maintainers are free by default.
@@ -231,7 +252,7 @@ func (s *Service) AuthorizePatch(
 			s.logger.Info("review authorized for repository maintainer",
 				"patch_event_id", patchEventID,
 				"author", authorPubkey)
-			return allow("free_maintainer")
+			return allow(AccessFreeMaintainer)
 		}
 	}
 
@@ -259,7 +280,7 @@ func (s *Service) AuthorizePatch(
 				"patch_event_id", patchEventID,
 				"author", authorPubkey,
 				"subscription_expires", sub.ExpiresAt)
-			return allow("subscription")
+			return allow(AccessSubscription)
 		}
 	}
 
@@ -276,7 +297,7 @@ func (s *Service) AuthorizePatch(
 				"patch_event_id", patchEventID,
 				"receipt_event_id", receipt.EventID,
 				"amount_msat", receipt.AmountMSat)
-			return allow("zap")
+			return allow(AccessZap)
 		}
 	}
 
@@ -297,7 +318,7 @@ func (s *Service) AuthorizePatch(
 				"patch_event_id", patchEventID,
 				"author", authorPubkey,
 				"usage_day", usageDay)
-			return allow("free_tier")
+			return allow(AccessFreeTier)
 		}
 	}
 

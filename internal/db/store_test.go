@@ -92,7 +92,7 @@ func TestMigrateAddsReviewLogColumnsFromOldSnapshot(t *testing.T) {
 		t.Fatalf("migrate old snapshot: %v", err)
 	}
 
-	for _, column := range []string{"status_event_id", "status_event_kind", "status_published_at"} {
+	for _, column := range []string{"status_event_id", "status_event_kind", "status_published_at", "force"} {
 		exists, err := store.hasColumn(ctx, "review_log", column)
 		if err != nil {
 			t.Fatalf("hasColumn(%s): %v", column, err)
@@ -590,6 +590,42 @@ func TestGetAndSetReviewEventID(t *testing.T) {
 	}
 }
 
+func TestBeginReviewForceReopensOnlyStatusSkipped(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	acquired, err := store.BeginReview(ctx, "patch", "repo", false)
+	if err != nil || !acquired {
+		t.Fatalf("initial BeginReview = %v, %v", acquired, err)
+	}
+	if err := store.MarkReviewFailed(ctx, "patch", "repo", "status_skipped:root status is draft"); err != nil {
+		t.Fatalf("MarkReviewFailed: %v", err)
+	}
+
+	acquired, err = store.BeginReview(ctx, "patch", "repo", false)
+	if err != nil {
+		t.Fatalf("ordinary BeginReview: %v", err)
+	}
+	if acquired {
+		t.Fatal("ordinary request reopened status_skipped review")
+	}
+
+	acquired, err = store.BeginReview(ctx, "patch", "repo", true)
+	if err != nil || !acquired {
+		t.Fatalf("forced BeginReview = %v, %v", acquired, err)
+	}
+	var status, reason string
+	var force bool
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT status, COALESCE(failure_reason, ''), force FROM review_log WHERE patch_event_id=? AND repo_id=?`,
+		"patch", "repo").Scan(&status, &reason, &force); err != nil {
+		t.Fatalf("read forced review: %v", err)
+	}
+	if status != "reviewing" || reason != "" || !force {
+		t.Fatalf("forced review state = status %q reason %q force %v", status, reason, force)
+	}
+}
+
 func TestRequeueFailedReviews(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
@@ -600,8 +636,8 @@ func TestRequeueFailedReviews(t *testing.T) {
 
 	// Seed two failed reviews — one old enough to requeue, one too recent.
 	_, err := store.db.ExecContext(ctx,
-		`INSERT INTO review_log(patch_event_id, repo_id, status, failure_reason, created_at, updated_at)
-		VALUES (?, ?, 'failed', 'queue full', ?, ?)`,
+		`INSERT INTO review_log(patch_event_id, repo_id, status, failure_reason, force, created_at, updated_at)
+		VALUES (?, ?, 'failed', 'queue full', 1, ?, ?)`,
 		"old-patch", "repo-1", now-600, now-600,
 	)
 	if err != nil {
@@ -635,6 +671,9 @@ func TestRequeueFailedReviews(t *testing.T) {
 	}
 	if tasks[0].PatchEventID != "old-patch" {
 		t.Fatalf("expected 'old-patch', got %q", tasks[0].PatchEventID)
+	}
+	if !tasks[0].Force {
+		t.Fatal("requeued task lost persisted Force flag")
 	}
 
 	// Verify old-patch is now pending.

@@ -435,6 +435,24 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 8,
+		name:    "review_log_force",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			exists, err := hasColumn(ctx, tx, "review_log", "force")
+			if err != nil {
+				return fmt.Errorf("check review_log.force: %w", err)
+			}
+			if exists {
+				return nil
+			}
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE review_log
+				ADD COLUMN force INTEGER NOT NULL DEFAULT 0 CHECK (force IN (0, 1))`); err != nil {
+				return fmt.Errorf("add review_log.force: %w", err)
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -1095,9 +1113,17 @@ func (s *Store) UpsertThreadCache(ctx context.Context, rootID, eventID string, n
 }
 
 // BeginReview transitions a patch/repo from pending|failed -> reviewing.
+// A forced request may reopen a permanent status_skipped failure; ordinary
+// requests leave that denial untouched. The optional argument preserves source
+// compatibility for callers that always begin non-forced reviews.
 // Returns true if caller obtained the lock and should proceed.
-func (s *Store) BeginReview(ctx context.Context, patchEventID, repoID string) (bool, error) {
+func (s *Store) BeginReview(ctx context.Context, patchEventID, repoID string, force ...bool) (bool, error) {
 	now := time.Now().Unix()
+	forced := len(force) > 0 && force[0]
+	forceValue := 0
+	if forced {
+		forceValue = 1
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1107,10 +1133,10 @@ func (s *Store) BeginReview(ctx context.Context, patchEventID, repoID string) (b
 
 	_, err = tx.ExecContext(
 		ctx,
-		`INSERT INTO review_log(patch_event_id, repo_id, status, created_at, updated_at)
-		 VALUES (?, ?, 'pending', ?, ?)
+		`INSERT INTO review_log(patch_event_id, repo_id, status, force, created_at, updated_at)
+		 VALUES (?, ?, 'pending', ?, ?, ?)
 		 ON CONFLICT(patch_event_id, repo_id) DO NOTHING`,
-		patchEventID, repoID, now, now,
+		patchEventID, repoID, forceValue, now, now,
 	)
 	if err != nil {
 		return false, fmt.Errorf("ensure review_log row: %w", err)
@@ -1119,9 +1145,11 @@ func (s *Store) BeginReview(ctx context.Context, patchEventID, repoID string) (b
 	res, err := tx.ExecContext(
 		ctx,
 		`UPDATE review_log
-		    SET status='reviewing', failure_reason=NULL, updated_at=?
-		  WHERE patch_event_id=? AND repo_id=? AND status IN ('pending', 'failed')`,
-		now, patchEventID, repoID,
+		    SET status='reviewing', failure_reason=NULL, force=?, updated_at=?
+		  WHERE patch_event_id=? AND repo_id=?
+		    AND (status='pending' OR (status='failed'
+		AND (failure_reason IS NULL OR failure_reason NOT LIKE 'status_skipped:%' OR ?=1)))`,
+		forceValue, now, patchEventID, repoID, forceValue,
 	)
 	if err != nil {
 		return false, fmt.Errorf("begin review transition: %w", err)
@@ -1873,6 +1901,7 @@ func (s *Store) UpdateListenerHighWaterMark(ctx context.Context, ts int64) error
 type ReviewTask struct {
 	PatchEventID string
 	RepoID       string
+	Force        bool
 }
 
 // ResetStuckReviews transitions entries stuck in "reviewing" (e.g. from a crash)
@@ -1899,7 +1928,7 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 	// Exclude permanent denials from requeue: payment rejections
 	// ('payment_blocked:') and status-gated skips ('status_skipped:').
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT patch_event_id, repo_id FROM review_log
+		`SELECT patch_event_id, repo_id, force FROM review_log
 		WHERE status='failed' AND updated_at < ?
 		AND (failure_reason IS NULL OR failure_reason = ''
 			OR (failure_reason NOT LIKE 'payment_blocked:%' AND failure_reason NOT LIKE 'status_skipped:%'))
@@ -1913,7 +1942,7 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 	var tasks []ReviewTask
 	for rows.Next() {
 		var t ReviewTask
-		if err := rows.Scan(&t.PatchEventID, &t.RepoID); err != nil {
+		if err := rows.Scan(&t.PatchEventID, &t.RepoID, &t.Force); err != nil {
 			return nil, fmt.Errorf("scan failed review: %w", err)
 		}
 		tasks = append(tasks, t)

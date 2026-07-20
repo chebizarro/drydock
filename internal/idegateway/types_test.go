@@ -75,7 +75,9 @@ func TestParseReviewRequest(t *testing.T) {
 		"request_id": "req-456",
 		"diff": "--- a/main.go\n+++ b/main.go\n@@ -1 +1 @@\n-old\n+new",
 		"changed_files": ["main.go"],
-		"full_review": true
+		"full_review": true,
+		"patch_event_id": "patch-123",
+		"force": true
 	}`
 
 	req, err := ParseReviewRequest(content)
@@ -91,6 +93,9 @@ func TestParseReviewRequest(t *testing.T) {
 	}
 	if !req.FullReview {
 		t.Error("FullReview should be true")
+	}
+	if req.PatchEventID != "patch-123" || !req.Force {
+		t.Errorf("patch force fields = %q, %v", req.PatchEventID, req.Force)
 	}
 	if len(req.ChangedFiles) != 1 || req.ChangedFiles[0] != "main.go" {
 		t.Errorf("ChangedFiles = %v, want [main.go]", req.ChangedFiles)

@@ -290,18 +290,10 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	// 1c2. Status gate: reviews run automatically only for roots whose
-	// current NIP-34 status is allowed by repo config (default: open only;
-	// a root with no status event counts as open). Applied/merged and closed
-	// roots are never auto-reviewed. The status_skipped: prefix marks this
-	// as permanent so the failed-review sweep does not retry it.
-	statusKind, _, _, hasStatus, err := r.store.GetRootStatus(ctx, patchRec.RootID, task.RepoID)
-	if err != nil {
-		return fmt.Errorf("get root status: %w", err)
-	}
-	if reason, allowed := reviewStatusAllowed(statusKind, hasStatus, repoCfg.Review.Statuses); !allowed {
-		r.logger.Info("skipping review for root status",
-			"patch_event_id", task.PatchEventID, "repo_id", task.RepoID, "reason", reason)
-		return fmt.Errorf("status_skipped:%s", reason)
+	// current NIP-34 status is allowed by repo config. An authorized explicit
+	// force request is the sole bypass.
+	if err := r.checkReviewStatus(ctx, task, patchRec.RootID, repoCfg.Review.Statuses); err != nil {
+		return err
 	}
 
 	// 1d. Authorize payment-gated repositories before documentation/code indexing, context building, or LLM calls.
@@ -835,6 +827,24 @@ func meanConfidence(findings []reviewengine.Finding) float64 {
 		sum += f.Confidence
 	}
 	return sum / float64(len(findings))
+}
+
+func (r *Runner) checkReviewStatus(ctx context.Context, task db.ReviewTask, rootID string, allowedStatuses []string) error {
+	if task.Force {
+		r.logger.Info("bypassing root status gate for authorized forced review",
+			"patch_event_id", task.PatchEventID, "repo_id", task.RepoID)
+		return nil
+	}
+	statusKind, _, _, hasStatus, err := r.store.GetRootStatus(ctx, rootID, task.RepoID)
+	if err != nil {
+		return fmt.Errorf("get root status: %w", err)
+	}
+	if reason, allowed := reviewStatusAllowed(statusKind, hasStatus, allowedStatuses); !allowed {
+		r.logger.Info("skipping review for root status",
+			"patch_event_id", task.PatchEventID, "repo_id", task.RepoID, "reason", reason)
+		return fmt.Errorf("status_skipped:%s", reason)
+	}
+	return nil
 }
 
 // reviewStatusAllowed reports whether a root with the given NIP-34 status may

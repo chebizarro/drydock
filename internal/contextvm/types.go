@@ -40,6 +40,11 @@ const (
 	ErrorMethodNotFound = shared.MethodNotFoundCode
 	ErrorInvalidParams  = shared.InvalidParamsCode
 	ErrorInternal       = shared.InternalErrorCode
+
+	// Application errors used by gated asynchronous review requests.
+	ErrorUnauthorized = -32001
+	ErrorNotFound     = -32002
+	ErrorConflict     = -32003
 )
 
 // Request is an inbound ContextVM JSON-RPC request with its source event.
