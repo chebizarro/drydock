@@ -167,10 +167,10 @@ are omitted with a warning.
 | `DRYDOCK_PROFILE_NAME` | string | `Drydock` | Profile display name. |
 | `DRYDOCK_PROFILE_ABOUT` | string | *(summary of what Drydock does)* | Profile about text. |
 | `DRYDOCK_PROFILE_WEBSITE` | URL | *(empty)* | Profile website field. |
-| `DRYDOCK_PROFILE_PICTURE_URL` | URL | *(empty)* | Explicit picture URL; overrides the icon upload. |
-| `DRYDOCK_PROFILE_BANNER_URL` | URL | *(empty)* | Explicit banner URL; overrides the banner upload. |
-| `DRYDOCK_PROFILE_ICON_PATH` | path | `assets/drydock-icon.png` | Local icon pushed to Blossom for the `picture` field. |
-| `DRYDOCK_PROFILE_BANNER_PATH` | path | `assets/drydock-banner.png` | Local banner pushed to Blossom for the `banner` field. |
+| `DRYDOCK_PROFILE_PICTURE_URL` | URL | `https://blossom.sharegap.net/7abc2455…78c8` | Profile picture URL. Set to override; takes precedence over any icon upload. |
+| `DRYDOCK_PROFILE_BANNER_URL` | URL | `https://blossom.sharegap.net/775f7d11…51c1e` | Profile banner URL. Set to override; takes precedence over any banner upload. |
+| `DRYDOCK_PROFILE_ICON_PATH` | path | *(empty)* | Optional local icon pushed to Blossom for the `picture` field when no picture URL is set. |
+| `DRYDOCK_PROFILE_BANNER_PATH` | path | *(empty)* | Optional local banner pushed to Blossom for the `banner` field when no banner URL is set. |
 | `DRYDOCK_BLOSSOM_SERVERS` | comma-separated URLs | *(empty)* | Blossom media servers tried in order for image uploads. |
 
 ## Health & Monitoring
