@@ -58,6 +58,7 @@ type Config struct {
 	Relays               []string
 	LookbackMinutes      int
 	HighWaterMarkOverlap time.Duration
+	MaxFutureSkew        time.Duration
 }
 
 type Service struct {
@@ -125,22 +126,31 @@ func (s *Service) Run(ctx context.Context) error {
 		overlap = 30 * time.Second
 	}
 
-	// Determine Since: use persisted high-water-mark if available, else lookback.
-	since := time.Now().Add(-time.Duration(lookback) * time.Minute).Unix()
+	maxFutureSkew := s.cfg.MaxFutureSkew
+	if maxFutureSkew <= 0 {
+		maxFutureSkew = 10 * time.Minute
+	}
+
+	// Determine Since: use a plausible persisted high-water-mark if available,
+	// else recover from the configured lookback window.
+	now := time.Now()
+	since := now.Add(-time.Duration(lookback) * time.Minute).Unix()
 	if s.store != nil {
 		if hwm, err := s.store.GetListenerHighWaterMark(ctx); err == nil && hwm > 0 {
-			// Use high-water-mark with a small overlap to handle clock skew.
-			// Choose the MORE RECENT timestamp (larger unix timestamp) to avoid
-			// re-processing events we've already seen, while still respecting
-			// the lookback window for initial startup.
-			hwmWithOverlap := hwm - int64(overlap/time.Second)
-			if hwmWithOverlap > since {
-				since = hwmWithOverlap
+			var used bool
+			since, used = subscriptionSince(now, hwm, time.Duration(lookback)*time.Minute, overlap, maxFutureSkew)
+			if used {
+				s.logger.Info("using persisted high-water-mark for lookback",
+					"high_water_mark", hwm,
+					"since", since,
+				)
+			} else {
+				s.logger.Warn("ignoring implausible future listener high-water-mark",
+					"high_water_mark", hwm,
+					"max_allowed", now.Add(maxFutureSkew).Unix(),
+					"since", since,
+				)
 			}
-			s.logger.Info("using persisted high-water-mark for lookback",
-				"high_water_mark", hwm,
-				"since", since,
-			)
 		}
 	}
 
@@ -242,10 +252,34 @@ func (s *Service) processRelayEvent(ctx context.Context, ie nostr.RelayEvent, la
 	// Track high-water-mark for restart resilience only after successful processing.
 	if s.store != nil {
 		ts := int64(ie.Event.CreatedAt)
+		maxFutureSkew := s.cfg.MaxFutureSkew
+		if maxFutureSkew <= 0 {
+			maxFutureSkew = 10 * time.Minute
+		}
+		if ts > time.Now().Add(maxFutureSkew).Unix() {
+			s.logger.Warn("refusing to checkpoint implausible future event timestamp",
+				"event_id", ie.Event.ID.Hex(),
+				"high_water_mark", ts,
+				"max_future_skew", maxFutureSkew.String(),
+			)
+			return
+		}
 		if ts > lastSeen.Load() && s.persistHighWaterMark(ctx, ts) {
 			lastSeen.Store(ts)
 		}
 	}
+}
+
+func subscriptionSince(now time.Time, highWaterMark int64, lookback, overlap, maxFutureSkew time.Duration) (int64, bool) {
+	since := now.Add(-lookback).Unix()
+	if highWaterMark > now.Add(maxFutureSkew).Unix() {
+		return since, false
+	}
+	hwmWithOverlap := highWaterMark - int64(overlap/time.Second)
+	if hwmWithOverlap > since {
+		since = hwmWithOverlap
+	}
+	return since, true
 }
 
 func (s *Service) persistHighWaterMark(ctx context.Context, ts int64) bool {

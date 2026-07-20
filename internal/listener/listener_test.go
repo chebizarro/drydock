@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"fiatjaf.com/nostr"
 )
@@ -160,6 +161,61 @@ func TestProcessRelayEventDoesNotAdvanceHighWaterOnProcessingFailure(t *testing.
 
 	if len(store.updates) != 0 {
 		t.Fatalf("expected no high-water update on processing failure, got %v", store.updates)
+	}
+}
+
+func TestProcessRelayEventDoesNotAdvanceHighWaterForFutureTimestamp(t *testing.T) {
+	proc := &fakeProcessor{}
+	store := &fakeHighWaterStore{}
+	svc := New(Config{MaxFutureSkew: 10 * time.Minute}, proc, noopLogger())
+	svc.store = store
+	var lastSeen atomic.Int64
+
+	svc.processRelayEvent(context.Background(), nostr.RelayEvent{Event: nostr.Event{
+		ID:        nostr.MustIDFromHex("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+		Kind:      1,
+		CreatedAt: nostr.Timestamp(time.Now().Add(time.Hour).Unix()),
+	}}, &lastSeen)
+
+	if len(proc.events) != 1 {
+		t.Fatalf("expected event to be passed to the processor, got %d calls", len(proc.events))
+	}
+	if len(store.updates) != 0 {
+		t.Fatalf("expected no high-water update for future event, got %v", store.updates)
+	}
+	if got := lastSeen.Load(); got != 0 {
+		t.Fatalf("lastSeen advanced for future event: %d", got)
+	}
+}
+
+func TestSubscriptionSinceIgnoresFutureHighWaterMark(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	lookback := 5 * time.Minute
+	overlap := 30 * time.Second
+	maxFutureSkew := 10 * time.Minute
+
+	got, used := subscriptionSince(now, now.Add(time.Hour).Unix(), lookback, overlap, maxFutureSkew)
+	want := now.Add(-lookback).Unix()
+	if used {
+		t.Fatal("expected poisoned future high-water mark to be ignored")
+	}
+	if got != want {
+		t.Fatalf("expected lookback timestamp %d, got %d", want, got)
+	}
+}
+
+func TestSubscriptionSinceUsesPlausibleHighWaterMark(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	hwm := now.Add(-time.Minute).Unix()
+	overlap := 30 * time.Second
+
+	got, used := subscriptionSince(now, hwm, 5*time.Minute, overlap, 10*time.Minute)
+	if !used {
+		t.Fatal("expected plausible high-water mark to be used")
+	}
+	want := hwm - int64(overlap/time.Second)
+	if got != want {
+		t.Fatalf("expected overlapped high-water timestamp %d, got %d", want, got)
 	}
 }
 

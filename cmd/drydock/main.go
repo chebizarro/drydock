@@ -526,6 +526,7 @@ func main() {
 		Relays:               readRelays,
 		LookbackMinutes:      cfg.ListenerLookbackMin,
 		HighWaterMarkOverlap: cfg.ListenerHWMOverlap,
+		MaxFutureSkew:        cfg.ListenerMaxFutureSkew,
 	}, processor, logger, listener.WithPool(pool), listener.WithStore(store))
 
 	// --- Pipeline runner ---
