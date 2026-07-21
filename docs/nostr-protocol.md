@@ -264,6 +264,11 @@ See [Deployment](deployment.md#signing-configuration) for setup instructions.
 
 The listener tracks the most recent event timestamp in the `listener_state` SQLite table. On restart, it uses this timestamp (minus a 30-second overlap for clock skew) as the `since` filter for relay subscriptions.
 
+Only timestamps within `DRYDOCK_LISTENER_MAX_FUTURE_SKEW` may advance the
+cursor. If an older deployment persisted an implausible future cursor, Drydock
+resets it to the configured lookback boundary on startup and resumes from
+there.
+
 This means:
 - No events are missed across restarts
 - A small window of events may be re-delivered (deduplicated by `ingested_events` primary key)

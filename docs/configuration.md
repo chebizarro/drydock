@@ -54,6 +54,9 @@ Drydock supports separate relay lists for reading (subscribing to events) and wr
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_LISTENER_LOOKBACK_MIN` | integer (minutes) | `5` | How far back to look when starting a fresh subscription with no persisted high-water-mark. |
+| `DRYDOCK_LISTENER_HWM_OVERLAP` | duration | `30s` | Overlap subtracted from a valid persisted high-water mark when resubscribing. |
+| `DRYDOCK_LISTENER_MAX_FUTURE_SKEW` | duration | `10m` | Maximum accepted future clock skew. Events beyond this bound cannot advance the listener cursor, and an already-future persisted cursor is ignored on startup. |
+| `DRYDOCK_LISTENER_MAX_EVENT_AGE` | duration | `8760h` | Maximum accepted event age (one year by default). |
 
 ## Signing
 
