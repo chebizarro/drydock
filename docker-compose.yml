@@ -31,6 +31,7 @@ services:
       DRYDOCK_LOG_LEVEL: ${DRYDOCK_LOG_LEVEL:-info}
       # Signing (shared NIP-46 client; bunker required outside dev mode)
       DRYDOCK_SIGNER_BUNKER_URL: ${DRYDOCK_SIGNER_BUNKER_URL:?Set DRYDOCK_SIGNER_BUNKER_URL in .env before starting Drydock}
+      DRYDOCK_SIGNER_CLIENT_KEY_FILE: ${DRYDOCK_SIGNER_CLIENT_KEY_FILE:-/data/signet-client.key}
       DRYDOCK_SIGNER_NSEC: ${DRYDOCK_SIGNER_NSEC:-}
       # LLM endpoints
       DRYDOCK_LLM_API_KEY: ${DRYDOCK_LLM_API_KEY:-}

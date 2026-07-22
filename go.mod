@@ -6,7 +6,6 @@ toolchain go1.26.0
 
 require (
 	fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026
-	git.sharegap.net/cascadia/cascadia-go v1.0.2
 	github.com/bluekeyes/go-gitdiff v0.7.1
 	github.com/btcsuite/btcd/btcutil v1.1.5
 	github.com/pkoukk/tiktoken-go v0.1.8

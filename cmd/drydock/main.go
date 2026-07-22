@@ -46,7 +46,6 @@ import (
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip11"
-	cascadiasignet "git.sharegap.net/cascadia/cascadia-go/signet"
 )
 
 func main() {
@@ -114,7 +113,7 @@ func main() {
 	// --- Signer (shared NIP-46 client, with local nsec for development only) ---
 	var signer publisher.Signer
 	if cfg.SignerBunkerURL != "" {
-		s, err := cascadiasignet.NewBunkerSigner(ctx, cfg.SignerBunkerURL, cfg.Relays...)
+		s, err := signing.NewBunkerSigner(ctx, cfg.SignerBunkerURL, cfg.SignerClientKeyFile, cfg.Relays...)
 		if err != nil {
 			logger.Error("failed to create bunker signer", "error", err)
 			os.Exit(1)

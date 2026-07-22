@@ -70,6 +70,7 @@ If none is configured, the listener and ingest pipeline still run, but the revie
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_SIGNER_BUNKER_URL` | string | *(empty)* | NIP-46 bunker URL (`bunker://...`) or NIP-05 bunker identifier. Checked first. |
+| `DRYDOCK_SIGNER_CLIENT_KEY_FILE` | string | *(empty)* | Persistent NIP-46 client key file. Set this for supervised/container deployments so one-time connect grants survive restarts. |
 | `DRYDOCK_SIGNER_NSEC` | string | *(empty)* | Raw nsec bech32 key or 64-character hex private key. **Warning**: this is a plaintext secret. Use Docker secrets or a secrets manager in production. Checked last. |
 
 ## LLM Endpoints

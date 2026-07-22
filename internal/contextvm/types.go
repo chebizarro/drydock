@@ -6,7 +6,6 @@ import (
 	"drydock/internal/eventkind"
 
 	"fiatjaf.com/nostr"
-	shared "git.sharegap.net/cascadia/cascadia-go/contextvm"
 )
 
 const (
@@ -14,7 +13,7 @@ const (
 	KindGiftWrap  nostr.Kind = eventkind.GiftWrap  // NIP-59 encrypted wrapper
 )
 
-const jsonRPCVersion = shared.JSONRPCVersion
+const jsonRPCVersion = "2.0"
 
 // Message is a JSON-RPC 2.0 message carried in a ContextVM event.
 type Message struct {
@@ -35,11 +34,11 @@ type Error struct {
 }
 
 const (
-	ErrorParseError     = shared.ParseErrorCode
-	ErrorInvalidRequest = shared.InvalidRequestCode
-	ErrorMethodNotFound = shared.MethodNotFoundCode
-	ErrorInvalidParams  = shared.InvalidParamsCode
-	ErrorInternal       = shared.InternalErrorCode
+	ErrorParseError     = -32700
+	ErrorInvalidRequest = -32600
+	ErrorMethodNotFound = -32601
+	ErrorInvalidParams  = -32602
+	ErrorInternal       = -32603
 
 	// Application errors used by gated asynchronous review requests.
 	ErrorUnauthorized = -32001

@@ -40,4 +40,3 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 EXPOSE 8081
 
 ENTRYPOINT ["/entrypoint.sh"]
-
