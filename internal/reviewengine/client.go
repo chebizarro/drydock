@@ -83,7 +83,10 @@ type OpenAICompatClient struct {
 
 func NewOpenAICompatClient() *OpenAICompatClient {
 	return &OpenAICompatClient{
-		HTTP: &http.Client{Timeout: 120 * time.Second},
+		// Production reasoning models can legitimately spend several minutes on
+		// a review stage. Keep a finite transport deadline, but do not abandon a
+		// healthy in-flight generation at the previous two-minute boundary.
+		HTTP: &http.Client{Timeout: 10 * time.Minute},
 	}
 }
 
