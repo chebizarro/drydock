@@ -24,6 +24,21 @@ func TestFromEnvManagementDefaults(t *testing.T) {
 	}
 }
 
+func TestFromEnvSecurityModelRoutes(t *testing.T) {
+	t.Setenv("DRYDOCK_SEC70B_BASE_URL", "http://sec70b")
+	t.Setenv("DRYDOCK_SEC70B_MODEL", "security-model")
+	t.Setenv("DRYDOCK_SECCLASSIFY_BASE_URL", "http://secclassify")
+	t.Setenv("DRYDOCK_SECCLASSIFY_MODEL", "classifier-model")
+
+	cfg := FromEnv()
+	if cfg.Sec70BBaseURL != "http://sec70b" || cfg.Sec70BModel != "security-model" {
+		t.Fatalf("unexpected sec70b config: %#v", cfg)
+	}
+	if cfg.SecClassifyBaseURL != "http://secclassify" || cfg.SecClassifyModel != "classifier-model" {
+		t.Fatalf("unexpected secclassify config: %#v", cfg)
+	}
+}
+
 func TestFromEnvNormalizesRepositoryScopeNpubs(t *testing.T) {
 	owner := nostr.GetPublicKey(nostr.Generate())
 	npub := nip19.EncodeNpub(owner)

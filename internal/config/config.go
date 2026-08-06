@@ -79,6 +79,10 @@ type Config struct {
 	Coder32BModel              string
 	LLM70BBaseURL              string
 	LLM70BModel                string
+	Sec70BBaseURL              string
+	Sec70BModel                string
+	SecClassifyBaseURL         string
+	SecClassifyModel           string
 	Coder14BBaseURL            string
 	Coder14BModel              string
 	LLMAPIKey                  string
@@ -112,6 +116,8 @@ type Config struct {
 	HealthAddr                 string
 	DashboardBearerToken       string
 	PipelineWorkers            int
+	SecurityEnabled            bool
+	SecurityAuditWorkers       int
 	CodeChatLimit              int
 	CodeChatWindow             time.Duration
 	FeedbackLimit              int
@@ -175,6 +181,10 @@ func FromEnv() Config {
 		Coder32BModel:      envOrDefault("DRYDOCK_CODER32B_MODEL", devDefault(production, defaultCoder32BModel)),
 		LLM70BBaseURL:      envOrDefault("DRYDOCK_LLM70B_BASE_URL", devDefault(production, defaultLLM70BBaseURL)),
 		LLM70BModel:        envOrDefault("DRYDOCK_LLM70B_MODEL", devDefault(production, defaultLLM70BModel)),
+		Sec70BBaseURL:      envOrDefault("DRYDOCK_SEC70B_BASE_URL", ""),
+		Sec70BModel:        envOrDefault("DRYDOCK_SEC70B_MODEL", ""),
+		SecClassifyBaseURL: envOrDefault("DRYDOCK_SECCLASSIFY_BASE_URL", ""),
+		SecClassifyModel:   envOrDefault("DRYDOCK_SECCLASSIFY_MODEL", ""),
 		Coder14BBaseURL:    envOrDefault("DRYDOCK_CODER14B_BASE_URL", devDefault(production, defaultCoder14BBaseURL)),
 		Coder14BModel:      envOrDefault("DRYDOCK_CODER14B_MODEL", devDefault(production, defaultCoder14BModel)),
 		LLMAPIKey:          envOrDefault("DRYDOCK_LLM_API_KEY", ""),
@@ -213,6 +223,8 @@ func FromEnv() Config {
 		HealthAddr:                 envOrDefault("DRYDOCK_HEALTH_ADDR", "127.0.0.1:8081"),
 		DashboardBearerToken:       envOrDefault("DRYDOCK_DASHBOARD_BEARER_TOKEN", ""),
 		PipelineWorkers:            parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
+		SecurityEnabled:           parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_ENABLED", "false"), false),
+		SecurityAuditWorkers:      parseIntOrDefault(envOrDefault("DRYDOCK_SECURITY_AUDIT_WORKERS", "2"), 2),
 		CodeChatLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "20"), 20),
 		CodeChatWindow:             parseDurationOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "1h"), time.Hour),
 		FeedbackLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "100"), 100),

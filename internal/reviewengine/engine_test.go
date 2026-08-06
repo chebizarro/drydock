@@ -64,6 +64,56 @@ func TestEngineRoutesPlannerToLLM70B(t *testing.T) {
 	}
 }
 
+func TestRouteEndpointSecurityRoutes(t *testing.T) {
+	llm70b := ModelEndpoint{BaseURL: "http://70b", Model: "70b-model"}
+	sec70b := ModelEndpoint{BaseURL: "http://sec70b", Model: "security-model"}
+	secClassify := ModelEndpoint{BaseURL: "http://secclassify", Model: "classifier-model"}
+	engine := New(Config{
+		LLM70B:      llm70b,
+		Sec70B:      sec70b,
+		SecClassify: secClassify,
+	}, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	got, err := engine.routeEndpoint(RouteSec70B)
+	if err != nil {
+		t.Fatalf("route sec70b: %v", err)
+	}
+	if got != sec70b {
+		t.Fatalf("expected sec70b endpoint, got %#v", got)
+	}
+
+	got, err = engine.routeEndpoint(RouteSecClassify)
+	if err != nil {
+		t.Fatalf("route secclassify: %v", err)
+	}
+	if got != secClassify {
+		t.Fatalf("expected secclassify endpoint, got %#v", got)
+	}
+}
+
+func TestRouteEndpointSec70BFallsBackToLLM70B(t *testing.T) {
+	llm70b := ModelEndpoint{BaseURL: "http://70b", Model: "70b-model"}
+	engine := New(Config{LLM70B: llm70b}, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	got, err := engine.routeEndpoint(RouteSec70B)
+	if err != nil {
+		t.Fatalf("route sec70b: %v", err)
+	}
+	if got != llm70b {
+		t.Fatalf("expected llm70b fallback, got %#v", got)
+	}
+}
+
+func TestPlannerOutputAcceptsSecurityRoutes(t *testing.T) {
+	for _, route := range []ModelRoute{RouteSec70B, RouteSecClassify} {
+		t.Run(string(route), func(t *testing.T) {
+			if err := (PlannerOutput{ChangeType: "security", ModelRoute: route}).Validate(); err != nil {
+				t.Fatalf("expected route %q to be valid: %v", route, err)
+			}
+		})
+	}
+}
+
 func TestEngineRunPropagatesServedModel(t *testing.T) {
 	fake := &fakeLLM{
 		servedModel: "gemma-4-26b",

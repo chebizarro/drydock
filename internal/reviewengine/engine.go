@@ -19,6 +19,8 @@ type Config struct {
 	Coder32B     ModelEndpoint
 	LLM70B       ModelEndpoint
 	Coder14B     ModelEndpoint
+	Sec70B       ModelEndpoint
+	SecClassify  ModelEndpoint
 	PlannerTemp  float64
 	ReviewerTemp float64
 }
@@ -174,6 +176,13 @@ func (e *Engine) routeEndpoint(route ModelRoute) (ModelEndpoint, error) {
 		return e.cfg.LLM70B, nil
 	case RouteCoder14B:
 		return e.cfg.Coder14B, nil
+	case RouteSec70B:
+		if strings.TrimSpace(e.cfg.Sec70B.BaseURL) == "" {
+			return e.cfg.LLM70B, nil
+		}
+		return e.cfg.Sec70B, nil
+	case RouteSecClassify:
+		return e.cfg.SecClassify, nil
 	default:
 		return ModelEndpoint{}, fmt.Errorf("unsupported model route %q", route)
 	}
