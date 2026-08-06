@@ -32,6 +32,23 @@ func TestBuiltinRulesCompile(t *testing.T) {
 	}
 }
 
+func TestBuiltinRulesHaveCWEMappings(t *testing.T) {
+	rules := BuiltinRules()
+	if len(SASTRuleCWE) != len(rules) {
+		t.Fatalf("CWE mappings = %d, builtin rules = %d", len(SASTRuleCWE), len(rules))
+	}
+	for _, rule := range rules {
+		cwe, ok := SASTRuleCWE[rule.ID]
+		if !ok {
+			t.Errorf("rule %s has no CWE mapping", rule.ID)
+			continue
+		}
+		if !regexp.MustCompile(`^CWE-[0-9]+$`).MatchString(cwe) {
+			t.Errorf("rule %s has invalid CWE mapping %q", rule.ID, cwe)
+		}
+	}
+}
+
 func TestScanDetectsHardcodedAPIKey(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "config.go", `package config

@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"drydock/internal/securityscan/surface"
 )
 
 // SecurityFinding represents a single security issue found by the scanner.
@@ -35,12 +37,13 @@ type ScanResult struct {
 
 // Scanner runs deterministic security rules against source files.
 type Scanner struct {
-	rules []Rule
+	rules        []Rule
+	surfaceRules []Rule
 }
 
 // New creates a Scanner with the builtin rule set.
 func New() *Scanner {
-	return &Scanner{rules: BuiltinRules()}
+	return &Scanner{rules: BuiltinRules(), surfaceRules: SurfaceRules()}
 }
 
 // NewWithRules creates a Scanner with a custom rule set (useful for testing).
@@ -100,6 +103,32 @@ func (s *Scanner) ScanFiles(ctx context.Context, repoPath string, changedFiles [
 	return result
 }
 
+// LocateSurface finds security-relevant locations in the selected files.
+// Locator matches are context only and are never returned as findings.
+func (s *Scanner) LocateSurface(ctx context.Context, repoPath string, files []string) surface.Result {
+	result := surface.Result{RulesChecked: len(s.surfaceRules)}
+	for _, relPath := range files {
+		select {
+		case <-ctx.Done():
+			return result
+		default:
+		}
+
+		locations, err := s.scanSurfaceFile(ctx, relPath, filepath.Join(repoPath, relPath))
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				result.FilesSkipped++
+			} else {
+				result.FilesErrored++
+			}
+			continue
+		}
+		result.Locations = append(result.Locations, locations...)
+		result.FilesScanned++
+	}
+	return result
+}
+
 // scanFile scans a single file against all applicable rules.
 // If addedLineNums is non-nil, only those line numbers are checked (diff-aware).
 func (s *Scanner) scanFile(_ context.Context, relPath, absPath string, addedLineNums map[int]bool) ([]SecurityFinding, error) {
@@ -125,7 +154,7 @@ func (s *Scanner) scanFile(_ context.Context, relPath, absPath string, addedLine
 		}
 
 		for _, rule := range s.rules {
-			if !rule.appliesToFile(relPath) {
+			if rule.Classification == RuleClassificationSurface || !rule.appliesToFile(relPath) {
 				continue
 			}
 			if rule.Pattern.MatchString(line) {
@@ -154,6 +183,49 @@ func (s *Scanner) scanFile(_ context.Context, relPath, absPath string, addedLine
 		return nil, fmt.Errorf("scan %s: %w", relPath, err)
 	}
 	return findings, nil
+}
+
+func (s *Scanner) scanSurfaceFile(ctx context.Context, relPath, absPath string) ([]surface.Location, error) {
+	f, err := os.Open(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", relPath, err)
+	}
+	defer f.Close()
+
+	var locations []surface.Location
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lineNum := 0
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return locations, ctx.Err()
+		default:
+		}
+
+		lineNum++
+		line := scanner.Text()
+		for _, rule := range s.surfaceRules {
+			if rule.Classification != RuleClassificationSurface || !rule.appliesToFile(relPath) || !rule.Pattern.MatchString(line) {
+				continue
+			}
+			evidence := strings.TrimSpace(line)
+			if len(evidence) > 200 {
+				evidence = evidence[:200] + "..."
+			}
+			locations = append(locations, surface.Location{
+				Tag:      rule.SurfaceTag,
+				RuleID:   rule.ID,
+				File:     relPath,
+				Line:     lineNum,
+				Evidence: evidence,
+			})
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan %s: %w", relPath, err)
+	}
+	return locations, nil
 }
 
 // parseDiffAddedLines extracts a map of file → {lineNumber: true} for all lines

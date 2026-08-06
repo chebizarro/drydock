@@ -5,15 +5,73 @@ package securityscan
 
 import "regexp"
 
-// Rule defines a single security scanning pattern.
+// SurfaceRules returns locator rules that identify security-relevant code.
+// These rules provide context only and must never be reported as findings.
+func SurfaceRules() []Rule {
+	return []Rule{
+		{
+			ID:             "SURFACE-ENTRY",
+			Pattern:        regexp.MustCompile(`(?i)(?:\b(?:HandleFunc|ListenAndServe|ServeHTTP)\s*\(|\b(?:router|app|server)\.(?:get|post|put|patch|delete|use|handle)\s*\(|@(?:app|router)\.(?:get|post|put|patch|delete)\s*\(|\bfunc\s+main\s*\(|\bdef\s+(?:main|handler)\s*\()`),
+			Classification: RuleClassificationSurface,
+			SurfaceTag:     "entry-point",
+		},
+		{
+			ID:             "SURFACE-AUTH",
+			Pattern:        regexp.MustCompile(`(?i)\b(?:authenticat(?:e|ion)|authoriz(?:e|ation)|authz|requireAuth|checkPermission|verifyToken|jwt|oauth|middleware)\b`),
+			Classification: RuleClassificationSurface,
+			SurfaceTag:     "auth-check",
+		},
+		{
+			ID:             "SURFACE-DESERIALIZE",
+			Pattern:        regexp.MustCompile(`(?i)(?:\bjson\.(?:Unmarshal|NewDecoder|loads?|parse)\b|\byaml\.(?:Unmarshal|load|unsafe_load)\b|\bpickle\.loads?\b|\bgob\.NewDecoder\b|\bObjectInputStream\b|\bserde_json::from_)`),
+			Classification: RuleClassificationSurface,
+			SurfaceTag:     "deserialization",
+		},
+		{
+			ID:             "SURFACE-EXEC",
+			Pattern:        regexp.MustCompile(`(?i)(?:\bexec\.Command\b|\bos\.(?:system|popen)\b|\bsubprocess\.(?:call|run|Popen)\b|\bchild_process\.(?:exec|spawn)\b|\bRuntime\.getRuntime\(\)\.exec\b|\bCommand::new\b)`),
+			Classification: RuleClassificationSurface,
+			SurfaceTag:     "exec-subprocess",
+		},
+		{
+			ID:             "SURFACE-FILE",
+			Pattern:        regexp.MustCompile(`(?i)(?:\b(?:os|ioutil)\.(?:Open|OpenFile|ReadFile|WriteFile|Create|Remove|Rename)\b|\bfs\.(?:read|write|open|unlink|rename)\w*\b|\bFile\.(?:open|read|write)\b|\bFiles\.(?:read|write|delete|move)\b|\bopen\s*\()`),
+			Classification: RuleClassificationSurface,
+			SurfaceTag:     "file-io",
+		},
+		{
+			ID:             "SURFACE-CRYPTO",
+			Pattern:        regexp.MustCompile(`(?i)(?:\bcrypto(?:graphy)?\b|\b(?:bcrypt|scrypt|argon2|sha256|sha512|aes|chacha20|cipher)\b|\b(?:encrypt|decrypt|sign|verify)\w*\s*\()`),
+			Classification: RuleClassificationSurface,
+			SurfaceTag:     "crypto",
+		},
+		{
+			ID:             "SURFACE-SQL",
+			Pattern:        regexp.MustCompile(`(?i)(?:\bdatabase/sql\b|\b(?:Query|QueryRow|Exec)(?:Context)?\s*\(|\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER)\b|\b(?:cursor|session)\.execute\s*\()`),
+			Classification: RuleClassificationSurface,
+			SurfaceTag:     "sql",
+		},
+	}
+}
+
+type RuleClassification string
+
+const (
+	RuleClassificationFinding RuleClassification = "finding"
+	RuleClassificationSurface RuleClassification = "surface"
+)
+
+// Rule defines a single security scanning or locator pattern.
 type Rule struct {
-	ID          string         // unique identifier, e.g. "SEC-001"
-	Pattern     *regexp.Regexp // compiled regex to match against source lines
-	Severity    string         // "critical", "high", "medium"
-	Category    string         // "security"
-	Description string         // human-readable explanation
-	Languages   []string       // file extensions this rule applies to (empty = all)
-	Suggestion  string         // recommended fix
+	ID             string             // unique identifier, e.g. "SEC-001"
+	Pattern        *regexp.Regexp     // compiled regex to match against source lines
+	Severity       string             // "critical", "high", "medium"
+	Category       string             // "security"
+	Description    string             // human-readable explanation
+	Languages      []string           // file extensions this rule applies to (empty = all)
+	Suggestion     string             // recommended fix
+	Classification RuleClassification // finding (default) or surface locator
+	SurfaceTag     string             // security-surface tag for locator rules
 }
 
 // appliesToFile returns true if the rule applies to the given file path.
@@ -34,6 +92,25 @@ func hasExtension(path, ext string) bool {
 		return false
 	}
 	return path[len(path)-len(ext):] == ext
+}
+
+// SASTRuleCWE maps each built-in SAST rule to its CWE hypothesis.
+var SASTRuleCWE = map[string]string{
+	"SEC-001": "CWE-798",
+	"SEC-002": "CWE-798",
+	"SEC-003": "CWE-321",
+	"SEC-010": "CWE-89",
+	"SEC-011": "CWE-89",
+	"SEC-020": "CWE-78",
+	"SEC-021": "CWE-78",
+	"SEC-030": "CWE-22",
+	"SEC-040": "CWE-328",
+	"SEC-041": "CWE-328",
+	"SEC-042": "CWE-327",
+	"SEC-050": "CWE-79",
+	"SEC-060": "CWE-918",
+	"SEC-070": "CWE-295",
+	"SEC-080": "CWE-502",
 }
 
 // BuiltinRules returns the curated set of security scanning rules.
@@ -57,10 +134,10 @@ func BuiltinRules() []Rule {
 			Suggestion:  "Use environment variables or a secrets manager for credentials.",
 		},
 		{
-			ID:       "SEC-003",
-			Pattern:  regexp.MustCompile(`(?i)-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----`),
-			Severity: "critical",
-			Category: "security",
+			ID:          "SEC-003",
+			Pattern:     regexp.MustCompile(`(?i)-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----`),
+			Severity:    "critical",
+			Category:    "security",
 			Description: "Private key committed to source. Private keys must be stored in secure key management, not in code.",
 			Suggestion:  "Remove the private key and rotate it immediately.",
 		},

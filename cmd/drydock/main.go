@@ -383,7 +383,10 @@ func main() {
 	// --- Security scanner ---
 	secScanner := securityscan.New()
 	secProvider := securityscan.NewProvider(secScanner)
-	builderOpts = append(builderOpts, contextbuilder.WithExtraProviders(secProvider))
+	builderOpts = append(builderOpts, contextbuilder.WithExtraProviders(
+		secProvider,
+		contextbuilder.NewSecuritySurfaceProvider(secScanner),
+	))
 	logger.Info("security scanner enabled", "rules", len(securityscan.BuiltinRules()))
 
 	// --- Context builder ---
