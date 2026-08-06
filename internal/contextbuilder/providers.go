@@ -32,6 +32,7 @@ func DefaultProviders(opts ...BuilderOptions) []Provider {
 		patchDiffProvider{},
 		fileContextProvider{},
 		changeImpactProvider{search: srch},
+		taintProvider{lspClient: opt.lspClient},
 		symbolsCallsitesProvider{lspClient: opt.lspClient, search: srch},
 		testsProvider{search: srch},
 		importsExportsProvider{},
