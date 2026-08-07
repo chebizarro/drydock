@@ -352,8 +352,8 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 			}
 		}
 		return nil
-	case eventkind.ReviewerProfile, eventkind.ReviewFeedback:
-		// Route to marketplace handler.
+	case eventkind.ReviewerProfile:
+		// Route reviewer profiles to the marketplace handler.
 		if p.marketplace != nil {
 			if err := p.marketplace.HandleEvent(ctx, event, relayURL); err != nil {
 				metrics.MarketplaceRoutingFailures.Inc()

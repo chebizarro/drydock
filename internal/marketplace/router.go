@@ -590,24 +590,3 @@ func (r *Router) attemptReassignment(ctx context.Context, originalAssignmentID s
 
 	return nil
 }
-
-// HandleFeedback processes feedback on a completed review.
-func (r *Router) HandleFeedback(ctx context.Context, event nostr.Event) error {
-	feedback, err := ParseReviewFeedbackEvent(event)
-	if err != nil {
-		return fmt.Errorf("parse feedback: %w", err)
-	}
-
-	if err := r.registry.RecordFeedback(ctx, feedback); err != nil {
-		return fmt.Errorf("record feedback: %w", err)
-	}
-
-	metrics.MarketplaceFeedbackReceived.Inc()
-	r.logger.Info("review feedback received",
-		"review_event_id", feedback.ReviewEventID,
-		"reviewer", feedback.ReviewerPubkey,
-		"rating", feedback.Rating,
-	)
-
-	return nil
-}

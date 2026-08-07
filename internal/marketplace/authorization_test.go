@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"drydock/internal/contextvm"
 	"drydock/internal/db"
 
 	"fiatjaf.com/nostr"
@@ -205,6 +206,7 @@ func TestHandlerRejectsUnauthorizedAndDuplicateFeedback(t *testing.T) {
 	attackerSK := nostr.Generate()
 	reviewer := testPubKey().Hex()
 	assignmentID := "assign-feedback-auth"
+	reviewEventID := "review-feedback-auth"
 	seedAssignment(t, ctx, store, db.ReviewAssignment{
 		PatchEventID:      "patch-feedback-auth",
 		RepoID:            "repo-1",
@@ -212,6 +214,8 @@ func TestHandlerRejectsUnauthorizedAndDuplicateFeedback(t *testing.T) {
 		RequesterPubkey:   requester,
 		Status:            "completed",
 		AssignmentEventID: assignmentID,
+		CompletionEventID: reviewEventID,
+		ReviewEventID:     reviewEventID,
 		ExpiresAt:         time.Now().Add(time.Hour).Unix(),
 	})
 	assignment, err := store.GetAssignmentByEventID(ctx, assignmentID)
@@ -219,29 +223,57 @@ func TestHandlerRejectsUnauthorizedAndDuplicateFeedback(t *testing.T) {
 		t.Fatalf("GetAssignmentByEventID: %v", err)
 	}
 
-	unauthorized := signedMarketplaceEvent(t, attackerSK, int(KindReviewFeedback), ReviewFeedback{AssignmentID: assignment.ID, Rating: 5, Comment: "fake"})
-	if err := handler.handleFeedback(ctx, unauthorized); err == nil || !strings.Contains(err.Error(), "unauthorized feedback rater") {
-		t.Fatalf("expected unauthorized feedback error, got %v", err)
+	unauthorized := feedbackNotificationRequest(t, attackerSK, MarketplaceFeedbackParams{ReviewEventID: reviewEventID, Rating: 5, Comment: "fake"})
+	if err := handler.handleContextVMFeedback(ctx, unauthorized); err != nil {
+		t.Fatalf("unauthorized feedback should be a handled rejection, got %v", err)
 	}
 	if count := feedbackCount(t, ctx, store, assignment.ID); count != 0 {
 		t.Fatalf("unauthorized feedback was stored; count=%d", count)
 	}
 
-	authorized := signedMarketplaceEvent(t, requesterSK, int(KindReviewFeedback), ReviewFeedback{AssignmentID: assignment.ID, Rating: 5, Comment: "legit"})
-	if err := handler.handleFeedback(ctx, authorized); err != nil {
+	authorized := feedbackNotificationRequest(t, requesterSK, MarketplaceFeedbackParams{ReviewEventID: reviewEventID, Rating: 5, Comment: "legit"})
+	if err := handler.handleContextVMFeedback(ctx, authorized); err != nil {
 		t.Fatalf("authorized feedback rejected: %v", err)
 	}
 	if count := feedbackCount(t, ctx, store, assignment.ID); count != 1 {
 		t.Fatalf("authorized feedback count=%d, want 1", count)
 	}
 
-	duplicate := signedMarketplaceEvent(t, requesterSK, int(KindReviewFeedback), ReviewFeedback{AssignmentID: assignment.ID, Rating: 4, Comment: "again"})
-	if err := handler.handleFeedback(ctx, duplicate); err != nil {
+	duplicate := feedbackNotificationRequest(t, requesterSK, MarketplaceFeedbackParams{ReviewEventID: reviewEventID, Rating: 4, Comment: "again"})
+	if err := handler.handleContextVMFeedback(ctx, duplicate); err != nil {
 		t.Fatalf("duplicate feedback should be idempotent, got %v", err)
 	}
 	if count := feedbackCount(t, ctx, store, assignment.ID); count != 1 {
 		t.Fatalf("duplicate feedback changed count to %d, want 1", count)
 	}
+	var storedRating int
+	if err := store.DB().QueryRowContext(ctx, `SELECT rating FROM review_feedback WHERE assignment_id = ?`, assignment.ID).Scan(&storedRating); err != nil {
+		t.Fatalf("read stored feedback rating: %v", err)
+	}
+	if storedRating != 5 {
+		t.Fatalf("duplicate overwrote first rating: got %d, want 5", storedRating)
+	}
+}
+
+func feedbackNotificationRequest(t *testing.T, sk nostr.SecretKey, params MarketplaceFeedbackParams) contextvm.Request {
+	t.Helper()
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal feedback params: %v", err)
+	}
+	msg := contextvm.Message{JSONRPC: "2.0", Method: MethodFeedback, Params: raw}
+	content, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal feedback notification: %v", err)
+	}
+	event := nostr.Event{
+		Kind: nostr.Kind(25910), CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{{"method", MethodFeedback}, {"e", params.ReviewEventID}}, Content: string(content),
+	}
+	if err := event.Sign(sk); err != nil {
+		t.Fatalf("sign feedback notification: %v", err)
+	}
+	return contextvm.Request{Event: event, Sender: event.PubKey, Msg: msg}
 }
 
 func seedAssignment(t *testing.T, ctx context.Context, store *db.Store, assignment db.ReviewAssignment) {

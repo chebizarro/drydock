@@ -46,6 +46,23 @@ func TestLimiter_Allow(t *testing.T) {
 	}
 }
 
+func TestLimiter_RefundRestoresAllowance(t *testing.T) {
+	ctx := context.Background()
+	limiter := New(Config{Window: time.Hour, MaxRequests: 1, KeyPrefix: "feedback:"}, NewMemoryStore())
+	if result, err := limiter.Allow(ctx, "sender"); err != nil || !result.Allowed {
+		t.Fatalf("initial allowance: result=%+v err=%v", result, err)
+	}
+	if result, err := limiter.Allow(ctx, "sender"); err != nil || result.Allowed {
+		t.Fatalf("exhausted allowance: result=%+v err=%v", result, err)
+	}
+	if err := limiter.Refund(ctx, "sender"); err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	if result, err := limiter.Allow(ctx, "sender"); err != nil || !result.Allowed {
+		t.Fatalf("allowance after refund: result=%+v err=%v", result, err)
+	}
+}
+
 func TestLimiter_Check_DoesNotConsume(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore()

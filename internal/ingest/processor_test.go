@@ -584,6 +584,32 @@ func TestProcessorUsesEAsRootForPRUpdates(t *testing.T) {
 	}
 }
 
+type recordingMarketplaceHandler struct{ calls int }
+
+func (h *recordingMarketplaceHandler) HandleEvent(context.Context, nostr.Event, string) error {
+	h.calls++
+	return nil
+}
+
+func TestProcessorIgnoresKind7000AfterContextVMCutover(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	marketplace := &recordingMarketplaceHandler{}
+	processor := ingest.NewProcessor(
+		store,
+		slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		ingest.WithMarketplace(marketplace),
+	)
+	event := nostr.Event{Kind: nostr.Kind(7000), CreatedAt: nostr.Now(), Content: `{}`}
+	signEvent(t, nostr.Generate(), &event)
+	if err := processor.ProcessEvent(ctx, event, "wss://relay.test"); err != nil {
+		t.Fatalf("kind 7000 processing returned error: %v", err)
+	}
+	if marketplace.calls != 0 {
+		t.Fatalf("kind 7000 reached marketplace handler %d time(s)", marketplace.calls)
+	}
+}
+
 type recordingContextVMResponder struct {
 	calls     int
 	failCalls int

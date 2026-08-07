@@ -35,6 +35,12 @@ type cachedReviewer struct {
 
 const cacheExpiry = 5 * time.Minute
 
+var (
+	ErrFeedbackInvalid      = errors.New("invalid marketplace feedback")
+	ErrFeedbackUnauthorized = errors.New("unauthorized marketplace feedback")
+	ErrFeedbackNotFound     = errors.New("marketplace feedback assignment not found")
+)
+
 // ReviewerProfileQueryFilter scopes Nostr queries to Drydock reviewer NIP-89 app handlers.
 func ReviewerProfileQueryFilter() nostr.Filter {
 	return nostr.Filter{
@@ -406,21 +412,20 @@ func (r *Registry) RecordRejection(ctx context.Context, rejection ReviewRejectio
 	return r.store.TransitionPendingAssignment(ctx, assignment.ID, rejection.ReviewerPubkey, "rejected", rejection.EventID, time.Now().Unix())
 }
 
-// RecordFeedback records feedback on a review and updates reputation.
-func (r *Registry) RecordFeedback(ctx context.Context, feedback ReviewFeedback) error {
+// RecordFeedback records authenticated feedback and reports whether the
+// immutable first-write record was inserted. Reputation is recalculated only
+// for a new row, never for an idempotent duplicate.
+func (r *Registry) RecordFeedback(ctx context.Context, feedback ReviewFeedback) (bool, error) {
 	if !IsValidRating(feedback.Rating) {
-		return fmt.Errorf("invalid rating: %d", feedback.Rating)
+		return false, fmt.Errorf("%w: rating must be between 1 and 5", ErrFeedbackInvalid)
 	}
 
 	assignment, err := r.feedbackAssignment(ctx, feedback)
 	if err != nil {
-		return err
-	}
-	if feedback.ReviewerPubkey == "" {
-		feedback.ReviewerPubkey = assignment.ReviewerPubkey
+		return false, err
 	}
 	if err := r.authorizeFeedbackRater(ctx, assignment, feedback.RaterPubkey); err != nil {
-		return err
+		return false, err
 	}
 	dbFeedback := db.ReviewFeedback{
 		AssignmentID:   assignment.ID,
@@ -430,25 +435,28 @@ func (r *Registry) RecordFeedback(ctx context.Context, feedback ReviewFeedback) 
 		Comment:        feedback.Comment,
 		EventID:        feedback.EventID,
 	}
-	if _, err := r.store.RecordFeedback(ctx, dbFeedback); err != nil {
-		return err
+	inserted, err := r.store.RecordFeedback(ctx, dbFeedback)
+	if err != nil {
+		return false, err
 	}
-
-	return r.recalculateReputation(ctx, assignment.ReviewerPubkey)
+	if !inserted {
+		return false, nil
+	}
+	metrics.MarketplaceReputationUpdates.Inc()
+	r.mu.Lock()
+	delete(r.reviewers, assignment.ReviewerPubkey)
+	r.mu.Unlock()
+	return true, nil
 }
 
 func (r *Registry) feedbackAssignment(ctx context.Context, feedback ReviewFeedback) (*db.ReviewAssignment, error) {
-	if feedback.AssignmentID > 0 {
-		assignment, err := r.store.GetAssignmentByID(ctx, feedback.AssignmentID)
-		if err != nil {
-			return nil, fmt.Errorf("find feedback assignment: %w", err)
-		}
-		return assignment, nil
-	}
-	if feedback.ReviewEventID == "" {
-		return nil, fmt.Errorf("feedback assignment_id or review_event_id is required")
+	if strings.TrimSpace(feedback.ReviewEventID) == "" {
+		return nil, fmt.Errorf("%w: review_event_id is required", ErrFeedbackInvalid)
 	}
 	assignment, err := r.store.GetAssignmentByCompletionEventID(ctx, feedback.ReviewEventID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s", ErrFeedbackNotFound, feedback.ReviewEventID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("find assignment by review event: %w", err)
 	}
@@ -460,13 +468,13 @@ func (r *Registry) authorizeFeedbackRater(ctx context.Context, assignment *db.Re
 		return nil
 	}
 	patchAuthor, err := r.store.GetPatchAuthorPubKey(ctx, assignment.PatchEventID)
-	if err == nil && patchAuthor == raterPubkey {
+	if err == nil && patchAuthor == raterPubkey && raterPubkey != "" {
 		return nil
 	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) && assignment.RequesterPubkey == "" {
+	if err != nil && !errors.Is(err, db.ErrPatchEventNotFound) {
 		return fmt.Errorf("resolve assignment requester: %w", err)
 	}
-	return fmt.Errorf("unauthorized feedback rater: sender %s is not requester/patch author", raterPubkey)
+	return fmt.Errorf("%w: sender %s is not requester/patch author", ErrFeedbackUnauthorized, raterPubkey)
 }
 
 // RecalculateReputation triggers reputation recalculation for a reviewer.

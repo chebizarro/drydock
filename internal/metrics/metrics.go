@@ -225,26 +225,31 @@ var (
 	IDEFixResponsesSent       = &Counter{}
 
 	// Marketplace
-	MarketplaceRoutingAttempts     = &Counter{}
-	MarketplaceRoutingSuccesses    = &Counter{}
-	MarketplaceRoutingFailures     = &Counter{}
-	MarketplaceNoReviewersFound    = &Counter{}
-	MarketplaceAssignmentsCreated  = &Counter{}
-	MarketplaceAssignmentsAccepted = &Counter{}
-	MarketplaceAssignmentsRejected = &Counter{}
-	MarketplaceAssignmentsExpired  = &Counter{}
-	MarketplaceReviewersActive     = &Gauge{}
-	MarketplaceFeedbackReceived    = &Counter{}
-	FeedbackRateLimited            = &Counter{}
-	FeedbackRateLimitFailures      = &Counter{}
-	MarketplaceReputationUpdates   = &Counter{}
+	MarketplaceRoutingAttempts      = &Counter{}
+	MarketplaceRoutingSuccesses     = &Counter{}
+	MarketplaceRoutingFailures      = &Counter{}
+	MarketplaceNoReviewersFound     = &Counter{}
+	MarketplaceAssignmentsCreated   = &Counter{}
+	MarketplaceAssignmentsAccepted  = &Counter{}
+	MarketplaceAssignmentsRejected  = &Counter{}
+	MarketplaceAssignmentsExpired   = &Counter{}
+	MarketplaceReviewersActive      = &Gauge{}
+	MarketplaceFeedbackReceived     = &Counter{}
+	MarketplaceFeedbackAccepted     = &Counter{}
+	MarketplaceFeedbackDuplicate    = &Counter{}
+	MarketplaceFeedbackUnauthorized = &Counter{}
+	MarketplaceFeedbackMalformed    = &Counter{}
+	FeedbackRateLimited             = &Counter{}
+	FeedbackRateLimitFailures       = &Counter{}
+	MarketplaceReputationUpdates    = &Counter{}
 
 	// Security review
-	SecurityAuditsRun          = NewCounterVec2() // labels: depth, state
-	SecurityFindings           = NewCounterVec2() // labels: CWE, severity
-	SecurityVerifyOutcomes     = NewCounterVec()  // label: refuted, survived
-	SecurityFalsePositives     = &Counter{}
-	SecurityBaselineSuppressed = &Counter{}
+	SecurityAuditsRun                         = NewCounterVec2() // labels: depth, state
+	SecurityFindings                          = NewCounterVec2() // labels: CWE, severity
+	SecurityVerifyOutcomes                    = NewCounterVec()  // label: refuted, survived
+	SecurityFalsePositives                    = &Counter{}
+	SecurityBaselineSuppressed                = &Counter{}
+	SecurityAuditProgressNotificationFailures = &Counter{}
 
 	// Security scan and context extraction capabilities
 	SecurityScanFindings = &Counter{}
@@ -430,6 +435,14 @@ func writeMetrics(w io.Writer) {
 		"Number of active community reviewers.", MarketplaceReviewersActive)
 	writeCounter(w, "drydock_marketplace_feedback_received_total",
 		"Review feedback/ratings received.", MarketplaceFeedbackReceived)
+	writeCounter(w, "drydock_marketplace_feedback_notifications_accepted_total",
+		"Marketplace feedback notifications durably inserted.", MarketplaceFeedbackAccepted)
+	writeCounter(w, "drydock_marketplace_feedback_notifications_duplicate_total",
+		"Idempotent duplicate marketplace feedback notifications.", MarketplaceFeedbackDuplicate)
+	writeCounter(w, "drydock_marketplace_feedback_notifications_unauthorized_total",
+		"Marketplace feedback notifications rejected by sender authorization.", MarketplaceFeedbackUnauthorized)
+	writeCounter(w, "drydock_marketplace_feedback_notifications_malformed_total",
+		"Malformed marketplace feedback notifications rejected.", MarketplaceFeedbackMalformed)
 	writeCounter(w, "drydock_marketplace_feedback_rate_limited_total",
 		"Marketplace feedback dropped due to rate limit.", FeedbackRateLimited)
 	writeCounter(w, "drydock_marketplace_feedback_rate_limit_failures_total",
@@ -448,6 +461,8 @@ func writeMetrics(w io.Writer) {
 		"Candidate security findings refuted as estimated false positives.", SecurityFalsePositives)
 	writeCounter(w, "drydock_security_baseline_suppressed_total",
 		"Verified security findings suppressed by the audit baseline.", SecurityBaselineSuppressed)
+	writeCounter(w, "drydock_security_audit_progress_notification_failures_total",
+		"Security audit progress notifications that failed to publish.", SecurityAuditProgressNotificationFailures)
 
 	// Security scan
 	writeCounter(w, "drydock_security_scan_findings_total",

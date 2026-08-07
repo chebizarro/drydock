@@ -503,7 +503,7 @@ func main() {
 	if pubSvc != nil {
 		verifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel}
 		classifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel}
-		feedback := contextvm.NewAuditFeedbackReporter(signer, relayPub, writeRelays)
+		feedback := contextvm.NewAuditFeedbackReporter(contextVMTransport, writeRelays)
 		auditEngine := auditengine.New(
 			auditengine.Config{
 				Workers:           cfg.SecurityAuditWorkers,

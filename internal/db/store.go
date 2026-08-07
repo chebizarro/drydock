@@ -997,7 +997,7 @@ func (s *Store) GetPatchAuthorPubKey(ctx context.Context, eventID string) (strin
 		eventID,
 	).Scan(&pubkey); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("patch event %s not found", eventID)
+			return "", fmt.Errorf("%w: %s", ErrPatchEventNotFound, eventID)
 		}
 		return "", fmt.Errorf("get patch author pubkey: %w", err)
 	}

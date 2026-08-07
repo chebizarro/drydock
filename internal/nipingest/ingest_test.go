@@ -144,6 +144,15 @@ func TestExtractEventKinds(t *testing.T) {
 	}
 }
 
+func TestExtractEventKindsIgnoresRetiredNIP90Kinds(t *testing.T) {
+	kinds := extractEventKinds("legacy kinds 5900, 6900, and 7000; current kind 25910")
+	for _, kind := range kinds {
+		if kind == 5900 || kind == 6900 || kind == 7000 {
+			t.Fatalf("retired kind %d was still recognized", kind)
+		}
+	}
+}
+
 func TestChunkID_Stable(t *testing.T) {
 	c := Chunk{NIPID: "34", SectionTitle: "Patch Events"}
 	id1 := chunkID(c)

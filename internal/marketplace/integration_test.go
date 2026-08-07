@@ -218,7 +218,7 @@ func TestIntegrationMarketplaceContextVMAssignmentAcceptanceAndRejection(t *test
 	}
 }
 
-func TestIntegrationFeedbackWithNIP90Kind7000(t *testing.T) {
+func TestIntegrationMarketplaceFeedbackNotification(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
 	registry := NewRegistry(store, slog.Default())
@@ -254,25 +254,20 @@ func TestIntegrationFeedbackWithNIP90Kind7000(t *testing.T) {
 		t.Fatalf("UpdateAssignmentStatus completed: %v", err)
 	}
 
-	content, err := json.Marshal(ReviewFeedback{Helpful: true, Accurate: true, Comment: "Useful review"})
+	vmRouter := contextvm.NewRouter()
+	if err := handler.RegisterContextVMMethods(vmRouter); err != nil {
+		t.Fatalf("RegisterContextVMMethods: %v", err)
+	}
+	req := contextVMRequest(t, rater, MethodFeedback, "", MarketplaceFeedbackParams{
+		ReviewEventID: "review-complete-event", Rating: 5,
+		Helpful: true, Accurate: true, Comment: "Useful review",
+	}, nostr.Tags{{"p", testPubKey().Hex()}, {"method", MethodFeedback}, {"e", "review-complete-event"}})
+	response, err := vmRouter.Handle(ctx, req)
 	if err != nil {
-		t.Fatalf("marshal feedback: %v", err)
+		t.Fatalf("handle feedback notification: %v", err)
 	}
-	feedbackEvent := nostr.Event{
-		Kind:      KindReviewFeedback,
-		CreatedAt: nostr.Now(),
-		Tags:      ReviewFeedbackTags("review-complete-event", reviewer.pubkey().Hex(), 5),
-		Content:   string(content),
-	}
-	if feedbackEvent.Kind != KindReviewFeedback {
-		t.Fatalf("feedback kind = %d, want %d", feedbackEvent.Kind, KindReviewFeedback)
-	}
-	if err := rater.SignEvent(ctx, &feedbackEvent); err != nil {
-		t.Fatalf("sign feedback: %v", err)
-	}
-
-	if err := handler.HandleEvent(ctx, feedbackEvent, "wss://relay.test"); err != nil {
-		t.Fatalf("HandleEvent feedback: %v", err)
+	if response.ID != "" || response.Error != nil || len(response.Result) != 0 {
+		t.Fatalf("feedback notification produced a response: %+v", response)
 	}
 	_, reputation, err := registry.GetReviewer(ctx, reviewer.pubkey().Hex())
 	if err != nil {

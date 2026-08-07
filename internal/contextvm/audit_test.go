@@ -44,14 +44,14 @@ func (l auditTestConfigLoader) LoadBaseRepoConfig(context.Context, string) ([]by
 	return l.data, nil
 }
 
-type auditTestPublisher struct {
-	events []nostr.Event
-	err    error
+type auditTestNotifier struct {
+	notifications []Notification
+	err           error
 }
 
-func (p *auditTestPublisher) Publish(_ context.Context, _ []string, event nostr.Event) error {
-	p.events = append(p.events, event)
-	return p.err
+func (n *auditTestNotifier) Notify(_ context.Context, notification Notification) (string, error) {
+	n.notifications = append(n.notifications, notification)
+	return "notification-event-id", n.err
 }
 
 type auditTestRunner struct {
@@ -88,9 +88,8 @@ func TestSecurityAuditMethodRunsEngineAndPublishesProgress(t *testing.T) {
 	}
 	announcement.ID = announcement.GetID()
 
-	signer := newTestSigner(23)
-	published := &auditTestPublisher{}
-	feedback := NewAuditFeedbackReporter(signer, published, []string{"wss://write.test"})
+	published := &auditTestNotifier{}
+	feedback := NewAuditFeedbackReporter(published, []string{"wss://write.test"})
 	runner := &auditTestRunner{progress: feedback, result: auditengine.Result{AuditID: 42}}
 	handler := NewSecurityAuditHandler(
 		runner,
@@ -132,11 +131,11 @@ func TestSecurityAuditMethodRunsEngineAndPublishesProgress(t *testing.T) {
 	if runner.req.Ref != "" || runner.req.Subtree != "internal/auth" || runner.req.SinceCommit != "abc123" {
 		t.Fatalf("audit params not forwarded: %+v", runner.req)
 	}
-	if len(published.events) != 2 {
-		t.Fatalf("published feedback count = %d, want 2", len(published.events))
+	if len(published.notifications) != 2 {
+		t.Fatalf("published progress count = %d, want 2", len(published.notifications))
 	}
-	assertAuditFeedback(t, published.events[0], requestEvent.ID.Hex(), requester.Hex(), "prepare", "processing")
-	assertAuditFeedback(t, published.events[1], requestEvent.ID.Hex(), requester.Hex(), "published", "success")
+	assertAuditProgressNotification(t, published.notifications[0], requestEvent.ID.Hex(), requester, "prepare", "processing")
+	assertAuditProgressNotification(t, published.notifications[1], requestEvent.ID.Hex(), requester, "published", "success")
 }
 
 func TestSecurityAuditMethodPublishesFailure(t *testing.T) {
@@ -145,9 +144,8 @@ func TestSecurityAuditMethodPublishesFailure(t *testing.T) {
 	announcement := nostr.Event{Kind: 30617, PubKey: owner, Tags: nostr.Tags{{"d", "repo"}}}
 	announcement.ID = announcement.GetID()
 
-	signer := newTestSigner(29)
-	published := &auditTestPublisher{}
-	feedback := NewAuditFeedbackReporter(signer, published, []string{"wss://write.test"})
+	published := &auditTestNotifier{}
+	feedback := NewAuditFeedbackReporter(published, []string{"wss://write.test"})
 	runner := &auditTestRunner{progress: feedback, result: auditengine.Result{AuditID: 42}, err: errors.New("review failed")}
 	handler := NewSecurityAuditHandler(
 		runner,
@@ -168,10 +166,10 @@ func TestSecurityAuditMethodPublishesFailure(t *testing.T) {
 	if rpcErr != nil {
 		t.Fatalf("HandleSecurityAudit error: %+v", rpcErr)
 	}
-	if len(published.events) != 2 {
-		t.Fatalf("published feedback count = %d, want progress + failure", len(published.events))
+	if len(published.notifications) != 2 {
+		t.Fatalf("published progress count = %d, want progress + failure", len(published.notifications))
 	}
-	assertAuditFeedback(t, published.events[1], requestEvent.ID.Hex(), requester.Hex(), "failed", "error")
+	assertAuditProgressNotification(t, published.notifications[1], requestEvent.ID.Hex(), requester, "failed", "error")
 }
 
 func TestSecurityAuditSARIFMethodAuthorizesRequester(t *testing.T) {
@@ -215,22 +213,42 @@ func TestSecurityAuditMethodRejectsInvalidDepth(t *testing.T) {
 	}
 }
 
-func assertAuditFeedback(t *testing.T, event nostr.Event, requestID, requester, phase, status string) {
+func assertAuditProgressNotification(t *testing.T, notification Notification, requestID string, requester nostr.PubKey, phase, status string) {
 	t.Helper()
-	if event.Kind != eventkindReviewFeedbackForTest() {
-		t.Fatalf("feedback kind = %d, want 7000", event.Kind)
+	if notification.Method != MethodSecurityAuditProgress || notification.RelatedEventID != requestID {
+		t.Fatalf("notification routing = %+v", notification)
 	}
-	for name, want := range map[string]string{
-		"e": requestID, "p": requester, "phase": phase, "status": status, "t": "security-audit",
-	} {
-		tag := event.Tags.Find(name)
-		if tag == nil || len(tag) < 2 || tag[1] != want {
-			t.Fatalf("%s tag = %#v, want %q", name, tag, want)
-		}
+	if len(notification.Recipients) != 1 || notification.Recipients[0] != requester {
+		t.Fatalf("notification recipients = %v, want %s", notification.Recipients, requester.Hex())
 	}
-	if !event.CheckID() || !event.VerifySignature() {
-		t.Fatal("feedback event is not validly signed")
+	progress, ok := notification.Params.(SecurityAuditProgress)
+	if !ok {
+		t.Fatalf("notification params type = %T", notification.Params)
+	}
+	if progress.AuditID != 42 || progress.RequestEventID != requestID || progress.Phase != phase || progress.Status != status || progress.OccurredAt <= 0 {
+		t.Fatalf("progress params = %+v", progress)
 	}
 }
 
-func eventkindReviewFeedbackForTest() nostr.Kind { return nostr.KindJobFeedback }
+func TestSecurityAuditProgressTerminalAndOutOfOrderSemantics(t *testing.T) {
+	processing := SecurityAuditProgress{Status: "processing", OccurredAt: 10}
+	success := SecurityAuditProgress{Status: "success", OccurredAt: 20}
+	if !ShouldApplySecurityAuditProgress(processing, "event-a", success, "event-b") {
+		t.Fatal("newer terminal progress was rejected")
+	}
+	if !ShouldApplySecurityAuditProgress(SecurityAuditProgress{Status: "processing", OccurredAt: 20}, "event-z", success, "event-a") {
+		t.Fatal("equal-timestamp terminal progress lost to event-id ordering")
+	}
+	if ShouldApplySecurityAuditProgress(success, "event-b", SecurityAuditProgress{Status: "processing", OccurredAt: 30}, "event-c") {
+		t.Fatal("terminal progress regressed to later processing")
+	}
+	if ShouldApplySecurityAuditProgress(processing, "event-b", SecurityAuditProgress{Status: "processing", OccurredAt: 9}, "event-z") {
+		t.Fatal("older out-of-order progress was accepted")
+	}
+	if !ShouldApplySecurityAuditProgress(processing, "event-b", SecurityAuditProgress{Status: "processing", OccurredAt: 10}, "event-c") {
+		t.Fatal("event id did not break equal-timestamp ordering")
+	}
+	if ShouldApplySecurityAuditProgress(processing, "event-b", processing, "event-b") {
+		t.Fatal("exact duplicate progress was accepted")
+	}
+}

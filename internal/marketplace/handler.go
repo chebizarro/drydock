@@ -2,12 +2,17 @@
 package marketplace
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"strconv"
+	"strings"
+	"time"
 
 	"drydock/internal/contextvm"
 	"drydock/internal/db"
@@ -53,6 +58,7 @@ func (h *Handler) RegisterContextVMMethods(router *contextvm.Router) error {
 		router.Register(MethodAccept, h.handleContextVMAcceptance),
 		router.Register(MethodReject, h.handleContextVMRejection),
 		router.Register(MethodComplete, h.handleContextVMCompletion),
+		router.RegisterNotification(MethodFeedback, h.handleContextVMFeedback),
 	)
 }
 
@@ -61,14 +67,6 @@ func (h *Handler) HandleEvent(ctx context.Context, event nostr.Event, relayURL s
 	switch event.Kind {
 	case KindReviewerProfile:
 		return h.handleReviewerProfile(ctx, event)
-	case KindReviewFeedback:
-		if tagValue(event.Tags, "t") != TagReviewFeedback {
-			h.logger.Debug("ignoring non-marketplace NIP-90 feedback",
-				"event_id", event.ID.Hex(),
-			)
-			return nil
-		}
-		return h.handleFeedback(ctx, event)
 	default:
 		h.logger.Debug("ignoring unknown marketplace event kind",
 			"kind", int(event.Kind),
@@ -314,58 +312,147 @@ func (h *Handler) handleContextVMRejection(ctx context.Context, req contextvm.Re
 	return map[string]string{"status": "rejected"}, nil
 }
 
-// handleFeedback processes review feedback/rating events.
-func (h *Handler) handleFeedback(ctx context.Context, event nostr.Event) error {
-	senderPubkey := event.PubKey.Hex()
+const (
+	feedbackNotificationMaxLifetime = 15 * time.Minute
+	feedbackCommentMaxBytes         = 4096
+)
 
-	// Check per-user rate limit for feedback submissions.
+// handleContextVMFeedback processes a notification-only marketplace rating.
+// Invalid, expired, unauthorized, and rate-limited notifications are handled
+// rejections. Transient limiter/store failures are returned so ingest remains
+// incomplete and relay redelivery can retry them.
+func (h *Handler) handleContextVMFeedback(ctx context.Context, req contextvm.Request) error {
+	senderPubkey := req.Sender.Hex()
 	if h.feedbackLimiter != nil {
 		result, err := h.feedbackLimiter.Allow(ctx, senderPubkey)
 		if err != nil {
 			metrics.FeedbackRateLimitFailures.Inc()
-			h.logger.Error("feedback rate limit check failed; denying feedback", "sender", senderPubkey, "error", err)
-			return nil
-		} else if !result.Allowed {
+			h.logger.Error("feedback rate limit check failed", "sender", senderPubkey, "error", err)
+			return fmt.Errorf("check feedback rate limit: %w", err)
+		}
+		if !result.Allowed {
 			metrics.FeedbackRateLimited.Inc()
-			h.logger.Info("feedback rate limited",
-				"sender", senderPubkey,
-				"reset_at", result.ResetAt,
-			)
-			return nil // Silently drop rate-limited feedback
-		}
-	}
-
-	feedback, err := ParseReviewFeedbackEvent(event)
-	if err != nil {
-		// Legacy compatibility: older callers/tests send feedback as JSON content
-		// without the NIP-90 t/status/rating tags.
-		if jsonErr := json.Unmarshal([]byte(event.Content), &feedback); jsonErr != nil {
-			h.logger.Warn("failed to parse feedback event",
-				"event_id", event.ID.Hex(),
-				"error", err,
-			)
+			h.logger.Info("feedback rate limited", "sender", senderPubkey, "reset_at", result.ResetAt)
 			return nil
 		}
 	}
-	feedback.RaterPubkey = event.PubKey.Hex()
-	feedback.CreatedAt = int64(event.CreatedAt)
-	feedback.EventID = event.ID.Hex()
 
-	if err := h.registry.RecordFeedback(ctx, feedback); err != nil {
-		h.logger.Error("failed to store feedback",
-			"event_id", event.ID.Hex(),
-			"error", err,
-		)
-		return err
+	params, err := parseMarketplaceFeedbackParams(req.Msg.Params)
+	if err == nil {
+		err = validateMarketplaceFeedbackEnvelope(req, params)
+	}
+	if err != nil {
+		metrics.MarketplaceFeedbackMalformed.Inc()
+		h.logger.Warn("rejected malformed marketplace feedback notification", "event_id", req.Event.ID.Hex(), "error", err)
+		return nil
+	}
+	if h.registry == nil {
+		return errors.New("marketplace feedback registry is not configured")
+	}
+
+	inserted, err := h.registry.RecordFeedback(ctx, ReviewFeedback{
+		ReviewEventID: params.ReviewEventID,
+		RaterPubkey:   senderPubkey,
+		Rating:        params.Rating, Helpful: params.Helpful, Accurate: params.Accurate,
+		Comment: params.Comment, EventID: req.Event.ID.Hex(), CreatedAt: int64(req.Event.CreatedAt),
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrFeedbackUnauthorized):
+			metrics.MarketplaceFeedbackUnauthorized.Inc()
+			h.logger.Warn("rejected unauthorized marketplace feedback", "event_id", req.Event.ID.Hex(), "sender", senderPubkey)
+			return nil
+		case errors.Is(err, ErrFeedbackInvalid), errors.Is(err, ErrFeedbackNotFound):
+			metrics.MarketplaceFeedbackMalformed.Inc()
+			h.logger.Warn("rejected invalid marketplace feedback", "event_id", req.Event.ID.Hex(), "error", err)
+			return nil
+		default:
+			h.logger.Error("failed to store marketplace feedback", "event_id", req.Event.ID.Hex(), "error", err)
+			if h.feedbackLimiter != nil {
+				if refundErr := h.feedbackLimiter.Refund(ctx, senderPubkey); refundErr != nil {
+					return errors.Join(err, refundErr)
+				}
+			}
+			return err
+		}
+	}
+	if !inserted {
+		metrics.MarketplaceFeedbackDuplicate.Inc()
+		h.logger.Info("ignored idempotent marketplace feedback duplicate", "event_id", req.Event.ID.Hex(), "review_event_id", params.ReviewEventID)
+		return nil
 	}
 
 	metrics.MarketplaceFeedbackReceived.Inc()
-
-	h.logger.Info("recorded review feedback",
-		"event_id", event.ID.Hex(),
-		"review_event_id", feedback.ReviewEventID,
-		"rating", feedback.Rating,
-	)
-
+	metrics.MarketplaceFeedbackAccepted.Inc()
+	h.logger.Info("recorded marketplace feedback", "event_id", req.Event.ID.Hex(), "review_event_id", params.ReviewEventID, "rating", params.Rating)
 	return nil
+}
+
+func parseMarketplaceFeedbackParams(raw json.RawMessage) (MarketplaceFeedbackParams, error) {
+	var params MarketplaceFeedbackParams
+	if len(raw) == 0 {
+		return params, errors.New("feedback params are required")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&params); err != nil {
+		return params, fmt.Errorf("decode feedback params: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return params, errors.New("feedback params must contain one JSON object")
+	}
+	if strings.TrimSpace(params.ReviewEventID) == "" {
+		return params, errors.New("review_event_id is required")
+	}
+	if !IsValidRating(params.Rating) {
+		return params, errors.New("rating must be between 1 and 5")
+	}
+	if len(params.Comment) > feedbackCommentMaxBytes {
+		return params, errors.New("comment exceeds 4096 bytes")
+	}
+	return params, nil
+}
+
+func validateMarketplaceFeedbackEnvelope(req contextvm.Request, params MarketplaceFeedbackParams) error {
+	if req.Sender == nostr.ZeroPK || req.Event.ID == nostr.ZeroID {
+		return errors.New("authenticated sender and event id are required")
+	}
+	methods := feedbackTagValues(req.Event.Tags, "method")
+	if len(methods) != 1 || methods[0] != MethodFeedback {
+		return errors.New("method tag must match marketplace/feedback")
+	}
+	related := feedbackTagValues(req.Event.Tags, "e")
+	if len(related) != 1 || related[0] != params.ReviewEventID {
+		return errors.New("e tag must match review_event_id")
+	}
+	expirations := feedbackTagValues(req.Event.Tags, "expiration")
+	if len(expirations) > 1 {
+		return errors.New("at most one expiration tag is allowed")
+	}
+	if len(expirations) == 0 {
+		return nil
+	}
+	expiresAt, err := strconv.ParseInt(expirations[0], 10, 64)
+	if err != nil {
+		return errors.New("expiration must be a Unix timestamp")
+	}
+	now := time.Now().Unix()
+	if expiresAt <= now {
+		return errors.New("feedback notification expired")
+	}
+	createdAt := int64(req.Event.CreatedAt)
+	if createdAt <= 0 || expiresAt <= createdAt || expiresAt > createdAt+int64(feedbackNotificationMaxLifetime/time.Second) {
+		return errors.New("expiration exceeds the 15 minute feedback lifetime")
+	}
+	return nil
+}
+
+func feedbackTagValues(tags nostr.Tags, name string) []string {
+	var values []string
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == name {
+			values = append(values, tag[1])
+		}
+	}
+	return values
 }

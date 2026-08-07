@@ -313,7 +313,6 @@ var knownKinds = map[int]bool{
 	0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: true,
 	1111: true, 1617: true, 1618: true, 1619: true, 1621: true, 1622: true,
 	1630: true, 1631: true, 1632: true, 1633: true, 1985: true,
-	5900: true, 6900: true, 7000: true,
 	10002: true, 30017: true, 30023: true, 30617: true, 30618: true, 30818: true,
 	30819: true,
 }

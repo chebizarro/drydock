@@ -597,12 +597,29 @@ func TestRecordFeedback(t *testing.T) {
 	if !inserted {
 		t.Fatal("expected first feedback insert")
 	}
-	inserted, err = store.RecordFeedback(ctx, feedback)
+	reputation, err := store.GetReviewerReputation(ctx, "reviewer-1")
+	if err != nil {
+		t.Fatalf("GetReviewerReputation: %v", err)
+	}
+	if reputation.AverageRating != 5 {
+		t.Fatalf("average rating after insert = %v, want 5", reputation.AverageRating)
+	}
+	duplicate := feedback
+	duplicate.Rating = 1
+	duplicate.EventID = "feedback-evt-2"
+	inserted, err = store.RecordFeedback(ctx, duplicate)
 	if err != nil {
 		t.Fatalf("duplicate RecordFeedback: %v", err)
 	}
 	if inserted {
 		t.Fatal("expected duplicate feedback to be idempotent")
+	}
+	reputation, err = store.GetReviewerReputation(ctx, "reviewer-1")
+	if err != nil {
+		t.Fatalf("GetReviewerReputation after duplicate: %v", err)
+	}
+	if reputation.AverageRating != 5 {
+		t.Fatalf("duplicate changed average rating to %v, want 5", reputation.AverageRating)
 	}
 }
 

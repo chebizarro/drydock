@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
+	"time"
 
 	"drydock/internal/auditengine"
-	"drydock/internal/eventkind"
+	"drydock/internal/metrics"
 	"drydock/internal/repoconfig"
 	"drydock/internal/scope"
 
@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	MethodSecurityAudit      = "security/audit"
-	MethodSecurityAuditSARIF = "security/audit/sarif"
+	MethodSecurityAudit         = "security/audit"
+	MethodSecurityAuditSARIF    = "security/audit/sarif"
+	MethodSecurityAuditProgress = "security/audit/progress"
 )
 
 type SecurityAuditParams struct {
@@ -45,6 +46,46 @@ type SecurityAuditSARIFResult struct {
 	SARIF   json.RawMessage `json:"sarif"`
 }
 
+// SecurityAuditProgress is the notification payload published as an audit
+// advances. Event IDs deduplicate exact repeats; OccurredAt and then event ID
+// define a deterministic relay-delivery order.
+type SecurityAuditProgress struct {
+	AuditID        int64  `json:"audit_id"`
+	RequestEventID string `json:"request_event_id"`
+	Phase          string `json:"phase"`
+	Status         string `json:"status"`
+	Message        string `json:"message,omitempty"`
+	OccurredAt     int64  `json:"occurred_at"`
+}
+
+// ShouldApplySecurityAuditProgress applies the consumer ordering contract.
+// Terminal states never regress to processing, even if a processing event is
+// delivered later by a relay.
+func ShouldApplySecurityAuditProgress(current SecurityAuditProgress, currentEventID string, candidate SecurityAuditProgress, candidateEventID string) bool {
+	if candidateEventID == "" || candidateEventID == currentEventID {
+		return false
+	}
+	currentTerminal := isTerminalAuditStatus(current.Status)
+	candidateTerminal := isTerminalAuditStatus(candidate.Status)
+	if currentTerminal && !candidateTerminal {
+		return false
+	}
+	if !currentTerminal && candidateTerminal {
+		return true
+	}
+	if currentEventID == "" {
+		return true
+	}
+	if candidate.OccurredAt != current.OccurredAt {
+		return candidate.OccurredAt > current.OccurredAt
+	}
+	return candidateEventID > currentEventID
+}
+
+func isTerminalAuditStatus(status string) bool {
+	return status == "success" || status == "error"
+}
+
 type SecurityAuditRunner interface {
 	Run(context.Context, auditengine.Request) (auditengine.Result, error)
 }
@@ -67,19 +108,18 @@ type auditFeedbackTarget struct {
 
 type auditFeedbackContextKey struct{}
 
-type AuditFeedbackPublisher interface {
-	Publish(context.Context, []string, nostr.Event) error
+type AuditProgressNotifier interface {
+	Notify(context.Context, Notification) (string, error)
 }
 
-// AuditFeedbackReporter publishes NIP-90 kind 7000 progress for an audit.
+// AuditFeedbackReporter publishes one-way ContextVM audit progress notifications.
 type AuditFeedbackReporter struct {
-	signer    Signer
-	publisher AuditFeedbackPublisher
-	relays    []string
+	notifier AuditProgressNotifier
+	relays   []string
 }
 
-func NewAuditFeedbackReporter(signer Signer, publisher AuditFeedbackPublisher, relays []string) *AuditFeedbackReporter {
-	return &AuditFeedbackReporter{signer: signer, publisher: publisher, relays: append([]string(nil), relays...)}
+func NewAuditFeedbackReporter(notifier AuditProgressNotifier, relays []string) *AuditFeedbackReporter {
+	return &AuditFeedbackReporter{notifier: notifier, relays: append([]string(nil), relays...)}
 }
 
 func (r *AuditFeedbackReporter) ReportAuditProgress(ctx context.Context, auditID int64, phase string) error {
@@ -90,17 +130,15 @@ func (r *AuditFeedbackReporter) ReportAuditProgress(ctx context.Context, auditID
 	return r.publish(ctx, auditID, phase, status, "")
 }
 
-func (r *AuditFeedbackReporter) ReportAuditFailure(ctx context.Context, auditID int64, err error) error {
-	message := "security audit failed"
-	if err != nil {
-		message = err.Error()
-	}
-	return r.publish(ctx, auditID, "failed", "error", message)
+func (r *AuditFeedbackReporter) ReportAuditFailure(ctx context.Context, auditID int64, _ error) error {
+	// Detailed failures remain in server logs and durable audit state; avoid
+	// exposing repository/security internals in relay-visible notification content.
+	return r.publish(ctx, auditID, "failed", "error", "security audit failed")
 }
 
 func (r *AuditFeedbackReporter) publish(ctx context.Context, auditID int64, phase, status, message string) error {
-	if r == nil || r.signer == nil || r.publisher == nil {
-		return errors.New("audit feedback publisher is not configured")
+	if r == nil || r.notifier == nil {
+		return errors.New("audit progress notifier is not configured")
 	}
 	target, ok := ctx.Value(auditFeedbackContextKey{}).(auditFeedbackTarget)
 	if !ok || target.RequestEventID == "" || target.Requester == nostr.ZeroPK {
@@ -110,33 +148,17 @@ func (r *AuditFeedbackReporter) publish(ctx context.Context, auditID int64, phas
 	if len(relays) == 0 {
 		relays = append(relays, r.relays...)
 	}
-	content, err := json.Marshal(struct {
-		AuditID int64  `json:"audit_id"`
-		Phase   string `json:"phase"`
-		Status  string `json:"status"`
-		Message string `json:"message,omitempty"`
-	}{AuditID: auditID, Phase: phase, Status: status, Message: message})
-	if err != nil {
-		return err
+	progress := SecurityAuditProgress{
+		AuditID: auditID, RequestEventID: target.RequestEventID, Phase: phase,
+		Status: status, Message: message, OccurredAt: time.Now().Unix(),
 	}
-	event := nostr.Event{
-		Kind:      eventkind.ReviewFeedback,
-		CreatedAt: nostr.Now(),
-		Tags: nostr.Tags{
-			{"e", target.RequestEventID},
-			{"p", target.Requester.Hex()},
-			{"status", status},
-			{"phase", phase},
-			{"audit", strconv.FormatInt(auditID, 10)},
-			{"t", "security-audit"},
-		},
-		Content: string(content),
-	}
-	if err := r.signer.SignEvent(ctx, &event); err != nil {
-		return fmt.Errorf("sign audit feedback: %w", err)
-	}
-	if err := r.publisher.Publish(ctx, relays, event); err != nil {
-		return fmt.Errorf("publish audit feedback: %w", err)
+	if _, err := r.notifier.Notify(ctx, Notification{
+		Method: MethodSecurityAuditProgress, Params: progress,
+		Recipients: []nostr.PubKey{target.Requester}, RelatedEventID: target.RequestEventID,
+		Relays: relays,
+	}); err != nil {
+		metrics.SecurityAuditProgressNotificationFailures.Inc()
+		return fmt.Errorf("publish audit progress notification: %w", err)
 	}
 	return nil
 }

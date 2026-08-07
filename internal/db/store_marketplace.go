@@ -620,12 +620,18 @@ func (s *Store) ExpireStaleAssignments(ctx context.Context) (int64, error) {
 	return result.RowsAffected()
 }
 
-// RecordFeedback stores feedback on a completed review and reports whether
-// this call inserted the immutable first-write-wins record.
+// RecordFeedback stores immutable first-write-wins feedback and updates the
+// affected reviewer's derived reputation in the same transaction. The returned
+// bool is false for an idempotent duplicate.
 func (s *Store) RecordFeedback(ctx context.Context, fb ReviewFeedback) (bool, error) {
 	now := time.Now().Unix()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin feedback transaction: %w", err)
+	}
+	defer tx.Rollback()
 
-	result, err := s.db.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO review_feedback (
 			assignment_id, reviewer_pubkey, rater_pubkey,
 			rating, comment, event_id, created_at
@@ -642,7 +648,62 @@ func (s *Store) RecordFeedback(ctx context.Context, fb ReviewFeedback) (bool, er
 	if err != nil {
 		return false, err
 	}
-	return inserted == 1, nil
+	if inserted == 0 {
+		return false, nil
+	}
+
+	var totalAssignments, accepted, rejected, completed int
+	var totalFeedback int
+	var totalRating float64
+	var lastReviewAt int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0),
+			COALESCE(MAX(updated_at), 0)
+		FROM review_assignments WHERE reviewer_pubkey = ?
+	`, fb.ReviewerPubkey).Scan(&totalAssignments, &accepted, &rejected, &completed, &lastReviewAt); err != nil {
+		return false, fmt.Errorf("feedback reputation assignment stats: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(rating), 0)
+		FROM review_feedback WHERE reviewer_pubkey = ?
+	`, fb.ReviewerPubkey).Scan(&totalFeedback, &totalRating); err != nil {
+		return false, fmt.Errorf("feedback reputation rating stats: %w", err)
+	}
+
+	var acceptanceRate, averageRating float64
+	if totalAssignments > 0 {
+		acceptanceRate = float64(accepted) / float64(totalAssignments)
+	}
+	if totalFeedback > 0 {
+		averageRating = totalRating / float64(totalFeedback)
+	}
+	volumeBonus := 1.0 - (1.0 / (1.0 + float64(completed)/10.0))
+	overallScore := acceptanceRate*0.4 + (averageRating/5.0)*0.4 + volumeBonus*0.2
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO reviewer_reputations (
+			pubkey, overall_score, total_reviews, accepted_reviews, rejected_reviews,
+			average_rating, acceptance_rate, last_review_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(pubkey) DO UPDATE SET
+			overall_score = excluded.overall_score,
+			total_reviews = excluded.total_reviews,
+			accepted_reviews = excluded.accepted_reviews,
+			rejected_reviews = excluded.rejected_reviews,
+			average_rating = excluded.average_rating,
+			acceptance_rate = excluded.acceptance_rate,
+			last_review_at = excluded.last_review_at,
+			updated_at = excluded.updated_at
+	`, fb.ReviewerPubkey, overallScore, completed, accepted, rejected,
+		averageRating, acceptanceRate, lastReviewAt, now); err != nil {
+		return false, fmt.Errorf("update feedback reputation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit feedback transaction: %w", err)
+	}
+	return true, nil
 }
 
 // GetReviewerStats retrieves aggregated stats for reputation calculation.

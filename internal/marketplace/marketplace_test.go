@@ -2,6 +2,7 @@ package marketplace
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"path/filepath"
 	"testing"
@@ -281,23 +282,8 @@ func TestReputationCalculation(t *testing.T) {
 }
 
 func TestEventKinds(t *testing.T) {
-	tests := []struct {
-		name string
-		kind int
-	}{
-		{"KindReviewerProfile", int(KindReviewerProfile)},
-		{"KindReviewFeedback", int(KindReviewFeedback)},
-	}
-
-	expectedKinds := map[int]bool{
-		31990: true, // Reviewer profile (NIP-89 app handler)
-		7000:  true, // NIP-90 feedback
-	}
-
-	for _, tc := range tests {
-		if !expectedKinds[tc.kind] {
-			t.Errorf("%s = %d, not in expected kinds", tc.name, tc.kind)
-		}
+	if KindReviewerProfile != nostr.Kind(31990) {
+		t.Fatalf("KindReviewerProfile = %d, want 31990", KindReviewerProfile)
 	}
 }
 
@@ -333,7 +319,7 @@ func TestReviewerProfileNIP89Event(t *testing.T) {
 		{"drydock:availability", "available"},
 		{"drydock:price", "1000"},
 		{"drydock:payout", "lnbc1profilepayout"},
-		{"drydock:methods", "marketplace/assign", "marketplace/accept", "marketplace/reject", "marketplace/complete"},
+		{"drydock:methods", "marketplace/assign", "marketplace/accept", "marketplace/reject", "marketplace/complete", "marketplace/feedback"},
 	}
 	for _, want := range wantTags {
 		if !hasTag(event.Tags, want) {
@@ -378,49 +364,22 @@ func hasTag(tags nostr.Tags, want nostr.Tag) bool {
 	return false
 }
 
-func TestReviewFeedbackTags(t *testing.T) {
-	tags := ReviewFeedbackTags("review123", "reviewer456", 5)
-
-	if tagValue(tags, "e") != "review123" {
-		t.Errorf("e tag = %q, want review123", tagValue(tags, "e"))
+func TestMarketplaceFeedbackParamsRejectSenderSuppliedIdentity(t *testing.T) {
+	for _, raw := range []string{
+		`{"review_event_id":"review123","rating":5,"rater_pubkey":"attacker"}`,
+		`{"review_event_id":"review123","rating":5,"reviewer_pubkey":"attacker"}`,
+		`{"review_event_id":"review123","rating":5,"assignment_id":42}`,
+	} {
+		if _, err := parseMarketplaceFeedbackParams(json.RawMessage(raw)); err == nil {
+			t.Fatalf("accepted forbidden feedback identity field: %s", raw)
+		}
 	}
-	if tagValue(tags, "p") != "reviewer456" {
-		t.Errorf("p tag = %q, want reviewer456", tagValue(tags, "p"))
-	}
-	if tagValue(tags, "status") != FeedbackStatusSuccess {
-		t.Errorf("status tag = %q, want %q", tagValue(tags, "status"), FeedbackStatusSuccess)
-	}
-	if tagValue(tags, "rating") != "5" {
-		t.Errorf("rating tag = %q, want 5", tagValue(tags, "rating"))
-	}
-	if tagValue(tags, "t") != TagReviewFeedback {
-		t.Errorf("t tag = %q, want %q", tagValue(tags, "t"), TagReviewFeedback)
-	}
-}
-
-func TestParseReviewFeedbackEventReadsRatingFromTag(t *testing.T) {
-	event := nostr.Event{
-		Kind:    KindReviewFeedback,
-		Tags:    ReviewFeedbackTags("review123", "reviewer456", 5),
-		Content: `{"helpful":true,"accurate":true,"comment":"Great review!","rating":1}`,
-	}
-
-	feedback, err := ParseReviewFeedbackEvent(event)
+	params, err := parseMarketplaceFeedbackParams(json.RawMessage(`{"review_event_id":"review123","rating":5,"helpful":true,"accurate":true,"comment":"Great review!"}`))
 	if err != nil {
-		t.Fatalf("ParseReviewFeedbackEvent failed: %v", err)
+		t.Fatalf("valid feedback params rejected: %v", err)
 	}
-
-	if feedback.Rating != 5 {
-		t.Errorf("Rating = %d, want 5", feedback.Rating)
-	}
-	if feedback.ReviewEventID != "review123" {
-		t.Errorf("ReviewEventID = %q, want review123", feedback.ReviewEventID)
-	}
-	if feedback.ReviewerPubkey != "reviewer456" {
-		t.Errorf("ReviewerPubkey = %q, want reviewer456", feedback.ReviewerPubkey)
-	}
-	if !feedback.Helpful || !feedback.Accurate || feedback.Comment != "Great review!" {
-		t.Errorf("feedback content not parsed: %+v", feedback)
+	if params.ReviewEventID != "review123" || params.Rating != 5 || !params.Helpful || !params.Accurate {
+		t.Fatalf("parsed feedback params = %+v", params)
 	}
 }
 

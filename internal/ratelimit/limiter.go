@@ -65,6 +65,10 @@ func New(cfg Config, store Store) *Limiter {
 	}
 }
 
+type refundableStore interface {
+	RefundRateLimit(ctx context.Context, key string) error
+}
+
 // Result contains the outcome of a rate limit check.
 type Result struct {
 	Allowed   bool
@@ -150,6 +154,22 @@ func (l *Limiter) Allow(ctx context.Context, key string) (Result, error) {
 	}, nil
 }
 
+// Refund returns one previously consumed allowance for key. It is used when
+// downstream durable processing fails and the same event must remain eligible
+// for relay redelivery.
+func (l *Limiter) Refund(ctx context.Context, key string) error {
+	store, ok := l.store.(refundableStore)
+	if !ok {
+		return fmt.Errorf("rate limit store does not support refunds")
+	}
+	fullKey := l.cfg.KeyPrefix + key
+	if err := store.RefundRateLimit(ctx, fullKey); err != nil {
+		return fmt.Errorf("refund rate limit: %w", err)
+	}
+	l.decrementCache(fullKey)
+	return nil
+}
+
 // Cleanup removes old rate limit entries from the database.
 // Should be called periodically (e.g., every hour).
 func (l *Limiter) Cleanup(ctx context.Context) (int64, error) {
@@ -175,6 +195,14 @@ func (l *Limiter) incrementCache(key string) {
 	defer l.mu.Unlock()
 	if entry, ok := l.cache[key]; ok {
 		entry.count++
+	}
+}
+
+func (l *Limiter) decrementCache(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if entry, ok := l.cache[key]; ok && entry.count > 0 {
+		entry.count--
 	}
 }
 
@@ -288,6 +316,21 @@ func (m *MemoryStore) CheckAndIncrementRateLimit(ctx context.Context, key string
 	return count, false, nil
 }
 
+func (m *MemoryStore) RefundRateLimit(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	timestamps := m.entries[key]
+	if len(timestamps) == 0 {
+		return fmt.Errorf("no rate limit allowance to refund for %s", key)
+	}
+	if len(timestamps) == 1 {
+		delete(m.entries, key)
+	} else {
+		m.entries[key] = timestamps[:len(timestamps)-1]
+	}
+	return nil
+}
+
 func (m *MemoryStore) CleanupOldRateLimits(ctx context.Context, olderThan int64) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -379,6 +422,24 @@ func (s *SQLStore) CheckAndIncrementRateLimit(ctx context.Context, key string, w
 	// Over limit - rollback (no insert)
 	tx.Rollback()
 	return count, false, nil
+}
+
+func (s *SQLStore) RefundRateLimit(ctx context.Context, key string) error {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM rate_limits
+		WHERE id = (SELECT id FROM rate_limits WHERE key = ? ORDER BY id DESC LIMIT 1)
+	`, key)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("no rate limit allowance to refund for %s", key)
+	}
+	return nil
 }
 
 func (s *SQLStore) CleanupOldRateLimits(ctx context.Context, olderThan int64) (int64, error) {

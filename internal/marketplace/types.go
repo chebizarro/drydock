@@ -8,7 +8,7 @@
 //   - kind 31990: Reviewer NIP-89 application handler (d=drydock-reviewer)
 //   - kind 25910: Review assignment ContextVM intent (marketplace/assign)
 //   - kind 25910: ContextVM JSON-RPC intents for assignment acceptance/rejection
-//   - kind 7000:  NIP-90 review feedback (patch author rates the review)
+//   - kind 25910: marketplace/feedback notification (requester rates the review)
 //
 // # Reputation Model
 //
@@ -21,7 +21,6 @@ package marketplace
 
 import (
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"time"
 
@@ -33,19 +32,12 @@ import (
 // Event kinds for marketplace.
 const (
 	KindReviewerProfile = eventkind.ReviewerProfile // NIP-89 application handler
-	KindReviewFeedback  = eventkind.ReviewFeedback  // NIP-90 feedback (patch author rates the review)
 
 	// Legacy constants retained for compatibility with older tests/helpers.
 	// Live marketplace assignment/accept/reject now uses ContextVM kind 25910.
 	KindReviewAssignment = 1660
 	KindReviewAcceptance = 1661
 	KindReviewRejection  = 1662
-)
-
-// NIP-90 feedback tags for marketplace review feedback.
-const (
-	FeedbackStatusSuccess = "success"
-	TagReviewFeedback     = "review-feedback"
 )
 
 const (
@@ -56,6 +48,7 @@ const (
 	MethodAccept   = "marketplace/accept"
 	MethodReject   = "marketplace/reject"
 	MethodComplete = "marketplace/complete"
+	MethodFeedback = "marketplace/feedback"
 )
 
 // ReviewerProfile represents a community reviewer's registration.
@@ -127,19 +120,27 @@ type ReviewRejection struct {
 	EventID        string `json:"-"`
 }
 
-// ReviewFeedback represents a patch author's rating of a review.
-// Published as NIP-90 feedback kind 7000 in reply to the review.
+// MarketplaceFeedbackParams is the notification-only wire contract. Sender
+// and reviewer identities are derived from the authenticated event and the
+// durable assignment rather than accepted from params.
+type MarketplaceFeedbackParams struct {
+	ReviewEventID string `json:"review_event_id"`
+	Rating        int    `json:"rating"`
+	Helpful       bool   `json:"helpful,omitempty"`
+	Accurate      bool   `json:"accurate,omitempty"`
+	Comment       string `json:"comment,omitempty"`
+}
+
+// ReviewFeedback is the internal, authenticated feedback command.
 type ReviewFeedback struct {
-	AssignmentID   int    `json:"assignment_id,omitempty"` // Legacy compatibility; NIP-90 uses review_event_id/e-tag.
-	ReviewEventID  string `json:"review_event_id"`
-	ReviewerPubkey string `json:"reviewer_pubkey"`
-	RaterPubkey    string `json:"rater_pubkey,omitempty"`
-	Rating         int    `json:"rating"`   // 1-5 stars
-	Helpful        bool   `json:"helpful"`  // Was the review helpful?
-	Accurate       bool   `json:"accurate"` // Were findings accurate?
-	Comment        string `json:"comment,omitempty"`
-	EventID        string `json:"event_id,omitempty"`
-	CreatedAt      int64  `json:"created_at"`
+	ReviewEventID string
+	RaterPubkey   string
+	Rating        int
+	Helpful       bool
+	Accurate      bool
+	Comment       string
+	EventID       string
+	CreatedAt     int64
 }
 
 // ReputationScore holds a reviewer's calculated reputation.
@@ -198,7 +199,7 @@ func ReviewerProfileTags(profile ReviewerProfile) nostr.Tags {
 	if profile.PayoutDestination != "" {
 		tags = append(tags, DrydockTag("payout", profile.PayoutDestination))
 	}
-	tags = append(tags, DrydockTag("methods", MethodAssign, MethodAccept, MethodReject, MethodComplete))
+	tags = append(tags, DrydockTag("methods", MethodAssign, MethodAccept, MethodReject, MethodComplete, MethodFeedback))
 	return tags
 }
 
@@ -296,51 +297,6 @@ func ParseReviewAssignment(content string) (ReviewAssignment, error) {
 	return assignment, err
 }
 
-// ParseReviewFeedback parses a ReviewFeedback from event content.
-func ParseReviewFeedback(content string) (ReviewFeedback, error) {
-	var feedback ReviewFeedback
-	err := json.Unmarshal([]byte(content), &feedback)
-	return feedback, err
-}
-
-// ParseReviewFeedbackEvent parses NIP-90 review feedback from a kind 7000 event.
-func ParseReviewFeedbackEvent(event nostr.Event) (ReviewFeedback, error) {
-	if event.Kind != KindReviewFeedback {
-		return ReviewFeedback{}, fmt.Errorf("unexpected feedback kind: %d", event.Kind)
-	}
-	if tagValue(event.Tags, "t") != TagReviewFeedback {
-		return ReviewFeedback{}, fmt.Errorf("missing review feedback t tag")
-	}
-	if status := tagValue(event.Tags, "status"); status != "" && status != FeedbackStatusSuccess {
-		return ReviewFeedback{}, fmt.Errorf("unsupported feedback status: %s", status)
-	}
-
-	feedback, err := ParseReviewFeedback(event.Content)
-	if err != nil {
-		return ReviewFeedback{}, err
-	}
-
-	feedback.ReviewEventID = tagValue(event.Tags, "e")
-	feedback.ReviewerPubkey = tagValue(event.Tags, "p")
-	feedback.RaterPubkey = event.PubKey.Hex()
-	feedback.EventID = event.ID.Hex()
-	feedback.CreatedAt = int64(event.CreatedAt)
-
-	ratingTag := tagValue(event.Tags, "rating")
-	if ratingTag == "" {
-		return ReviewFeedback{}, fmt.Errorf("missing rating tag")
-	}
-	feedback.Rating, err = strconv.Atoi(ratingTag)
-	if err != nil {
-		return ReviewFeedback{}, fmt.Errorf("parse rating tag: %w", err)
-	}
-	if !IsValidRating(feedback.Rating) {
-		return ReviewFeedback{}, fmt.Errorf("invalid rating: %d", feedback.Rating)
-	}
-
-	return feedback, nil
-}
-
 func tagValue(tags nostr.Tags, name string) string {
 	for _, tag := range tags {
 		if len(tag) >= 2 && tag[0] == name {
@@ -348,17 +304,6 @@ func tagValue(tags nostr.Tags, name string) string {
 		}
 	}
 	return ""
-}
-
-// ReviewFeedbackTags builds the required NIP-90 tags for review feedback.
-func ReviewFeedbackTags(reviewEventID, reviewerPubkey string, rating int) nostr.Tags {
-	return nostr.Tags{
-		nostr.Tag{"e", reviewEventID},
-		nostr.Tag{"p", reviewerPubkey},
-		nostr.Tag{"status", FeedbackStatusSuccess},
-		nostr.Tag{"rating", strconv.Itoa(rating)},
-		nostr.Tag{"t", TagReviewFeedback},
-	}
 }
 
 // IsValidRating checks if a rating is in the valid range.

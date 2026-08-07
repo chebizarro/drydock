@@ -40,7 +40,6 @@ func TestSubscribedKindsSet(t *testing.T) {
 		30078: true, // IDE workspace session (NIP-78 app data)
 		25910: true, // ContextVM IDE/marketplace intents/responses
 		31990: true, // Marketplace: reviewer profile (NIP-89 app handler)
-		7000:  true, // Marketplace: NIP-90 review feedback
 		9735:  true, // NIP-57 zap receipt
 	}
 
@@ -57,6 +56,9 @@ func TestSubscribedKindsSet(t *testing.T) {
 		if !seen[kind] {
 			t.Fatalf("missing kind %d", kind)
 		}
+	}
+	if seen[7000] {
+		t.Fatal("kind 7000 remains in listener subscriptions after ContextVM cutover")
 	}
 }
 
