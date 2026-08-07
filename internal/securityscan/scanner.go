@@ -51,6 +51,11 @@ func NewWithRules(rules []Rule) *Scanner {
 	return &Scanner{rules: rules}
 }
 
+// NewWithRuleSets creates a Scanner with custom finding and surface rules.
+func NewWithRuleSets(rules, surfaceRules []Rule) *Scanner {
+	return &Scanner{rules: rules, surfaceRules: surfaceRules}
+}
+
 // ScanFiles runs all applicable rules against the changed files in repoPath.
 // Only lines added in the diff (prefixed with "+") are scanned when diffContent
 // is provided, to avoid flagging pre-existing issues.

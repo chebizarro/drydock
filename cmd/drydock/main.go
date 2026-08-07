@@ -422,6 +422,7 @@ func main() {
 		llmClient,
 		reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel},
 		reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel},
+		securityreview.WithNostrEnabled(cfg.SecurityNostrEnabled),
 	)
 
 	// Verify configured model names against what each endpoint actually
@@ -460,7 +461,7 @@ func main() {
 		classifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel}
 		feedback := contextvm.NewAuditFeedbackReporter(signer, relayPub, writeRelays)
 		auditEngine := auditengine.New(
-			auditengine.Config{Workers: cfg.SecurityAuditWorkers},
+			auditengine.Config{Workers: cfg.SecurityAuditWorkers, NostrEnabled: cfg.SecurityNostrEnabled},
 			auditengine.Dependencies{
 				Repos:          repoManager,
 				Store:          store,

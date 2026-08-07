@@ -127,6 +127,29 @@ func TestNostrSurfaceRulePatterns(t *testing.T) {
 	}
 }
 
+func TestPresenceRulesAreRoleGated(t *testing.T) {
+	clientRules := PresenceRulesForRoles([]Role{RoleClient})
+	if !containsRule(clientRules, "NOSTR-V6") || containsRule(clientRules, "NOSTR-R1") {
+		t.Fatalf("client role rules are not gated: %#v", clientRules)
+	}
+	relayRules := PresenceRulesForRoles([]Role{RoleRelay})
+	if containsRule(relayRules, "NOSTR-V5") || containsRule(relayRules, "NOSTR-V6") {
+		t.Fatalf("relay role includes client preview rules: %#v", relayRules)
+	}
+	if !RuleAppliesToRoles("NOSTR-R1", []Role{RoleRelay}) {
+		t.Fatal("relay role should include replay/persistence checks")
+	}
+}
+
+func containsRule(rules []securityscan.Rule, id string) bool {
+	for _, rule := range rules {
+		if rule.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func ruleByID(t *testing.T, id string) securityscan.Rule {
 	t.Helper()
 	for _, rule := range PresenceRules() {

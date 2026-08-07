@@ -22,7 +22,10 @@ import (
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/metrics"
+	"drydock/internal/nostrscan"
+	"drydock/internal/nostrscan/knowledge"
 	"drydock/internal/publisher"
+	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
 	"drydock/internal/securityscan"
 	"drydock/internal/securityscan/surface"
@@ -120,7 +123,10 @@ type Dependencies struct {
 	Tools           ToolRunner
 	Localizer       Localizer
 }
-type Config struct{ Workers int }
+type Config struct {
+	Workers      int
+	NostrEnabled string
+}
 type Engine struct {
 	cfg    Config
 	deps   Dependencies
@@ -164,6 +170,7 @@ type Request struct {
 	EnableSCA     bool
 	EnableSecrets bool
 	Localizer     string
+	Nostr         repoconfig.NostrConfig
 	Announcement  nostr.Event
 	Requester     nostr.PubKey
 	Relays        []string
@@ -247,6 +254,16 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		return result, fmt.Errorf("resolve audit commit: %w", err)
 	}
 
+	var nostrProfile nostrscan.NostrProfile
+	nostrActive := e.cfg.NostrEnabled != "false" && e.cfg.NostrEnabled != "" && req.Nostr.Enabled != "false" && req.Nostr.Enabled != ""
+	if nostrActive {
+		nostrProfile, err = nostrscan.Detect(ctx, repoPath, "HEAD", nostrscan.WithMinConfidence(req.Nostr.MinDetectConfidence), nostrscan.WithLogger(e.logger))
+		if err != nil {
+			return result, fmt.Errorf("detect nostr project: %w", err)
+		}
+		nostrActive = nostrProfile.IsNostr
+	}
+
 	e.progress(ctx, auditID, "codemap")
 	codeMap, err := e.deps.CodeMap.Build(ctx, repoPath, "HEAD")
 	if err != nil {
@@ -259,6 +276,35 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	result.ScannedFiles = scan.FilesScanned
 	surfaceResult := e.deps.Scanner.LocateSurface(ctx, repoPath, files)
 	allDeterministic := append(scanFindings(scan.Findings), e.runOptionalTools(ctx, repoPath, req)...)
+
+	var nostrContext, nostrPreamble string
+	if nostrActive {
+		roles := auditNostrRoles(nostrProfile.Roles, req.Nostr)
+		rules := auditNostrRules(nostrscan.PresenceRulesForRoles(roles), req.Nostr)
+		nostrScanner := securityscan.NewWithRuleSets(rules, nostrscan.SurfaceRules())
+		nostrPresence := nostrScanner.ScanFiles(ctx, repoPath, files, "")
+		nostrSurfaces := nostrScanner.LocateSurface(ctx, repoPath, files)
+		surfaceResult.Locations = append(surfaceResult.Locations, nostrSurfaces.Locations...)
+		nostrFindings := auditNostrFindings(nostrPresence.Findings, files, roles, req.Nostr)
+		if req.Nostr.AbsenceAnalysis {
+			absence := nostrscan.AnalyzeAbsences(ctx, repoPath, codeMap, nostrSurfaces)
+			nostrFindings = append(nostrFindings, auditNostrFindings(absence.Findings, files, roles, req.Nostr)...)
+		}
+		allDeterministic = append(allDeterministic, scanFindings(nostrFindings)...)
+		if req.Nostr.KnowledgePack {
+			nostrContext, err = knowledge.Context()
+			if err != nil {
+				return result, fmt.Errorf("load nostr knowledge context: %w", err)
+			}
+			nostrPreamble, err = knowledge.ReviewerSystemPreamble()
+			if err != nil {
+				return result, fmt.Errorf("load nostr reviewer preamble: %w", err)
+			}
+		}
+		if req.Nostr.VerifyVotes > budget.VerifyVotes {
+			budget.VerifyVotes = req.Nostr.VerifyVotes
+		}
+	}
 
 	e.progress(ctx, auditID, "localize")
 	units := e.localize(ctx, repoPath, codeMap, files, allDeterministic, surfaceResult, req.SinceCommit)
@@ -273,12 +319,12 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	for i := range units {
 		units[i].Findings = findingsForFile(allDeterministic, units[i].File)
 		if budget.ModelReview {
-			units[i].Packet = e.assemblePacket(ctx, repoPath, req.RepoID, codeMap, units[i].File, units[i].Findings, surfaceResult, budget.TokenBudget)
+			units[i].Packet = e.assemblePacket(ctx, repoPath, req.RepoID, codeMap, units[i].File, units[i].Findings, surfaceResult, budget.TokenBudget, nostrContext)
 		}
 	}
 
 	e.progress(ctx, auditID, "review")
-	verified, err := e.reviewUnits(ctx, units, budget)
+	verified, err := e.reviewUnits(ctx, units, budget, nostrPreamble)
 	if err != nil {
 		return result, err
 	}
@@ -369,6 +415,9 @@ func scanFindings(findings []securityscan.SecurityFinding) []reviewengine.Findin
 	out := make([]reviewengine.Finding, 0, len(findings))
 	for _, finding := range findings {
 		cwe, evidence := securityscan.SASTRuleCWE[finding.RuleID], finding.Evidence
+		if strings.HasPrefix(finding.RuleID, "NOSTR-") {
+			evidence = "[" + finding.RuleID + "] " + evidence
+		}
 		if cwe != "" {
 			evidence = "[" + cwe + "] " + evidence
 		}
@@ -376,6 +425,46 @@ func scanFindings(findings []securityscan.SecurityFinding) []reviewengine.Findin
 	}
 	return out
 }
+func auditNostrRoles(detected []nostrscan.Role, cfg repoconfig.NostrConfig) []nostrscan.Role {
+	detectedStrings := make([]string, 0, len(detected))
+	for _, role := range detected {
+		detectedStrings = append(detectedStrings, string(role))
+	}
+	configured := cfg.EffectiveRoles(detectedStrings)
+	roles := make([]nostrscan.Role, 0, len(configured))
+	for _, role := range configured {
+		roles = append(roles, nostrscan.Role(role))
+	}
+	return roles
+}
+
+func auditNostrRules(rules []securityscan.Rule, cfg repoconfig.NostrConfig) []securityscan.Rule {
+	out := make([]securityscan.Rule, 0, len(rules))
+	for _, rule := range rules {
+		if cfg.AllowsRule(rule.ID) {
+			out = append(out, rule)
+		}
+	}
+	return out
+}
+
+func auditNostrFindings(findings []securityscan.SecurityFinding, files []string, roles []nostrscan.Role, cfg repoconfig.NostrConfig) []securityscan.SecurityFinding {
+	allowedFiles := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		allowedFiles[file] = struct{}{}
+	}
+	out := make([]securityscan.SecurityFinding, 0, len(findings))
+	for _, finding := range findings {
+		if _, ok := allowedFiles[finding.File]; !ok {
+			continue
+		}
+		if cfg.AllowsRule(finding.RuleID) && nostrscan.RuleAppliesToRoles(finding.RuleID, roles) {
+			out = append(out, finding)
+		}
+	}
+	return out
+}
+
 func (e *Engine) localize(ctx context.Context, repoPath string, codeMap *codemap.Map, files []string, deterministic []reviewengine.Finding, surfaces surface.Result, sinceCommit string) []candidateUnit {
 	scores, allowed := make(map[string]int), make(map[string]struct{}, len(files))
 	for _, file := range files {
@@ -512,13 +601,17 @@ func topRank(m *codemap.Map, file string) float64 {
 	return 0
 }
 
-func (e *Engine) assemblePacket(ctx context.Context, repoPath, repoID string, codeMap *codemap.Map, file string, findings []reviewengine.Finding, surfaces surface.Result, tokenBudget int) string {
+func (e *Engine) assemblePacket(ctx context.Context, repoPath, repoID string, codeMap *codemap.Map, file string, findings []reviewengine.Finding, surfaces surface.Result, tokenBudget int, nostrContext string) string {
 	bundle, err := e.deps.ContextBuilder.Build(ctx, contextbuilder.BuildInput{PatchEventContent: syntheticPatch(repoPath, file), RepoPath: repoPath, RepoID: repoID, TokenBudgetOverride: tokenBudget, DisableDocs: true})
 	if err != nil {
 		e.logger.Warn("audit context packet degraded", "file", file, "error", err)
 	}
 	var b strings.Builder
 	b.WriteString(bundle.Content)
+	if nostrContext != "" {
+		b.WriteString("\n\n## nostr-protocol\n")
+		b.WriteString(nostrContext)
+	}
 	b.WriteString("\n\n## blast-radius\n")
 	for _, symbol := range codeMap.Files[file].Symbols {
 		fmt.Fprintf(&b, "%s:%d %s", file, symbol.StartLine, symbol.Name)
@@ -553,7 +646,7 @@ func syntheticPatch(repoPath, file string) string {
 	return fmt.Sprintf("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1,0 +1,1 @@\n+%s\n", file, file, file, file, line)
 }
 
-func (e *Engine) reviewUnits(ctx context.Context, units []candidateUnit, budget Budget) ([]reviewengine.Finding, error) {
+func (e *Engine) reviewUnits(ctx context.Context, units []candidateUnit, budget Budget, nostrPreamble string) ([]reviewengine.Finding, error) {
 	if len(units) == 0 {
 		return nil, nil
 	}
@@ -575,7 +668,11 @@ func (e *Engine) reviewUnits(ctx context.Context, units []candidateUnit, budget 
 				}
 				candidates := append([]reviewengine.Finding(nil), unit.Findings...)
 				if budget.ModelReview {
-					output, err := e.deps.Reviewer.Run(ctx, reviewengine.RunInput{ContextBundle: unit.Packet, ChangedFiles: []string{unit.File}, ReviewerRoute: reviewengine.RouteSec70B, ReviewerSystemPromptOverride: securityAuditPrompt(), SkipWalkthrough: true})
+					systemPrompt := securityAuditPrompt()
+					if nostrPreamble != "" {
+						systemPrompt += "\n\n" + nostrPreamble
+					}
+					output, err := e.deps.Reviewer.Run(ctx, reviewengine.RunInput{ContextBundle: unit.Packet, ChangedFiles: []string{unit.File}, ReviewerRoute: reviewengine.RouteSec70B, ReviewerSystemPromptOverride: systemPrompt, SkipWalkthrough: true})
 					if err != nil {
 						results <- unitResult{err: fmt.Errorf("review %s: %w", unit.File, err)}
 						continue
@@ -591,6 +688,15 @@ func (e *Engine) reviewUnits(ctx context.Context, units []candidateUnit, budget 
 				if err != nil {
 					results <- unitResult{err: fmt.Errorf("verify %s: %w", unit.File, err)}
 					continue
+				}
+				for i := range verified {
+					if strings.Contains(strings.ToUpper(verified[i].Evidence), "NOSTR-") {
+						cwe := strings.ToUpper(strings.TrimSpace(verified[i].Category))
+						if strings.HasPrefix(cwe, "CWE-") && !strings.Contains(verified[i].Evidence, "["+cwe+"]") {
+							verified[i].Evidence = "[" + cwe + "] " + verified[i].Evidence
+						}
+						verified[i].Category = "security"
+					}
 				}
 				results <- unitResult{findings: verified}
 			}

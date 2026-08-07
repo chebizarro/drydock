@@ -194,6 +194,7 @@ func (h *SecurityAuditHandler) HandleSecurityAudit(ctx context.Context, req Requ
 		Depth: depth, RequestedBy: req.Sender.Hex(), Subtree: strings.TrimSpace(params.Subtree),
 		SinceCommit: strings.TrimSpace(params.SinceCommit), EnableSCA: repoCfg.Security.SCA,
 		EnableSecrets: repoCfg.Security.SecretScan, Localizer: repoCfg.Security.Audit.Localizer,
+		Nostr:        repoCfg.Security.Nostr,
 		Announcement: announcement, Requester: req.Sender, Relays: relays,
 	}
 	h.start(func() {

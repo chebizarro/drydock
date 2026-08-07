@@ -624,6 +624,36 @@ func validateNostrRules(config *NostrRulesConfig) error {
 	return err
 }
 
+// EffectiveRoles returns explicit roles when configured, otherwise detected roles.
+func (c NostrConfig) EffectiveRoles(detected []string) []string {
+	if !c.Roles.Auto {
+		return append([]string(nil), c.Roles.Roles...)
+	}
+	return append([]string(nil), detected...)
+}
+
+// AllowsRule reports whether a Nostr rule is selected by repository policy.
+func (c NostrConfig) AllowsRule(id string) bool {
+	id = strings.ToUpper(strings.TrimSpace(id))
+	if c.Rules.All {
+		return true
+	}
+	for _, configured := range c.Rules.Include {
+		if configured == id {
+			return true
+		}
+	}
+	if len(c.Rules.Exclude) > 0 {
+		for _, configured := range c.Rules.Exclude {
+			if configured == id {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // AllowsCategory returns true if the given category is allowed by this config.
 // When no categories are configured, all categories are allowed.
 func (c RepoConfig) AllowsCategory(category string) bool {

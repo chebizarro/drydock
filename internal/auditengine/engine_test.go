@@ -8,7 +8,10 @@ import (
 
 	"drydock/internal/codemap"
 	"drydock/internal/db"
+	"drydock/internal/nostrscan"
+	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
+	"drydock/internal/securityscan"
 	"drydock/internal/securityverify"
 	"drydock/internal/testutil"
 )
@@ -43,6 +46,25 @@ func TestBudgetForDepth(t *testing.T) {
 	}
 	if _, err := BudgetForDepth("unknown"); err == nil {
 		t.Fatal("invalid depth accepted")
+	}
+}
+
+func TestNostrAuditFindingsKeepRuleIDAndCWE(t *testing.T) {
+	cfg := repoconfig.Default().Security.Nostr
+	roles := []nostrscan.Role{nostrscan.RoleRelay}
+	findings := auditNostrFindings([]securityscan.SecurityFinding{
+		{RuleID: "NOSTR-V2", File: "relay.go", Evidence: "ingest -> store", Category: "security"},
+		{RuleID: "NOSTR-V6", File: "relay.go", Evidence: "preview", Category: "security"},
+	}, []string{"relay.go"}, roles, cfg)
+	if len(findings) != 1 || findings[0].RuleID != "NOSTR-V2" {
+		t.Fatalf("role-gated findings = %#v", findings)
+	}
+	converted := scanFindings(findings)
+	if len(converted) != 1 || converted[0].Category != "security" || findingCWE(converted[0]) != "CWE-347" {
+		t.Fatalf("converted findings = %#v", converted)
+	}
+	if converted[0].Evidence != "[CWE-347] [NOSTR-V2] ingest -> store" {
+		t.Fatalf("evidence = %q", converted[0].Evidence)
 	}
 }
 

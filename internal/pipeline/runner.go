@@ -497,8 +497,12 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 6d. Run the verified security lens when explicitly enabled or when the
 	// deterministic changed-file set contains a security-sensitive path.
 	var verifiedSecurityFindings []reviewengine.Finding
-	if r.securityReviewer != nil && (repoCfg.Security.Enabled || reviewengine.IsSecuritySensitive(changedFiles)) {
-		securityResult := r.securityReviewer.Run(ctx, bundle, prep.RepoPath, repoCfg.Security)
+	generalSecurity := repoCfg.Security.Enabled || reviewengine.IsSecuritySensitive(changedFiles)
+	nostrConfigured := repoCfg.Security.Nostr.Enabled != "" && repoCfg.Security.Nostr.Enabled != "false"
+	if r.securityReviewer != nil && (generalSecurity || nostrConfigured) {
+		stageConfig := repoCfg.Security
+		stageConfig.Enabled = generalSecurity
+		securityResult := r.securityReviewer.Run(ctx, bundle, prep.RepoPath, stageConfig)
 		if securityResult.Error != nil {
 			return fmt.Errorf("security review: %w", securityResult.Error)
 		}

@@ -77,6 +77,51 @@ func PresenceRules() []securityscan.Rule {
 	}
 }
 
+// PresenceRulesForRoles returns only rules relevant to at least one selected role.
+func PresenceRulesForRoles(roles []Role) []securityscan.Rule {
+	all := PresenceRules()
+	out := make([]securityscan.Rule, 0, len(all))
+	for _, rule := range all {
+		if RuleAppliesToRoles(rule.ID, roles) {
+			out = append(out, rule)
+		}
+	}
+	return out
+}
+
+// RuleAppliesToRoles reports whether a Nostr rule is meaningful for the roles.
+func RuleAppliesToRoles(ruleID string, roles []Role) bool {
+	if len(roles) == 0 {
+		return true
+	}
+	for _, role := range roles {
+		if role == RoleLibrary {
+			return true
+		}
+		switch ruleID {
+		case "NOSTR-V5", "NOSTR-V6":
+			if role == RoleClient {
+				return true
+			}
+		case "NOSTR-R1":
+			if role == RoleRelay || role == RoleDVM {
+				return true
+			}
+		case "NOSTR-V1", "NOSTR-R2":
+			if role == RoleClient || role == RoleDVM {
+				return true
+			}
+		case "NOSTR-V3", "NOSTR-V4":
+			if role == RoleClient || role == RoleSigner || role == RoleDVM {
+				return true
+			}
+		default: // Event authenticity and id integrity apply to every event consumer.
+			return true
+		}
+	}
+	return false
+}
+
 // SurfaceRules returns Nostr protocol boundary locators. They provide context
 // for absence analysis and must never be reported as findings.
 func SurfaceRules() []securityscan.Rule {

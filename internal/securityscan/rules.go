@@ -111,10 +111,15 @@ var SASTRuleCWE = map[string]string{
 	"SEC-060":  "CWE-918",
 	"SEC-070":  "CWE-295",
 	"SEC-080":  "CWE-502",
+	"NOSTR-V1": "CWE-345",
+	"NOSTR-V2": "CWE-347",
 	"NOSTR-V3": "CWE-353, CWE-327",
 	"NOSTR-V4": "CWE-323, CWE-1204",
 	"NOSTR-V5": "CWE-200",
 	"NOSTR-V6": "CWE-200, CWE-918",
+	"NOSTR-V7": "CWE-345",
+	"NOSTR-R1": "CWE-294",
+	"NOSTR-R2": "CWE-20",
 }
 
 // BuiltinRules returns the curated set of security scanning rules.
