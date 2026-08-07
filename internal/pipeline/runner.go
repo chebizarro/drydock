@@ -21,6 +21,7 @@ import (
 	"drydock/internal/repo"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
+	"drydock/internal/securityreview"
 	"drydock/internal/securityscan"
 	"drydock/internal/tracing"
 
@@ -55,6 +56,11 @@ type PaymentAuthorizer interface {
 	AuthorizePatch(ctx context.Context, patchEvent nostr.Event, repoID string, policy repoconfig.PaymentsConfig) (payment.AuthorizeResult, error)
 }
 
+// SecurityReviewStage runs the verified security lens over an assembled context bundle.
+type SecurityReviewStage interface {
+	Run(context.Context, contextbuilder.ContextBundle, string, repoconfig.SecurityConfig) securityreview.SecurityResult
+}
+
 type Runner struct {
 	store            *db.Store
 	repoSvc          *repo.Service
@@ -67,6 +73,7 @@ type Runner struct {
 	docIngester      DocIngester
 	codeIndexer      CodeIndexer
 	secScanner       *securityscan.Scanner
+	securityReviewer SecurityReviewStage
 	paymentAuth      PaymentAuthorizer
 	queue            <-chan db.ReviewTask
 	workers          int
@@ -123,6 +130,13 @@ func WithCodeIndexer(ci CodeIndexer) func(*Runner) {
 func WithSecurityScanner(scanner *securityscan.Scanner) func(*Runner) {
 	return func(r *Runner) {
 		r.secScanner = scanner
+	}
+}
+
+// WithSecurityReviewer enables the verified security review lens.
+func WithSecurityReviewer(stage SecurityReviewStage) func(*Runner) {
+	return func(r *Runner) {
+		r.securityReviewer = stage
 	}
 }
 
@@ -481,7 +495,19 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return err
 	}
 
-	// 6d. Run security scanner (deterministic SAST, parallel with LLM review is possible
+	// 6d. Run the verified security lens when explicitly enabled or when the
+	// deterministic changed-file set contains a security-sensitive path.
+	var verifiedSecurityFindings []reviewengine.Finding
+	if r.securityReviewer != nil && (repoCfg.Security.Enabled || reviewengine.IsSecuritySensitive(changedFiles)) {
+		securityResult := r.securityReviewer.Run(ctx, bundle, prep.RepoPath, repoCfg.Security)
+		if securityResult.Error != nil {
+			return fmt.Errorf("security review: %w", securityResult.Error)
+		}
+		verifiedSecurityFindings = securityResult.Findings
+		log.Info("security review completed", "findings", len(verifiedSecurityFindings))
+	}
+
+	// 6e. Run security scanner (deterministic SAST, parallel with LLM review is possible
 	// but kept sequential here for simplicity and determinism).
 	var scanFindings []securityscan.SecurityFinding
 	if r.secScanner != nil && len(changedFiles) > 0 {
@@ -502,7 +528,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	ctxHash := fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content)))
 
 	// 7b. Deduplicate scanner findings with LLM findings, then apply review policy.
-	mergedFindings := securityscan.DeduplicateFindings(scanFindings, result.Review.Findings)
+	llmFindings := append(result.Review.Findings, verifiedSecurityFindings...)
+	mergedFindings := securityscan.DeduplicateFindings(scanFindings, llmFindings)
 	mergedReview := result.Review
 	mergedReview.Findings = mergedFindings
 	filteredReview := applyReviewPolicy(mergedReview, repoCfg)

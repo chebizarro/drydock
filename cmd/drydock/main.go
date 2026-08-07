@@ -39,6 +39,7 @@ import (
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
 	"drydock/internal/scope"
+	"drydock/internal/securityreview"
 	"drydock/internal/securityscan"
 	"drydock/internal/signing"
 	"drydock/internal/symbols"
@@ -413,6 +414,12 @@ func main() {
 		ReviewerTemp: 0.2,
 	}, llmClient, logger)
 	engine.UseModelIdentity(modelIdentity)
+	securityStage := securityreview.New(
+		engine,
+		llmClient,
+		reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel},
+		reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel},
+	)
 
 	// Verify configured model names against what each endpoint actually
 	// serves; mismatches are logged and the registry is seeded with the
@@ -542,6 +549,7 @@ func main() {
 		var pipelineOpts []func(*pipeline.Runner)
 		pipelineOpts = append(pipelineOpts, pipeline.WithPromptRefiner(prSvc))
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityScanner(secScanner))
+		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityReviewer(securityStage))
 		pipelineOpts = append(pipelineOpts, pipeline.WithActivityHeartbeat(healthSrv.RecordActivity))
 		if paymentSvc != nil {
 			pipelineOpts = append(pipelineOpts, pipeline.WithPaymentAuthorizer(paymentSvc))

@@ -29,6 +29,8 @@ type RunInput struct {
 	ContextBundle string
 	ChangedFiles  []string
 	FewShot       []string
+	// ReviewerRoute, when set, overrides the planner-selected reviewer route.
+	ReviewerRoute ModelRoute
 	// ReviewerSystemPromptOverride, if non-empty, replaces the default base
 	// reviewer system prompt. Checklist, security preamble, and few-shot
 	// examples are still appended.
@@ -45,9 +47,9 @@ type RunInput struct {
 }
 
 type RunOutput struct {
-	Planner           PlannerOutput
-	Review            ReviewerOutput
-	Route             ModelRoute
+	Planner PlannerOutput
+	Review  ReviewerOutput
+	Route   ModelRoute
 	// ServedModel is the model identifier the reviewer endpoint reported
 	// serving for this specific review. Empty when the provider omitted it;
 	// callers should fall back to ModelForRoute(Route).
@@ -91,7 +93,11 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	system := reviewerSystemPrompt(in.ReviewerSystemPromptOverride, in.AdditionalInstructions, checklist, IsSecuritySensitive(in.ChangedFiles), in.FewShot)
 	user := reviewerUserPrompt(in.ContextBundle, planner)
 
-	endpoint, err := e.routeEndpoint(planner.ModelRoute)
+	reviewerRoute := planner.ModelRoute
+	if in.ReviewerRoute != "" {
+		reviewerRoute = in.ReviewerRoute
+	}
+	endpoint, err := e.routeEndpoint(reviewerRoute)
 	if err != nil {
 		return RunOutput{}, err
 	}
@@ -111,11 +117,11 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	// Generate walkthrough (using planner model — lightweight 14B)
 	walkthrough, walkthroughStatus := e.generateWalkthrough(ctx, in)
 
-	e.logger.Info("review engine completed", "route", planner.ModelRoute, "findings", len(review.Findings), "checklist_items", len(checklist), "walkthrough_status", walkthroughStatus.State, "has_walkthrough", walkthrough.Walkthrough != "")
+	e.logger.Info("review engine completed", "route", reviewerRoute, "findings", len(review.Findings), "checklist_items", len(checklist), "walkthrough_status", walkthroughStatus.State, "has_walkthrough", walkthrough.Walkthrough != "")
 	return RunOutput{
 		Planner:           planner,
 		Review:            review,
-		Route:             planner.ModelRoute,
+		Route:             reviewerRoute,
 		ServedModel:       servedModel,
 		Checklist:         checklist,
 		Walkthrough:       walkthrough,
