@@ -59,6 +59,20 @@ func Version() string {
 	return pack.Version
 }
 
+// VulnerabilitySource returns the knowledge-pack citation for a NOSTR vulnerability.
+func VulnerabilitySource(id string) string {
+	pack, err := Load()
+	if err != nil {
+		return ""
+	}
+	for _, vulnerability := range pack.Vulnerabilities {
+		if vulnerability.ID == id {
+			return vulnerability.Source
+		}
+	}
+	return ""
+}
+
 // Context renders the corpus for the nostr-protocol contextbuilder layer.
 func Context() (string, error) {
 	pack, err := Load()

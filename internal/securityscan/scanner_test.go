@@ -34,7 +34,7 @@ func TestBuiltinRulesCompile(t *testing.T) {
 
 func TestBuiltinRulesHaveCWEMappings(t *testing.T) {
 	rules := BuiltinRules()
-	if len(SASTRuleCWE) != len(rules) {
+	if len(SASTRuleCWE) < len(rules) {
 		t.Fatalf("CWE mappings = %d, builtin rules = %d", len(SASTRuleCWE), len(rules))
 	}
 	for _, rule := range rules {
@@ -43,7 +43,7 @@ func TestBuiltinRulesHaveCWEMappings(t *testing.T) {
 			t.Errorf("rule %s has no CWE mapping", rule.ID)
 			continue
 		}
-		if !regexp.MustCompile(`^CWE-[0-9]+$`).MatchString(cwe) {
+		if !regexp.MustCompile(`^CWE-[0-9]+(?:, CWE-[0-9]+)*$`).MatchString(cwe) {
 			t.Errorf("rule %s has invalid CWE mapping %q", rule.ID, cwe)
 		}
 	}

@@ -94,23 +94,27 @@ func hasExtension(path, ext string) bool {
 	return path[len(path)-len(ext):] == ext
 }
 
-// SASTRuleCWE maps each built-in SAST rule to its CWE hypothesis.
+// SASTRuleCWE maps each deterministic finding rule to its CWE hypotheses.
 var SASTRuleCWE = map[string]string{
-	"SEC-001": "CWE-798",
-	"SEC-002": "CWE-798",
-	"SEC-003": "CWE-321",
-	"SEC-010": "CWE-89",
-	"SEC-011": "CWE-89",
-	"SEC-020": "CWE-78",
-	"SEC-021": "CWE-78",
-	"SEC-030": "CWE-22",
-	"SEC-040": "CWE-328",
-	"SEC-041": "CWE-328",
-	"SEC-042": "CWE-327",
-	"SEC-050": "CWE-79",
-	"SEC-060": "CWE-918",
-	"SEC-070": "CWE-295",
-	"SEC-080": "CWE-502",
+	"SEC-001":  "CWE-798",
+	"SEC-002":  "CWE-798",
+	"SEC-003":  "CWE-321",
+	"SEC-010":  "CWE-89",
+	"SEC-011":  "CWE-89",
+	"SEC-020":  "CWE-78",
+	"SEC-021":  "CWE-78",
+	"SEC-030":  "CWE-22",
+	"SEC-040":  "CWE-328",
+	"SEC-041":  "CWE-328",
+	"SEC-042":  "CWE-327",
+	"SEC-050":  "CWE-79",
+	"SEC-060":  "CWE-918",
+	"SEC-070":  "CWE-295",
+	"SEC-080":  "CWE-502",
+	"NOSTR-V3": "CWE-353, CWE-327",
+	"NOSTR-V4": "CWE-323, CWE-1204",
+	"NOSTR-V5": "CWE-200",
+	"NOSTR-V6": "CWE-200, CWE-918",
 }
 
 // BuiltinRules returns the curated set of security scanning rules.
