@@ -605,6 +605,22 @@ func (s *Store) UpsertRepositoryAnnouncement(ctx context.Context, event nostr.Ev
 	return nil
 }
 
+func (s *Store) GetRepositoryAnnouncement(ctx context.Context, repoID string) (nostr.Event, error) {
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT raw_event_json FROM repositories WHERE repo_id=?`, repoID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nostr.Event{}, fmt.Errorf("repository %s not found", repoID)
+	}
+	if err != nil {
+		return nostr.Event{}, fmt.Errorf("lookup repository announcement: %w", err)
+	}
+	var event nostr.Event
+	if err := json.Unmarshal([]byte(raw), &event); err != nil {
+		return nostr.Event{}, fmt.Errorf("decode repository announcement: %w", err)
+	}
+	return event, nil
+}
+
 func (s *Store) GetRepositoryOwnerPubkey(ctx context.Context, repoID string) (string, error) {
 	var pubkey string
 	err := s.db.QueryRowContext(ctx, `SELECT pubkey FROM repositories WHERE repo_id=?`, repoID).Scan(&pubkey)

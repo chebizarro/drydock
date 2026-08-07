@@ -386,6 +386,18 @@ func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, rela
 	if msg.Method == "" {
 		return nil
 	}
+	if p.servicePubkey != "" {
+		recipient, err := singleTagValue(event, "p")
+		if err != nil || scope.NormalizePubkey(recipient) != p.servicePubkey {
+			p.logger.Debug("ignoring ContextVM request for another recipient", "event_id", event.ID.Hex())
+			return nil
+		}
+		method, err := singleTagValue(event, "method")
+		if err != nil || method != msg.Method {
+			p.logger.Debug("ignoring ContextVM request with invalid method tag", "event_id", event.ID.Hex(), "method", msg.Method)
+			return nil
+		}
+	}
 
 	resp, err := p.contextVMRouter.Handle(ctx, contextvm.Request{
 		Event:  event,

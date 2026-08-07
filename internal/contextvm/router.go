@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -32,6 +33,17 @@ func (r *Router) Register(method string, handler Handler) error {
 	defer r.mu.Unlock()
 	r.handlers[method] = handler
 	return nil
+}
+
+func (r *Router) Methods() []string {
+	r.mu.RLock()
+	methods := make([]string, 0, len(r.handlers))
+	for method := range r.handlers {
+		methods = append(methods, method)
+	}
+	r.mu.RUnlock()
+	sort.Strings(methods)
+	return methods
 }
 
 func (r *Router) Handle(ctx context.Context, req Request) (Message, error) {

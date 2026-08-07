@@ -58,6 +58,35 @@ func TestSubscribedKindsSet(t *testing.T) {
 	}
 }
 
+func TestSubscriptionFiltersScopeContextVMByRecipientAndMethod(t *testing.T) {
+	since := nostr.Timestamp(1234)
+	filters := subscriptionFilters(since, Config{
+		ContextVMPubkey:  "service-pubkey",
+		ContextVMMethods: []string{"security/audit", "review/request", "security/audit"},
+	})
+	if len(filters) != 2 {
+		t.Fatalf("filter count = %d, want 2", len(filters))
+	}
+	contextFilter := filters[1]
+	if len(contextFilter.Kinds) != 1 || contextFilter.Kinds[0] != 25910 {
+		t.Fatalf("ContextVM kinds = %v", contextFilter.Kinds)
+	}
+	if got := contextFilter.Tags["p"]; len(got) != 1 || got[0] != "service-pubkey" {
+		t.Fatalf("p filter = %v", got)
+	}
+	if got := contextFilter.Tags["method"]; len(got) != 2 || got[0] != "security/audit" || got[1] != "review/request" {
+		t.Fatalf("method filter = %v", got)
+	}
+	if contextFilter.Since != since {
+		t.Fatalf("since = %d, want %d", contextFilter.Since, since)
+	}
+	for _, kind := range filters[0].Kinds {
+		if kind == 25910 {
+			t.Fatal("general filter must exclude ContextVM when scoped filter is active")
+		}
+	}
+}
+
 func TestSubscribedKindsReturnsCopy(t *testing.T) {
 	k1 := SubscribedKinds()
 	k2 := SubscribedKinds()

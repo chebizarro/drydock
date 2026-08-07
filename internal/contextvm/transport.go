@@ -69,7 +69,7 @@ func (t *Transport) SendWithID(ctx context.Context, id, method string, params an
 	evt := nostr.Event{
 		CreatedAt: nostr.Now(),
 		Kind:      KindContextVM,
-		Tags:      recipientTags(recipients),
+		Tags:      append(recipientTags(recipients), nostr.Tag{"method", method}),
 	}
 	if err := t.signer.SignEvent(ctx, &evt); err != nil {
 		return "", fmt.Errorf("sign correlation event: %w", err)

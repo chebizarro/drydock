@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"drydock/internal/auditengine"
 	"drydock/internal/circuitbreaker"
 	"drydock/internal/codechat"
 	"drydock/internal/codeindex"
@@ -41,6 +42,7 @@ import (
 	"drydock/internal/scope"
 	"drydock/internal/securityreview"
 	"drydock/internal/securityscan"
+	"drydock/internal/securityverify"
 	"drydock/internal/signing"
 	"drydock/internal/symbols"
 	"drydock/internal/vectorstore"
@@ -452,6 +454,35 @@ func main() {
 		}, store, signer, relayPub, logger)
 	}
 
+	var securityAuditHandler *contextvm.SecurityAuditHandler
+	if pubSvc != nil {
+		verifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel}
+		classifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel}
+		feedback := contextvm.NewAuditFeedbackReporter(signer, relayPub, writeRelays)
+		auditEngine := auditengine.New(
+			auditengine.Config{Workers: cfg.SecurityAuditWorkers},
+			auditengine.Dependencies{
+				Repos:          repoManager,
+				Store:          store,
+				Scanner:        secScanner,
+				ContextBuilder: ctxBuilder,
+				Reviewer:       engine,
+				VerifierFactory: func(votes int) auditengine.Verifier {
+					return securityverify.New(llmClient, securityverify.Config{
+						VerifyVotes: votes, VerifyEndpoint: verifyEndpoint, ClassifyEndpoint: classifyEndpoint,
+					})
+				},
+				Publisher: pubSvc,
+				Progress:  feedback,
+				Localizer: auditengine.NewAntaresLocalizer(llmClient, reviewengine.ModelEndpoint{
+					BaseURL: cfg.SecLocalizeBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecLocalizeModel,
+				}),
+			},
+			logger,
+		)
+		securityAuditHandler = contextvm.NewSecurityAuditHandler(auditEngine, store, repoSvc, feedback, writeRelays, logger)
+	}
+
 	// --- Meta-review (with retry + circuit breaker) ---
 	metaClient := reviewengine.NewCircuitBreakingClient(
 		reviewengine.NewRetryingClient(
@@ -513,6 +544,10 @@ func main() {
 			logger.Error("failed to register IDE ContextVM handlers", "error", err)
 			os.Exit(1)
 		}
+		if err := contextvm.RegisterSecurityAuditMethods(contextVMRouter, securityAuditHandler); err != nil {
+			logger.Error("failed to register security audit ContextVM handler", "error", err)
+			os.Exit(1)
+		}
 		processorOpts = append(processorOpts, ingest.WithContextVM(contextVMRouter, contextVMTransport))
 		logger.Info("IDE gateway handler registered")
 
@@ -543,6 +578,8 @@ func main() {
 		LookbackMinutes:      cfg.ListenerLookbackMin,
 		HighWaterMarkOverlap: cfg.ListenerHWMOverlap,
 		MaxFutureSkew:        cfg.ListenerMaxFutureSkew,
+		ContextVMPubkey:      servicePubkey,
+		ContextVMMethods:     contextVMRouter.Methods(),
 	}, processor, logger, listener.WithPool(pool), listener.WithStore(store))
 
 	// --- Pipeline runner ---

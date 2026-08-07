@@ -13,6 +13,19 @@ func RegisterIDEMethods(router *Router, gateway IDEGateway) error {
 	return gateway.RegisterContextVMHandlers(router)
 }
 
+// SecurityAuditor registers security audit ContextVM handlers.
+type SecurityAuditor interface {
+	RegisterContextVMMethods(router *Router) error
+}
+
+// RegisterSecurityAuditMethods registers the security/audit handler.
+func RegisterSecurityAuditMethods(router *Router, auditor SecurityAuditor) error {
+	if auditor == nil {
+		return nil
+	}
+	return auditor.RegisterContextVMMethods(router)
+}
+
 // Marketplace registers marketplace ContextVM handlers.
 type Marketplace interface {
 	RegisterContextVMMethods(router *Router) error

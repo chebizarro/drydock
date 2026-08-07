@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -55,11 +56,47 @@ func SubscribedKinds() []nostr.Kind {
 	return append([]nostr.Kind(nil), subscribedKinds...)
 }
 
+func subscriptionFilters(since nostr.Timestamp, cfg Config) []nostr.Filter {
+	pubkey := strings.TrimSpace(cfg.ContextVMPubkey)
+	methods := make([]string, 0, len(cfg.ContextVMMethods))
+	seenMethods := make(map[string]struct{}, len(cfg.ContextVMMethods))
+	for _, method := range cfg.ContextVMMethods {
+		method = strings.TrimSpace(method)
+		if method == "" {
+			continue
+		}
+		if _, ok := seenMethods[method]; ok {
+			continue
+		}
+		seenMethods[method] = struct{}{}
+		methods = append(methods, method)
+	}
+	if pubkey == "" || len(methods) == 0 {
+		return []nostr.Filter{{Kinds: append([]nostr.Kind(nil), subscribedKinds...), Since: since}}
+	}
+	generalKinds := make([]nostr.Kind, 0, len(subscribedKinds)-1)
+	for _, kind := range subscribedKinds {
+		if kind != eventkind.ContextVM {
+			generalKinds = append(generalKinds, kind)
+		}
+	}
+	return []nostr.Filter{
+		{Kinds: generalKinds, Since: since},
+		{
+			Kinds: []nostr.Kind{eventkind.ContextVM},
+			Tags:  nostr.TagMap{"p": {pubkey}, "method": methods},
+			Since: since,
+		},
+	}
+}
+
 type Config struct {
 	Relays               []string
 	LookbackMinutes      int
 	HighWaterMarkOverlap time.Duration
 	MaxFutureSkew        time.Duration
+	ContextVMPubkey      string
+	ContextVMMethods     []string
 }
 
 type Service struct {
@@ -167,10 +204,7 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
-	filter := nostr.Filter{
-		Kinds: append([]nostr.Kind(nil), subscribedKinds...),
-		Since: nostr.Timestamp(since),
-	}
+	filters := subscriptionFilters(nostr.Timestamp(since), s.cfg)
 
 	s.logger.Info("starting nostr listener", "relay_count", len(s.cfg.Relays))
 
@@ -178,9 +212,23 @@ func (s *Service) Run(ctx context.Context) error {
 	backoff := time.Second
 
 	for {
-		stream, closedCh := s.pool.SubscribeManyNotifyClosed(ctx, s.cfg.Relays, filter, nostr.SubscriptionOptions{
-			Label: "drydock-listener",
-		})
+		var stream chan nostr.RelayEvent
+		var closedCh chan nostr.RelayClosed
+		if len(filters) == 1 {
+			stream, closedCh = s.pool.SubscribeManyNotifyClosed(ctx, s.cfg.Relays, filters[0], nostr.SubscriptionOptions{
+				Label: "drydock-listener",
+			})
+		} else {
+			directed := make([]nostr.DirectedFilter, 0, len(filters)*len(s.cfg.Relays))
+			for _, relay := range s.cfg.Relays {
+				for _, filter := range filters {
+					directed = append(directed, nostr.DirectedFilter{Relay: relay, Filter: filter})
+				}
+			}
+			stream, closedCh = s.pool.BatchedSubscribeManyNotifyClosed(ctx, directed, nostr.SubscriptionOptions{
+				Label: "drydock-listener",
+			})
+		}
 
 		streamEnded := false
 		for !streamEnded {

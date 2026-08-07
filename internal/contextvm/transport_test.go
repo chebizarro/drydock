@@ -81,6 +81,9 @@ func TestTransportSendPublishesContextVMEvent(t *testing.T) {
 	if !evt.Tags.ContainsAny("p", []string{recipient.Hex()}) {
 		t.Fatalf("missing recipient tag: %+v", evt.Tags)
 	}
+	if method := evt.Tags.Find("method"); method == nil || len(method) < 2 || method[1] != "tools/list" {
+		t.Fatalf("missing method tag: %+v", evt.Tags)
+	}
 	var msg Message
 	if err := json.Unmarshal([]byte(evt.Content), &msg); err != nil {
 		t.Fatalf("content json: %v", err)
