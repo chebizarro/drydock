@@ -322,9 +322,9 @@ func (s *Store) RequeueReviewAfterPayment(ctx context.Context, patchEventID stri
 	var task ReviewTask
 	task.PatchEventID = patchEventID
 	if err := tx.QueryRowContext(ctx, `
-		SELECT repo_id, force FROM review_log
+		SELECT repo_id, force, invocation, requester_pubkey, order_id FROM review_log
 		WHERE patch_event_id = ? AND status = 'pending'
-	`, patchEventID).Scan(&task.RepoID, &task.Force); err != nil {
+	`, patchEventID).Scan(&task.RepoID, &task.Force, &task.Invocation, &task.RequesterPubkey, &task.OrderID); err != nil {
 		return ReviewTask{}, false, fmt.Errorf("read requeued payment review: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

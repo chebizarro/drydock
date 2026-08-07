@@ -11,6 +11,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/eventkind"
 	"drydock/internal/metrics"
+	"drydock/internal/monitoring"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip59"
@@ -109,23 +110,46 @@ func subscriptionFilters(since nostr.Timestamp, cfg Config) []nostr.Filter {
 		seenMethods[method] = struct{}{}
 		methods = append(methods, method)
 	}
+
+	filters := make([]nostr.Filter, 0, 4)
 	if pubkey == "" || len(methods) == 0 {
-		return []nostr.Filter{{Kinds: kinds, Since: since}}
-	}
-	generalKinds := make([]nostr.Kind, 0, len(kinds)-1)
-	for _, kind := range kinds {
-		if kind != eventkind.ContextVM {
-			generalKinds = append(generalKinds, kind)
+		filters = append(filters, nostr.Filter{Kinds: kinds, Since: since})
+	} else {
+		generalKinds := make([]nostr.Kind, 0, len(kinds)-1)
+		for _, kind := range kinds {
+			if kind != eventkind.ContextVM {
+				generalKinds = append(generalKinds, kind)
+			}
 		}
+		filters = append(filters,
+			nostr.Filter{Kinds: generalKinds, Since: since},
+			nostr.Filter{
+				Kinds: []nostr.Kind{eventkind.ContextVM},
+				Tags:  nostr.TagMap{"p": {pubkey}, "method": methods},
+				Since: since,
+			},
+		)
 	}
-	return []nostr.Filter{
-		{Kinds: generalKinds, Since: since},
-		{
-			Kinds: []nostr.Kind{eventkind.ContextVM},
-			Tags:  nostr.TagMap{"p": {pubkey}, "method": methods},
-			Since: since,
-		},
+
+	operator, err := nostr.PubKeyFromHex(strings.TrimSpace(cfg.MonitoredReposAuthor))
+	if err == nil && operator != nostr.ZeroPK {
+		listAddress := monitoring.ListAddress(operator.Hex())
+		// These control-plane filters intentionally have no Since. They must
+		// recover the current replaceable list independently of the event HWM.
+		filters = append(filters,
+			nostr.Filter{
+				Kinds:   []nostr.Kind{eventkind.MonitoredRepositories},
+				Authors: []nostr.PubKey{operator},
+				Tags:    nostr.TagMap{"d": {monitoring.ListIdentifier}},
+			},
+			nostr.Filter{
+				Kinds:   []nostr.Kind{eventkind.Deletion},
+				Authors: []nostr.PubKey{operator},
+				Tags:    nostr.TagMap{"a": {listAddress}},
+			},
+		)
 	}
+	return filters
 }
 
 type Config struct {
@@ -137,6 +161,7 @@ type Config struct {
 	GiftWrapEnabled      bool
 	ContextVMPubkey      string
 	ContextVMMethods     []string
+	MonitoredReposAuthor string
 }
 
 type Service struct {

@@ -90,6 +90,41 @@ func TestSubscriptionFiltersScopeContextVMByRecipientAndMethod(t *testing.T) {
 	}
 }
 
+func TestSubscriptionFiltersAddNoSinceMonitoredListControlPlane(t *testing.T) {
+	operator := nostr.GetPublicKey(nostr.Generate())
+	since := nostr.Timestamp(1234)
+	filters := subscriptionFilters(since, Config{MonitoredReposAuthor: operator.Hex()})
+	if len(filters) != 3 {
+		t.Fatalf("filter count = %d, want general + list + deletion", len(filters))
+	}
+	if filters[0].Since != since {
+		t.Fatalf("general since = %d, want %d", filters[0].Since, since)
+	}
+
+	listFilter := filters[1]
+	if len(listFilter.Kinds) != 1 || listFilter.Kinds[0] != 30001 || listFilter.Since != 0 {
+		t.Fatalf("list filter = %#v", listFilter)
+	}
+	if len(listFilter.Authors) != 1 || listFilter.Authors[0] != operator {
+		t.Fatalf("list authors = %v", listFilter.Authors)
+	}
+	if got := listFilter.Tags["d"]; len(got) != 1 || got[0] != "drydock:monitored-repositories:v1" {
+		t.Fatalf("list d filter = %v", got)
+	}
+
+	deletionFilter := filters[2]
+	if len(deletionFilter.Kinds) != 1 || deletionFilter.Kinds[0] != 5 || deletionFilter.Since != 0 {
+		t.Fatalf("deletion filter = %#v", deletionFilter)
+	}
+	if len(deletionFilter.Authors) != 1 || deletionFilter.Authors[0] != operator {
+		t.Fatalf("deletion authors = %v", deletionFilter.Authors)
+	}
+	wantAddress := "30001:" + operator.Hex() + ":drydock:monitored-repositories:v1"
+	if got := deletionFilter.Tags["a"]; len(got) != 1 || got[0] != wantAddress {
+		t.Fatalf("deletion a filter = %v, want %q", got, wantAddress)
+	}
+}
+
 func TestSubscriptionFiltersExcludeGiftWrapWhenDisabled(t *testing.T) {
 	filters := subscriptionFilters(nostr.Timestamp(1234), Config{})
 	if len(filters) != 1 {

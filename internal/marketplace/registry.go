@@ -430,7 +430,7 @@ func (r *Registry) RecordFeedback(ctx context.Context, feedback ReviewFeedback) 
 		Comment:        feedback.Comment,
 		EventID:        feedback.EventID,
 	}
-	if err := r.store.RecordFeedback(ctx, dbFeedback); err != nil {
+	if _, err := r.store.RecordFeedback(ctx, dbFeedback); err != nil {
 		return err
 	}
 

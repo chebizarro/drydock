@@ -350,11 +350,12 @@ func TestRecordFeedbackConcurrentDuplicateIsIdempotent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs <- store.RecordFeedback(ctx, ReviewFeedback{
+			_, err := store.RecordFeedback(ctx, ReviewFeedback{
 				AssignmentID: assignment.ID, ReviewerPubkey: assignment.ReviewerPubkey,
 				RaterPubkey: assignment.RequesterPubkey, Rating: 5,
 				EventID: fmt.Sprintf("feedback-race-%d", i),
 			})
+			errs <- err
 		}(i)
 	}
 	wg.Wait()
@@ -589,8 +590,19 @@ func TestRecordFeedback(t *testing.T) {
 		EventID:        "feedback-evt-1",
 	}
 
-	if err := store.RecordFeedback(ctx, feedback); err != nil {
+	inserted, err := store.RecordFeedback(ctx, feedback)
+	if err != nil {
 		t.Fatalf("RecordFeedback: %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected first feedback insert")
+	}
+	inserted, err = store.RecordFeedback(ctx, feedback)
+	if err != nil {
+		t.Fatalf("duplicate RecordFeedback: %v", err)
+	}
+	if inserted {
+		t.Fatal("expected duplicate feedback to be idempotent")
 	}
 }
 

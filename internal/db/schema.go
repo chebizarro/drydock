@@ -128,11 +128,38 @@ CREATE TABLE IF NOT EXISTS review_log (
   status_event_kind INTEGER NOT NULL DEFAULT 0,
   status_published_at INTEGER NOT NULL DEFAULT 0,
   force INTEGER NOT NULL DEFAULT 0 CHECK (force IN (0, 1)),
+  invocation TEXT NOT NULL DEFAULT 'reactive'
+    CHECK (invocation IN ('reactive', 'ide', 'contextvm')),
+  requester_pubkey TEXT NOT NULL DEFAULT '',
+  order_id TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE(patch_event_id, repo_id)
 );
 CREATE INDEX IF NOT EXISTS idx_review_log_status ON review_log(status);
+
+CREATE TABLE IF NOT EXISTS review_orders (
+  requester_pubkey TEXT NOT NULL,
+  order_id TEXT NOT NULL,
+  request_event_id TEXT NOT NULL UNIQUE,
+  patch_event_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  repository_addr TEXT NOT NULL,
+  force INTEGER NOT NULL DEFAULT 0 CHECK (force IN (0, 1)),
+  accepted_at INTEGER NOT NULL,
+  PRIMARY KEY(requester_pubkey, order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_orders_patch_repository
+  ON review_orders(patch_event_id, repository_id);
+
+CREATE TABLE IF NOT EXISTS review_skips (
+  patch_event_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(patch_event_id, repo_id)
+);
 
 CREATE TABLE IF NOT EXISTS security_audits (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -251,6 +278,28 @@ CREATE TABLE IF NOT EXISTS listener_state (
   value TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS monitored_repository_list_state (
+  list_address TEXT PRIMARY KEY,
+  operator_pubkey TEXT NOT NULL,
+  d_tag TEXT NOT NULL,
+  source_kind INTEGER NOT NULL,
+  event_id TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+  raw_event TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS monitored_repository_members (
+  list_address TEXT NOT NULL,
+  repository_addr TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  PRIMARY KEY(list_address, repository_addr),
+  FOREIGN KEY(list_address) REFERENCES monitored_repository_list_state(list_address) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_monitored_repository_members_repository
+  ON monitored_repository_members(repository_addr);
 
 CREATE TABLE IF NOT EXISTS eval_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

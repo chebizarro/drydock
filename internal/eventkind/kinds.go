@@ -4,6 +4,8 @@ package eventkind
 import "fiatjaf.com/nostr"
 
 const (
+	Deletion               nostr.Kind = 5
+	MonitoredRepositories  nostr.Kind = 30001
 	RepositoryAnnouncement            = nostr.KindRepositoryAnnouncement
 	RepositoryState                   = nostr.KindRepositoryState
 	Patch                             = nostr.KindPatch

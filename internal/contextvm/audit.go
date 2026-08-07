@@ -12,6 +12,7 @@ import (
 	"drydock/internal/auditengine"
 	"drydock/internal/eventkind"
 	"drydock/internal/repoconfig"
+	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )
@@ -180,10 +181,15 @@ func (h *SecurityAuditHandler) HandleSecurityAudit(ctx context.Context, req Requ
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	repoID, err := repositoryIDFromAddress(params.RepoAddr)
+	repository, err := scope.ParseRepositoryRef(params.RepoAddr)
 	if err != nil {
-		return nil, &Error{Code: ErrorInvalidParams, Message: err.Error()}
+		message := "repo_addr must be a 30617:<pubkey>:<identifier> address"
+		if errors.Is(err, scope.ErrInvalidRepositoryPubkey) {
+			message = "repo_addr contains an invalid pubkey"
+		}
+		return nil, &Error{Code: ErrorInvalidParams, Message: message}
 	}
+	repoID := repository.RepositoryID
 	depth, repoCfg, err := h.auditConfig(ctx, repoID, params.Depth)
 	if err != nil {
 		return nil, &Error{Code: ErrorInvalidParams, Message: err.Error()}
@@ -281,18 +287,6 @@ func (h *SecurityAuditHandler) auditConfig(ctx context.Context, repoID, requeste
 		return "", cfg, err
 	}
 	return depth, cfg, nil
-}
-
-func repositoryIDFromAddress(addr string) (string, error) {
-	parts := strings.SplitN(strings.TrimSpace(addr), ":", 3)
-	if len(parts) != 3 || parts[0] != "30617" || strings.TrimSpace(parts[2]) == "" {
-		return "", errors.New("repo_addr must be a 30617:<pubkey>:<identifier> address")
-	}
-	pubkey, err := nostr.PubKeyFromHex(parts[1])
-	if err != nil {
-		return "", errors.New("repo_addr contains an invalid pubkey")
-	}
-	return pubkey.Hex() + ":" + strings.TrimSpace(parts[2]), nil
 }
 
 func dedupeStrings(values []string) []string {

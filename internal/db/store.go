@@ -20,6 +20,37 @@ var (
 	ErrReviewNotFound         = errors.New("review log row not found")
 )
 
+// ReviewInvocation records which intake path durably created a review.
+type ReviewInvocation string
+
+const (
+	ReviewInvocationReactive  ReviewInvocation = "reactive"
+	ReviewInvocationIDE       ReviewInvocation = "ide"
+	ReviewInvocationContextVM ReviewInvocation = "contextvm"
+)
+
+// ReviewClaim is the durable metadata attached when a review is claimed.
+type ReviewClaim struct {
+	Force           bool
+	Invocation      ReviewInvocation
+	RequesterPubkey string
+	OrderID         string
+}
+
+func (c ReviewClaim) normalized() (ReviewClaim, error) {
+	if c.Invocation == "" {
+		c.Invocation = ReviewInvocationReactive
+	}
+	switch c.Invocation {
+	case ReviewInvocationReactive, ReviewInvocationIDE, ReviewInvocationContextVM:
+	default:
+		return ReviewClaim{}, fmt.Errorf("invalid review invocation %q", c.Invocation)
+	}
+	c.RequesterPubkey = strings.TrimSpace(c.RequesterPubkey)
+	c.OrderID = strings.TrimSpace(c.OrderID)
+	return c, nil
+}
+
 type Store struct {
 	db *sql.DB
 }
@@ -520,6 +551,62 @@ CREATE INDEX idx_review_payments_author_repo
 				SET reservation_expires_at = updated_at
 				WHERE status = 'pending' AND melt_state = '' AND reservation_expires_at = 0`)
 			return err
+		},
+	},
+	{
+		version: 11,
+		name:    "contextvm_monitoring_foundations",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			for _, col := range []struct{ name, ddl string }{
+				{"invocation", "ALTER TABLE review_log ADD COLUMN invocation TEXT NOT NULL DEFAULT 'reactive' CHECK (invocation IN ('reactive', 'ide', 'contextvm'))"},
+				{"requester_pubkey", "ALTER TABLE review_log ADD COLUMN requester_pubkey TEXT NOT NULL DEFAULT ''"},
+				{"order_id", "ALTER TABLE review_log ADD COLUMN order_id TEXT NOT NULL DEFAULT ''"},
+			} {
+				exists, err := hasColumn(ctx, tx, "review_log", col.name)
+				if err != nil {
+					return fmt.Errorf("check review_log.%s: %w", col.name, err)
+				}
+				if !exists {
+					if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+						return fmt.Errorf("add review_log.%s: %w", col.name, err)
+					}
+				}
+			}
+
+			for _, ddl := range []string{
+				`CREATE INDEX IF NOT EXISTS idx_review_log_invocation ON review_log(invocation)`,
+				`CREATE TABLE IF NOT EXISTS review_orders (
+					requester_pubkey TEXT NOT NULL, order_id TEXT NOT NULL,
+					request_event_id TEXT NOT NULL UNIQUE, patch_event_id TEXT NOT NULL,
+					repository_id TEXT NOT NULL, repository_addr TEXT NOT NULL,
+					force INTEGER NOT NULL DEFAULT 0 CHECK (force IN (0, 1)),
+					accepted_at INTEGER NOT NULL,
+					PRIMARY KEY(requester_pubkey, order_id))`,
+				`CREATE INDEX IF NOT EXISTS idx_review_orders_patch_repository
+					ON review_orders(patch_event_id, repository_id)`,
+				`CREATE TABLE IF NOT EXISTS review_skips (
+					patch_event_id TEXT NOT NULL, repo_id TEXT NOT NULL,
+					reason TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+					PRIMARY KEY(patch_event_id, repo_id))`,
+				`CREATE TABLE IF NOT EXISTS monitored_repository_list_state (
+					list_address TEXT PRIMARY KEY, operator_pubkey TEXT NOT NULL,
+					d_tag TEXT NOT NULL, source_kind INTEGER NOT NULL,
+					event_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+					deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+					raw_event TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
+				`CREATE TABLE IF NOT EXISTS monitored_repository_members (
+					list_address TEXT NOT NULL, repository_addr TEXT NOT NULL,
+					repository_id TEXT NOT NULL,
+					PRIMARY KEY(list_address, repository_addr),
+					FOREIGN KEY(list_address) REFERENCES monitored_repository_list_state(list_address) ON DELETE CASCADE)`,
+				`CREATE INDEX IF NOT EXISTS idx_monitored_repository_members_repository
+					ON monitored_repository_members(repository_addr)`,
+			} {
+				if _, err := tx.ExecContext(ctx, ddl); err != nil {
+					return fmt.Errorf("apply ContextVM monitoring foundation ddl: %w", err)
+				}
+			}
+			return nil
 		},
 	},
 }
@@ -1225,30 +1312,50 @@ func (s *Store) UpsertThreadCache(ctx context.Context, rootID, eventID string, n
 }
 
 // BeginReview transitions a patch/repo from pending|failed -> reviewing.
-// A forced request may reopen a permanent status_skipped failure; ordinary
-// requests leave that denial untouched. The optional argument preserves source
-// compatibility for callers that always begin non-forced reviews.
-// Returns true if caller obtained the lock and should proceed.
+// It preserves the legacy force-only API; new intake paths should use
+// BeginReviewWithClaim so invocation metadata survives recovery.
 func (s *Store) BeginReview(ctx context.Context, patchEventID, repoID string, force ...bool) (bool, error) {
-	now := time.Now().Unix()
-	forced := len(force) > 0 && force[0]
-	forceValue := 0
-	if forced {
-		forceValue = 1
+	claim := ReviewClaim{}
+	if len(force) > 0 {
+		claim.Force = force[0]
 	}
+	return s.BeginReviewWithClaim(ctx, patchEventID, repoID, claim)
+}
 
+// BeginReviewWithClaim atomically claims a review with durable invocation data.
+func (s *Store) BeginReviewWithClaim(ctx context.Context, patchEventID, repoID string, claim ReviewClaim) (bool, error) {
+	claim, err := claim.normalized()
+	if err != nil {
+		return false, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(
+	acquired, err := beginReviewTx(ctx, tx, patchEventID, repoID, claim, time.Now().Unix())
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit transaction: %w", err)
+	}
+	return acquired, nil
+}
+
+func beginReviewTx(ctx context.Context, tx *sql.Tx, patchEventID, repoID string, claim ReviewClaim, now int64) (bool, error) {
+	forceValue := 0
+	if claim.Force {
+		forceValue = 1
+	}
+	_, err := tx.ExecContext(
 		ctx,
-		`INSERT INTO review_log(patch_event_id, repo_id, status, force, created_at, updated_at)
-		 VALUES (?, ?, 'pending', ?, ?, ?)
+		`INSERT INTO review_log(
+			patch_event_id, repo_id, status, force, invocation, requester_pubkey, order_id, created_at, updated_at
+		) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(patch_event_id, repo_id) DO NOTHING`,
-		patchEventID, repoID, forceValue, now, now,
+		patchEventID, repoID, forceValue, claim.Invocation, claim.RequesterPubkey, claim.OrderID, now, now,
 	)
 	if err != nil {
 		return false, fmt.Errorf("ensure review_log row: %w", err)
@@ -1257,24 +1364,29 @@ func (s *Store) BeginReview(ctx context.Context, patchEventID, repoID string, fo
 	res, err := tx.ExecContext(
 		ctx,
 		`UPDATE review_log
-		    SET status='reviewing', failure_reason=NULL, force=?, updated_at=?
+		SET status='reviewing', failure_reason=NULL, force=?, invocation=?,
+		requester_pubkey=?, order_id=?, updated_at=?
 		  WHERE patch_event_id=? AND repo_id=?
 		    AND (status='pending' OR (status='failed'
-		AND (failure_reason IS NULL OR failure_reason NOT LIKE 'status_skipped:%' OR ?=1)))`,
-		forceValue, now, patchEventID, repoID, forceValue,
+		AND (failure_reason IS NULL OR failure_reason NOT LIKE 'status_skipped:%' OR ?=1
+			OR (?!='reactive' AND EXISTS (
+				SELECT 1 FROM review_skips rs
+				WHERE rs.patch_event_id=review_log.patch_event_id AND rs.repo_id=review_log.repo_id
+			)))))`,
+		forceValue, claim.Invocation, claim.RequesterPubkey, claim.OrderID, now,
+		patchEventID, repoID, forceValue, claim.Invocation,
 	)
 	if err != nil {
 		return false, fmt.Errorf("begin review transition: %w", err)
 	}
-
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("rows affected: %w", err)
 	}
-
 	if affected == 1 {
-		if err := tx.Commit(); err != nil {
-			return false, fmt.Errorf("commit transaction: %w", err)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM review_skips
+			WHERE patch_event_id=? AND repo_id=?`, patchEventID, repoID); err != nil {
+			return false, fmt.Errorf("clear review skip: %w", err)
 		}
 		return true, nil
 	}
@@ -2028,9 +2140,12 @@ func (s *Store) ResetListenerHighWaterMark(ctx context.Context, ts int64) error 
 
 // ReviewTask is a queued patch/repo pair ready for pipeline execution.
 type ReviewTask struct {
-	PatchEventID string
-	RepoID       string
-	Force        bool
+	PatchEventID    string
+	RepoID          string
+	Force           bool
+	Invocation      ReviewInvocation
+	RequesterPubkey string
+	OrderID         string
 }
 
 // ResetStuckReviews transitions entries stuck in "reviewing" (e.g. from a crash)
@@ -2057,7 +2172,7 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 	// Exclude permanent denials from requeue: payment rejections
 	// ('payment_blocked:') and status-gated skips ('status_skipped:').
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT patch_event_id, repo_id, force FROM review_log
+		`SELECT patch_event_id, repo_id, force, invocation, requester_pubkey, order_id FROM review_log
 		WHERE status='failed' AND updated_at < ?
 		AND (failure_reason IS NULL OR failure_reason = ''
 			OR (failure_reason NOT LIKE 'payment_blocked:%' AND failure_reason NOT LIKE 'status_skipped:%'))
@@ -2071,7 +2186,7 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 	var tasks []ReviewTask
 	for rows.Next() {
 		var t ReviewTask
-		if err := rows.Scan(&t.PatchEventID, &t.RepoID, &t.Force); err != nil {
+		if err := rows.Scan(&t.PatchEventID, &t.RepoID, &t.Force, &t.Invocation, &t.RequesterPubkey, &t.OrderID); err != nil {
 			return nil, fmt.Errorf("scan failed review: %w", err)
 		}
 		tasks = append(tasks, t)
@@ -2102,7 +2217,7 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 func (s *Store) ListStalePendingReviews(ctx context.Context, minAgeSeconds int64, limit int) ([]ReviewTask, error) {
 	cutoff := time.Now().Unix() - minAgeSeconds
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT patch_event_id, repo_id, force FROM review_log
+		`SELECT patch_event_id, repo_id, force, invocation, requester_pubkey, order_id FROM review_log
 		WHERE status='pending' AND updated_at <= ?
 		ORDER BY updated_at ASC
 		LIMIT ?`, cutoff, limit)
@@ -2114,7 +2229,7 @@ func (s *Store) ListStalePendingReviews(ctx context.Context, minAgeSeconds int64
 	var tasks []ReviewTask
 	for rows.Next() {
 		var t ReviewTask
-		if err := rows.Scan(&t.PatchEventID, &t.RepoID, &t.Force); err != nil {
+		if err := rows.Scan(&t.PatchEventID, &t.RepoID, &t.Force, &t.Invocation, &t.RequesterPubkey, &t.OrderID); err != nil {
 			return nil, fmt.Errorf("scan pending review: %w", err)
 		}
 		tasks = append(tasks, t)

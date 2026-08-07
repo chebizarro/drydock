@@ -63,6 +63,49 @@ func TestFromEnvNormalizesRepositoryScopeNpubs(t *testing.T) {
 	}
 }
 
+func TestFromEnvNormalizesMonitoredRepositoriesAuthor(t *testing.T) {
+	author := nostr.GetPublicKey(nostr.Generate())
+	t.Setenv("DRYDOCK_MONITORED_REPOS_AUTHOR", nip19.EncodeNpub(author))
+
+	cfg := FromEnv()
+	if cfg.MonitoredReposAuthor != author.Hex() {
+		t.Fatalf("MonitoredReposAuthor = %q, want %q", cfg.MonitoredReposAuthor, author.Hex())
+	}
+}
+
+func TestValidateMonitoredRepositoriesAuthor(t *testing.T) {
+	base := func() Config {
+		return Config{
+			Relays:          []string{"wss://relay.example.com"},
+			PipelineWorkers: 2,
+			DatabaseURL:     ":memory:",
+		}
+	}
+
+	dev := base()
+	result := dev.Validate(context.Background())
+	if !hasWarningContaining(result, "DRYDOCK_MONITORED_REPOS_AUTHOR") {
+		t.Fatalf("missing development warning: %#v", result.Warnings)
+	}
+	if hasErrorContaining(result, "DRYDOCK_MONITORED_REPOS_AUTHOR") {
+		t.Fatalf("missing development author was fatal: %#v", result.Errors)
+	}
+
+	invalid := base()
+	invalid.MonitoredReposAuthor = "not-a-pubkey"
+	result = invalid.Validate(context.Background())
+	if !hasErrorContaining(result, "DRYDOCK_MONITORED_REPOS_AUTHOR") {
+		t.Fatalf("invalid author errors: %#v", result.Errors)
+	}
+
+	production := base()
+	production.Production = true
+	result = production.Validate(context.Background())
+	if !hasErrorContaining(result, "DRYDOCK_MONITORED_REPOS_AUTHOR") {
+		t.Fatalf("missing production author errors: %#v", result.Errors)
+	}
+}
+
 func TestFromEnvContextInfrastructureDefaults(t *testing.T) {
 	for _, key := range []string{
 		"DRYDOCK_QDRANT_COLLECTION_NIP_SPECS",
@@ -441,6 +484,7 @@ func clearConfigEnv(t *testing.T) {
 		"DRYDOCK_WRITE_RELAYS",
 		"DRYDOCK_REPO_ALLOWLIST",
 		"DRYDOCK_REPO_OWNER_ALLOWLIST",
+		"DRYDOCK_MONITORED_REPOS_AUTHOR",
 		"DRYDOCK_LLM_API_KEY",
 		"DRYDOCK_PLANNER_BASE_URL",
 		"DRYDOCK_PLANNER_MODEL",
@@ -470,6 +514,15 @@ func clearConfigEnv(t *testing.T) {
 		t.Setenv(key, "")
 	}
 	t.Setenv("DRYDOCK_DATABASE_URL", ":memory:")
+}
+
+func hasWarningContaining(result ValidationResult, substr string) bool {
+	for _, warning := range result.Warnings {
+		if contains(warning, substr) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasErrorContaining(result ValidationResult, substr string) bool {

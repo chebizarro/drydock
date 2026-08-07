@@ -12,6 +12,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/eventkind"
 	"drydock/internal/metrics"
+	"drydock/internal/monitoring"
 	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
@@ -39,6 +40,12 @@ type MarketplaceHandler interface {
 	HandleEvent(ctx context.Context, event nostr.Event, relayURL string) error
 }
 
+// MonitoringHandler applies the operator-authored repository control plane.
+type MonitoringHandler interface {
+	ApplyList(ctx context.Context, event nostr.Event) (bool, error)
+	ApplyDeletion(ctx context.Context, event nostr.Event) (bool, error)
+}
+
 // ContextVMResponder publishes ContextVM JSON-RPC responses.
 type ContextVMResponder interface {
 	SendResponseToEvent(ctx context.Context, requestEventID, id string, result any, rpcErr *contextvm.Error, recipients ...nostr.PubKey) error
@@ -52,6 +59,7 @@ type Processor struct {
 	codeChat           CodeChatHandler
 	ideGateway         IDEGatewayHandler
 	marketplace        MarketplaceHandler
+	monitoring         MonitoringHandler
 	contextVMRouter    *contextvm.Router
 	contextVMResponder ContextVMResponder
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
@@ -129,6 +137,13 @@ func WithMarketplace(h MarketplaceHandler) func(*Processor) {
 	}
 }
 
+// WithMonitoring sets the monitored-repository list handler.
+func WithMonitoring(handler MonitoringHandler) func(*Processor) {
+	return func(p *Processor) {
+		p.monitoring = handler
+	}
+}
+
 // WithContextVM sets the ContextVM router and responder for kind 25910 events.
 func WithContextVM(router *contextvm.Router, responder ContextVMResponder) func(*Processor) {
 	return func(p *Processor) {
@@ -202,6 +217,10 @@ func (p *Processor) processEvent(ctx context.Context, event nostr.Event, relayUR
 
 func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL string) error {
 	switch event.Kind {
+	case eventkind.MonitoredRepositories:
+		return p.handleMonitoringEvent(ctx, event, false)
+	case eventkind.Deletion:
+		return p.handleMonitoringEvent(ctx, event, true)
 	case eventkind.RepositoryAnnouncement:
 		return p.store.UpsertRepositoryAnnouncement(ctx, event)
 	case eventkind.RepositoryState:
@@ -378,7 +397,7 @@ func (p *Processor) validateEventForIngest(event nostr.Event, relayURL string, a
 		reason = "id_mismatch"
 	case !authenticatedEnvelope && !event.VerifySignature():
 		reason = "invalid_signature"
-	case !eventTimestampPlausible(event.CreatedAt, p.maxEventFutureSkew, p.maxEventPastAge):
+	case !eventTimestampPlausibleForKind(event.Kind, event.CreatedAt, p.maxEventFutureSkew, p.maxEventPastAge):
 		reason = "implausible_timestamp"
 	}
 	if reason == "" {
@@ -395,6 +414,43 @@ func (p *Processor) validateEventForIngest(event nostr.Event, relayURL string, a
 		"created_at", int64(event.CreatedAt),
 	)
 	return false
+}
+
+func (p *Processor) handleMonitoringEvent(ctx context.Context, event nostr.Event, deletion bool) error {
+	if p.monitoring == nil {
+		return nil
+	}
+	var (
+		applied bool
+		err     error
+	)
+	if deletion {
+		applied, err = p.monitoring.ApplyDeletion(ctx, event)
+	} else {
+		applied, err = p.monitoring.ApplyList(ctx, event)
+	}
+	if err != nil {
+		if errors.Is(err, monitoring.ErrUnauthorizedAuthor) ||
+			errors.Is(err, monitoring.ErrMalformedList) ||
+			errors.Is(err, monitoring.ErrMalformedDeletion) {
+			p.logger.Warn("rejected monitored repository control event",
+				"event_id", event.ID.Hex(),
+				"kind", int(event.Kind),
+				"author", event.PubKey.Hex(),
+				"reason", err.Error(),
+			)
+			return nil
+		}
+		return err
+	}
+	if applied {
+		p.logger.Info("applied monitored repository control event",
+			"event_id", event.ID.Hex(),
+			"kind", int(event.Kind),
+			"deleted", deletion,
+		)
+	}
+	return nil
 }
 
 func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, relayURL string) error {
@@ -437,6 +493,21 @@ func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, rela
 		return nil
 	}
 	return p.contextVMResponder.SendResponseToEvent(ctx, event.ID.Hex(), resp.ID, resp.Result, resp.Error, event.PubKey)
+}
+
+func eventTimestampPlausibleForKind(kind nostr.Kind, ts nostr.Timestamp, maxFutureSkew, maxPastAge time.Duration) bool {
+	now := time.Now()
+	createdAt := time.Unix(int64(ts), 0)
+	if createdAt.After(now.Add(maxFutureSkew)) {
+		return false
+	}
+	// Dedicated no-Since subscriptions must be able to recover an old current
+	// replaceable list or tombstone. Replacement ordering, not a global age
+	// cutoff, decides whether these control-plane events still matter.
+	if kind == eventkind.MonitoredRepositories || kind == eventkind.Deletion {
+		return true
+	}
+	return !createdAt.Before(now.Add(-maxPastAge))
 }
 
 func eventTimestampPlausible(ts nostr.Timestamp, maxFutureSkew, maxPastAge time.Duration) bool {

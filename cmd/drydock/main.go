@@ -31,6 +31,7 @@ import (
 	"drydock/internal/marketplace"
 	"drydock/internal/metareview"
 	"drydock/internal/metrics"
+	"drydock/internal/monitoring"
 	"drydock/internal/payment"
 	"drydock/internal/pipeline"
 	"drydock/internal/profile"
@@ -89,6 +90,26 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+
+	var monitoredRepos *monitoring.Registry
+	if cfg.MonitoredReposAuthor != "" {
+		monitoredRepos, err = monitoring.NewRegistry(store, cfg.MonitoredReposAuthor)
+		if err != nil {
+			logger.Error("failed to initialize monitored repository registry", "error", err)
+			os.Exit(1)
+		}
+		if err := monitoredRepos.Load(ctx); err != nil {
+			logger.Error("failed to load monitored repository registry", "error", err)
+			os.Exit(1)
+		}
+		snapshot := monitoredRepos.Snapshot()
+		logger.Info("loaded monitored repository registry",
+			"initialized", snapshot.Initialized,
+			"deleted", snapshot.Deleted,
+			"revision_event_id", snapshot.RevisionID,
+			"repository_count", len(snapshot.Repositories),
+		)
+	}
 
 	rateLimitStore := ratelimit.NewSQLStore(store.DB())
 	codeChatRateLimiter := ratelimit.New(ratelimit.Config{
@@ -281,6 +302,9 @@ func main() {
 
 	// --- Ingest / Listener ---
 	var processorOpts []func(*ingest.Processor)
+	if monitoredRepos != nil {
+		processorOpts = append(processorOpts, ingest.WithMonitoring(monitoredRepos))
+	}
 	if convHandler != nil {
 		processorOpts = append(processorOpts, ingest.WithConversation(convHandler))
 	}
@@ -605,6 +629,7 @@ func main() {
 		GiftWrapEnabled:      giftWrapOpener != nil,
 		ContextVMPubkey:      servicePubkey,
 		ContextVMMethods:     contextVMRouter.Methods(),
+		MonitoredReposAuthor: cfg.MonitoredReposAuthor,
 	}, processor, logger, listenerOpts...)
 
 	// --- Pipeline runner ---

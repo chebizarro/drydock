@@ -51,6 +51,7 @@ type Config struct {
 	RepoCacheMaxSizeMB    int
 	RepoAllowlist         []string
 	RepoOwnerAllowlist    []string
+	MonitoredReposAuthor  string
 	FreePubkeys           []string
 	TrustedZappers        []string
 	Relays                []string
@@ -146,17 +147,18 @@ func FromEnv() Config {
 	}
 
 	return Config{
-		Environment:        environment,
-		Production:         production,
-		ExplicitEnv:        configuredEnv(),
-		DatabaseURL:        envOrDefault("DRYDOCK_DATABASE_URL", "file:drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)"),
-		RepoCacheDir:       envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
-		RepoCacheMaxCount:  parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_COUNT", "50"), 50),
-		RepoCacheMaxSizeMB: parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_SIZE_MB", "10240"), 10240),
-		RepoAllowlist:      normalizeRepositoryAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_ALLOWLIST", ""))),
-		RepoOwnerAllowlist: normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_OWNER_ALLOWLIST", ""))),
-		FreePubkeys:        normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_FREE_PUBKEYS", ""))),
-		TrustedZappers:     normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_TRUSTED_ZAPPERS", ""))),
+		Environment:          environment,
+		Production:           production,
+		ExplicitEnv:          configuredEnv(),
+		DatabaseURL:          envOrDefault("DRYDOCK_DATABASE_URL", "file:drydock.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)"),
+		RepoCacheDir:         envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
+		RepoCacheMaxCount:    parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_COUNT", "50"), 50),
+		RepoCacheMaxSizeMB:   parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_SIZE_MB", "10240"), 10240),
+		RepoAllowlist:        normalizeRepositoryAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_ALLOWLIST", ""))),
+		RepoOwnerAllowlist:   normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_OWNER_ALLOWLIST", ""))),
+		MonitoredReposAuthor: scope.NormalizePubkey(envOrDefault("DRYDOCK_MONITORED_REPOS_AUTHOR", "")),
+		FreePubkeys:          normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_FREE_PUBKEYS", ""))),
+		TrustedZappers:       normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_TRUSTED_ZAPPERS", ""))),
 		Relays: splitCSV(
 			envOrDefault(
 				"DRYDOCK_RELAYS",
@@ -266,6 +268,7 @@ func configuredEnv() map[string]bool {
 		"DRYDOCK_RELAYS",
 		"DRYDOCK_READ_RELAYS",
 		"DRYDOCK_WRITE_RELAYS",
+		"DRYDOCK_MONITORED_REPOS_AUTHOR",
 		"DRYDOCK_LLM_API_KEY",
 		"DRYDOCK_PLANNER_BASE_URL",
 		"DRYDOCK_PLANNER_MODEL",
@@ -456,6 +459,20 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 		if u.Scheme != "wss" && u.Scheme != "ws" {
 			result.Errors = append(result.Errors, fmt.Sprintf("relay URL must use ws:// or wss:// scheme: %q", relay))
 		}
+	}
+
+	// --- Operator-authored monitored repository list ---
+	monitoredAuthor := strings.TrimSpace(c.MonitoredReposAuthor)
+	if monitoredAuthor == "" {
+		if c.IsProduction() {
+			result.Errors = append(result.Errors, "production mode requires DRYDOCK_MONITORED_REPOS_AUTHOR")
+		} else {
+			result.Warnings = append(result.Warnings, "DRYDOCK_MONITORED_REPOS_AUTHOR is empty: monitored repository control-plane ingestion is disabled")
+		}
+	} else if pubkey, err := scope.ParsePubkey(monitoredAuthor); err != nil {
+		result.Errors = append(result.Errors, "DRYDOCK_MONITORED_REPOS_AUTHOR must be a valid hex or npub public key")
+	} else {
+		c.MonitoredReposAuthor = pubkey.Hex()
 	}
 
 	// --- Signer configuration ---

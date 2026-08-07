@@ -620,11 +620,12 @@ func (s *Store) ExpireStaleAssignments(ctx context.Context) (int64, error) {
 	return result.RowsAffected()
 }
 
-// RecordFeedback stores feedback on a completed review.
-func (s *Store) RecordFeedback(ctx context.Context, fb ReviewFeedback) error {
+// RecordFeedback stores feedback on a completed review and reports whether
+// this call inserted the immutable first-write-wins record.
+func (s *Store) RecordFeedback(ctx context.Context, fb ReviewFeedback) (bool, error) {
 	now := time.Now().Unix()
 
-	_, err := s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO review_feedback (
 			assignment_id, reviewer_pubkey, rater_pubkey,
 			rating, comment, event_id, created_at
@@ -634,7 +635,14 @@ func (s *Store) RecordFeedback(ctx context.Context, fb ReviewFeedback) error {
 		fb.AssignmentID, fb.ReviewerPubkey, fb.RaterPubkey,
 		fb.Rating, fb.Comment, fb.EventID, now,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return inserted == 1, nil
 }
 
 // GetReviewerStats retrieves aggregated stats for reputation calculation.
