@@ -1,5 +1,5 @@
 {
-  "id": "heldout-sample-v2",
+  "id": "heldout-sample-v3",
   "cases": [
     {
       "case_id": "sample-auth-empty-token",
@@ -356,6 +356,27 @@
       "patch_diff": "diff --git a/store/repo.go b/store/repo.go\n--- a/store/repo.go\n+++ b/store/repo.go\n@@ -10,10 +10,10 @@\n func (s *Store) GetByID(ctx context.Context, id string) (*Item, error) {\n-\tvar x Item\n-\terr := s.db.QueryRowContext(ctx, \"SELECT id, name, price FROM items WHERE id = ?\", id).Scan(&x.ID, &x.Name, &x.Price)\n+\tvar item Item\n+\terr := s.db.QueryRowContext(ctx, \"SELECT id, name, price FROM items WHERE id = ?\", id).Scan(&item.ID, &item.Name, &item.Price)\n \tif err != nil {\n \t\treturn nil, fmt.Errorf(\"get item by id: %w\", err)\n \t}\n-\treturn &x, nil\n+\treturn &item, nil\n }\n",
       "changed_files": ["store/repo.go"],
       "context_bundle": "Database store layer. Renaming a variable for readability, no logic changes.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "sample-clean-parameterized-query",
+      "patch_diff": "diff --git a/db/query.go b/db/query.go\n--- a/db/query.go\n+++ b/db/query.go\n@@ -10,6 +10,8 @@\n func GetUserByEmail(db *sql.DB, email string) (*User, error) {\n+\trow := db.QueryRow(\"SELECT id, email FROM users WHERE email = ?\", email)\n+\tvar user User\n+\terr := row.Scan(&user.ID, &user.Email)\n+\treturn &user, err\n }\n",
+      "changed_files": ["db/query.go"],
+      "context_bundle": "Database lookup uses a parameter placeholder and passes untrusted email separately to the driver.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "sample-clean-bounded-upload",
+      "patch_diff": "diff --git a/api/upload.go b/api/upload.go\n--- a/api/upload.go\n+++ b/api/upload.go\n@@ -10,6 +10,9 @@\n func (s *Server) UploadHandler(w http.ResponseWriter, r *http.Request) {\n+\tr.Body = http.MaxBytesReader(w, r.Body, 10<<20)\n+\tbody, err := io.ReadAll(r.Body)\n+\tif err != nil { http.Error(w, \"invalid upload\", http.StatusBadRequest); return }\n+\ts.processUpload(body)\n }\n",
+      "changed_files": ["api/upload.go"],
+      "context_bundle": "Internet-facing upload endpoint caps the request body at 10 MiB before reading it.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "sample-clean-authorized-delete",
+      "patch_diff": "diff --git a/api/admin.go b/api/admin.go\n--- a/api/admin.go\n+++ b/api/admin.go\n@@ -15,6 +15,11 @@\n func (s *Server) DeleteUser(w http.ResponseWriter, r *http.Request) {\n+\tcaller := r.Context().Value(ctxKeyUser).(*User)\n+\tif !caller.IsAdmin {\n+\t\thttp.Error(w, \"forbidden\", http.StatusForbidden)\n+\t\treturn\n+\t}\n+\ts.store.DeleteUser(r.Context(), r.URL.Query().Get(\"user_id\"))\n }\n",
+      "changed_files": ["api/admin.go"],
+      "context_bundle": "Authenticated admin endpoint performs an explicit role check before deleting the requested user.",
       "expected_findings": []
     },
     {
