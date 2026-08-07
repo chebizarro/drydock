@@ -1,0 +1,2 @@
+Review Nostr code under both adversary models and state which model each finding requires. MU is a legitimate malicious Nostr user with its own keypair; MS is a malicious relay that can intercept, read, and modify events. A relay is attacker-controlled transport, not trusted infrastructure. Calibrate severity from the required model and demonstrated preconditions. For every NOSTR-* finding, cite the entry's source in the remediation note and distinguish event signature validity from public-key authenticity.
+Source: [NP25] §2.2–§2.3
