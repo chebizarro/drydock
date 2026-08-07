@@ -110,6 +110,74 @@ func TestRunSurvivorIsClassifiedAsFinding(t *testing.T) {
 	}
 }
 
+func TestNostrAbsenceWrapperVerificationRefutesWithDedicatedLens(t *testing.T) {
+	fake := &testutil.FakeLLM{Responses: []string{
+		`{"refuted":true,"certain":true,"reason":"handler.go:17 calls verifyEvent before dispatch"}`,
+		`{"refuted":true,"certain":true,"reason":"the wrapper library guarantees signature verification"}`,
+	}}
+	engine := New(&lockedFakeLLM{fake: fake}, DefaultConfig())
+	finding := candidate()
+	finding.Category = "NOSTR-V2"
+	finding.Evidence = "relay.go:10 ingest -> handler.go:42 store"
+	finding.Confidence = 0.79
+
+	got, err := engine.Run(context.Background(), []reviewengine.Finding{finding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d findings, want wrapper-verified absence claim refuted", len(got))
+	}
+	if len(fake.Requests) != AbsenceVerifyVotes {
+		t.Fatalf("got %d verifier calls, want absence default %d", len(fake.Requests), AbsenceVerifyVotes)
+	}
+	for _, req := range fake.Requests {
+		if !strings.Contains(req.System, "exact file:line where this check DOES occur") {
+			t.Fatalf("Nostr refute instruction missing from verifier prompt")
+		}
+		if !strings.Contains(req.System, "framework/library guarantee") {
+			t.Fatalf("framework/library refutation instruction missing from verifier prompt")
+		}
+		if !strings.Contains(req.System, "NIP-01") {
+			t.Fatalf("Nostr knowledge pack missing from verifier prompt")
+		}
+		if !strings.Contains(req.User, `"confidence":0.79`) {
+			t.Fatalf("absence confidence cap was not preserved into verification: %s", req.User)
+		}
+	}
+}
+
+func TestNostrAbsenceConfidenceChangesOnlyAfterVerificationConfirms(t *testing.T) {
+	fake := &testutil.FakeLLM{Responses: []string{
+		`{"refuted":false,"certain":true,"reason":"no verification on the path"}`,
+		`{"refuted":false,"certain":true,"reason":"no library guarantee applies"}`,
+		`{"cwe":"CWE-347","severity":"high","confidence":0.95,"remediation":"verify the event signature"}`,
+	}}
+	engine := New(&lockedFakeLLM{fake: fake}, DefaultConfig())
+	finding := candidate()
+	finding.Explanation = "Missing signature verification [NOSTR-V2]"
+	finding.Confidence = 0.79
+
+	got, err := engine.Run(context.Background(), []reviewengine.Finding{finding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want verified survivor", len(got))
+	}
+	if len(fake.Requests) != AbsenceVerifyVotes+1 {
+		t.Fatalf("got %d calls, want %d verifier calls plus classification", len(fake.Requests), AbsenceVerifyVotes)
+	}
+	for _, req := range fake.Requests[:AbsenceVerifyVotes] {
+		if !strings.Contains(req.User, `"confidence":0.79`) {
+			t.Fatalf("absence confidence cap changed before verification: %s", req.User)
+		}
+	}
+	if got[0].Confidence != 0.95 {
+		t.Fatalf("confirmed finding confidence = %v, want classifier confidence 0.95", got[0].Confidence)
+	}
+}
+
 func TestRunDefaultsUncertainVotesToRefuted(t *testing.T) {
 	fake := &testutil.FakeLLM{Responses: []string{`{"refuted":false,"certain":false,"reason":"insufficient context"}`}}
 	engine := New(fake, DefaultConfig())

@@ -15,10 +15,21 @@ import (
 
 const (
 	DefaultVerifyVotes   = 1
+	AbsenceVerifyVotes   = 2
 	DeepAuditVerifyVotes = 3
 )
 
-var cwePattern = regexp.MustCompile(`^CWE-[1-9][0-9]*$`)
+var (
+	cwePattern         = regexp.MustCompile(`^CWE-[1-9][0-9]*$`)
+	nostrRulePattern   = regexp.MustCompile(`(?i)\bNOSTR-[A-Z0-9]+(?:-[A-Z0-9]+)*\b`)
+	nostrAbsenceRuleID = map[string]struct{}{
+		"NOSTR-V1": {},
+		"NOSTR-V2": {},
+		"NOSTR-V7": {},
+		"NOSTR-R1": {},
+		"NOSTR-R2": {},
+	}
+)
 
 // Config controls adversarial verification and classification calls.
 type Config struct {
@@ -133,10 +144,11 @@ type verifierResponse struct {
 }
 
 func (e *Engine) refuted(ctx context.Context, finding reviewengine.Finding) (bool, error) {
-	results := make(chan verifyResult, e.cfg.VerifyVotes)
+	verifyVotes := e.verifyVotes(finding)
+	results := make(chan verifyResult, verifyVotes)
 	var wg sync.WaitGroup
-	for vote := 0; vote < e.cfg.VerifyVotes; vote++ {
-		lens := verifierLens(vote)
+	for vote := 0; vote < verifyVotes; vote++ {
+		lens := verifierLens(finding, vote)
 		wg.Add(1)
 		go func(vote int, lens string) {
 			defer wg.Done()
@@ -160,9 +172,16 @@ func (e *Engine) refuted(ctx context.Context, finding reviewengine.Finding) (boo
 		}
 	}
 	if validVotes == 0 {
-		return false, fmt.Errorf("verification unavailable for %s:%d: all %d verifier votes failed", finding.File, finding.Line, e.cfg.VerifyVotes)
+		return false, fmt.Errorf("verification unavailable for %s:%d: all %d verifier votes failed", finding.File, finding.Line, verifyVotes)
 	}
 	return refuteVotes > validVotes/2, nil
+}
+
+func (e *Engine) verifyVotes(finding reviewengine.Finding) int {
+	if isNostrAbsenceFinding(finding) && e.cfg.VerifyVotes == DefaultVerifyVotes {
+		return AbsenceVerifyVotes
+	}
+	return e.cfg.VerifyVotes
 }
 
 func (e *Engine) runVerifier(ctx context.Context, finding reviewengine.Finding, vote int, lens string) verdict {
@@ -194,13 +213,34 @@ func (e *Engine) runVerifier(ctx context.Context, finding reviewengine.Finding, 
 	return verdictSurvived
 }
 
-func verifierLens(vote int) string {
+func verifierLens(finding reviewengine.Finding, vote int) string {
+	if isNostrFinding(finding) {
+		return nostrRefuteLens()
+	}
 	lenses := []string{
 		"reachability and exploitability: prove the vulnerable path cannot be reached or exploited",
 		"input controllability: prove an attacker cannot control the relevant source, value, or state",
 		"existing mitigation: find validation, authorization, escaping, sandboxing, or another effective control",
 	}
 	return lenses[vote%len(lenses)]
+}
+
+func isNostrFinding(finding reviewengine.Finding) bool {
+	return nostrRuleID(finding) != ""
+}
+
+func isNostrAbsenceFinding(finding reviewengine.Finding) bool {
+	_, ok := nostrAbsenceRuleID[nostrRuleID(finding)]
+	return ok
+}
+
+func nostrRuleID(finding reviewengine.Finding) string {
+	for _, field := range []string{finding.Category, finding.Explanation, finding.Evidence} {
+		if ruleID := nostrRulePattern.FindString(field); ruleID != "" {
+			return strings.ToUpper(ruleID)
+		}
+	}
+	return ""
 }
 
 type classificationResponse struct {
