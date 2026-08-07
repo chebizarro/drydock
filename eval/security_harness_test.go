@@ -7,12 +7,15 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	evaldata "drydock/internal/eval"
 	"drydock/internal/reviewengine"
 	"drydock/internal/securityverify"
 	"drydock/internal/testutil"
 )
+
+const prLensCIBudget = 5 * time.Second
 
 type securityMetrics struct {
 	TruePositives     int
@@ -21,6 +24,7 @@ type securityMetrics struct {
 	Precision         float64
 	Recall            float64
 	FalsePositiveRate float64
+	Latency           time.Duration
 }
 
 func TestSecurityPipelineVerifyImprovesFalsePositiveRate(t *testing.T) {
@@ -47,8 +51,8 @@ func TestSecurityPipelineVerifyImprovesFalsePositiveRate(t *testing.T) {
 	t.Logf("security eval without securityverify: precision=%.3f recall=%.3f false-positive-rate=%.3f (tp=%d fp=%d fn=%d)",
 		withoutVerify.Precision, withoutVerify.Recall, withoutVerify.FalsePositiveRate,
 		withoutVerify.TruePositives, withoutVerify.FalsePositives, withoutVerify.FalseNegatives)
-	t.Logf("security eval with securityverify: precision=%.3f recall=%.3f false-positive-rate=%.3f (tp=%d fp=%d fn=%d)",
-		withVerify.Precision, withVerify.Recall, withVerify.FalsePositiveRate,
+	t.Logf("security eval with securityverify: precision=%.3f recall=%.3f false-positive-rate=%.3f latency=%s (tp=%d fp=%d fn=%d)",
+		withVerify.Precision, withVerify.Recall, withVerify.FalsePositiveRate, withVerify.Latency,
 		withVerify.TruePositives, withVerify.FalsePositives, withVerify.FalseNegatives)
 
 	if withoutVerify.FalsePositiveRate == 0 {
@@ -66,11 +70,15 @@ func TestSecurityPipelineVerifyImprovesFalsePositiveRate(t *testing.T) {
 		t.Fatalf("securityverify did not improve precision: without=%.3f with=%.3f",
 			withoutVerify.Precision, withVerify.Precision)
 	}
+	if withVerify.Latency > prLensCIBudget {
+		t.Fatalf("verified PR-lens latency %s exceeds CI budget %s", withVerify.Latency, prLensCIBudget)
+	}
 }
 
 func runSecurityEval(t *testing.T, cases []evaldata.PatchCase, withVerify bool) securityMetrics {
 	t.Helper()
 	ctx := context.Background()
+	started := time.Now()
 	var total securityMetrics
 	for _, c := range cases {
 		expected := securityExpected(c)
@@ -88,6 +96,7 @@ func runSecurityEval(t *testing.T, cases []evaldata.PatchCase, withVerify bool) 
 	// Match the existing eval harness definition: the fraction of predicted
 	// findings that are false positives.
 	total.FalsePositiveRate = metricRatio(total.FalsePositives, total.TruePositives+total.FalsePositives)
+	total.Latency = time.Since(started)
 	return total
 }
 
