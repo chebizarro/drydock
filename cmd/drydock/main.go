@@ -83,17 +83,12 @@ func main() {
 	logger.Info("configuration validation passed")
 
 	// --- Database ---
-	store, err := db.Open(ctx, cfg.DatabaseURL)
+	store, err := openMigratedStore(ctx, cfg.DatabaseURL)
 	if err != nil {
-		logger.Error("failed to open database", "error", err)
+		logger.Error("failed to initialize database", "error", err)
 		os.Exit(1)
 	}
 	defer store.Close()
-
-	if err := store.Migrate(ctx); err != nil {
-		logger.Error("failed to migrate database", "error", err)
-		os.Exit(1)
-	}
 
 	rateLimitStore := ratelimit.NewSQLStore(store.DB())
 	codeChatRateLimiter := ratelimit.New(ratelimit.Config{
@@ -905,13 +900,25 @@ func main() {
 	}
 }
 
+func openMigratedStore(ctx context.Context, databaseURL string) (*db.Store, error) {
+	store, err := db.Open(ctx, databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		store.Close()
+		return nil, fmt.Errorf("migrate database: %w", err)
+	}
+	return store, nil
+}
+
 // runDriftGuard runs the convention drift guard CLI and exits.
 func runDriftGuard(cfg config.Config, logger *slog.Logger) {
 	ctx := context.Background()
 
-	store, err := db.Open(ctx, cfg.DatabaseURL)
+	store, err := openMigratedStore(ctx, cfg.DatabaseURL)
 	if err != nil {
-		logger.Error("failed to open database", "error", err)
+		logger.Error("failed to initialize database", "error", err)
 		os.Exit(1)
 	}
 	defer store.Close()

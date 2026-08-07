@@ -459,9 +459,14 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 
 	// --- Signer configuration ---
-	hasSignerConfig := c.SignerBunkerURL != "" || c.SignerNsec != "" || c.SignerNsecFile != ""
+	hasSignerConfig := c.SignerBunkerURL != "" || c.SignerNsec != ""
 	if !hasSignerConfig {
-		result.Warnings = append(result.Warnings, "no signer configured: review publishing will be disabled (set DRYDOCK_SIGNER_BUNKER_URL or DRYDOCK_SIGNER_NSEC)")
+		message := "no signer configured: review publishing will be disabled (set DRYDOCK_SIGNER_BUNKER_URL or DRYDOCK_SIGNER_NSEC)"
+		if c.IsProduction() {
+			result.Errors = append(result.Errors, message)
+		} else {
+			result.Warnings = append(result.Warnings, message)
+		}
 	}
 
 	// --- Database connectivity ---

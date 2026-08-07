@@ -170,6 +170,40 @@ func TestValidate_NoSigner_Warning(t *testing.T) {
 	if !foundSignerWarning {
 		t.Error("expected 'no signer configured' warning")
 	}
+	if hasErrorContaining(result, "no signer configured") {
+		t.Error("expected missing signer to remain non-fatal outside production")
+	}
+}
+
+func TestValidate_ProductionRequiresSigner(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		signerNsecFile string
+	}{
+		{name: "not configured"},
+		{name: "configured file did not load", signerNsecFile: "/missing/signer.nsec"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				Production:      true,
+				Relays:          []string{"wss://relay.example.com"},
+				PipelineWorkers: 2,
+				DatabaseURL:     ":memory:",
+				SignerNsecFile:  tc.signerNsecFile,
+			}
+
+			result := cfg.Validate(context.Background())
+
+			if !hasErrorContaining(result, "no signer configured") {
+				t.Errorf("expected production validation error for missing signer; got %#v", result.Errors)
+			}
+			for _, warning := range result.Warnings {
+				if contains(warning, "no signer configured") {
+					t.Errorf("expected missing production signer to be fatal, got warning %q", warning)
+				}
+			}
+		})
+	}
 }
 
 func TestValidate_InvalidPipelineWorkers(t *testing.T) {
