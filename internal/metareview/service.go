@@ -43,13 +43,14 @@ type Config struct {
 }
 
 type Input struct {
-	PatchEventID  string
-	RepoID        string
-	PatchDiff     string
-	ContextBundle string
-	ContextHash   string
-	ChangedFiles  []string
-	LocalReview   reviewengine.ReviewerOutput
+	PatchEventID     string
+	RepoID           string
+	PatchDiff        string
+	ContextBundle    string
+	ContextHash      string
+	ChangedFiles     []string
+	LocalReview      reviewengine.ReviewerOutput
+	SecurityFindings []SecurityFinding
 }
 
 type Result struct {
@@ -120,16 +121,22 @@ func (s *Service) RunAsync(ctx context.Context, in Input) {
 }
 
 func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
-	reasons := gateReasons(in.LocalReview, in.ChangedFiles, s.cfg.RandomSampleRate)
+	reasons := gateReasons(in.LocalReview, in.ChangedFiles, in.SecurityFindings, s.cfg.RandomSampleRate)
 	if len(reasons) == 0 {
 		return Result{Triggered: false}, nil
 	}
 	changedLines := changedLineSet(in.PatchDiff)
 	gateReason := strings.Join(reasons, ",")
 
-	reuse, err := s.store.FindReusableMetaReview(ctx, in.ContextHash, changedLines, s.cfg.MinReuseJaccard)
-	if err != nil {
-		return Result{}, err
+	var reuse *db.MetaReviewReuse
+	var err error
+	// Verification outcomes are fresh quality evidence and must not reuse a
+	// response produced for a prior security-review batch.
+	if len(in.SecurityFindings) == 0 {
+		reuse, err = s.store.FindReusableMetaReview(ctx, in.ContextHash, changedLines, s.cfg.MinReuseJaccard)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 
 	var parsed MetaReviewOutput
@@ -181,8 +188,11 @@ func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
 	return Result{Triggered: true, Reused: false, Reasons: reasons, Output: &parsed}, nil
 }
 
-func gateReasons(local reviewengine.ReviewerOutput, changedFiles []string, randomRate float64) []string {
-	reasons := make([]string, 0, 3)
+func gateReasons(local reviewengine.ReviewerOutput, changedFiles []string, securityFindings []SecurityFinding, randomRate float64) []string {
+	reasons := make([]string, 0, 4)
+	if len(securityFindings) > 0 {
+		reasons = append(reasons, "security-verify-outcomes")
+	}
 	if meanConfidence(local.Findings) < 0.7 {
 		reasons = append(reasons, "mean-confidence-below-0.7")
 	}
@@ -242,11 +252,15 @@ func (s *Service) queuePromptGaps(ctx context.Context, in Input, out MetaReviewO
 }
 
 func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOutput) error {
+	securityAnalysis := AnalyzeSecurityFindings(in.SecurityFindings)
 	if out.SuggestedFewShot {
 		payload := map[string]any{
 			"patch_diff":   in.PatchDiff,
 			"meta_review":  out,
 			"local_review": in.LocalReview,
+		}
+		if len(in.SecurityFindings) > 0 {
+			payload["security_review"] = securityAnalysis
 		}
 		buf, _ := json.Marshal(payload)
 		content := string(buf)
@@ -264,6 +278,9 @@ func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOut
 				// Extract metadata for cross-repo learning.
 				lang := detectPrimaryLanguage(in.ChangedFiles)
 				categories := extractFindingCategories(in.LocalReview.Findings)
+				if len(in.SecurityFindings) > 0 && !slices.Contains(categories, "security") {
+					categories = append(categories, "security")
+				}
 
 				point := vectorstore.Point{
 					ID:     in.PatchEventID,
@@ -283,10 +300,13 @@ func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOut
 			}
 		}
 	}
-	if len(out.FalsePositives) > 0 {
+	if len(out.FalsePositives) > 0 || securityAnalysis.Refuted > 0 {
 		payload := map[string]any{
 			"kind":            "negative-pattern",
 			"false_positives": out.FalsePositives,
+		}
+		if len(in.SecurityFindings) > 0 {
+			payload["security_review"] = securityAnalysis
 		}
 		buf, _ := json.Marshal(payload)
 		if err := s.store.InsertFewShot(ctx, in.PatchEventID, in.RepoID, "negative", string(buf), out.ContextUtilization); err != nil {
@@ -298,16 +318,22 @@ func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOut
 
 func metaReviewSystemPrompt() string {
 	return `You are a meta-review evaluator.
+Evaluate security-review quality when security verification evidence is provided. Treat confirmed findings as supported vulnerabilities and refuted findings as rejected candidates. Use refute rate and CWE counts to identify over-reporting, under-detection, and recurring CWE misses; reflect actionable weaknesses in prompt_gaps and few-shot recommendations.
 Return JSON only with keys:
 missed_findings, false_positives, reasoning_quality, context_utilization, prompt_gaps, suggested_few_shot.`
 }
 
 func metaReviewUserPrompt(in Input) string {
 	localReviewJSON, _ := json.Marshal(in.LocalReview)
-	return fmt.Sprintf(
+	prompt := fmt.Sprintf(
 		"Patch:\n%s\n\nContext:\n%s\n\nLocal review JSON:\n%s",
 		in.PatchDiff, in.ContextBundle, string(localReviewJSON),
 	)
+	if len(in.SecurityFindings) > 0 {
+		securityJSON, _ := json.Marshal(AnalyzeSecurityFindings(in.SecurityFindings))
+		prompt += "\n\nSecurity review verification analysis JSON:\n" + string(securityJSON)
+	}
+	return prompt
 }
 
 func changedLineSet(diff string) []string {

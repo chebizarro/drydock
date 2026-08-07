@@ -627,13 +627,14 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 12. Async meta-review (non-blocking, uses filtered review)
 	if r.metaSvc != nil {
 		r.metaSvc.RunAsync(ctx, metareview.Input{
-			PatchEventID:  task.PatchEventID,
-			RepoID:        task.RepoID,
-			PatchDiff:     patchDiffContent,
-			ContextBundle: bundle.Content,
-			ContextHash:   ctxHash,
-			ChangedFiles:  changedFiles,
-			LocalReview:   filteredReview,
+			PatchEventID:     task.PatchEventID,
+			RepoID:           task.RepoID,
+			PatchDiff:        patchDiffContent,
+			ContextBundle:    bundle.Content,
+			ContextHash:      ctxHash,
+			ChangedFiles:     changedFiles,
+			LocalReview:      filteredReview,
+			SecurityFindings: metareview.ConfirmedSecurityFindings(verifiedSecurityFindings),
 		})
 	}
 

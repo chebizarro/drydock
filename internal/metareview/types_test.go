@@ -1,6 +1,10 @@
 package metareview
 
-import "testing"
+import (
+	"testing"
+
+	"drydock/internal/reviewengine"
+)
 
 const validMetaReviewJSON = `{"missed_findings":[{"type":"correctness","description":"missed nil check","evidence":"foo dereferences bar","why_missed":"prompt_gap"}],"false_positives":[{"finding_index":0,"reason":"the reported issue is guarded"}],"reasoning_quality":0.8,"context_utilization":0.7,"prompt_gaps":["emphasize nil checks"],"suggested_few_shot":true}`
 
@@ -38,6 +42,37 @@ func TestParseMetaReviewOutputForFindingsRejectsInvalidNestedFields(t *testing.T
 				t.Fatal("expected invalid meta-review output to be rejected")
 			}
 		})
+	}
+}
+
+func TestAnalyzeSecurityFindingsTracksCWEOutcomes(t *testing.T) {
+	analysis := AnalyzeSecurityFindings([]SecurityFinding{
+		{Category: "CWE-89", CWE: "cwe-89", VerifyOutcome: SecurityConfirmed},
+		{CWE: "CWE-89", VerifyOutcome: SecurityRefuted, RefuteVotes: 2, VerifyVotes: 3},
+		{CWE: "CWE-22", VerifyOutcome: SecurityConfirmed},
+	})
+	if analysis.TotalCandidates != 3 || analysis.Confirmed != 2 || analysis.Refuted != 1 {
+		t.Fatalf("unexpected outcome counts: %+v", analysis)
+	}
+	if analysis.RefuteRate != 1.0/3.0 {
+		t.Fatalf("refute rate = %v, want %v", analysis.RefuteRate, 1.0/3.0)
+	}
+	if analysis.CWECounts["CWE-89"] != 2 || analysis.ConfirmedByCWE["CWE-22"] != 1 || analysis.RefutedByCWE["CWE-89"] != 1 {
+		t.Fatalf("unexpected CWE counts: %+v", analysis)
+	}
+	for _, finding := range analysis.Findings {
+		if finding.Category != "security" {
+			t.Fatalf("category = %q, want security", finding.Category)
+		}
+	}
+}
+
+func TestConfirmedSecurityFindingsPreservesCWEMetadata(t *testing.T) {
+	got := ConfirmedSecurityFindings([]reviewengine.Finding{{
+		Severity: "high", File: "auth.go", Line: 12, Evidence: "[CWE-89] user input reaches query", Explanation: "SQL injection", Confidence: 0.96,
+	}})
+	if len(got) != 1 || got[0].CWE != "CWE-89" || got[0].VerifyOutcome != SecurityConfirmed || got[0].Category != "security" {
+		t.Fatalf("unexpected security finding: %+v", got)
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"drydock/internal/db"
@@ -12,12 +14,14 @@ import (
 )
 
 type fakeClient struct {
-	calls int
-	resp  string
+	calls    int
+	resp     string
+	requests []reviewengine.ChatRequest
 }
 
-func (f *fakeClient) ChatCompletion(context.Context, reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
+func (f *fakeClient) ChatCompletion(_ context.Context, req reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
 	f.calls++
+	f.requests = append(f.requests, req)
 	return reviewengine.ChatResult{Content: f.resp}, nil
 }
 
@@ -80,8 +84,8 @@ func TestMetaReviewReusesByContextHashAndSimilarity(t *testing.T) {
 		ContextHash:   "hash-1",
 		ChangedFiles:  []string{"security/auth.go"},
 		LocalReview: reviewengine.ReviewerOutput{
-			Summary:   "s",
-			Findings:  []reviewengine.Finding{{Severity: "high", Category: "security", File: "a.go", Line: 1, Evidence: "e", Explanation: "x", Suggestion: "s", Confidence: 0.95}},
+			Summary:          "s",
+			Findings:         []reviewengine.Finding{{Severity: "high", Category: "security", File: "a.go", Line: 1, Evidence: "e", Explanation: "x", Suggestion: "s", Confidence: 0.95}},
 			NeedsMoreContext: nil,
 		},
 	})
@@ -93,6 +97,48 @@ func TestMetaReviewReusesByContextHashAndSimilarity(t *testing.T) {
 	}
 	if client.calls != 0 {
 		t.Fatalf("expected zero client calls when reuse matches, got %d", client.calls)
+	}
+}
+
+func TestMetaReviewAnalyzesSecurityVerifyOutcomes(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	client := &fakeClient{
+		resp: `{"missed_findings":[],"false_positives":[],"reasoning_quality":0.8,"context_utilization":0.7,"prompt_gaps":["reduce CWE-79 false positives"],"suggested_few_shot":false}`,
+	}
+	svc := New(Config{
+		Endpoint:         reviewengine.ModelEndpoint{BaseURL: "http://meta", Model: "meta"},
+		RandomSampleRate: 0.000000001,
+	}, store, client, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	result, err := svc.Run(ctx, Input{
+		PatchEventID: "security-patch",
+		RepoID:       "repo-1",
+		PatchDiff:    "+render(userInput)",
+		ContextHash:  "security-hash",
+		ChangedFiles: []string{"internal/render.go"},
+		LocalReview: reviewengine.ReviewerOutput{
+			Summary: "no local findings",
+		},
+		SecurityFindings: []SecurityFinding{
+			{CWE: "cwe-79", VerifyOutcome: SecurityConfirmed, Evidence: "reachable sink"},
+			{CWE: "CWE-79", VerifyOutcome: SecurityRefuted, Evidence: "escaped output", RefuteVotes: 2, VerifyVotes: 3},
+		},
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if !result.Triggered || !slices.Contains(result.Reasons, "security-verify-outcomes") {
+		t.Fatalf("security outcomes did not trigger meta-review: %+v", result)
+	}
+	if len(client.requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(client.requests))
+	}
+	prompt := client.requests[0].User
+	for _, want := range []string{`"category":"security"`, `"cwe":"CWE-79"`, `"verify_outcome":"confirmed"`, `"verify_outcome":"refuted"`, `"refute_rate":0.5`} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("security analysis prompt missing %s: %s", want, prompt)
+		}
 	}
 }
 
@@ -109,4 +155,3 @@ func mustStore(t *testing.T, ctx context.Context) *db.Store {
 	}
 	return store
 }
-

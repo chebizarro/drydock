@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"drydock/internal/reviewengine"
 )
 
 type MetaReviewOutput struct {
@@ -25,6 +27,112 @@ type MissedFinding struct {
 type FalsePositive struct {
 	FindingIndex int    `json:"finding_index"`
 	Reason       string `json:"reason"`
+}
+
+type SecurityVerifyOutcome string
+
+const (
+	SecurityConfirmed SecurityVerifyOutcome = "confirmed"
+	SecurityRefuted   SecurityVerifyOutcome = "refuted"
+)
+
+// SecurityFinding records a security-review candidate and the outcome of the
+// adversarial verify stage. Category is normalized to "security" before the
+// finding is included in meta-review analysis.
+type SecurityFinding struct {
+	Category      string                `json:"category"`
+	CWE           string                `json:"cwe,omitempty"`
+	Severity      string                `json:"severity,omitempty"`
+	File          string                `json:"file,omitempty"`
+	Line          int                   `json:"line,omitempty"`
+	Evidence      string                `json:"evidence,omitempty"`
+	Description   string                `json:"description,omitempty"`
+	Confidence    float64               `json:"confidence,omitempty"`
+	VerifyOutcome SecurityVerifyOutcome `json:"verify_outcome"`
+	RefuteVotes   int                   `json:"refute_votes,omitempty"`
+	VerifyVotes   int                   `json:"verify_votes,omitempty"`
+}
+
+// SecurityReviewAnalysis provides deterministic quality signals for the
+// meta-review prompt and few-shot store.
+type SecurityReviewAnalysis struct {
+	Findings        []SecurityFinding `json:"findings"`
+	TotalCandidates int               `json:"total_candidates"`
+	Confirmed       int               `json:"confirmed"`
+	Refuted         int               `json:"refuted"`
+	RefuteRate      float64           `json:"refute_rate"`
+	CWECounts       map[string]int    `json:"cwe_counts"`
+	ConfirmedByCWE  map[string]int    `json:"confirmed_by_cwe"`
+	RefutedByCWE    map[string]int    `json:"refuted_by_cwe"`
+}
+
+// AnalyzeSecurityFindings normalizes findings and derives verify-quality and
+// CWE recurrence signals for meta-review.
+func AnalyzeSecurityFindings(findings []SecurityFinding) SecurityReviewAnalysis {
+	analysis := SecurityReviewAnalysis{
+		Findings:        make([]SecurityFinding, 0, len(findings)),
+		TotalCandidates: len(findings),
+		CWECounts:       make(map[string]int),
+		ConfirmedByCWE:  make(map[string]int),
+		RefutedByCWE:    make(map[string]int),
+	}
+	for _, finding := range findings {
+		finding.Category = "security"
+		finding.CWE = strings.ToUpper(strings.TrimSpace(finding.CWE))
+		analysis.Findings = append(analysis.Findings, finding)
+		if finding.CWE != "" {
+			analysis.CWECounts[finding.CWE]++
+		}
+		switch finding.VerifyOutcome {
+		case SecurityConfirmed:
+			analysis.Confirmed++
+			if finding.CWE != "" {
+				analysis.ConfirmedByCWE[finding.CWE]++
+			}
+		case SecurityRefuted:
+			analysis.Refuted++
+			if finding.CWE != "" {
+				analysis.RefutedByCWE[finding.CWE]++
+			}
+		}
+	}
+	classified := analysis.Confirmed + analysis.Refuted
+	if classified > 0 {
+		analysis.RefuteRate = float64(analysis.Refuted) / float64(classified)
+	}
+	return analysis
+}
+
+// ConfirmedSecurityFindings adapts verified PR security findings into
+// meta-review inputs without mutating the security-review result.
+func ConfirmedSecurityFindings(findings []reviewengine.Finding) []SecurityFinding {
+	out := make([]SecurityFinding, 0, len(findings))
+	for _, finding := range findings {
+		out = append(out, SecurityFinding{
+			Category:      "security",
+			CWE:           cweFromEvidence(finding.Evidence),
+			Severity:      finding.Severity,
+			File:          finding.File,
+			Line:          finding.Line,
+			Evidence:      finding.Evidence,
+			Description:   finding.Explanation,
+			Confidence:    finding.Confidence,
+			VerifyOutcome: SecurityConfirmed,
+		})
+	}
+	return out
+}
+
+func cweFromEvidence(evidence string) string {
+	upper := strings.ToUpper(strings.TrimSpace(evidence))
+	if !strings.HasPrefix(upper, "[CWE-") {
+		return ""
+	}
+	end := strings.IndexByte(upper, ']')
+	if end < 0 {
+		return ""
+	}
+	return upper[1:end]
 }
 
 func ParseMetaReviewOutput(raw string) (MetaReviewOutput, error) {
