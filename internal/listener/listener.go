@@ -13,14 +13,40 @@ import (
 	"drydock/internal/metrics"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip59"
 )
 
 type EventProcessor interface {
 	ProcessEvent(ctx context.Context, event nostr.Event, relayURL string) error
+	ProcessGiftWrappedEvent(ctx context.Context, event nostr.Event, relayURL string) error
 }
 
 type GiftWrapOpener interface {
 	OpenGiftWrap(ctx context.Context, wrapper nostr.Event) (nostr.Event, error)
+}
+
+// GiftWrapDecrypter is the NIP-44 capability required to open NIP-59 wraps.
+type GiftWrapDecrypter interface {
+	Decrypt(ctx context.Context, ciphertext string, sender nostr.PubKey) (string, error)
+}
+
+type nip59GiftWrapOpener struct {
+	decrypter GiftWrapDecrypter
+}
+
+// NewNIP59GiftWrapOpener opens and verifies NIP-59 gift wraps with the
+// configured signer's NIP-44 decryption capability.
+func NewNIP59GiftWrapOpener(decrypter GiftWrapDecrypter) GiftWrapOpener {
+	return &nip59GiftWrapOpener{decrypter: decrypter}
+}
+
+func (o *nip59GiftWrapOpener) OpenGiftWrap(ctx context.Context, wrapper nostr.Event) (nostr.Event, error) {
+	if o == nil || o.decrypter == nil {
+		return nostr.Event{}, errors.New("gift wrap decrypter is not configured")
+	}
+	return nip59.GiftUnwrap(wrapper, func(sender nostr.PubKey, ciphertext string) (string, error) {
+		return o.decrypter.Decrypt(ctx, ciphertext, sender)
+	})
 }
 
 type highWaterStore interface {
@@ -56,7 +82,19 @@ func SubscribedKinds() []nostr.Kind {
 	return append([]nostr.Kind(nil), subscribedKinds...)
 }
 
+func subscriptionKinds(giftWrapEnabled bool) []nostr.Kind {
+	kinds := make([]nostr.Kind, 0, len(subscribedKinds))
+	for _, kind := range subscribedKinds {
+		if kind == eventkind.GiftWrap && !giftWrapEnabled {
+			continue
+		}
+		kinds = append(kinds, kind)
+	}
+	return kinds
+}
+
 func subscriptionFilters(since nostr.Timestamp, cfg Config) []nostr.Filter {
+	kinds := subscriptionKinds(cfg.GiftWrapEnabled)
 	pubkey := strings.TrimSpace(cfg.ContextVMPubkey)
 	methods := make([]string, 0, len(cfg.ContextVMMethods))
 	seenMethods := make(map[string]struct{}, len(cfg.ContextVMMethods))
@@ -72,10 +110,10 @@ func subscriptionFilters(since nostr.Timestamp, cfg Config) []nostr.Filter {
 		methods = append(methods, method)
 	}
 	if pubkey == "" || len(methods) == 0 {
-		return []nostr.Filter{{Kinds: append([]nostr.Kind(nil), subscribedKinds...), Since: since}}
+		return []nostr.Filter{{Kinds: kinds, Since: since}}
 	}
-	generalKinds := make([]nostr.Kind, 0, len(subscribedKinds)-1)
-	for _, kind := range subscribedKinds {
+	generalKinds := make([]nostr.Kind, 0, len(kinds)-1)
+	for _, kind := range kinds {
 		if kind != eventkind.ContextVM {
 			generalKinds = append(generalKinds, kind)
 		}
@@ -94,7 +132,9 @@ type Config struct {
 	Relays               []string
 	LookbackMinutes      int
 	HighWaterMarkOverlap time.Duration
+	CatchupMaxAge        time.Duration
 	MaxFutureSkew        time.Duration
+	GiftWrapEnabled      bool
 	ContextVMPubkey      string
 	ContextVMMethods     []string
 }
@@ -154,6 +194,9 @@ func (s *Service) Run(ctx context.Context) error {
 	if len(s.cfg.Relays) == 0 {
 		return errors.New("no relays configured")
 	}
+	if s.cfg.GiftWrapEnabled && s.opener == nil {
+		return errors.New("gift wrap subscription enabled without an opener")
+	}
 
 	lookback := s.cfg.LookbackMinutes
 	if lookback <= 0 {
@@ -162,6 +205,10 @@ func (s *Service) Run(ctx context.Context) error {
 	overlap := s.cfg.HighWaterMarkOverlap
 	if overlap <= 0 {
 		overlap = 30 * time.Second
+	}
+	catchupMaxAge := s.cfg.CatchupMaxAge
+	if catchupMaxAge <= 0 {
+		catchupMaxAge = 365 * 24 * time.Hour
 	}
 
 	maxFutureSkew := s.cfg.MaxFutureSkew
@@ -176,9 +223,9 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.store != nil {
 		if hwm, err := s.store.GetListenerHighWaterMark(ctx); err == nil && hwm > 0 {
 			var used bool
-			since, used = subscriptionSince(now, hwm, time.Duration(lookback)*time.Minute, overlap, maxFutureSkew)
+			since, used = subscriptionSince(now, hwm, time.Duration(lookback)*time.Minute, overlap, catchupMaxAge, maxFutureSkew)
 			if used {
-				s.logger.Info("using persisted high-water-mark for lookback",
+				s.logger.Info("using persisted high-water-mark for catch-up",
 					"high_water_mark", hwm,
 					"since", since,
 				)
@@ -292,6 +339,7 @@ func (s *Service) processRelayEvent(ctx context.Context, ie nostr.RelayEvent, la
 		relayURL = ie.Relay.URL
 	}
 	event := ie.Event
+	giftWrapped := false
 	if event.Kind == 1059 {
 		if s.opener == nil {
 			s.logger.Warn("dropping gift wrap without configured opener", "event_id", event.ID.Hex(), "relay", relayURL)
@@ -303,24 +351,31 @@ func (s *Service) processRelayEvent(ctx context.Context, ie nostr.RelayEvent, la
 			return
 		}
 		event = opened
+		giftWrapped = true
 	}
 
-	if err := s.processor.ProcessEvent(ctx, event, relayURL); err != nil {
+	var err error
+	if giftWrapped {
+		err = s.processor.ProcessGiftWrappedEvent(ctx, event, relayURL)
+	} else {
+		err = s.processor.ProcessEvent(ctx, event, relayURL)
+	}
+	if err != nil {
 		s.logger.Error("failed to process event", "event_id", event.ID.Hex(), "kind", int(event.Kind), "relay", relayURL, "error", err)
 		return
 	}
 
 	// Track high-water-mark for restart resilience only after successful processing.
 	if s.store != nil {
-		ts := int64(ie.Event.CreatedAt)
 		maxFutureSkew := s.cfg.MaxFutureSkew
 		if maxFutureSkew <= 0 {
 			maxFutureSkew = 10 * time.Minute
 		}
-		if ts > time.Now().Add(maxFutureSkew).Unix() {
+		ts, ok := checkpointTimestamp(time.Now(), int64(ie.Event.CreatedAt), maxFutureSkew)
+		if !ok {
 			s.logger.Warn("refusing to checkpoint implausible future event timestamp",
 				"event_id", ie.Event.ID.Hex(),
-				"high_water_mark", ts,
+				"high_water_mark", int64(ie.Event.CreatedAt),
 				"max_future_skew", maxFutureSkew.String(),
 			)
 			return
@@ -331,14 +386,28 @@ func (s *Service) processRelayEvent(ctx context.Context, ie nostr.RelayEvent, la
 	}
 }
 
-func subscriptionSince(now time.Time, highWaterMark int64, lookback, overlap, maxFutureSkew time.Duration) (int64, bool) {
-	since := now.Add(-lookback).Unix()
-	if highWaterMark > now.Add(maxFutureSkew).Unix() {
-		return since, false
+func checkpointTimestamp(now time.Time, eventTimestamp int64, maxFutureSkew time.Duration) (int64, bool) {
+	if eventTimestamp > now.Add(maxFutureSkew).Unix() {
+		return 0, false
 	}
-	hwmWithOverlap := highWaterMark - int64(overlap/time.Second)
-	if hwmWithOverlap > since {
-		since = hwmWithOverlap
+	if eventTimestamp > now.Unix() {
+		return now.Unix(), true
+	}
+	return eventTimestamp, true
+}
+
+func subscriptionSince(now time.Time, highWaterMark int64, lookback, overlap, catchupMaxAge, maxFutureSkew time.Duration) (int64, bool) {
+	freshStart := now.Add(-lookback).Unix()
+	if highWaterMark > now.Add(maxFutureSkew).Unix() {
+		return freshStart, false
+	}
+	if highWaterMark > now.Unix() {
+		highWaterMark = now.Unix()
+	}
+	since := highWaterMark - int64(overlap/time.Second)
+	catchupBound := now.Add(-catchupMaxAge).Unix()
+	if since < catchupBound {
+		since = catchupBound
 	}
 	return since, true
 }

@@ -17,6 +17,12 @@ CREATE TABLE IF NOT EXISTS ingested_events (
 );
 CREATE INDEX IF NOT EXISTS idx_ingested_events_kind ON ingested_events(kind);
 
+CREATE TABLE IF NOT EXISTS ingest_handler_completions (
+  event_id TEXT PRIMARY KEY,
+  completed_at INTEGER NOT NULL,
+  FOREIGN KEY (event_id) REFERENCES ingested_events(event_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS repositories (
   repo_id TEXT PRIMARY KEY,
   pubkey TEXT NOT NULL,

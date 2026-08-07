@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/keyer"
+	"fiatjaf.com/nostr/nip59"
 )
 
 func noopLogger() *slog.Logger {
@@ -61,6 +63,7 @@ func TestSubscribedKindsSet(t *testing.T) {
 func TestSubscriptionFiltersScopeContextVMByRecipientAndMethod(t *testing.T) {
 	since := nostr.Timestamp(1234)
 	filters := subscriptionFilters(since, Config{
+		GiftWrapEnabled:  true,
 		ContextVMPubkey:  "service-pubkey",
 		ContextVMMethods: []string{"security/audit", "review/request", "security/audit"},
 	})
@@ -87,6 +90,18 @@ func TestSubscriptionFiltersScopeContextVMByRecipientAndMethod(t *testing.T) {
 	}
 }
 
+func TestSubscriptionFiltersExcludeGiftWrapWhenDisabled(t *testing.T) {
+	filters := subscriptionFilters(nostr.Timestamp(1234), Config{})
+	if len(filters) != 1 {
+		t.Fatalf("filter count = %d, want 1", len(filters))
+	}
+	for _, kind := range filters[0].Kinds {
+		if kind == 1059 {
+			t.Fatal("gift-wrap kind subscribed without a configured opener")
+		}
+	}
+}
+
 func TestSubscribedKindsReturnsCopy(t *testing.T) {
 	k1 := SubscribedKinds()
 	k2 := SubscribedKinds()
@@ -104,6 +119,11 @@ type fakeProcessor struct {
 }
 
 func (f *fakeProcessor) ProcessEvent(_ context.Context, event nostr.Event, _ string) error {
+	f.events = append(f.events, event)
+	return f.err
+}
+
+func (f *fakeProcessor) ProcessGiftWrappedEvent(_ context.Context, event nostr.Event, _ string) error {
 	f.events = append(f.events, event)
 	return f.err
 }
@@ -157,6 +177,17 @@ func TestRunReturnsErrorWhenNoRelays(t *testing.T) {
 	}
 }
 
+func TestRunRejectsGiftWrapSubscriptionWithoutOpener(t *testing.T) {
+	svc := New(Config{
+		Relays:          []string{"wss://test.relay"},
+		GiftWrapEnabled: true,
+	}, &fakeProcessor{}, noopLogger())
+
+	if err := svc.Run(context.Background()); err == nil {
+		t.Fatal("expected startup error when gift-wrap subscription has no opener")
+	}
+}
+
 func TestNewAppliesOptions(t *testing.T) {
 	proc := &fakeProcessor{}
 	pool := nostr.NewPool()
@@ -200,6 +231,32 @@ func TestProcessRelayEventDoesNotAdvanceHighWaterOnProcessingFailure(t *testing.
 	}
 }
 
+func TestProcessRelayEventClampsCheckpointForAcceptedFutureTimestamp(t *testing.T) {
+	proc := &fakeProcessor{}
+	store := &fakeHighWaterStore{}
+	svc := New(Config{MaxFutureSkew: 10 * time.Minute}, proc, noopLogger())
+	svc.store = store
+	var lastSeen atomic.Int64
+	before := time.Now().Unix()
+
+	svc.processRelayEvent(context.Background(), nostr.RelayEvent{Event: nostr.Event{
+		ID:        nostr.MustIDFromHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+		Kind:      1,
+		CreatedAt: nostr.Timestamp(time.Now().Add(5 * time.Minute).Unix()),
+	}}, &lastSeen)
+
+	after := time.Now().Unix()
+	if len(store.updates) != 1 {
+		t.Fatalf("expected one high-water update, got %v", store.updates)
+	}
+	if got := store.updates[0]; got < before || got > after {
+		t.Fatalf("checkpoint = %d, want wall-clock range [%d,%d]", got, before, after)
+	}
+	if got := lastSeen.Load(); got != store.updates[0] {
+		t.Fatalf("lastSeen = %d, want %d", got, store.updates[0])
+	}
+}
+
 func TestProcessRelayEventDoesNotAdvanceHighWaterForFutureTimestamp(t *testing.T) {
 	proc := &fakeProcessor{}
 	store := &fakeHighWaterStore{}
@@ -230,7 +287,7 @@ func TestSubscriptionSinceIgnoresFutureHighWaterMark(t *testing.T) {
 	overlap := 30 * time.Second
 	maxFutureSkew := 10 * time.Minute
 
-	got, used := subscriptionSince(now, now.Add(time.Hour).Unix(), lookback, overlap, maxFutureSkew)
+	got, used := subscriptionSince(now, now.Add(time.Hour).Unix(), lookback, overlap, 24*time.Hour, maxFutureSkew)
 	want := now.Add(-lookback).Unix()
 	if used {
 		t.Fatal("expected poisoned future high-water mark to be ignored")
@@ -240,18 +297,43 @@ func TestSubscriptionSinceIgnoresFutureHighWaterMark(t *testing.T) {
 	}
 }
 
-func TestSubscriptionSinceUsesPlausibleHighWaterMark(t *testing.T) {
+func TestSubscriptionSinceCatchesUpFromCheckpointOlderThanLookback(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	hwm := now.Add(-time.Minute).Unix()
+	hwm := now.Add(-time.Hour).Unix()
 	overlap := 30 * time.Second
 
-	got, used := subscriptionSince(now, hwm, 5*time.Minute, overlap, 10*time.Minute)
+	got, used := subscriptionSince(now, hwm, 5*time.Minute, overlap, 24*time.Hour, 10*time.Minute)
 	if !used {
 		t.Fatal("expected plausible high-water mark to be used")
 	}
 	want := hwm - int64(overlap/time.Second)
 	if got != want {
 		t.Fatalf("expected overlapped high-water timestamp %d, got %d", want, got)
+	}
+}
+
+func TestSubscriptionSinceBoundsAncientCheckpointCatchup(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	got, used := subscriptionSince(now, now.Add(-48*time.Hour).Unix(), 5*time.Minute, 30*time.Second, 24*time.Hour, 10*time.Minute)
+	if !used {
+		t.Fatal("expected old high-water mark to be used with a catch-up bound")
+	}
+	want := now.Add(-24 * time.Hour).Unix()
+	if got != want {
+		t.Fatalf("bounded catch-up timestamp = %d, want %d", got, want)
+	}
+}
+
+func TestSubscriptionSinceClampsPlausibleFutureCheckpoint(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	overlap := 30 * time.Second
+	got, used := subscriptionSince(now, now.Add(5*time.Minute).Unix(), 5*time.Minute, overlap, 24*time.Hour, 10*time.Minute)
+	if !used {
+		t.Fatal("expected plausible future high-water mark to be recovered")
+	}
+	want := now.Unix() - int64(overlap/time.Second)
+	if got != want {
+		t.Fatalf("future checkpoint recovery timestamp = %d, want %d", got, want)
 	}
 }
 
@@ -277,6 +359,49 @@ func TestProcessRelayEventDoesNotAdvanceHighWaterWhenPersistenceFails(t *testing
 	}
 	if got := ListenerCheckpointPersistFailures.Value(); got != failuresBefore+1 {
 		t.Fatalf("expected checkpoint failure metric to increment, before=%d after=%d", failuresBefore, got)
+	}
+}
+
+func TestNIP59GiftWrapOpenerDecryptsAndVerifiesRumor(t *testing.T) {
+	ctx := context.Background()
+	sender := keyer.NewPlainKeySigner(nostr.Generate())
+	recipient := keyer.NewPlainKeySigner(nostr.Generate())
+	senderPubkey, err := sender.GetPublicKey(ctx)
+	if err != nil {
+		t.Fatalf("sender public key: %v", err)
+	}
+	recipientPubkey, err := recipient.GetPublicKey(ctx)
+	if err != nil {
+		t.Fatalf("recipient public key: %v", err)
+	}
+	rumor := nostr.Event{
+		PubKey:    senderPubkey,
+		Kind:      25910,
+		CreatedAt: nostr.Now(),
+		Content:   `{"jsonrpc":"2.0","id":"req-1","method":"review/request"}`,
+	}
+	rumor.ID = rumor.GetID()
+	wrapper, err := nip59.GiftWrap(
+		rumor,
+		recipientPubkey,
+		func(plaintext string) (string, error) {
+			return sender.Encrypt(ctx, plaintext, recipientPubkey)
+		},
+		func(event *nostr.Event) error {
+			return sender.SignEvent(ctx, event)
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("gift wrap: %v", err)
+	}
+
+	opened, err := NewNIP59GiftWrapOpener(recipient).OpenGiftWrap(ctx, wrapper)
+	if err != nil {
+		t.Fatalf("open gift wrap: %v", err)
+	}
+	if opened.ID != rumor.ID || opened.Kind != rumor.Kind || opened.Content != rumor.Content {
+		t.Fatalf("opened rumor = %#v, want %#v", opened, rumor)
 	}
 }
 

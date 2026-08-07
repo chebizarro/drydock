@@ -160,7 +160,17 @@ const (
 )
 
 func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayURL string) error {
-	if !p.validateEventForIngest(event, relayURL) {
+	return p.processEvent(ctx, event, relayURL, false)
+}
+
+// ProcessGiftWrappedEvent ingests a rumor authenticated by a verified NIP-59
+// envelope. Rumors have IDs but intentionally do not carry direct signatures.
+func (p *Processor) ProcessGiftWrappedEvent(ctx context.Context, event nostr.Event, relayURL string) error {
+	return p.processEvent(ctx, event, relayURL, true)
+}
+
+func (p *Processor) processEvent(ctx context.Context, event nostr.Event, relayURL string, authenticatedEnvelope bool) error {
+	if !p.validateEventForIngest(event, relayURL, authenticatedEnvelope) {
 		return nil // drop silently — do not propagate invalid events
 	}
 
@@ -169,14 +179,28 @@ func (p *Processor) ProcessEvent(ctx context.Context, event nostr.Event, relayUR
 		return err
 	}
 	if !inserted {
-		p.logger.Debug("reprocessing duplicate event through idempotent handler", "event_id", event.ID.Hex(), "kind", int(event.Kind))
-		if !isTrackedHandlerKind(event.Kind) {
+		complete, err := p.store.IsIngestHandlerComplete(ctx, event.ID.Hex())
+		if err != nil {
+			return err
+		}
+		if complete {
+			p.logger.Debug("skipping duplicate event with completed handler", "event_id", event.ID.Hex(), "kind", int(event.Kind))
 			return nil
 		}
+		p.logger.Debug("retrying duplicate event with incomplete handler", "event_id", event.ID.Hex(), "kind", int(event.Kind))
 	} else {
 		metrics.EventsIngested.With(fmt.Sprintf("%d", int(event.Kind))).Inc()
 	}
 
+	if err := p.handleEvent(ctx, event, relayURL); err != nil {
+		return err
+	}
+	// A synchronous handler may drain successfully after shutdown cancellation;
+	// persist that success so restart redelivery does not repeat its side effects.
+	return p.store.MarkIngestHandlerComplete(context.WithoutCancel(ctx), event.ID.Hex())
+}
+
+func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL string) error {
 	switch event.Kind {
 	case eventkind.RepositoryAnnouncement:
 		return p.store.UpsertRepositoryAnnouncement(ctx, event)
@@ -347,12 +371,12 @@ func (p *Processor) EnqueueReview(ctx context.Context, task db.ReviewTask, sourc
 	}
 }
 
-func (p *Processor) validateEventForIngest(event nostr.Event, relayURL string) bool {
+func (p *Processor) validateEventForIngest(event nostr.Event, relayURL string, authenticatedEnvelope bool) bool {
 	reason := ""
 	switch {
 	case !event.CheckID():
 		reason = "id_mismatch"
-	case !event.VerifySignature():
+	case !authenticatedEnvelope && !event.VerifySignature():
 		reason = "invalid_signature"
 	case !eventTimestampPlausible(event.CreatedAt, p.maxEventFutureSkew, p.maxEventPastAge):
 		reason = "implausible_timestamp"
@@ -367,6 +391,7 @@ func (p *Processor) validateEventForIngest(event nostr.Event, relayURL string) b
 		"kind", int(event.Kind),
 		"relay", relayURL,
 		"reason", reason,
+		"authenticated_envelope", authenticatedEnvelope,
 		"created_at", int64(event.CreatedAt),
 	)
 	return false
@@ -412,15 +437,6 @@ func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, rela
 		return nil
 	}
 	return p.contextVMResponder.SendResponseToEvent(ctx, event.ID.Hex(), resp.ID, resp.Result, resp.Error, event.PubKey)
-}
-
-func isTrackedHandlerKind(kind nostr.Kind) bool {
-	switch kind {
-	case eventkind.Comment, eventkind.EncryptedDirectMessage, eventkind.SealedDirectMessage, eventkind.IDESession, eventkind.ReviewerProfile, eventkind.ReviewFeedback, eventkind.ZapReceipt:
-		return true
-	default:
-		return false
-	}
 }
 
 func eventTimestampPlausible(ts nostr.Timestamp, maxFutureSkew, maxPastAge time.Duration) bool {

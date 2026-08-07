@@ -2,12 +2,14 @@ package ingest_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"drydock/internal/contextvm"
 	"drydock/internal/db"
 	"drydock/internal/ingest"
 	"drydock/internal/scope"
@@ -571,6 +573,96 @@ func TestProcessorUsesEAsRootForPRUpdates(t *testing.T) {
 	}
 	if rec.RootID != rootPRID {
 		t.Fatalf("expected root_id=%s got %s", rootPRID, rec.RootID)
+	}
+}
+
+type recordingContextVMResponder struct {
+	calls     int
+	failCalls int
+}
+
+func (r *recordingContextVMResponder) SendResponseToEvent(context.Context, string, string, any, *contextvm.Error, ...nostr.PubKey) error {
+	r.calls++
+	if r.calls <= r.failCalls {
+		return errors.New("temporary publish failure")
+	}
+	return nil
+}
+
+func TestProcessorRetriesDuplicateContextVMAfterTransientHandlerFailure(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	router := contextvm.NewRouter()
+	if err := router.Register("review/request", func(context.Context, contextvm.Request) (any, *contextvm.Error) {
+		return map[string]string{"status": "ok"}, nil
+	}); err != nil {
+		t.Fatalf("register ContextVM method: %v", err)
+	}
+	responder := &recordingContextVMResponder{failCalls: 1}
+	processor := ingest.NewProcessor(
+		store,
+		slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		ingest.WithContextVM(router, responder),
+	)
+	event := nostr.Event{
+		Kind:      25910,
+		CreatedAt: nostr.Now(),
+		Content:   `{"jsonrpc":"2.0","id":"req-1","method":"review/request"}`,
+	}
+	signEvent(t, nostr.Generate(), &event)
+
+	if err := processor.ProcessEvent(ctx, event, "wss://relay.test"); err == nil {
+		t.Fatal("expected first delivery to fail")
+	}
+	if err := processor.ProcessEvent(ctx, event, "wss://relay.test"); err != nil {
+		t.Fatalf("duplicate redelivery did not retry handler: %v", err)
+	}
+	if responder.calls != 2 {
+		t.Fatalf("responder calls = %d, want 2", responder.calls)
+	}
+	if err := processor.ProcessEvent(ctx, event, "wss://another-relay.test"); err != nil {
+		t.Fatalf("completed duplicate returned error: %v", err)
+	}
+	if responder.calls != 2 {
+		t.Fatalf("completed duplicate repeated handler; responder calls = %d", responder.calls)
+	}
+}
+
+func TestProcessorAcceptsUnsignedRumorFromAuthenticatedGiftWrap(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	router := contextvm.NewRouter()
+	if err := router.Register("review/request", func(context.Context, contextvm.Request) (any, *contextvm.Error) {
+		return map[string]string{"status": "ok"}, nil
+	}); err != nil {
+		t.Fatalf("register ContextVM method: %v", err)
+	}
+	responder := &recordingContextVMResponder{}
+	processor := ingest.NewProcessor(
+		store,
+		slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		ingest.WithContextVM(router, responder),
+	)
+	pubkey := nostr.GetPublicKey(nostr.Generate())
+	rumor := nostr.Event{
+		PubKey:    pubkey,
+		Kind:      25910,
+		CreatedAt: nostr.Now(),
+		Content:   `{"jsonrpc":"2.0","id":"req-2","method":"review/request"}`,
+	}
+	rumor.ID = rumor.GetID()
+
+	if err := processor.ProcessEvent(ctx, rumor, "wss://relay.test"); err != nil {
+		t.Fatalf("ordinary unsigned relay event returned error: %v", err)
+	}
+	if responder.calls != 0 {
+		t.Fatal("ordinary unsigned relay event reached handler")
+	}
+	if err := processor.ProcessGiftWrappedEvent(ctx, rumor, "wss://relay.test"); err != nil {
+		t.Fatalf("authenticated unsigned rumor was rejected: %v", err)
+	}
+	if responder.calls != 1 {
+		t.Fatalf("authenticated rumor handler calls = %d, want 1", responder.calls)
 	}
 }
 

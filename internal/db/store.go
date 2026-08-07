@@ -621,6 +621,33 @@ func (s *Store) InsertIngestedEvent(ctx context.Context, event nostr.Event) (boo
 	return affected == 1, nil
 }
 
+// IsIngestHandlerComplete reports whether downstream handling finished
+// successfully for an ingested event.
+func (s *Store) IsIngestHandlerComplete(ctx context.Context, eventID string) (bool, error) {
+	var complete int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM ingest_handler_completions WHERE event_id=?)`,
+		eventID,
+	).Scan(&complete); err != nil {
+		return false, fmt.Errorf("check ingest handler completion: %w", err)
+	}
+	return complete == 1, nil
+}
+
+// MarkIngestHandlerComplete records successful downstream handling
+// idempotently so ordinary relay duplicates do not repeat side effects.
+func (s *Store) MarkIngestHandlerComplete(ctx context.Context, eventID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO ingest_handler_completions(event_id, completed_at) VALUES (?, ?)
+		ON CONFLICT(event_id) DO NOTHING`,
+		eventID, time.Now().Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("mark ingest handler complete: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) UpsertRepositoryAnnouncement(ctx context.Context, event nostr.Event) error {
 	repo := nip34.ParseRepository(event)
 	repoID := RepoIDFromAnnouncement(event)

@@ -143,6 +143,14 @@ func main() {
 		logger.Warn("no signer configured — review publishing disabled")
 	}
 
+	var giftWrapOpener listener.GiftWrapOpener
+	if keyer, ok := signer.(nostr.Keyer); ok {
+		giftWrapOpener = listener.NewNIP59GiftWrapOpener(keyer)
+		logger.Info("NIP-59 gift-wrap opener enabled")
+	} else if signer != nil {
+		logger.Warn("signer does not support NIP-44 decryption; gift-wrap subscription disabled")
+	}
+
 	// --- Shared Nostr pool (with NIP-42 AUTH if signer available) ---
 	pool := nostr.NewPool()
 	if signer != nil {
@@ -589,14 +597,20 @@ func main() {
 	if ideHandler != nil {
 		ideHandler.SetReviewEnqueuer(processor)
 	}
+	listenerOpts := []listener.Option{listener.WithPool(pool), listener.WithStore(store)}
+	if giftWrapOpener != nil {
+		listenerOpts = append(listenerOpts, listener.WithGiftWrapOpener(giftWrapOpener))
+	}
 	svc := listener.New(listener.Config{
 		Relays:               readRelays,
 		LookbackMinutes:      cfg.ListenerLookbackMin,
 		HighWaterMarkOverlap: cfg.ListenerHWMOverlap,
+		CatchupMaxAge:        cfg.ListenerMaxEventAge,
 		MaxFutureSkew:        cfg.ListenerMaxFutureSkew,
+		GiftWrapEnabled:      giftWrapOpener != nil,
 		ContextVMPubkey:      servicePubkey,
 		ContextVMMethods:     contextVMRouter.Methods(),
-	}, processor, logger, listener.WithPool(pool), listener.WithStore(store))
+	}, processor, logger, listenerOpts...)
 
 	// --- Pipeline runner ---
 	var pipelineRunner *pipeline.Runner

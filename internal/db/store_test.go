@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"fiatjaf.com/nostr"
 )
 
 func mustOpenStore(t *testing.T, ctx context.Context) *Store {
@@ -34,6 +36,28 @@ func TestOpenEnforcesForeignKeys(t *testing.T) {
 	) VALUES (?, ?, ?, ?, ?, ?, ?)`, 999999, "reviewer", "rater", 5, "", "orphan-feedback", time.Now().Unix())
 	if err == nil {
 		t.Fatal("expected orphan feedback insert to violate assignment foreign key")
+	}
+}
+
+func TestIngestHandlerCompletionIsDurableAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	event := nostr.Event{Kind: 25910, CreatedAt: nostr.Now(), Content: "{}"}
+	event.ID = event.GetID()
+	if inserted, err := store.InsertIngestedEvent(ctx, event); err != nil || !inserted {
+		t.Fatalf("insert ingested event: inserted=%v err=%v", inserted, err)
+	}
+	if complete, err := store.IsIngestHandlerComplete(ctx, event.ID.Hex()); err != nil || complete {
+		t.Fatalf("completion before mark: complete=%v err=%v", complete, err)
+	}
+	if err := store.MarkIngestHandlerComplete(ctx, event.ID.Hex()); err != nil {
+		t.Fatalf("mark complete: %v", err)
+	}
+	if err := store.MarkIngestHandlerComplete(ctx, event.ID.Hex()); err != nil {
+		t.Fatalf("mark complete idempotently: %v", err)
+	}
+	if complete, err := store.IsIngestHandlerComplete(ctx, event.ID.Hex()); err != nil || !complete {
+		t.Fatalf("completion after mark: complete=%v err=%v", complete, err)
 	}
 }
 
