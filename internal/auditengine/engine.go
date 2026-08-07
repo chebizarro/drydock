@@ -21,6 +21,7 @@ import (
 	"drydock/internal/codemap"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
+	"drydock/internal/metrics"
 	"drydock/internal/publisher"
 	"drydock/internal/reviewengine"
 	"drydock/internal/securityscan"
@@ -223,11 +224,16 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	}
 	running := true
 	defer func() {
-		if runErr != nil && running {
-			if err := e.deps.Store.FailSecurityAudit(context.WithoutCancel(ctx), auditID); err != nil {
-				e.logger.Error("failed to mark security audit failed", "audit_id", auditID, "error", err)
+		state := "published"
+		if runErr != nil {
+			state = "failed"
+			if running {
+				if err := e.deps.Store.FailSecurityAudit(context.WithoutCancel(ctx), auditID); err != nil {
+					e.logger.Error("failed to mark security audit failed", "audit_id", auditID, "error", err)
+				}
 			}
 		}
+		metrics.SecurityAuditsRun.With(string(req.Depth), state).Inc()
 	}()
 
 	e.progress(ctx, auditID, "prepare")
@@ -279,6 +285,9 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	result.ReviewedUnits = len(units)
 	verified = reviewengine.DeduplicateFindings(verified)
 	result.Findings = verified
+	for _, finding := range verified {
+		metrics.SecurityFindings.With(findingCWE(finding), finding.Severity).Inc()
+	}
 
 	e.progress(ctx, auditID, "aggregate")
 	persisted := make([]db.SecurityAuditFinding, 0, len(verified))
@@ -301,6 +310,7 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 			result.NewFindings = append(result.NewFindings, finding)
 		}
 	}
+	metrics.SecurityBaselineSuppressed.Add(int64(len(verified) - len(result.NewFindings)))
 
 	e.progress(ctx, auditID, "publish")
 	pubFindings := make([]publisher.SecurityAuditFinding, 0, len(result.NewFindings))

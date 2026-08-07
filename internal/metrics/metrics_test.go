@@ -57,6 +57,27 @@ func TestCounterVecConcurrent(t *testing.T) {
 	}
 }
 
+func TestCounterVec2Concurrent(t *testing.T) {
+	cv := NewCounterVec2()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cv.With("CWE-89", "high").Inc()
+			cv.With("CWE-78", "critical").Inc()
+		}()
+	}
+	wg.Wait()
+	snap := cv.Snapshot()
+	if snap[[2]string{"CWE-89", "high"}] != 100 {
+		t.Fatalf("expected CWE-89/high=100, got %d", snap[[2]string{"CWE-89", "high"}])
+	}
+	if snap[[2]string{"CWE-78", "critical"}] != 100 {
+		t.Fatalf("expected CWE-78/critical=100, got %d", snap[[2]string{"CWE-78", "critical"}])
+	}
+}
+
 func TestSummaryObserve(t *testing.T) {
 	s := &Summary{}
 	s.Observe(1.5)
@@ -114,6 +135,11 @@ func TestHandlerOutputPrometheusFormat(t *testing.T) {
 	ReviewQueueDepth.Set(5)
 	PublishAttempts.Add(3)
 	PublishSuccesses.Add(2)
+	SecurityAuditsRun.With("deep", "published").Inc()
+	SecurityFindings.With("CWE-89", "high").Inc()
+	SecurityVerifyOutcomes.With("refuted").Inc()
+	SecurityFalsePositives.Inc()
+	SecurityBaselineSuppressed.Inc()
 
 	rec := httptest.NewRecorder()
 	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -132,6 +158,11 @@ func TestHandlerOutputPrometheusFormat(t *testing.T) {
 	requireContains(t, body, "# TYPE drydock_review_queue_depth gauge")
 	requireContains(t, body, "drydock_review_queue_depth 5")
 	requireContains(t, body, "# TYPE drydock_publish_attempts_total counter")
+	requireContains(t, body, `drydock_security_audits_run_total{depth="deep",state="published"} 1`)
+	requireContains(t, body, `drydock_security_findings_total{cwe="CWE-89",severity="high"} 1`)
+	requireContains(t, body, `drydock_security_verify_outcomes_total{outcome="refuted"} 1`)
+	requireContains(t, body, "# TYPE drydock_security_false_positives_total counter")
+	requireContains(t, body, "# TYPE drydock_security_baseline_suppressed_total counter")
 }
 
 func requireContains(t *testing.T, haystack, needle string) {

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
 	"drydock/internal/testutil"
 )
@@ -46,6 +47,8 @@ func TestRunMajorityRefutesFindingWithDistinctLenses(t *testing.T) {
 	}}
 	client := &lockedFakeLLM{fake: fake}
 	engine := New(client, DeepAuditConfig())
+	refutedBefore := metrics.SecurityVerifyOutcomes.With("refuted").Value()
+	falsePositiveBefore := metrics.SecurityFalsePositives.Value()
 
 	got, err := engine.Run(context.Background(), []reviewengine.Finding{candidate()})
 	if err != nil {
@@ -53,6 +56,12 @@ func TestRunMajorityRefutesFindingWithDistinctLenses(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("got %d findings, want majority-refuted finding removed", len(got))
+	}
+	if got := metrics.SecurityVerifyOutcomes.With("refuted").Value(); got != refutedBefore+1 {
+		t.Fatalf("refuted metric = %d, want %d", got, refutedBefore+1)
+	}
+	if got := metrics.SecurityFalsePositives.Value(); got != falsePositiveBefore+1 {
+		t.Fatalf("false-positive metric = %d, want %d", got, falsePositiveBefore+1)
 	}
 	if len(fake.Requests) != 3 {
 		t.Fatalf("got %d calls, want 3 verifier calls", len(fake.Requests))
@@ -75,6 +84,7 @@ func TestRunSurvivorIsClassifiedAsFinding(t *testing.T) {
 		`{"cwe":"CWE-89","severity":"critical","confidence":0.97,"remediation":"parameterize the query"}`,
 	}}
 	engine := New(fake, DefaultConfig())
+	survivedBefore := metrics.SecurityVerifyOutcomes.With("survived").Value()
 
 	got, err := engine.Run(context.Background(), []reviewengine.Finding{candidate()})
 	if err != nil {
@@ -82,6 +92,9 @@ func TestRunSurvivorIsClassifiedAsFinding(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("got %d findings, want 1", len(got))
+	}
+	if metric := metrics.SecurityVerifyOutcomes.With("survived").Value(); metric != survivedBefore+1 {
+		t.Fatalf("survived metric = %d, want %d", metric, survivedBefore+1)
 	}
 	if got[0].Category != "CWE-89" || got[0].Severity != "critical" || got[0].Confidence != 0.97 {
 		t.Fatalf("unexpected classified finding: %+v", got[0])

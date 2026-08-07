@@ -68,6 +68,45 @@ func (v *CounterVec) Snapshot() map[string]int64 {
 	return out
 }
 
+// CounterVec2 is a set of counters keyed by two label values.
+type CounterVec2 struct {
+	mu sync.RWMutex
+	m  map[[2]string]*Counter
+}
+
+func NewCounterVec2() *CounterVec2 {
+	return &CounterVec2{m: make(map[[2]string]*Counter)}
+}
+
+func (v *CounterVec2) With(label1, label2 string) *Counter {
+	key := [2]string{label1, label2}
+	v.mu.RLock()
+	c, ok := v.m[key]
+	v.mu.RUnlock()
+	if ok {
+		return c
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if c, ok = v.m[key]; ok {
+		return c
+	}
+	c = &Counter{}
+	v.m[key] = c
+	return c
+}
+
+// Snapshot returns a copy of label-pair→value pairs.
+func (v *CounterVec2) Snapshot() map[[2]string]int64 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	out := make(map[[2]string]int64, len(v.m))
+	for k, c := range v.m {
+		out[k] = c.Value()
+	}
+	return out
+}
+
 // Summary tracks count and sum for computing averages of observed values.
 type Summary struct {
 	mu    sync.Mutex
@@ -199,6 +238,13 @@ var (
 	FeedbackRateLimited            = &Counter{}
 	FeedbackRateLimitFailures      = &Counter{}
 	MarketplaceReputationUpdates   = &Counter{}
+
+	// Security review
+	SecurityAuditsRun          = NewCounterVec2() // labels: depth, state
+	SecurityFindings           = NewCounterVec2() // labels: CWE, severity
+	SecurityVerifyOutcomes     = NewCounterVec()  // label: refuted, survived
+	SecurityFalsePositives     = &Counter{}
+	SecurityBaselineSuppressed = &Counter{}
 
 	// Security scan and context extraction capabilities
 	SecurityScanFindings = &Counter{}
@@ -391,6 +437,18 @@ func writeMetrics(w io.Writer) {
 	writeCounter(w, "drydock_marketplace_reputation_updates_total",
 		"Reviewer reputation recalculations.", MarketplaceReputationUpdates)
 
+	// Security review
+	writeCounterVec2(w, "drydock_security_audits_run_total",
+		"Security audit runs by depth and final state.", "depth", "state", SecurityAuditsRun)
+	writeCounterVec2(w, "drydock_security_findings_total",
+		"Verified security findings by CWE and severity.", "cwe", "severity", SecurityFindings)
+	writeCounterVec(w, "drydock_security_verify_outcomes_total",
+		"Adversarial security verification outcomes.", "outcome", SecurityVerifyOutcomes)
+	writeCounter(w, "drydock_security_false_positives_total",
+		"Candidate security findings refuted as estimated false positives.", SecurityFalsePositives)
+	writeCounter(w, "drydock_security_baseline_suppressed_total",
+		"Verified security findings suppressed by the audit baseline.", SecurityBaselineSuppressed)
+
 	// Security scan
 	writeCounter(w, "drydock_security_scan_findings_total",
 		"Security findings from deterministic SAST scanner.", SecurityScanFindings)
@@ -443,6 +501,28 @@ func writeCounterVec(w io.Writer, name, help, label string, cv *CounterVec) {
 	keys := sortedKeys(snap)
 	for _, k := range keys {
 		fmt.Fprintf(w, "%s{%s=%q} %d\n", name, label, k, snap[k])
+	}
+	fmt.Fprintln(w)
+}
+
+func writeCounterVec2(w io.Writer, name, help, label1, label2 string, cv *CounterVec2) {
+	snap := cv.Snapshot()
+	if len(snap) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n", name, help, name)
+	keys := make([][2]string, 0, len(snap))
+	for key := range snap {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i][0] != keys[j][0] {
+			return keys[i][0] < keys[j][0]
+		}
+		return keys[i][1] < keys[j][1]
+	})
+	for _, key := range keys {
+		fmt.Fprintf(w, "%s{%s=%q,%s=%q} %d\n", name, label1, key[0], label2, key[1], snap[key])
 	}
 	fmt.Fprintln(w)
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"drydock/internal/contextbuilder"
+	"drydock/internal/metrics"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
 	"drydock/internal/testutil"
@@ -37,6 +38,7 @@ func TestStageRunExtractsEvidenceRoutesVerifiesAndClassifies(t *testing.T) {
 		ChangedFiles: []string{"auth.go"},
 	}
 	cfg := repoconfig.Default().Security
+	findingsBefore := metrics.SecurityFindings.With("CWE-89", "high").Value()
 	result := stage.Run(context.Background(), bundle, t.TempDir(), cfg)
 	if result.Error != nil {
 		t.Fatalf("Run() error = %v", result.Error)
@@ -46,6 +48,9 @@ func TestStageRunExtractsEvidenceRoutesVerifiesAndClassifies(t *testing.T) {
 	}
 	if len(result.Findings) != 1 {
 		t.Fatalf("findings = %d, want 1", len(result.Findings))
+	}
+	if metric := metrics.SecurityFindings.With("CWE-89", "high").Value(); metric != findingsBefore+1 {
+		t.Fatalf("security findings metric = %d, want %d", metric, findingsBefore+1)
 	}
 	finding := result.Findings[0]
 	if finding.Category != "security" || finding.Severity != "high" || finding.Confidence != 0.96 {

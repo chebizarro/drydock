@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
 )
 
@@ -85,9 +86,13 @@ func (e *Engine) Run(ctx context.Context, candidates []reviewengine.Finding) ([]
 
 	survivors := make([]reviewengine.Finding, 0, len(candidates))
 	for _, candidate := range candidates {
-		if !e.refuted(ctx, candidate) {
-			survivors = append(survivors, candidate)
+		if e.refuted(ctx, candidate) {
+			metrics.SecurityVerifyOutcomes.With("refuted").Inc()
+			metrics.SecurityFalsePositives.Inc()
+			continue
 		}
+		metrics.SecurityVerifyOutcomes.With("survived").Inc()
+		survivors = append(survivors, candidate)
 	}
 
 	classified := make([]reviewengine.Finding, 0, len(survivors))

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"drydock/internal/contextbuilder"
+	"drydock/internal/metrics"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
 	"drydock/internal/securityscan"
@@ -102,6 +103,7 @@ func (s *Stage) Run(ctx context.Context, bundle contextbuilder.ContextBundle, re
 
 	for i := range verified {
 		cwe := strings.ToUpper(strings.TrimSpace(verified[i].Category))
+		metrics.SecurityFindings.With(cwe, verified[i].Severity).Inc()
 		verified[i].Evidence, _, _ = strings.Cut(verified[i].Evidence, "\n\nSecurity evidence packet:\n")
 		if strings.HasPrefix(cwe, "CWE-") {
 			verified[i].Evidence = strings.TrimSpace("[" + cwe + "] " + verified[i].Evidence)
