@@ -324,7 +324,59 @@ func mergeFindings(reviews []modelResult, cfg EnsembleConfig, logger *slog.Logge
 	return result
 }
 
-// collectNeedsMoreContext merges needs_more_context from all models.
+// DeduplicateFindings merges findings in the same file and category whose
+// locations are within two lines. The highest-confidence representative is
+// retained and the result uses the ensemble severity/confidence ordering.
+func DeduplicateFindings(findings []Finding) []Finding {
+	ordered := append([]Finding(nil), findings...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if strings.ToLower(ordered[i].File) != strings.ToLower(ordered[j].File) {
+			return strings.ToLower(ordered[i].File) < strings.ToLower(ordered[j].File)
+		}
+		if strings.ToLower(ordered[i].Category) != strings.ToLower(ordered[j].Category) {
+			return strings.ToLower(ordered[i].Category) < strings.ToLower(ordered[j].Category)
+		}
+		return ordered[i].Line < ordered[j].Line
+	})
+
+	result := make([]Finding, 0, len(ordered))
+	for _, finding := range ordered {
+		merged := false
+		for i := len(result) - 1; i >= 0; i-- {
+			existing := result[i]
+			if !strings.EqualFold(existing.File, finding.File) || !strings.EqualFold(existing.Category, finding.Category) {
+				continue
+			}
+			if existing.Line-finding.Line > 2 || finding.Line-existing.Line > 2 {
+				continue
+			}
+			if finding.Confidence > existing.Confidence {
+				result[i] = finding
+			}
+			merged = true
+			break
+		}
+		if !merged {
+			result = append(result, finding)
+		}
+	}
+
+	severityRank := map[string]int{"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
+	sort.SliceStable(result, func(i, j int) bool {
+		if severityRank[strings.ToLower(result[i].Severity)] != severityRank[strings.ToLower(result[j].Severity)] {
+			return severityRank[strings.ToLower(result[i].Severity)] > severityRank[strings.ToLower(result[j].Severity)]
+		}
+		if result[i].Confidence != result[j].Confidence {
+			return result[i].Confidence > result[j].Confidence
+		}
+		if result[i].File != result[j].File {
+			return result[i].File < result[j].File
+		}
+		return result[i].Line < result[j].Line
+	})
+	return result
+}
+
 func collectNeedsMoreContext(reviews []modelResult) []string {
 	seen := make(map[string]bool)
 	var result []string
