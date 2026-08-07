@@ -15,10 +15,8 @@ import (
 	"drydock/internal/contextvm"
 	"drydock/internal/db"
 	"drydock/internal/metrics"
-	"drydock/internal/payment"
-	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
-	"drydock/internal/scope"
+	"drydock/internal/revieworder"
 
 	"fiatjaf.com/nostr"
 )
@@ -45,19 +43,9 @@ type RelayPublisher interface {
 	Publish(ctx context.Context, relays []string, event nostr.Event) error
 }
 
-// RepositoryConfigLoader reads policy from the canonical repository base.
-type RepositoryConfigLoader interface {
-	LoadBaseRepoConfig(ctx context.Context, repoID string) ([]byte, error)
-}
-
-// PaymentAuthorizer applies the shared patch payment policy.
-type PaymentAuthorizer interface {
-	AuthorizePatch(ctx context.Context, patchEvent nostr.Event, repoID string, policy repoconfig.PaymentsConfig) (payment.AuthorizeResult, error)
-}
-
-// ReviewEnqueuer submits an already-claimed task to the normal review pipeline.
-type ReviewEnqueuer interface {
-	EnqueueReview(ctx context.Context, task db.ReviewTask, source string) error
+// PatchOrderer admits stored patch requests through the shared review service.
+type PatchOrderer interface {
+	SubmitOnDemand(context.Context, revieworder.OnDemandRequest) (revieworder.AcceptedOrder, error)
 }
 
 // Config holds IDE gateway configuration.
@@ -77,10 +65,7 @@ type Handler struct {
 	ourPubKey  string
 	sem        chan struct{}
 
-	repositoryScope scope.Matcher
-	configLoader    RepositoryConfigLoader
-	paymentAuth     PaymentAuthorizer
-	reviewEnqueuer  ReviewEnqueuer
+	patchOrderer PatchOrderer
 
 	// Track active sessions for routing responses
 	mu       sync.RWMutex
@@ -147,26 +132,9 @@ func New(
 	return h
 }
 
-// WithRepositoryScope applies the operator repository and owner allowlists to
-// ContextVM patch-target requests.
-func WithRepositoryScope(matcher scope.Matcher) func(*Handler) {
-	return func(h *Handler) { h.repositoryScope = matcher }
-}
-
-// WithRepositoryConfigLoader configures canonical repository policy loading.
-func WithRepositoryConfigLoader(loader RepositoryConfigLoader) func(*Handler) {
-	return func(h *Handler) { h.configLoader = loader }
-}
-
-// WithPaymentAuthorizer configures the shared payment gate.
-func WithPaymentAuthorizer(authorizer PaymentAuthorizer) func(*Handler) {
-	return func(h *Handler) { h.paymentAuth = authorizer }
-}
-
-// SetReviewEnqueuer completes startup wiring with the shared queue owner.
-// It must be called before the listener starts.
-func (h *Handler) SetReviewEnqueuer(enqueuer ReviewEnqueuer) {
-	h.reviewEnqueuer = enqueuer
+// WithPatchOrderer configures shared stored-patch admission.
+func WithPatchOrderer(orderer PatchOrderer) func(*Handler) {
+	return func(h *Handler) { h.patchOrderer = orderer }
 }
 
 // HandleEvent processes an IDE-related event.
@@ -297,6 +265,9 @@ func (h *Handler) handleContextVMEvent(ctx context.Context, event nostr.Event, r
 	if err != nil {
 		h.logger.Warn("ContextVM handler failed", "event_id", event.ID.Hex(), "method", msg.Method, "error", err)
 	}
+	if resp.ID == "" {
+		return err
+	}
 
 	sessionID := ""
 	fixID := ""
@@ -382,11 +353,11 @@ func (h *Handler) HandleApplyFixRequest(ctx context.Context, rpcReq contextvm.Re
 	return resp, nil
 }
 
-// processPatchReviewRequest gates and enqueues a stored NIP-34 patch review.
+// processPatchReviewRequest validates IDE session ownership, then delegates all
+// stored-target policy, payment, force, claim, and queue behavior to revieworder.
 func (h *Handler) processPatchReviewRequest(ctx context.Context, event nostr.Event, req ReviewRequest) (ReviewResponse, *contextvm.Error) {
 	metrics.IDEReviewRequestsReceived.Inc()
 
-	// The request sender must own the referenced IDE session.
 	h.mu.Lock()
 	session, ok := h.sessions[req.SessionID]
 	if !ok || session.PubKey == "" || !strings.EqualFold(session.PubKey, event.PubKey.Hex()) {
@@ -396,102 +367,42 @@ func (h *Handler) processPatchReviewRequest(ctx context.Context, event nostr.Eve
 	session.LastSeen = time.Now()
 	h.mu.Unlock()
 
-	patchRec, err := h.store.GetPatchEvent(ctx, req.PatchEventID)
-	if err != nil {
-		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorNotFound, Message: err.Error()}
-	}
-	var patchEvent nostr.Event
-	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
-		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: "decode stored patch event"}
-	}
-
-	if h.repositoryScope.Enabled() {
-		ownerPubkey, err := h.store.GetRepositoryOwnerPubkey(ctx, patchRec.RepoID)
-		if err != nil {
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
-		}
-		if !h.repositoryScope.Allows(patchRec.RepoID, ownerPubkey) {
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "repository is outside operator scope"}
-		}
-	}
-	if h.configLoader == nil || h.reviewEnqueuer == nil {
+	if h.patchOrderer == nil {
 		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: "patch review gateway is not configured"}
 	}
-
-	rawConfig, err := h.configLoader.LoadBaseRepoConfig(ctx, patchRec.RepoID)
-	if err != nil {
-		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: fmt.Sprintf("load repository policy: %v", err)}
-	}
-	repoCfg := repoconfig.Default()
-	if len(rawConfig) > 0 {
-		parsed, parseErr := repoconfig.Parse(rawConfig)
-		if parseErr != nil {
-			if repoconfig.ContainsPaymentsConfig(rawConfig) {
-				return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "payment denied: invalid_repo_payment_policy"}
-			}
-			h.logger.Warn("failed to parse .drydock.yaml for ContextVM request, using defaults",
-				"patch_event_id", req.PatchEventID, "repo_id", patchRec.RepoID, "error", parseErr)
-		} else {
-			repoCfg = parsed
-		}
-	}
-
-	var authorization payment.AuthorizeResult
-	if repoCfg.Payments.Enabled {
-		if h.paymentAuth == nil {
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "payment denied: payment_service_not_configured"}
-		}
-		authorization, err = h.paymentAuth.AuthorizePatch(ctx, patchEvent, patchRec.RepoID, repoCfg.Payments)
-		if err != nil {
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: fmt.Sprintf("authorize payment: %v", err)}
-		}
-		if !authorization.Allowed {
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "payment denied: " + authorization.Reason}
-		}
-	}
-
-	if req.Force {
-		statusAuthor, err := h.store.CanStatusAuthor(ctx, patchRec.RootID, patchRec.RepoID, event.PubKey)
-		if err != nil {
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: fmt.Sprintf("authorize force: %v", err)}
-		}
-		if !statusAuthor && !payment.IsPaidAccessKind(authorization.AccessKind) {
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: "force requires repository maintainer or paid access"}
-		}
-	}
-
-	claim := db.ReviewClaim{
-		Force:           req.Force,
-		Invocation:      db.ReviewInvocationIDE,
+	accepted, err := h.patchOrderer.SubmitOnDemand(ctx, revieworder.OnDemandRequest{
+		PatchEventID:    req.PatchEventID,
 		RequesterPubkey: event.PubKey.Hex(),
 		OrderID:         req.RequestID,
-	}
-	acquired, err := h.store.BeginReviewWithClaim(ctx, patchRec.EventID, patchRec.RepoID, claim)
-	if errors.Is(err, db.ErrReviewAlreadyPublished) {
-		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorConflict, Message: "review target was already published"}
-	}
-	if err != nil {
-		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
-	}
-	if !acquired {
-		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorConflict, Message: "review target is already in progress or permanently skipped"}
-	}
-	task := db.ReviewTask{
-		PatchEventID:    patchRec.EventID,
-		RepoID:          patchRec.RepoID,
+		RequestEventID:  event.ID.Hex(),
 		Force:           req.Force,
 		Invocation:      db.ReviewInvocationIDE,
-		RequesterPubkey: event.PubKey.Hex(),
-		OrderID:         req.RequestID,
-	}
-	if err := h.reviewEnqueuer.EnqueueReview(ctx, task, "contextvm_review_request"); err != nil {
-		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: fmt.Sprintf("enqueue review: %v", err)}
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, revieworder.ErrInvalidTarget):
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: err.Error()}
+		case errors.Is(err, revieworder.ErrTargetNotFound):
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorNotFound, Message: err.Error()}
+		case errors.Is(err, revieworder.ErrSecurityCeiling),
+			errors.Is(err, revieworder.ErrForceDenied),
+			errors.Is(err, revieworder.ErrPaymentDenied):
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: err.Error()}
+		case errors.Is(err, revieworder.ErrOrderConflict):
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorConflict, Message: err.Error()}
+		default:
+			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+		}
 	}
 
+	summary := "Patch review queued for asynchronous processing."
+	if accepted.RetryPending {
+		summary = "Patch review accepted; queue retry is pending."
+	}
 	return ReviewResponse{
 		RequestID: req.RequestID, SessionID: req.SessionID,
-		PatchEventID: patchRec.EventID, Queued: true, Forced: req.Force,
-		Summary: "Patch review queued for asynchronous processing.",
+		PatchEventID: accepted.Task.PatchEventID, Queued: accepted.Queued, Forced: accepted.Task.Force,
+		Summary: summary,
 	}, nil
 }
 

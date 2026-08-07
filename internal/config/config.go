@@ -126,6 +126,8 @@ type Config struct {
 	SecurityNostrProbeActive   bool
 	CodeChatLimit              int
 	CodeChatWindow             time.Duration
+	ReviewOrderLimit           int
+	ReviewOrderWindow          time.Duration
 	FeedbackLimit              int
 	FeedbackWindow             time.Duration
 }
@@ -239,6 +241,8 @@ func FromEnv() Config {
 		SecurityNostrProbeActive:   parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_ACTIVE", "false"), false),
 		CodeChatLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "20"), 20),
 		CodeChatWindow:             parseDurationOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "1h"), time.Hour),
+		ReviewOrderLimit:           parseIntOrDefault(envOrDefault("DRYDOCK_REVIEW_ORDER_RATE_LIMIT_REQUESTS", "20"), 20),
+		ReviewOrderWindow:          parseDurationOrDefault(envOrDefault("DRYDOCK_REVIEW_ORDER_RATE_LIMIT_WINDOW", "1h"), time.Hour),
 		FeedbackLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "100"), 100),
 		FeedbackWindow:             parseDurationOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW", "24h"), 24*time.Hour),
 	}
@@ -557,6 +561,12 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 	if c.CodeChatWindow <= 0 {
 		result.Errors = append(result.Errors, "DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW must be greater than 0")
+	}
+	if c.ReviewOrderLimit < 1 {
+		result.Errors = append(result.Errors, "DRYDOCK_REVIEW_ORDER_RATE_LIMIT_REQUESTS must be at least 1")
+	}
+	if c.ReviewOrderWindow <= 0 {
+		result.Errors = append(result.Errors, "DRYDOCK_REVIEW_ORDER_RATE_LIMIT_WINDOW must be greater than 0")
 	}
 	if c.FeedbackLimit < 1 {
 		result.Errors = append(result.Errors, "DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS must be at least 1")

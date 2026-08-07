@@ -26,6 +26,19 @@ func RegisterSecurityAuditMethods(router *Router, auditor SecurityAuditor) error
 	return auditor.RegisterContextVMMethods(router)
 }
 
+// ReviewOrderer registers the generic review/order ContextVM handler.
+type ReviewOrderer interface {
+	RegisterContextVMMethods(router *Router) error
+}
+
+// RegisterReviewOrderMethods registers generic on-demand review ordering.
+func RegisterReviewOrderMethods(router *Router, orders ReviewOrderer) error {
+	if orders == nil {
+		return nil
+	}
+	return orders.RegisterContextVMMethods(router)
+}
+
 // Marketplace registers marketplace ContextVM handlers.
 type Marketplace interface {
 	RegisterContextVMMethods(router *Router) error

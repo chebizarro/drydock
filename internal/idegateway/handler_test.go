@@ -12,6 +12,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/payment"
 	"drydock/internal/repoconfig"
+	"drydock/internal/revieworder"
 	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
@@ -56,15 +57,6 @@ func (f *fakePaymentAuthorizer) AuthorizePatch(context.Context, nostr.Event, str
 	return f.result, nil
 }
 
-type collectingReviewEnqueuer struct {
-	tasks []db.ReviewTask
-}
-
-func (e *collectingReviewEnqueuer) EnqueueReview(_ context.Context, task db.ReviewTask, _ string) error {
-	e.tasks = append(e.tasks, task)
-	return nil
-}
-
 func newTestHandler(pub *mockPublisher) *Handler {
 	return &Handler{
 		cfg:       Config{},
@@ -106,7 +98,7 @@ func seedPatchReviewTarget(t *testing.T, store *db.Store, ownerSK, patchSK nostr
 	return patch, repoID
 }
 
-func newPatchRequestHandler(t *testing.T, requester nostr.PubKey, loader RepositoryConfigLoader, authorizer PaymentAuthorizer, enqueuer ReviewEnqueuer) (*Handler, *db.Store) {
+func newPatchRequestHandler(t *testing.T, requester nostr.PubKey, loader revieworder.RepositoryConfigLoader, authorizer revieworder.PaymentAuthorizer, ceilings ...scope.Matcher) (*Handler, *db.Store, *revieworder.Service) {
 	t.Helper()
 	store, err := db.Open(context.Background(), ":memory:")
 	if err != nil {
@@ -116,13 +108,26 @@ func newPatchRequestHandler(t *testing.T, requester nostr.PubKey, loader Reposit
 	if err := store.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	ceiling := scope.Matcher{}
+	if len(ceilings) > 0 {
+		ceiling = ceilings[0]
+	}
+	orders := revieworder.New(revieworder.Config{QueueSize: 8}, store, ceiling, nil, loader, authorizer,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	h := newTestHandler(&mockPublisher{})
 	h.store = store
-	h.configLoader = loader
-	h.paymentAuth = authorizer
-	h.reviewEnqueuer = enqueuer
+	h.patchOrderer = orders
 	h.sessions["sess-1"] = &activeSession{PubKey: requester.Hex()}
-	return h, store
+	return h, store, orders
+}
+
+func popReviewTask(orders *revieworder.Service) (db.ReviewTask, bool) {
+	select {
+	case task := <-orders.Queue():
+		return task, true
+	default:
+		return db.ReviewTask{}, false
+	}
 }
 
 func TestSessionKindIsNIP78(t *testing.T) {
@@ -243,8 +248,7 @@ func TestPatchReviewRequestForcedMaintainerReopensStatusSkipped(t *testing.T) {
 	patchSK := nostr.Generate()
 	requester := nostr.GetPublicKey(ownerSK)
 	loader := &fakeConfigLoader{}
-	queue := &collectingReviewEnqueuer{}
-	h, store := newPatchRequestHandler(t, requester, loader, nil, queue)
+	h, store, orders := newPatchRequestHandler(t, requester, loader, nil)
 	patch, repoID := seedPatchReviewTarget(t, store, ownerSK, patchSK)
 
 	acquired, err := store.BeginReview(context.Background(), patch.ID.Hex(), repoID, false)
@@ -261,8 +265,9 @@ func TestPatchReviewRequestForcedMaintainerReopensStatusSkipped(t *testing.T) {
 	if rpcErr != nil {
 		t.Fatalf("forced patch request failed: %s", rpcErr.Message)
 	}
-	if !resp.Queued || !resp.Forced || len(queue.tasks) != 1 || !queue.tasks[0].Force {
-		t.Fatalf("forced response/task mismatch: resp=%+v tasks=%+v", resp, queue.tasks)
+	task, queued := popReviewTask(orders)
+	if !resp.Queued || !resp.Forced || !queued || !task.Force {
+		t.Fatalf("forced response/task mismatch: resp=%+v task=%+v queued=%v", resp, task, queued)
 	}
 }
 
@@ -270,8 +275,7 @@ func TestPatchReviewRequestRejectsUnauthorizedForce(t *testing.T) {
 	ownerSK := nostr.Generate()
 	patchSK := nostr.Generate()
 	requester := nostr.GetPublicKey(nostr.Generate())
-	queue := &collectingReviewEnqueuer{}
-	h, store := newPatchRequestHandler(t, requester, &fakeConfigLoader{}, nil, queue)
+	h, store, orders := newPatchRequestHandler(t, requester, &fakeConfigLoader{}, nil)
 	patch, _ := seedPatchReviewTarget(t, store, ownerSK, patchSK)
 
 	_, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
@@ -280,8 +284,8 @@ func TestPatchReviewRequestRejectsUnauthorizedForce(t *testing.T) {
 	if rpcErr == nil || rpcErr.Code != contextvm.ErrorUnauthorized {
 		t.Fatalf("unauthorized force error = %+v", rpcErr)
 	}
-	if len(queue.tasks) != 0 {
-		t.Fatalf("unauthorized force enqueued tasks: %+v", queue.tasks)
+	if task, queued := popReviewTask(orders); queued {
+		t.Fatalf("unauthorized force enqueued task: %+v", task)
 	}
 }
 
@@ -291,8 +295,7 @@ func TestPatchReviewRequestPaidAccessAuthorizesForce(t *testing.T) {
 	requester := nostr.GetPublicKey(nostr.Generate())
 	loader := &fakeConfigLoader{config: []byte("payments:\n  enabled: true\n  price_sats: 100\n")}
 	authorizer := &fakePaymentAuthorizer{result: payment.AuthorizeResult{Allowed: true, AccessKind: payment.AccessZap}}
-	queue := &collectingReviewEnqueuer{}
-	h, store := newPatchRequestHandler(t, requester, loader, authorizer, queue)
+	h, store, orders := newPatchRequestHandler(t, requester, loader, authorizer)
 	patch, _ := seedPatchReviewTarget(t, store, ownerSK, patchSK)
 
 	_, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
@@ -301,10 +304,10 @@ func TestPatchReviewRequestPaidAccessAuthorizesForce(t *testing.T) {
 	if rpcErr != nil {
 		t.Fatalf("paid force failed: %s", rpcErr.Message)
 	}
-	if authorizer.calls != 1 || len(queue.tasks) != 1 || !queue.tasks[0].Force {
-		t.Fatalf("paid force did not enqueue forced task: calls=%d tasks=%+v", authorizer.calls, queue.tasks)
+	task, queued := popReviewTask(orders)
+	if authorizer.calls != 1 || !queued || !task.Force {
+		t.Fatalf("paid force did not enqueue forced task: calls=%d task=%+v queued=%v", authorizer.calls, task, queued)
 	}
-	task := queue.tasks[0]
 	if task.Invocation != db.ReviewInvocationIDE || task.RequesterPubkey != requester.Hex() || task.OrderID != "req-1" {
 		t.Fatalf("IDE invocation metadata = %+v", task)
 	}
@@ -315,8 +318,7 @@ func TestPatchReviewRequestDeniesUnpaidTargetBeforeEnqueue(t *testing.T) {
 	requester := nostr.GetPublicKey(ownerSK)
 	loader := &fakeConfigLoader{config: []byte("payments:\n  enabled: true\n  price_sats: 100\n")}
 	authorizer := &fakePaymentAuthorizer{result: payment.AuthorizeResult{Allowed: false, Reason: "no_payment"}}
-	queue := &collectingReviewEnqueuer{}
-	h, store := newPatchRequestHandler(t, requester, loader, authorizer, queue)
+	h, store, orders := newPatchRequestHandler(t, requester, loader, authorizer)
 	patch, _ := seedPatchReviewTarget(t, store, ownerSK, nostr.Generate())
 
 	_, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
@@ -325,8 +327,8 @@ func TestPatchReviewRequestDeniesUnpaidTargetBeforeEnqueue(t *testing.T) {
 	if rpcErr == nil || rpcErr.Code != contextvm.ErrorUnauthorized {
 		t.Fatalf("payment denial error = %+v", rpcErr)
 	}
-	if authorizer.calls != 1 || len(queue.tasks) != 0 {
-		t.Fatalf("payment denial did not stop enqueue: calls=%d tasks=%+v", authorizer.calls, queue.tasks)
+	if task, queued := popReviewTask(orders); authorizer.calls != 1 || queued {
+		t.Fatalf("payment denial did not stop enqueue: calls=%d task=%+v queued=%v", authorizer.calls, task, queued)
 	}
 }
 
@@ -335,9 +337,8 @@ func TestPatchReviewRequestAppliesRepositoryScopeBeforePayment(t *testing.T) {
 	requester := nostr.GetPublicKey(ownerSK)
 	loader := &fakeConfigLoader{config: []byte("payments:\n  enabled: true\n  price_sats: 100\n")}
 	authorizer := &fakePaymentAuthorizer{result: payment.AuthorizeResult{Allowed: true, AccessKind: payment.AccessZap}}
-	queue := &collectingReviewEnqueuer{}
-	h, store := newPatchRequestHandler(t, requester, loader, authorizer, queue)
-	h.repositoryScope = scope.NewMatcher([]string{"another-owner:another-repo"}, nil)
+	h, store, orders := newPatchRequestHandler(t, requester, loader, authorizer,
+		scope.NewMatcher([]string{"another-owner:another-repo"}, nil))
 	patch, _ := seedPatchReviewTarget(t, store, ownerSK, nostr.Generate())
 
 	_, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
@@ -346,8 +347,9 @@ func TestPatchReviewRequestAppliesRepositoryScopeBeforePayment(t *testing.T) {
 	if rpcErr == nil || rpcErr.Code != contextvm.ErrorUnauthorized {
 		t.Fatalf("scope denial error = %+v", rpcErr)
 	}
-	if loader.calls != 0 || authorizer.calls != 0 || len(queue.tasks) != 0 {
-		t.Fatalf("scope denial ran later gates: loader=%d payment=%d tasks=%d", loader.calls, authorizer.calls, len(queue.tasks))
+	_, queued := popReviewTask(orders)
+	if loader.calls != 0 || authorizer.calls != 0 || queued {
+		t.Fatalf("scope denial ran later gates: loader=%d payment=%d queued=%v", loader.calls, authorizer.calls, queued)
 	}
 }
 

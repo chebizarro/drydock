@@ -404,17 +404,25 @@ func TestFromEnv_RateLimitDefaultsAndOverrides(t *testing.T) {
 	if cfg.CodeChatLimit != 20 || cfg.CodeChatWindow != time.Hour {
 		t.Fatalf("unexpected codechat rate limit defaults: %d per %s", cfg.CodeChatLimit, cfg.CodeChatWindow)
 	}
+	if cfg.ReviewOrderLimit != 20 || cfg.ReviewOrderWindow != time.Hour {
+		t.Fatalf("unexpected review order rate limit defaults: %d per %s", cfg.ReviewOrderLimit, cfg.ReviewOrderWindow)
+	}
 	if cfg.FeedbackLimit != 100 || cfg.FeedbackWindow != 24*time.Hour {
 		t.Fatalf("unexpected feedback rate limit defaults: %d per %s", cfg.FeedbackLimit, cfg.FeedbackWindow)
 	}
 
 	t.Setenv("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "7")
 	t.Setenv("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "15m")
+	t.Setenv("DRYDOCK_REVIEW_ORDER_RATE_LIMIT_REQUESTS", "9")
+	t.Setenv("DRYDOCK_REVIEW_ORDER_RATE_LIMIT_WINDOW", "30m")
 	t.Setenv("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "12")
 	t.Setenv("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW", "6h")
 	cfg = FromEnv()
 	if cfg.CodeChatLimit != 7 || cfg.CodeChatWindow != 15*time.Minute {
 		t.Fatalf("unexpected codechat rate limit overrides: %d per %s", cfg.CodeChatLimit, cfg.CodeChatWindow)
+	}
+	if cfg.ReviewOrderLimit != 9 || cfg.ReviewOrderWindow != 30*time.Minute {
+		t.Fatalf("unexpected review order rate limit overrides: %d per %s", cfg.ReviewOrderLimit, cfg.ReviewOrderWindow)
 	}
 	if cfg.FeedbackLimit != 12 || cfg.FeedbackWindow != 6*time.Hour {
 		t.Fatalf("unexpected feedback rate limit overrides: %d per %s", cfg.FeedbackLimit, cfg.FeedbackWindow)
@@ -426,6 +434,8 @@ func TestValidate_RateLimitsMustBePositive(t *testing.T) {
 	cfg.DatabaseURL = ":memory:"
 	cfg.CodeChatLimit = 0
 	cfg.CodeChatWindow = 0
+	cfg.ReviewOrderLimit = 0
+	cfg.ReviewOrderWindow = 0
 	cfg.FeedbackLimit = -1
 	cfg.FeedbackWindow = -time.Second
 
@@ -433,6 +443,8 @@ func TestValidate_RateLimitsMustBePositive(t *testing.T) {
 	for _, key := range []string{
 		"DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS",
 		"DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW",
+		"DRYDOCK_REVIEW_ORDER_RATE_LIMIT_REQUESTS",
+		"DRYDOCK_REVIEW_ORDER_RATE_LIMIT_WINDOW",
 		"DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS",
 		"DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW",
 	} {
@@ -508,6 +520,8 @@ func clearConfigEnv(t *testing.T) {
 		"DRYDOCK_EMBED_API_KEY",
 		"DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS",
 		"DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW",
+		"DRYDOCK_REVIEW_ORDER_RATE_LIMIT_REQUESTS",
+		"DRYDOCK_REVIEW_ORDER_RATE_LIMIT_WINDOW",
 		"DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS",
 		"DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW",
 	} {

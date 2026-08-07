@@ -18,6 +18,7 @@ import (
 var (
 	ErrReviewAlreadyPublished = errors.New("review already published for patch/repo")
 	ErrReviewNotFound         = errors.New("review log row not found")
+	ErrPatchEventNotFound     = errors.New("patch event not found")
 )
 
 // ReviewInvocation records which intake path durably created a review.
@@ -981,7 +982,7 @@ func (s *Store) GetPatchEvent(ctx context.Context, eventID string) (PatchEventRe
 	var rec PatchEventRecord
 	if err := row.Scan(&rec.EventID, &rec.RepoID, &rec.RootID, &rec.Kind, &rec.RawEvent); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return PatchEventRecord{}, fmt.Errorf("patch event %s not found", eventID)
+			return PatchEventRecord{}, fmt.Errorf("%w: %s", ErrPatchEventNotFound, eventID)
 		}
 		return PatchEventRecord{}, fmt.Errorf("get patch event: %w", err)
 	}

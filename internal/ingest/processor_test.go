@@ -636,12 +636,47 @@ func TestProcessorRetriesDuplicateContextVMAfterTransientHandlerFailure(t *testi
 	}
 }
 
-func TestProcessorAcceptsUnsignedRumorFromAuthenticatedGiftWrap(t *testing.T) {
+func TestProcessorContextVMNotificationProducesNoResponse(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
 	router := contextvm.NewRouter()
-	if err := router.Register("review/request", func(context.Context, contextvm.Request) (any, *contextvm.Error) {
-		return map[string]string{"status": "ok"}, nil
+	calls := 0
+	if err := router.RegisterNotification("review/progress", func(context.Context, contextvm.Request) error {
+		calls++
+		return nil
+	}); err != nil {
+		t.Fatalf("register notification: %v", err)
+	}
+	responder := &recordingContextVMResponder{}
+	processor := ingest.NewProcessor(
+		store,
+		slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		ingest.WithContextVM(router, responder),
+	)
+	event := nostr.Event{
+		Kind:      25910,
+		CreatedAt: nostr.Now(),
+		Content:   `{"jsonrpc":"2.0","method":"review/progress","params":{"status":"working"}}`,
+	}
+	signEvent(t, nostr.Generate(), &event)
+
+	if err := processor.ProcessEvent(ctx, event, "wss://relay.test"); err != nil {
+		t.Fatalf("notification delivery failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("notification calls = %d, want 1", calls)
+	}
+	if responder.calls != 0 {
+		t.Fatalf("notification produced %d responses", responder.calls)
+	}
+}
+
+func TestProcessorRoutesReviewOrderFromAuthenticatedGiftWrap(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	router := contextvm.NewRouter()
+	if err := router.Register("review/order", func(context.Context, contextvm.Request) (any, *contextvm.Error) {
+		return map[string]string{"status": "accepted"}, nil
 	}); err != nil {
 		t.Fatalf("register ContextVM method: %v", err)
 	}
@@ -656,7 +691,7 @@ func TestProcessorAcceptsUnsignedRumorFromAuthenticatedGiftWrap(t *testing.T) {
 		PubKey:    pubkey,
 		Kind:      25910,
 		CreatedAt: nostr.Now(),
-		Content:   `{"jsonrpc":"2.0","id":"req-2","method":"review/request"}`,
+		Content:   `{"jsonrpc":"2.0","id":"req-2","method":"review/order"}`,
 	}
 	rumor.ID = rumor.GetID()
 

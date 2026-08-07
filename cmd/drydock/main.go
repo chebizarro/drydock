@@ -118,6 +118,11 @@ func main() {
 		MaxRequests: cfg.CodeChatLimit,
 		KeyPrefix:   "codechat:",
 	}, rateLimitStore)
+	reviewOrderRateLimiter := ratelimit.New(ratelimit.Config{
+		Window:      cfg.ReviewOrderWindow,
+		MaxRequests: cfg.ReviewOrderLimit,
+		KeyPrefix:   "review-order:",
+	}, rateLimitStore)
 	feedbackRateLimiter := ratelimit.New(ratelimit.Config{
 		Window:      cfg.FeedbackWindow,
 		MaxRequests: cfg.FeedbackLimit,
@@ -326,7 +331,8 @@ func main() {
 				logger.Info("trusted zap receipt providers configured", "count", len(cfg.TrustedZappers))
 			}
 		} else {
-			logger.Warn("failed to resolve signer pubkey; autofix loop suppression and zap receipt validation disabled", "error", err)
+			logger.Error("failed to resolve signer pubkey; ContextVM recipient identity is unavailable", "error", err)
+			os.Exit(1)
 		}
 	}
 	// --- Repo service ---
@@ -564,7 +570,7 @@ func main() {
 	}
 	reviewOrders := revieworder.New(
 		revieworder.Config{}, store, repositoryScope, reactiveRegistry, repoSvc, paymentSvc, logger,
-	)
+	).WithRateLimiter(reviewOrderRateLimiter)
 	processorOpts = append(processorOpts, ingest.WithReviewOrders(reviewOrders))
 	if monitoredRepos == nil {
 		logger.Warn("reactive review disabled: no monitored repositories author is configured")
@@ -590,13 +596,16 @@ func main() {
 	if signer != nil {
 		ideHandler = idegateway.New(
 			idegateway.Config{DefaultRelays: writeRelays}, store, ctxBuilder, engine, signer, relayPub, logger,
-			idegateway.WithRepositoryScope(repositoryScope),
-			idegateway.WithRepositoryConfigLoader(repoSvc),
-			idegateway.WithPaymentAuthorizer(paymentSvc),
+			idegateway.WithPatchOrderer(reviewOrders),
 		)
 		processorOpts = append(processorOpts, ingest.WithIDEGateway(ideHandler))
 		if err := contextvm.RegisterIDEMethods(contextVMRouter, ideHandler); err != nil {
 			logger.Error("failed to register IDE ContextVM handlers", "error", err)
+			os.Exit(1)
+		}
+		reviewOrderHandler := revieworder.NewHandler(reviewOrders, servicePubkey, logger)
+		if err := contextvm.RegisterReviewOrderMethods(contextVMRouter, reviewOrderHandler); err != nil {
+			logger.Error("failed to register review order ContextVM handler", "error", err)
 			os.Exit(1)
 		}
 		if err := contextvm.RegisterSecurityAuditMethods(contextVMRouter, securityAuditHandler); err != nil {
@@ -624,9 +633,6 @@ func main() {
 		ingest.WithTimingPolicy(cfg.ListenerMaxFutureSkew, cfg.ListenerMaxEventAge),
 	)
 	processor := ingest.NewProcessor(store, logger, processorOpts...)
-	if ideHandler != nil {
-		ideHandler.SetReviewEnqueuer(reviewOrders)
-	}
 	listenerOpts := []listener.Option{listener.WithPool(pool), listener.WithStore(store)}
 	if giftWrapOpener != nil {
 		listenerOpts = append(listenerOpts, listener.WithGiftWrapOpener(giftWrapOpener))

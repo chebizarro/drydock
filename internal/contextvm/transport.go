@@ -2,10 +2,13 @@ package contextvm
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	"fiatjaf.com/nostr"
 )
@@ -44,15 +47,22 @@ func NewTransport(pool Pool, signer Signer, readRelays, writeRelays []string, lo
 	}
 }
 
-// Send publishes a kind 25910 JSON-RPC request. The signed Nostr event id is
-// returned to callers.
+// Send publishes a kind 25910 JSON-RPC request with a generated correlation
+// ID. The signed Nostr event ID is returned to callers.
 func (t *Transport) Send(ctx context.Context, method string, params any, recipients ...nostr.PubKey) (string, error) {
-	return t.SendWithID(ctx, "", method, params, recipients...)
+	id, err := randomRequestID()
+	if err != nil {
+		return "", err
+	}
+	return t.SendWithID(ctx, id, method, params, recipients...)
 }
 
 // SendWithID publishes a kind 25910 JSON-RPC request with an explicit
 // request/response correlation id.
 func (t *Transport) SendWithID(ctx context.Context, id, method string, params any, recipients ...nostr.PubKey) (string, error) {
+	if id == "" {
+		return "", errors.New("contextvm request id is required")
+	}
 	if t.pool == nil {
 		return "", errors.New("contextvm transport requires pool")
 	}
@@ -65,14 +75,15 @@ func (t *Transport) SendWithID(ctx context.Context, id, method string, params an
 	if len(t.writeRelays) == 0 {
 		return "", errors.New("contextvm transport requires write relays")
 	}
+	recipients, err := validRecipients(recipients)
+	if err != nil {
+		return "", err
+	}
 
 	evt := nostr.Event{
 		CreatedAt: nostr.Now(),
 		Kind:      KindContextVM,
 		Tags:      append(recipientTags(recipients), nostr.Tag{"method", method}),
-	}
-	if err := t.signer.SignEvent(ctx, &evt); err != nil {
-		return "", fmt.Errorf("sign correlation event: %w", err)
 	}
 
 	msg, err := newRequest(id, method, params)
@@ -94,6 +105,64 @@ func (t *Transport) SendWithID(ctx context.Context, id, method string, params an
 	return evt.ID.Hex(), nil
 }
 
+// Notification describes a one-way ContextVM message. Notifications carry no
+// JSON-RPC ID and therefore never receive an application-level response.
+type Notification struct {
+	Method         string
+	Params         any
+	Recipients     []nostr.PubKey
+	RelatedEventID string
+	Relays         []string
+	Expiration     int64
+}
+
+// Notify publishes a kind 25910 JSON-RPC notification.
+func (t *Transport) Notify(ctx context.Context, notification Notification) (string, error) {
+	if t.pool == nil {
+		return "", errors.New("contextvm transport requires pool")
+	}
+	if t.signer == nil {
+		return "", errors.New("contextvm transport requires signer")
+	}
+	if notification.Method == "" {
+		return "", errors.New("contextvm method is required")
+	}
+	relays := notification.Relays
+	if len(relays) == 0 {
+		relays = t.writeRelays
+	}
+	if len(relays) == 0 {
+		return "", errors.New("contextvm transport requires write relays")
+	}
+	recipients, err := validRecipients(notification.Recipients)
+	if err != nil {
+		return "", err
+	}
+	msg, err := newNotification(notification.Method, notification.Params)
+	if err != nil {
+		return "", fmt.Errorf("marshal contextvm notification params: %w", err)
+	}
+	content, err := json.Marshal(msg)
+	if err != nil {
+		return "", fmt.Errorf("marshal contextvm notification: %w", err)
+	}
+	tags := append(recipientTags(recipients), nostr.Tag{"method", notification.Method})
+	if notification.RelatedEventID != "" {
+		tags = append(tags, nostr.Tag{"e", notification.RelatedEventID})
+	}
+	if notification.Expiration > 0 {
+		tags = append(tags, nostr.Tag{"expiration", strconv.FormatInt(notification.Expiration, 10)})
+	}
+	evt := nostr.Event{CreatedAt: nostr.Now(), Kind: KindContextVM, Tags: tags, Content: string(content)}
+	if err := t.signer.SignEvent(ctx, &evt); err != nil {
+		return "", fmt.Errorf("sign contextvm notification: %w", err)
+	}
+	if err := t.publishTo(ctx, relays, evt); err != nil {
+		return "", err
+	}
+	return evt.ID.Hex(), nil
+}
+
 // SendResponse publishes a kind 25910 JSON-RPC response addressed to recipients.
 func (t *Transport) SendResponse(ctx context.Context, id string, result any, rpcErr *Error, recipients ...nostr.PubKey) error {
 	return t.SendResponseToEvent(ctx, "", id, result, rpcErr, recipients...)
@@ -102,6 +171,9 @@ func (t *Transport) SendResponse(ctx context.Context, id string, result any, rpc
 // SendResponseToEvent publishes a kind 25910 JSON-RPC response with an "e" tag
 // referencing the request event id.
 func (t *Transport) SendResponseToEvent(ctx context.Context, requestEventID, id string, result any, rpcErr *Error, recipients ...nostr.PubKey) error {
+	if id == "" {
+		return errors.New("contextvm response id is required")
+	}
 	if t.pool == nil {
 		return errors.New("contextvm transport requires pool")
 	}
@@ -111,9 +183,12 @@ func (t *Transport) SendResponseToEvent(ctx context.Context, requestEventID, id 
 	if len(t.writeRelays) == 0 {
 		return errors.New("contextvm transport requires write relays")
 	}
+	recipients, err := validRecipients(recipients)
+	if err != nil {
+		return err
+	}
 
 	var msg Message
-	var err error
 	if rpcErr != nil {
 		msg = Message{JSONRPC: jsonRPCVersion, ID: id, Error: rpcErr}
 	} else {
@@ -236,9 +311,13 @@ func (t *Transport) Subscribe(ctx context.Context) (<-chan Request, <-chan error
 }
 
 func (t *Transport) publish(ctx context.Context, evt nostr.Event) error {
+	return t.publishTo(ctx, t.writeRelays, evt)
+}
+
+func (t *Transport) publishTo(ctx context.Context, relays []string, evt nostr.Event) error {
 	success := 0
 	var errs []error
-	for res := range t.pool.PublishMany(ctx, t.writeRelays, evt) {
+	for res := range t.pool.PublishMany(ctx, relays, evt) {
 		if res.Error != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", res.RelayURL, res.Error))
 			continue
@@ -249,6 +328,33 @@ func (t *Transport) publish(ctx context.Context, evt nostr.Event) error {
 		return nil
 	}
 	return fmt.Errorf("publish contextvm event %s failed: %w", evt.ID.Hex(), errors.Join(errs...))
+}
+
+func randomRequestID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generate contextvm request id: %w", err)
+	}
+	return hex.EncodeToString(id[:]), nil
+}
+
+func validRecipients(recipients []nostr.PubKey) ([]nostr.PubKey, error) {
+	if len(recipients) == 0 {
+		return nil, errors.New("contextvm recipient is required")
+	}
+	seen := make(map[nostr.PubKey]struct{}, len(recipients))
+	valid := make([]nostr.PubKey, 0, len(recipients))
+	for _, recipient := range recipients {
+		if recipient == nostr.ZeroPK {
+			return nil, errors.New("contextvm recipient must be nonzero")
+		}
+		if _, exists := seen[recipient]; exists {
+			continue
+		}
+		seen[recipient] = struct{}{}
+		valid = append(valid, recipient)
+	}
+	return valid, nil
 }
 
 func recipientTags(recipients []nostr.PubKey) nostr.Tags {

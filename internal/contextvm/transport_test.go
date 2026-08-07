@@ -88,15 +88,77 @@ func TestTransportSendPublishesContextVMEvent(t *testing.T) {
 	if err := json.Unmarshal([]byte(evt.Content), &msg); err != nil {
 		t.Fatalf("content json: %v", err)
 	}
-	if msg.JSONRPC != jsonRPCVersion || msg.ID != "" || msg.Method != "tools/list" {
+	if msg.JSONRPC != jsonRPCVersion || msg.ID == "" || msg.Method != "tools/list" {
 		t.Fatalf("unexpected message: %+v", msg)
+	}
+}
+
+func TestTransportSendWithIDRequiresExplicitID(t *testing.T) {
+	tr := NewTransport(&fakePool{}, newTestSigner(1), nil, []string{"wss://write"}, nil)
+	if _, err := tr.SendWithID(context.Background(), "", "tools/list", nil); err == nil {
+		t.Fatal("expected missing request id error")
+	}
+}
+
+func TestTransportNotifyPublishesIDLessMessage(t *testing.T) {
+	ctx := context.Background()
+	pool := &fakePool{}
+	signer := newTestSigner(1)
+	recipient, _ := newTestSigner(2).GetPublicKey(ctx)
+	tr := NewTransport(pool, signer, nil, []string{"wss://default"}, nil)
+
+	eventID, err := tr.Notify(ctx, Notification{
+		Method:         "review/progress",
+		Params:         map[string]string{"status": "working"},
+		Recipients:     []nostr.PubKey{recipient},
+		RelatedEventID: "request-event",
+		Relays:         []string{"wss://override"},
+		Expiration:     12345,
+	})
+	if err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if len(pool.published) != 1 || pool.published[0].ID.Hex() != eventID {
+		t.Fatalf("published notification = %+v", pool.published)
+	}
+	evt := pool.published[0]
+	var msg Message
+	if err := json.Unmarshal([]byte(evt.Content), &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.ID != "" || msg.Method != "review/progress" || msg.JSONRPC != jsonRPCVersion {
+		t.Fatalf("notification message = %+v", msg)
+	}
+	for name, value := range map[string]string{
+		"p": recipient.Hex(), "method": "review/progress",
+		"e": "request-event", "expiration": "12345",
+	} {
+		if !evt.Tags.ContainsAny(name, []string{value}) {
+			t.Fatalf("missing %s=%s tag: %+v", name, value, evt.Tags)
+		}
+	}
+}
+
+func TestTransportRejectsMissingOrZeroRecipients(t *testing.T) {
+	ctx := context.Background()
+	tr := NewTransport(&fakePool{}, newTestSigner(1), nil, []string{"wss://write"}, nil)
+	if _, err := tr.SendWithID(ctx, "id", "tools/list", nil); err == nil {
+		t.Fatal("request without recipient succeeded")
+	}
+	if _, err := tr.Notify(ctx, Notification{Method: "progress", Recipients: []nostr.PubKey{nostr.ZeroPK}}); err == nil {
+		t.Fatal("notification with zero recipient succeeded")
+	}
+	if err := tr.SendResponse(ctx, "id", nil, nil); err == nil {
+		t.Fatal("response without recipient succeeded")
 	}
 }
 
 func TestTransportSendReturnsPublishError(t *testing.T) {
 	pool := &fakePool{pubErr: errors.New("blocked")}
-	tr := NewTransport(pool, newTestSigner(1), nil, []string{"wss://write"}, nil)
-	if _, err := tr.Send(context.Background(), "tools/list", nil); err == nil {
+	signer := newTestSigner(1)
+	recipient, _ := newTestSigner(2).GetPublicKey(context.Background())
+	tr := NewTransport(pool, signer, nil, []string{"wss://write"}, nil)
+	if _, err := tr.Send(context.Background(), "tools/list", nil, recipient); err == nil {
 		t.Fatal("expected publish error")
 	}
 }

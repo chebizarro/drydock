@@ -12,6 +12,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/metrics"
 	"drydock/internal/payment"
+	"drydock/internal/ratelimit"
 	"drydock/internal/repoconfig"
 	"drydock/internal/scope"
 
@@ -24,10 +25,28 @@ var (
 	ErrQueueFull       = errors.New("review queue full")
 	ErrNotMonitored    = errors.New("repository is not monitored")
 	ErrSecurityCeiling = errors.New("repository is outside operator scope")
+	ErrInvalidTarget   = errors.New("invalid review target")
+	ErrTargetNotFound  = errors.New("review target not found")
 	ErrOrderConflict   = errors.New("review target is already in progress or permanently skipped")
 	ErrPaymentDenied   = errors.New("review payment denied")
 	ErrForceDenied     = errors.New("force requires repository maintainer or paid access")
+	ErrRateLimited     = errors.New("review order rate limited")
 )
+
+// PaymentDeniedError carries safe payment preflight details for protocol errors.
+type PaymentDeniedError struct {
+	Reason    string
+	Retryable bool
+}
+
+func (e *PaymentDeniedError) Error() string {
+	if e == nil || e.Reason == "" {
+		return ErrPaymentDenied.Error()
+	}
+	return ErrPaymentDenied.Error() + ": " + e.Reason
+}
+
+func (e *PaymentDeniedError) Unwrap() error { return ErrPaymentDenied }
 
 // MonitoringRegistry is the live monitored-repository membership projection.
 type MonitoringRegistry interface {
@@ -54,6 +73,7 @@ type Service struct {
 	monitoring      MonitoringRegistry
 	configLoader    RepositoryConfigLoader
 	paymentAuth     PaymentAuthorizer
+	rateLimiter     *ratelimit.Limiter
 	queue           chan db.ReviewTask
 	logger          *slog.Logger
 }
@@ -84,6 +104,7 @@ type OnDemandRequest struct {
 // wake-up hint.
 type AcceptedOrder struct {
 	Task         db.ReviewTask
+	Receipt      db.ReviewOrderReceipt
 	Queued       bool
 	RetryPending bool
 	Idempotent   bool
@@ -114,6 +135,13 @@ func New(
 		queue:           make(chan db.ReviewTask, queueSize),
 		logger:          logger,
 	}
+}
+
+// WithRateLimiter configures the persistent per-requester limiter used only by
+// generic ContextVM orders. IDE requests retain their existing session controls.
+func (s *Service) WithRateLimiter(limiter *ratelimit.Limiter) *Service {
+	s.rateLimiter = limiter
+	return s
 }
 
 func (s *Service) Queue() <-chan db.ReviewTask {
@@ -204,12 +232,46 @@ func (s *Service) SubmitOnDemand(ctx context.Context, req OnDemandRequest) (Acce
 	req.OrderID = strings.TrimSpace(req.OrderID)
 	req.RequestEventID = strings.TrimSpace(req.RequestEventID)
 	if req.PatchEventID == "" || req.RequesterPubkey == "" || req.OrderID == "" {
-		return AcceptedOrder{}, errors.New("patch event, requester, and order id are required")
+		return AcceptedOrder{}, fmt.Errorf("%w: patch event, requester, and order id are required", ErrInvalidTarget)
+	}
+	requester, err := scope.ParsePubkey(req.RequesterPubkey)
+	if err != nil {
+		return AcceptedOrder{}, fmt.Errorf("%w: invalid requester", ErrInvalidTarget)
+	}
+	req.RequesterPubkey = requester.Hex()
+
+	if req.Invocation == db.ReviewInvocationContextVM {
+		if req.RequestEventID == "" {
+			return AcceptedOrder{}, fmt.Errorf("%w: contextvm request event id is required", ErrInvalidTarget)
+		}
+		existing, ok, err := s.store.GetReviewOrder(ctx, req.RequesterPubkey, req.OrderID)
+		if err != nil {
+			return AcceptedOrder{}, err
+		}
+		if ok {
+			if err := validateExistingOrder(existing, req); err != nil {
+				return AcceptedOrder{}, err
+			}
+			return s.resumeAcceptedOrder(ctx, existing)
+		}
+		if s.rateLimiter == nil {
+			return AcceptedOrder{}, errors.New("review order rate limiter is not configured")
+		}
+		limit, err := s.rateLimiter.Allow(ctx, req.RequesterPubkey)
+		if err != nil {
+			return AcceptedOrder{}, fmt.Errorf("check review order rate limit: %w", err)
+		}
+		if !limit.Allowed {
+			return AcceptedOrder{}, ErrRateLimited
+		}
 	}
 
 	patchRec, err := s.store.GetPatchEvent(ctx, req.PatchEventID)
+	if errors.Is(err, db.ErrPatchEventNotFound) {
+		return AcceptedOrder{}, fmt.Errorf("%w: patch event %s", ErrTargetNotFound, req.PatchEventID)
+	}
 	if err != nil {
-		return AcceptedOrder{}, err
+		return AcceptedOrder{}, fmt.Errorf("load stored patch event: %w", err)
 	}
 	var patchEvent nostr.Event
 	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
@@ -217,20 +279,23 @@ func (s *Service) SubmitOnDemand(ctx context.Context, req OnDemandRequest) (Acce
 	}
 	repository, err := repositoryRefFromPatch(patchEvent)
 	if err != nil {
-		return AcceptedOrder{}, err
+		return AcceptedOrder{}, fmt.Errorf("%w: %v", ErrInvalidTarget, err)
 	}
 	if req.RepositoryAddress != "" {
 		requested, err := scope.ParseRepositoryRef(req.RepositoryAddress)
 		if err != nil {
-			return AcceptedOrder{}, err
+			return AcceptedOrder{}, fmt.Errorf("%w: %v", ErrInvalidTarget, err)
 		}
 		if requested.Address != repository.Address {
-			return AcceptedOrder{}, errors.New("repository address does not match stored patch")
+			return AcceptedOrder{}, fmt.Errorf("%w: repository address does not match stored patch", ErrInvalidTarget)
 		}
 	}
 	owner, err := s.store.GetRepositoryOwnerPubkey(ctx, repository.RepositoryID)
 	if err != nil {
 		return AcceptedOrder{}, fmt.Errorf("load repository announcement: %w", err)
+	}
+	if owner == "" {
+		return AcceptedOrder{}, fmt.Errorf("%w: repository announcement %s", ErrTargetNotFound, repository.Address)
 	}
 	if s.securityCeiling.Enabled() && !s.securityCeiling.Allows(repository.RepositoryID, owner) {
 		return AcceptedOrder{}, ErrSecurityCeiling
@@ -247,7 +312,7 @@ func (s *Service) SubmitOnDemand(ctx context.Context, req OnDemandRequest) (Acce
 		parsed, parseErr := repoconfig.Parse(rawConfig)
 		if parseErr != nil {
 			if repoconfig.ContainsPaymentsConfig(rawConfig) {
-				return AcceptedOrder{}, fmt.Errorf("%w: invalid_repo_payment_policy", ErrPaymentDenied)
+				return AcceptedOrder{}, &PaymentDeniedError{Reason: "invalid_repo_payment_policy"}
 			}
 			s.logger.Warn("failed to parse .drydock.yaml for on-demand review, using defaults",
 				"patch_event_id", req.PatchEventID, "repo_id", repository.RepositoryID, "error", parseErr)
@@ -259,21 +324,17 @@ func (s *Service) SubmitOnDemand(ctx context.Context, req OnDemandRequest) (Acce
 	var authorization payment.AuthorizeResult
 	if repoCfg.Payments.Enabled {
 		if s.paymentAuth == nil {
-			return AcceptedOrder{}, fmt.Errorf("%w: payment_service_not_configured", ErrPaymentDenied)
+			return AcceptedOrder{}, &PaymentDeniedError{Reason: "payment_service_not_configured"}
 		}
 		authorization, err = s.paymentAuth.AuthorizePatch(ctx, patchEvent, repository.RepositoryID, repoCfg.Payments)
 		if err != nil {
 			return AcceptedOrder{}, fmt.Errorf("authorize payment: %w", err)
 		}
 		if !authorization.Allowed {
-			return AcceptedOrder{}, fmt.Errorf("%w: %s", ErrPaymentDenied, authorization.Reason)
+			return AcceptedOrder{}, &PaymentDeniedError{Reason: authorization.Reason, Retryable: authorization.Retryable}
 		}
 	}
 	if req.Force {
-		requester, err := scope.ParsePubkey(req.RequesterPubkey)
-		if err != nil {
-			return AcceptedOrder{}, ErrForceDenied
-		}
 		allowed, err := s.store.CanStatusAuthor(ctx, patchRec.RootID, repository.RepositoryID, requester)
 		if err != nil {
 			return AcceptedOrder{}, fmt.Errorf("authorize force: %w", err)
@@ -293,9 +354,6 @@ func (s *Service) SubmitOnDemand(ctx context.Context, req OnDemandRequest) (Acce
 	}
 	accepted := AcceptedOrder{Task: task}
 	if req.Invocation == db.ReviewInvocationContextVM {
-		if req.RequestEventID == "" {
-			return AcceptedOrder{}, errors.New("contextvm request event id is required")
-		}
 		result, err := s.store.AcceptReviewOrder(ctx, db.ReviewOrderReceipt{
 			RequesterPubkey:   req.RequesterPubkey,
 			OrderID:           req.OrderID,
@@ -312,16 +370,9 @@ func (s *Service) SubmitOnDemand(ctx context.Context, req OnDemandRequest) (Acce
 		case db.ReviewOrderConflict:
 			return AcceptedOrder{}, ErrOrderConflict
 		case db.ReviewOrderIdempotent:
-			accepted.Idempotent = true
-			if err := s.EnqueueRecovered(ctx, task, "contextvm_order_redelivery"); err != nil {
-				if errors.Is(err, ErrQueueFull) {
-					accepted.RetryPending = true
-					return accepted, nil
-				}
-				return AcceptedOrder{}, err
-			}
-			accepted.Queued = true
-			return accepted, nil
+			return s.resumeAcceptedOrder(ctx, result.Receipt)
+		default:
+			accepted.Receipt = result.Receipt
 		}
 	} else {
 		acquired, err := s.store.BeginReviewWithClaim(ctx, task.PatchEventID, task.RepoID, claimFromTask(task))
@@ -337,6 +388,44 @@ func (s *Service) SubmitOnDemand(ctx context.Context, req OnDemandRequest) (Acce
 	}
 
 	if err := s.enqueueClaimed(ctx, task, string(req.Invocation)); err != nil {
+		if errors.Is(err, ErrQueueFull) {
+			accepted.RetryPending = true
+			return accepted, nil
+		}
+		return AcceptedOrder{}, err
+	}
+	accepted.Queued = true
+	return accepted, nil
+}
+
+func validateExistingOrder(receipt db.ReviewOrderReceipt, req OnDemandRequest) error {
+	if receipt.PatchEventID != req.PatchEventID || receipt.Force != req.Force {
+		return ErrOrderConflict
+	}
+	if req.RepositoryAddress == "" {
+		return nil
+	}
+	repository, err := scope.ParseRepositoryRef(req.RepositoryAddress)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTarget, err)
+	}
+	if repository.Address != receipt.RepositoryAddress {
+		return ErrOrderConflict
+	}
+	return nil
+}
+
+func (s *Service) resumeAcceptedOrder(ctx context.Context, receipt db.ReviewOrderReceipt) (AcceptedOrder, error) {
+	task := db.ReviewTask{
+		PatchEventID:    receipt.PatchEventID,
+		RepoID:          receipt.RepositoryID,
+		Force:           receipt.Force,
+		Invocation:      db.ReviewInvocationContextVM,
+		RequesterPubkey: receipt.RequesterPubkey,
+		OrderID:         receipt.OrderID,
+	}
+	accepted := AcceptedOrder{Task: task, Receipt: receipt, Idempotent: true}
+	if err := s.EnqueueRecovered(ctx, task, "contextvm_order_redelivery"); err != nil {
 		if errors.Is(err, ErrQueueFull) {
 			accepted.RetryPending = true
 			return accepted, nil
@@ -367,18 +456,12 @@ func (s *Service) EnqueueRecovered(ctx context.Context, task db.ReviewTask, sour
 }
 
 // EnqueueClaimed emits a task whose durable row was atomically claimed by the
-// caller (currently zap receipts and the legacy IDE stored-patch path).
+// caller (currently zap receipts).
 func (s *Service) EnqueueClaimed(ctx context.Context, task db.ReviewTask, source string) error {
 	if task.Invocation == "" {
 		task.Invocation = db.ReviewInvocationReactive
 	}
 	return s.enqueueClaimed(ctx, task, source)
-}
-
-// EnqueueReview preserves the narrow legacy IDE enqueuer interface until the
-// IDE stored-patch path migrates to SubmitOnDemand.
-func (s *Service) EnqueueReview(ctx context.Context, task db.ReviewTask, source string) error {
-	return s.EnqueueClaimed(ctx, task, source)
 }
 
 func (s *Service) enqueueClaimed(ctx context.Context, task db.ReviewTask, source string) error {

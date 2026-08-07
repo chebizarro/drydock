@@ -42,9 +42,12 @@ const (
 	ErrorInternal       = shared.InternalErrorCode
 
 	// Application errors used by gated asynchronous review requests.
-	ErrorUnauthorized = -32001
-	ErrorNotFound     = -32002
-	ErrorConflict     = -32003
+	ErrorUnauthorized    = -32001
+	ErrorNotFound        = -32002
+	ErrorConflict        = -32003
+	ErrorExpired         = -32004
+	ErrorRateLimited     = -32005
+	ErrorPaymentRequired = -32006
 )
 
 // Request is an inbound ContextVM JSON-RPC request with its source event.
@@ -68,6 +71,14 @@ func newRequest(id, method string, params any) (Message, error) {
 		return Message{}, err
 	}
 	return Message{JSONRPC: jsonRPCVersion, ID: id, Method: method, Params: raw}, nil
+}
+
+func newNotification(method string, params any) (Message, error) {
+	raw, err := marshalRaw(params)
+	if err != nil {
+		return Message{}, err
+	}
+	return Message{JSONRPC: jsonRPCVersion, Method: method, Params: raw}, nil
 }
 
 func newResult(id string, result any) (Message, error) {
