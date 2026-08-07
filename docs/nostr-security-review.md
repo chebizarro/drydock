@@ -159,7 +159,7 @@ The pack is data (embedded files), not prompt strings scattered through code, so
 
 Drydock integrates it as an **audit-only evidence source** (Pathway A), never in a PR review:
 
-- **Integration shape.** Import `nostr-secprobe`'s `internal/probes` logic as a library (upstream those packages to `pkg/` — a small PR to that repo) rather than shelling out to the CLI. Fall back to shelling out to an operator-installed `nostr-secprobe` binary when the library is unavailable, following the skipped-if-absent pattern already used for Trivy/gitleaks.
+- **Integration shape.** The default backend directly imports `git.sharegap.net/cascadia/nostr-secprobe` at `v0.1.0`, using its published `pkg/probes` library API. If the library path fails, Drydock falls back to an operator-installed `nostr-secprobe` binary, following the skipped-if-absent pattern already used for Trivy/gitleaks.
 - **Authorization, non-negotiable.** Probing runs only when *all* hold: `security.nostr.probe.enabled: true`, the target appears in an operator-level (not repo-level, not PR-author-controlled) `authorized_targets` allow-list, and `i_understand: true` is set. Active/intrusive checks require a second explicit flag. This mirrors the existing "PR author cannot influence review policy" rule (DRYDOCK-nf8) — a fork's `.drydock.yaml` must never be able to point Drydock's prober at a third party.
 - **Evidence, not verdict.** Probe results become `SecurityEvidence` entries and corroborate static findings: a static `NOSTR-V2` candidate plus a live `NOSTR-RELAY-SIG` acceptance is a confirmed, gating finding. `INCONCLUSIVE` probe results never gate.
 - **Reporting.** Probe outcomes appear in the kind 30619 summary counts and in the gift-wrapped detail; raw target hostnames stay out of public events.
@@ -223,4 +223,3 @@ Env: `DRYDOCK_SECURITY_NOSTR_ENABLED`, `DRYDOCK_SECURITY_NOSTR_PROBE_TARGETS` (o
 2. *Detector false positives* would apply Nostr rules to non-Nostr repos; the confidence floor plus explicit logging of why a repo was classified Nostr keeps this auditable.
 3. *Probe misuse* — the operator-only allow-list and double opt-in are the control; this must be reviewed as carefully as the payment gating.
 4. *NIP drift* — the knowledge pack is versioned data with citations so it can be refreshed without touching rule code.
-5. *`nostr-secprobe` coupling* — upstreaming its probes to `pkg/` is a dependency on another repo; the shell-out fallback keeps Drydock shippable meanwhile.

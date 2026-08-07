@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"drydock/internal/reviewengine"
+
+	"git.sharegap.net/cascadia/nostr-secprobe/pkg/report"
 )
 
 type fakeBackend struct {
@@ -144,6 +146,48 @@ type missingTool struct{}
 func (missingTool) LookPath(string) (string, error) { return "", errors.New("missing") }
 func (missingTool) Run(context.Context, string, ...string) ([]byte, error) {
 	panic("Run called")
+}
+
+func TestMapLibraryReportMapsUpstreamResultsAtBoundary(t *testing.T) {
+	t.Parallel()
+	results := &report.Results{Findings: []report.Finding{
+		{
+			Name: "Reject invalid signature", Severity: report.High, Status: report.Fail,
+			Evidence: map[string]any{
+				"status": struct {
+					Success bool `json:"Success"`
+				}{Success: true},
+			},
+			Active: true,
+		},
+		{
+			Name: "Receiver-side link preview leakage", Severity: report.High, Status: report.Pass,
+			Evidence: map[string]any{"auto_detect_seen": true},
+			Active:   true,
+		},
+		{
+			Name: "Cross-protocol key reuse (NIP-04 vs NIP-46)", Severity: report.High, Status: report.Fail,
+			Evidence: map[string]any{"domain_separated": false},
+			Active:   true,
+		},
+	}}
+	got := mapLibraryReport(results, "wss://private.example")
+	want := []string{RuleRelaySignature, RuleClientPreview, RuleKeySeparation}
+	if len(got) != len(want) {
+		t.Fatalf("mapped evidence = %#v", got)
+	}
+	for i, ruleID := range want {
+		if got[i].RuleID != ruleID || got[i].Status != StatusFail {
+			t.Fatalf("evidence[%d] = %#v, want rule %s FAIL", i, got[i], ruleID)
+		}
+	}
+	status, ok := got[0].Details["status"].(map[string]any)
+	if !ok {
+		t.Fatalf("dependency-owned evidence type crossed boundary: %T", got[0].Details["status"])
+	}
+	if success, ok := status["Success"].(bool); !ok || !success {
+		t.Fatalf("plain status evidence = %#v", status)
+	}
 }
 
 func TestMapBinaryReport(t *testing.T) {

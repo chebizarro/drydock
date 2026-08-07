@@ -165,7 +165,7 @@ func New(cfg Config, deps Dependencies, logger *slog.Logger) *Engine {
 		logger = slog.Default()
 	}
 	if deps.NostrProber == nil {
-		deps.NostrProber = nostrprobe.New(nil, nostrprobe.NewBinaryBackend(deps.Tools, logger), logger)
+		deps.NostrProber = nostrprobe.New(nostrprobe.NewLibraryBackend(logger), nostrprobe.NewBinaryBackend(deps.Tools, logger), logger)
 	}
 	return &Engine{cfg: cfg, deps: deps, logger: logger}
 }
