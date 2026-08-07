@@ -86,7 +86,11 @@ func (e *Engine) Run(ctx context.Context, candidates []reviewengine.Finding) ([]
 
 	survivors := make([]reviewengine.Finding, 0, len(candidates))
 	for _, candidate := range candidates {
-		if e.refuted(ctx, candidate) {
+		isRefuted, err := e.refuted(ctx, candidate)
+		if err != nil {
+			return nil, err
+		}
+		if isRefuted {
 			metrics.SecurityVerifyOutcomes.With("refuted").Inc()
 			metrics.SecurityFalsePositives.Inc()
 			continue
@@ -106,8 +110,20 @@ func (e *Engine) Run(ctx context.Context, candidates []reviewengine.Finding) ([]
 	return classified, nil
 }
 
+type verdict int
+
+const (
+	verdictSurvived verdict = iota
+	verdictRefuted
+	// verdictIndeterminate means the verifier could not be consulted
+	// (transport failure or malformed response). It must never count as a
+	// refutation: an unavailable verifier eliminating findings would
+	// produce false verified-clean results.
+	verdictIndeterminate
+)
+
 type verifyResult struct {
-	Refuted bool
+	Verdict verdict
 }
 
 type verifierResponse struct {
@@ -116,7 +132,7 @@ type verifierResponse struct {
 	Reason  string `json:"reason"`
 }
 
-func (e *Engine) refuted(ctx context.Context, finding reviewengine.Finding) bool {
+func (e *Engine) refuted(ctx context.Context, finding reviewengine.Finding) (bool, error) {
 	results := make(chan verifyResult, e.cfg.VerifyVotes)
 	var wg sync.WaitGroup
 	for vote := 0; vote < e.cfg.VerifyVotes; vote++ {
@@ -124,22 +140,32 @@ func (e *Engine) refuted(ctx context.Context, finding reviewengine.Finding) bool
 		wg.Add(1)
 		go func(vote int, lens string) {
 			defer wg.Done()
-			results <- verifyResult{Refuted: e.runVerifier(ctx, finding, vote, lens)}
+			results <- verifyResult{Verdict: e.runVerifier(ctx, finding, vote, lens)}
 		}(vote, lens)
 	}
 	wg.Wait()
 	close(results)
 
 	refuteVotes := 0
+	validVotes := 0
 	for result := range results {
-		if result.Refuted {
+		switch result.Verdict {
+		case verdictRefuted:
+			validVotes++
 			refuteVotes++
+		case verdictSurvived:
+			validVotes++
+		case verdictIndeterminate:
+			metrics.SecurityVerifyOutcomes.With("indeterminate").Inc()
 		}
 	}
-	return refuteVotes > e.cfg.VerifyVotes/2
+	if validVotes == 0 {
+		return false, fmt.Errorf("verification unavailable for %s:%d: all %d verifier votes failed", finding.File, finding.Line, e.cfg.VerifyVotes)
+	}
+	return refuteVotes > validVotes/2, nil
 }
 
-func (e *Engine) runVerifier(ctx context.Context, finding reviewengine.Finding, vote int, lens string) bool {
+func (e *Engine) runVerifier(ctx context.Context, finding reviewengine.Finding, vote int, lens string) verdict {
 	result, err := e.client.ChatCompletion(ctx, reviewengine.ChatRequest{
 		BaseURL:     e.cfg.VerifyEndpoint.BaseURL,
 		APIKey:      e.cfg.VerifyEndpoint.APIKey,
@@ -150,15 +176,22 @@ func (e *Engine) runVerifier(ctx context.Context, finding reviewengine.Finding, 
 		User:        findingPrompt(finding),
 	})
 	if err != nil {
-		return true
+		return verdictIndeterminate
 	}
 
 	var response verifierResponse
 	if err := json.Unmarshal([]byte(result.Content), &response); err != nil {
-		return true
+		return verdictIndeterminate
 	}
-	// Only an explicit, certain failure to refute lets the finding survive.
-	return response.Refuted || !response.Certain
+	if response.Refuted {
+		return verdictRefuted
+	}
+	// An uncertain failure to refute still counts as a refutation vote:
+	// only an explicit, certain failure to refute lets the finding survive.
+	if !response.Certain {
+		return verdictRefuted
+	}
+	return verdictSurvived
 }
 
 func verifierLens(vote int) string {

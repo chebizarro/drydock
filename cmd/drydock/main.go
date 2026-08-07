@@ -733,6 +733,22 @@ func main() {
 	// Recovers tasks that failed due to transient issues (queue overflow,
 	// temporary LLM failures) by moving them back to pending after a cooldown.
 	if pipelineRunner != nil {
+		// Startup fill: rows reset from 'reviewing' to 'pending' by
+		// ResetStuckReviews (or stranded by earlier full-queue drops) are only
+		// in the database — load them into the worker queue now.
+		if tasks, err := store.ListStalePendingReviews(ctx, 0, 256); err != nil {
+			logger.Warn("startup pending-review load failed", "error", err)
+		} else if len(tasks) > 0 {
+			logger.Info("loading pending reviews into queue at startup", "count", len(tasks))
+			for _, task := range tasks {
+				select {
+				case processor.ReviewQueue <- task:
+				default:
+					logger.Warn("review queue full during startup fill; row remains pending for sweep",
+						"patch_event_id", task.PatchEventID)
+				}
+			}
+		}
 		go func() {
 			ticker := time.NewTicker(10 * time.Minute)
 			defer ticker.Stop()
@@ -741,6 +757,19 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					// Re-enqueue pending rows that have sat outside the
+					// in-memory queue (dropped sends, crash resets). Safe to
+					// double-enqueue: BeginReview claims atomically.
+					if tasks, err := store.ListStalePendingReviews(ctx, 300, 20); err != nil {
+						logger.Warn("stale pending review sweep error", "error", err)
+					} else {
+						for _, task := range tasks {
+							select {
+							case processor.ReviewQueue <- task:
+							default:
+							}
+						}
+					}
 					// Requeue tasks that have been in "failed" state for at least 5 minutes.
 					tasks, err := store.RequeueFailedReviews(ctx, 300, 20)
 					if err != nil {

@@ -1996,6 +1996,39 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 	return tasks, nil
 }
 
+// ListStalePendingReviews returns pending review tasks that have not been
+// updated for at least minAge seconds. These are rows that exist in the
+// database work queue but may not be present in the in-memory channel (e.g.
+// after a crash reset via ResetStuckReviews, or after a requeue whose channel
+// send was dropped because the queue was full). The database is the source of
+// truth; the channel is only a wake-up hint. Re-enqueueing is safe because
+// BeginReview atomically claims pending -> reviewing.
+func (s *Store) ListStalePendingReviews(ctx context.Context, minAgeSeconds int64, limit int) ([]ReviewTask, error) {
+	cutoff := time.Now().Unix() - minAgeSeconds
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT patch_event_id, repo_id, force FROM review_log
+		WHERE status='pending' AND updated_at <= ?
+		ORDER BY updated_at ASC
+		LIMIT ?`, cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query pending reviews: %w", err)
+	}
+	defer rows.Close()
+
+	var tasks []ReviewTask
+	for rows.Next() {
+		var t ReviewTask
+		if err := rows.Scan(&t.PatchEventID, &t.RepoID, &t.Force); err != nil {
+			return nil, fmt.Errorf("scan pending review: %w", err)
+		}
+		tasks = append(tasks, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending reviews: %w", err)
+	}
+	return tasks, nil
+}
+
 // IsPatchSuperseded returns true if a newer patch event exists for the same
 // root_id and repo_id. A patch is considered superseded when a later revision
 // has been submitted to the same thread.

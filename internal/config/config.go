@@ -562,6 +562,9 @@ func (c *Config) validateProductionConfig(result *ValidationResult) {
 		return
 	}
 
+	if len(c.TrustedZappers) == 0 {
+		result.Warnings = append(result.Warnings, "DRYDOCK_TRUSTED_ZAPPERS is empty: zap receipts will be rejected and zap-based payment is disabled")
+	}
 	if !c.hasExplicitProductionRelays() {
 		result.Errors = append(result.Errors, "production mode requires DRYDOCK_RELAYS or both DRYDOCK_READ_RELAYS and DRYDOCK_WRITE_RELAYS to be explicitly configured")
 	}
@@ -685,7 +688,7 @@ func (c *Config) validateDatabase(ctx context.Context) error {
 	}
 
 	// Try a write operation
-	_, err = db.ExecContext(pingCtx, "CREATE TABLE IF NOT EXISTS _config_validation_test (id INTEGER); DROP TABLE IF EXISTS _config_validation_test;")
+	_, err = db.ExecContext(pingCtx, "CREATE TEMPORARY TABLE _config_validation_probe (id INTEGER); DROP TABLE temp._config_validation_probe;")
 	if err != nil {
 		return fmt.Errorf("database not writable: %w", err)
 	}

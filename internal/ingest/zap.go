@@ -40,10 +40,13 @@ func (p *Processor) validateZapReceipt(event nostr.Event) (db.ZapReceiptRecord, 
 	}
 
 	receiptAuthor := event.PubKey.Hex()
-	if len(p.trustedZappers) > 0 {
-		if _, ok := p.trustedZappers[receiptAuthor]; !ok {
-			return db.ZapReceiptRecord{}, errors.New("untrusted_zapper")
-		}
+	if len(p.trustedZappers) == 0 {
+		// Fail closed: without a trusted-zapper allowlist any key could mint
+		// receipts. Zap-based payment requires explicit provider trust.
+		return db.ZapReceiptRecord{}, errors.New("no_trusted_zappers_configured")
+	}
+	if _, ok := p.trustedZappers[receiptAuthor]; !ok {
+		return db.ZapReceiptRecord{}, errors.New("untrusted_zapper")
 	}
 
 	amountMSat, err := zapAmountMSat(event)
@@ -51,14 +54,73 @@ func (p *Processor) validateZapReceipt(event nostr.Event) (db.ZapReceiptRecord, 
 		return db.ZapReceiptRecord{}, err
 	}
 
+	request, err := verifiedZapRequest(event)
+	if err != nil {
+		return db.ZapReceiptRecord{}, err
+	}
+	if err := correlateZapRequest(request, recipient, patchEventID, amountMSat); err != nil {
+		return db.ZapReceiptRecord{}, err
+	}
+
 	return db.ZapReceiptRecord{
 		EventID:       event.ID.Hex(),
 		PatchEventID:  patchEventID,
-		PayerPubkey:   zapPayerPubkey(event),
+		PayerPubkey:   request.PubKey.Hex(),
 		ReceiptAuthor: receiptAuthor,
 		AmountMSat:    amountMSat,
 		CreatedAt:     int64(event.CreatedAt),
 	}, nil
+}
+
+// verifiedZapRequest extracts the embedded kind-9734 zap request from the
+// receipt's description tag and verifies its ID and signature (NIP-57).
+func verifiedZapRequest(event nostr.Event) (nostr.Event, error) {
+	description, err := optionalSingleTagValue(event, "description")
+	if err != nil || description == "" {
+		return nostr.Event{}, errors.New("description_missing")
+	}
+	var request nostr.Event
+	if err := json.Unmarshal([]byte(description), &request); err != nil {
+		return nostr.Event{}, errors.New("description_invalid")
+	}
+	if request.Kind != 9734 {
+		return nostr.Event{}, errors.New("zap_request_wrong_kind")
+	}
+	if !request.CheckID() || !request.VerifySignature() {
+		return nostr.Event{}, errors.New("zap_request_unverified")
+	}
+	return request, nil
+}
+
+// correlateZapRequest requires the verified zap request to name the same
+// recipient, patch event, and (when specified) amount as the outer receipt.
+func correlateZapRequest(request nostr.Event, recipient, patchEventID string, amountMSat int64) error {
+	reqRecipient, err := singleTagValue(request, "p")
+	if err != nil {
+		return errors.New("zap_request_recipient_missing")
+	}
+	if scope.NormalizePubkey(reqRecipient) != recipient {
+		return errors.New("zap_request_recipient_mismatch")
+	}
+	reqEventID, err := singleTagValue(request, "e")
+	if err != nil {
+		return errors.New("zap_request_event_missing")
+	}
+	if !strings.EqualFold(strings.TrimSpace(reqEventID), patchEventID) {
+		return errors.New("zap_request_event_mismatch")
+	}
+	if raw, err := optionalSingleTagValue(request, "amount"); err != nil {
+		return errors.New("zap_request_amount_duplicated")
+	} else if raw != "" {
+		reqAmount, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || reqAmount <= 0 {
+			return errors.New("zap_request_amount_invalid")
+		}
+		if reqAmount != amountMSat {
+			return errors.New("zap_request_amount_mismatch")
+		}
+	}
+	return nil
 }
 
 func singleTagValue(event nostr.Event, name string) (string, error) {
@@ -106,16 +168,15 @@ func zapAmountMSat(event nostr.Event) (int64, error) {
 		invoiceAmount = amount
 	}
 
-	if tagAmount > 0 && invoiceAmount > 0 && tagAmount != invoiceAmount {
+	if invoiceAmount <= 0 {
+		// Fail closed: a bare amount tag with no invoice is unfalsifiable —
+		// require the BOLT11 invoice as evidence of an actual payment amount.
+		return 0, errors.New("bolt11_missing")
+	}
+	if tagAmount > 0 && tagAmount != invoiceAmount {
 		return 0, errors.New("conflicting_amount")
 	}
-	if tagAmount > 0 {
-		return tagAmount, nil
-	}
-	if invoiceAmount > 0 {
-		return invoiceAmount, nil
-	}
-	return 0, errors.New("amount_missing")
+	return invoiceAmount, nil
 }
 
 func optionalSingleTagValue(event nostr.Event, name string) (string, error) {
@@ -186,14 +247,3 @@ func decodeBolt11AmountMSat(invoice string) (int64, error) {
 	return value * unitMSat, nil
 }
 
-func zapPayerPubkey(event nostr.Event) string {
-	description, err := optionalSingleTagValue(event, "description")
-	if err != nil || description == "" {
-		return ""
-	}
-	var request nostr.Event
-	if err := json.Unmarshal([]byte(description), &request); err != nil {
-		return ""
-	}
-	return request.PubKey.Hex()
-}

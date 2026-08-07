@@ -709,10 +709,21 @@ func (e *Engine) runOptionalTools(ctx context.Context, repoPath string, req Requ
 		name, ok := e.availableTool("gitleaks")
 		if !ok {
 			e.logger.Info("optional security scanner unavailable; skipping", "tools", []string{"gitleaks"})
-		} else if out, err := e.deps.Tools.Run(ctx, name, "detect", "--source", repoPath, "--report-format", "json", "--report-path", "-"); err != nil {
-			e.logger.Warn("optional security scanner failed", "tool", name, "error", err)
 		} else {
-			findings = append(findings, parseExternalFindings(name, out)...)
+			// --exit-code=0 keeps gitleaks from exiting non-zero when it
+			// FINDS leaks, which would otherwise be mistaken for tool failure
+			// and silently discard positive results.
+			out, err := e.deps.Tools.Run(ctx, name, "detect", "--source", repoPath, "--report-format", "json", "--report-path", "-", "--exit-code", "0")
+			if err != nil {
+				// Older gitleaks may reject --exit-code; fall back and salvage
+				// parseable findings even on non-zero exit.
+				out, err = e.deps.Tools.Run(ctx, name, "detect", "--source", repoPath, "--report-format", "json", "--report-path", "-")
+			}
+			if leaked := parseExternalFindings(name, out); len(leaked) > 0 {
+				findings = append(findings, leaked...)
+			} else if err != nil {
+				e.logger.Warn("optional security scanner failed", "tool", name, "error", err)
+			}
 		}
 	}
 	return findings

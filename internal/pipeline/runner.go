@@ -404,6 +404,27 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 
 	// 5. Extract changed files from the context bundle (used for few-shot, engine, etc.).
 	changedFiles := bundle.ChangedFiles
+	if len(changedFiles) == 0 && len(bundle.ExcludedFiles) > 0 {
+		// All changed files were excluded by repo policy — skip LLM call and
+		// publish an explicit policy-skip review instead of failing.
+		reviewEventID, pubErr := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
+			PatchEventID:         task.PatchEventID,
+			RepoID:               task.RepoID,
+			Summary:              "This patch only modifies files excluded by repository review policy, so no automated review was run.",
+			Model:                "none",
+			ContextHash:          fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content))),
+			ContextLayersUsed:    bundle.LayersUsed,
+			ContextLayersDropped: bundle.LayersDropped,
+			ExcludedFiles:        bundle.ExcludedFiles,
+		})
+		if pubErr != nil {
+			return fmt.Errorf("publish exclusion-only review: %w", pubErr)
+		}
+		r.logger.Info("skipped LLM review (all files excluded by repo policy)",
+			"patch_event_id", task.PatchEventID, "review_event_id", reviewEventID,
+			"excluded_files", len(bundle.ExcludedFiles))
+		return nil
+	}
 	if len(changedFiles) == 0 {
 		// Fail closed: with no deterministic changed-file set, the reviewer
 		// would be anchored to nothing but contextual layers and can present
@@ -439,29 +460,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		promptOverride = r.promptRefiner.ActiveReviewerPrompt(ctx)
 	}
 
-	// 6b. Check if exclusions left no reviewable files.
-	if len(changedFiles) == 0 && len(bundle.ExcludedFiles) > 0 {
-		// All changed files were excluded by repo policy — skip LLM call.
-		reviewEventID, pubErr := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
-			PatchEventID:         task.PatchEventID,
-			RepoID:               task.RepoID,
-			Summary:              "This patch only modifies files excluded by repository review policy, so no automated review was run.",
-			Model:                "none",
-			ContextHash:          fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content))),
-			ContextLayersUsed:    bundle.LayersUsed,
-			ContextLayersDropped: bundle.LayersDropped,
-			ExcludedFiles:        bundle.ExcludedFiles,
-		})
-		if pubErr != nil {
-			return fmt.Errorf("publish exclusion-only review: %w", pubErr)
-		}
-		r.logger.Info("skipped LLM review (all files excluded by repo policy)",
-			"patch_event_id", task.PatchEventID, "review_event_id", reviewEventID,
-			"excluded_files", len(bundle.ExcludedFiles))
-		return nil
-	}
-
-	// 6c. Run review engine (single model or ensemble mode)
+	// 6b. Run review engine (single model or ensemble mode)
 	runInput := reviewengine.RunInput{
 		ContextBundle:                bundle.Content,
 		ChangedFiles:                 changedFiles,

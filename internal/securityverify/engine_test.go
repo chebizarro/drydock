@@ -110,24 +110,28 @@ func TestRunSurvivorIsClassifiedAsFinding(t *testing.T) {
 	}
 }
 
-func TestRunDefaultsUncertainAndMalformedVotesToRefuted(t *testing.T) {
-	for _, response := range []string{
-		`{"refuted":false,"certain":false,"reason":"insufficient context"}`,
-		`not json`,
-	} {
-		t.Run(response, func(t *testing.T) {
-			fake := &testutil.FakeLLM{Responses: []string{response}}
-			engine := New(fake, DefaultConfig())
-			got, err := engine.Run(context.Background(), []reviewengine.Finding{candidate()})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(got) != 0 {
-				t.Fatalf("got %d findings, want uncertain finding refuted", len(got))
-			}
-			if len(fake.Requests) != 1 {
-				t.Fatalf("classifier should not run after refutation")
-			}
-		})
+func TestRunDefaultsUncertainVotesToRefuted(t *testing.T) {
+	fake := &testutil.FakeLLM{Responses: []string{`{"refuted":false,"certain":false,"reason":"insufficient context"}`}}
+	engine := New(fake, DefaultConfig())
+	got, err := engine.Run(context.Background(), []reviewengine.Finding{candidate()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d findings, want uncertain finding refuted", len(got))
+	}
+	if len(fake.Requests) != 1 {
+		t.Fatalf("classifier should not run after refutation")
+	}
+}
+
+// A malformed or unavailable verifier must NOT silently refute findings — it
+// must surface an error so audits cannot publish false verified-clean results.
+func TestRunFailsWhenAllVerifierVotesIndeterminate(t *testing.T) {
+	fake := &testutil.FakeLLM{Responses: []string{`not json`}}
+	engine := New(fake, DefaultConfig())
+	got, err := engine.Run(context.Background(), []reviewengine.Finding{candidate()})
+	if err == nil {
+		t.Fatalf("want error when verification is unavailable, got %d findings", len(got))
 	}
 }

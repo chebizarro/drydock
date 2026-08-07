@@ -645,6 +645,57 @@ func TestBeginReviewForceReopensOnlyStatusSkipped(t *testing.T) {
 	}
 }
 
+func TestListStalePendingReviews(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	now := time.Now().Unix()
+
+	seed := func(patch, status string, updatedAt int64, force int) {
+		t.Helper()
+		if _, err := store.db.ExecContext(ctx,
+			`INSERT INTO review_log(patch_event_id, repo_id, status, force, created_at, updated_at)
+			VALUES (?, 'repo-1', ?, ?, ?, ?)`, patch, status, force, updatedAt, updatedAt); err != nil {
+			t.Fatalf("seed %s: %v", patch, err)
+		}
+	}
+	seed("stale-pending", "pending", now-600, 1)
+	seed("fresh-pending", "pending", now, 0)
+	seed("reviewing-row", "reviewing", now-600, 0)
+	seed("failed-row", "failed", now-600, 0)
+
+	// With minAge=300 only the stale pending row qualifies.
+	tasks, err := store.ListStalePendingReviews(ctx, 300, 10)
+	if err != nil {
+		t.Fatalf("ListStalePendingReviews: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].PatchEventID != "stale-pending" {
+		t.Fatalf("tasks = %+v, want only stale-pending", tasks)
+	}
+	if !tasks[0].Force {
+		t.Fatal("task lost persisted Force flag")
+	}
+
+	// With minAge=0 (startup fill) both pending rows are returned; the
+	// crash-reset row must be recoverable without waiting for a sweep.
+	tasks, err = store.ListStalePendingReviews(ctx, 0, 10)
+	if err != nil {
+		t.Fatalf("ListStalePendingReviews minAge=0: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 pending tasks at startup, got %+v", tasks)
+	}
+
+	// Listing does not mutate state: rows stay pending until BeginReview claims.
+	var status string
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT status FROM review_log WHERE patch_event_id='stale-pending'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("status = %q, want pending", status)
+	}
+}
+
 func TestRequeueFailedReviews(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
