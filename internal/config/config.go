@@ -120,6 +120,9 @@ type Config struct {
 	PipelineWorkers            int
 	SecurityEnabled            bool
 	SecurityAuditWorkers       int
+	SecurityNostrEnabled       string
+	SecurityNostrProbeTargets  []string
+	SecurityNostrProbeActive   bool
 	CodeChatLimit              int
 	CodeChatWindow             time.Duration
 	FeedbackLimit              int
@@ -172,10 +175,10 @@ func FromEnv() Config {
 		ProfileAbout: envOrDefault("DRYDOCK_PROFILE_ABOUT",
 			"Automated code review for git on Nostr. Drydock watches NIP-34 patch and pull-request events, checks out the proposed changes, and publishes structured reviews with findings, per-file walkthroughs, and status updates — powered by local LLMs."),
 		ProfileWebsite:     envOrDefault("DRYDOCK_PROFILE_WEBSITE", ""),
-		ProfilePictureURL:     envOrDefault("DRYDOCK_PROFILE_PICTURE_URL", "https://blossom.sharegap.net/7abc2455c35376c9c36c8562d5c753c7007379838b2c5708b5ed2d223ba978c8"),
-		ProfileBannerURL:      envOrDefault("DRYDOCK_PROFILE_BANNER_URL", "https://blossom.sharegap.net/775f7d11c179893f5130f796f1d0b5753a1d975fea39be5a19451d2a9ef51c1e"),
-		ProfileIconPath:       envOrDefault("DRYDOCK_PROFILE_ICON_PATH", ""),
-		ProfileBannerPath:     envOrDefault("DRYDOCK_PROFILE_BANNER_PATH", ""),
+		ProfilePictureURL:  envOrDefault("DRYDOCK_PROFILE_PICTURE_URL", "https://blossom.sharegap.net/7abc2455c35376c9c36c8562d5c753c7007379838b2c5708b5ed2d223ba978c8"),
+		ProfileBannerURL:   envOrDefault("DRYDOCK_PROFILE_BANNER_URL", "https://blossom.sharegap.net/775f7d11c179893f5130f796f1d0b5753a1d975fea39be5a19451d2a9ef51c1e"),
+		ProfileIconPath:    envOrDefault("DRYDOCK_PROFILE_ICON_PATH", ""),
+		ProfileBannerPath:  envOrDefault("DRYDOCK_PROFILE_BANNER_PATH", ""),
 		BlossomServers:     splitCSV(envOrDefault("DRYDOCK_BLOSSOM_SERVERS", "")),
 		PlannerBaseURL:     envOrDefault("DRYDOCK_PLANNER_BASE_URL", devDefault(production, defaultPlannerBaseURL)),
 		PlannerModel:       envOrDefault("DRYDOCK_PLANNER_MODEL", devDefault(production, defaultPlannerModel)),
@@ -229,6 +232,9 @@ func FromEnv() Config {
 		PipelineWorkers:            parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
 		SecurityEnabled:            parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_ENABLED", "false"), false),
 		SecurityAuditWorkers:       parseIntOrDefault(envOrDefault("DRYDOCK_SECURITY_AUDIT_WORKERS", "2"), 2),
+		SecurityNostrEnabled:       parseNostrEnabled(envOrDefault("DRYDOCK_SECURITY_NOSTR_ENABLED", "auto")),
+		SecurityNostrProbeTargets:  splitCSV(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_TARGETS", "")),
+		SecurityNostrProbeActive:   parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_ACTIVE", "false"), false),
 		CodeChatLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "20"), 20),
 		CodeChatWindow:             parseDurationOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "1h"), time.Hour),
 		FeedbackLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "100"), 100),
@@ -387,6 +393,17 @@ func parseBoolOrDefault(v string, fallback bool) bool {
 		return fallback
 	}
 	return parsed
+}
+
+func parseNostrEnabled(v string) string {
+	normalized := strings.ToLower(strings.TrimSpace(v))
+	switch normalized {
+	case "auto", "true", "false":
+		return normalized
+	default:
+		slog.Warn("invalid DRYDOCK_SECURITY_NOSTR_ENABLED; failing closed", "value", v)
+		return "false"
+	}
 }
 
 // ValidationResult contains the outcome of configuration validation.

@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSecurityConfigParsing(t *testing.T) {
@@ -60,6 +61,7 @@ security:
 					AutoOnSnapshot: true,
 					SARIF:          false,
 				},
+				Nostr: Default().Security.Nostr,
 			},
 		},
 		{
@@ -83,6 +85,68 @@ security:
 				t.Fatalf("Security = %#v, want %#v", cfg.Security, tt.want)
 			}
 		})
+	}
+}
+
+func TestSecurityNostrConfigParsing(t *testing.T) {
+	cfg, err := Parse([]byte(`version: 1
+security:
+  nostr:
+    enabled: true
+    min_detect_confidence: 0.75
+    roles: [client, signer]
+    rules:
+      exclude: [nostr-v6]
+    knowledge_pack: false
+    absence_analysis: false
+    verify_votes: 3
+    probe:
+      enabled: true
+      active: true
+      i_understand: true
+      timeout: 12s
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := NostrConfig{
+		Enabled:             "true",
+		MinDetectConfidence: 0.75,
+		Roles:               NostrRolesConfig{Roles: []string{"client", "signer"}},
+		Rules:               NostrRulesConfig{Exclude: []string{"NOSTR-V6"}},
+		KnowledgePack:       false,
+		AbsenceAnalysis:     false,
+		VerifyVotes:         3,
+		Probe: NostrProbeConfig{
+			Enabled:     true,
+			Active:      true,
+			IUnderstand: true,
+			Timeout:     12 * time.Second,
+		},
+	}
+	if !reflect.DeepEqual(cfg.Security.Nostr, want) {
+		t.Fatalf("Security.Nostr = %#v, want %#v", cfg.Security.Nostr, want)
+	}
+}
+
+func TestSecurityNostrAuthorizedTargetsRejected(t *testing.T) {
+	cfg, err := Parse([]byte(`version: 1
+security:
+  nostr:
+    probe:
+      enabled: true
+      active: true
+      i_understand: true
+      authorized_targets: [wss://third-party.example]
+`))
+	if err == nil || !strings.Contains(err.Error(), "authorized_targets is operator-only") {
+		t.Fatalf("Parse() error = %v, want operator-only rejection", err)
+	}
+	if !reflect.DeepEqual(cfg.Security.Nostr.Probe, Default().Security.Nostr.Probe) {
+		t.Fatalf("rejected repo targets changed probe config: %#v", cfg.Security.Nostr.Probe)
+	}
+	if cfg.Security.Nostr.Probe.Enabled || cfg.Security.Nostr.Probe.Active || cfg.Security.Nostr.Probe.IUnderstand {
+		t.Fatalf("rejected repo probe config did not fail closed: %#v", cfg.Security.Nostr.Probe)
 	}
 }
 
@@ -116,6 +180,36 @@ func TestSecurityConfigValidation(t *testing.T) {
 			name:    "confidence above range",
 			yaml:    "version: 1\nsecurity:\n  min_confidence: 1.01\n",
 			wantErr: "security.min_confidence must be in [0,1]",
+		},
+		{
+			name:    "invalid nostr enabled",
+			yaml:    "version: 1\nsecurity:\n  nostr:\n    enabled: sometimes\n",
+			wantErr: "security.nostr.enabled must be auto, true, or false",
+		},
+		{
+			name:    "invalid nostr role",
+			yaml:    "version: 1\nsecurity:\n  nostr:\n    roles: [client, server]\n",
+			wantErr: "invalid role",
+		},
+		{
+			name:    "invalid nostr rule mode",
+			yaml:    "version: 1\nsecurity:\n  nostr:\n    rules: none\n",
+			wantErr: "rules must be",
+		},
+		{
+			name:    "invalid nostr confidence",
+			yaml:    "version: 1\nsecurity:\n  nostr:\n    min_detect_confidence: 1.01\n",
+			wantErr: "security.nostr.min_detect_confidence must be in [0,1]",
+		},
+		{
+			name:    "invalid nostr verify votes",
+			yaml:    "version: 1\nsecurity:\n  nostr:\n    verify_votes: 0\n",
+			wantErr: "security.nostr.verify_votes must be at least 1",
+		},
+		{
+			name:    "invalid probe timeout",
+			yaml:    "version: 1\nsecurity:\n  nostr:\n    probe:\n      enabled: true\n      timeout: 0s\n",
+			wantErr: "security.nostr.probe.timeout must be greater than zero",
 		},
 	}
 

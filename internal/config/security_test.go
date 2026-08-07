@@ -46,3 +46,44 @@ func TestFromEnvSecurity(t *testing.T) {
 		})
 	}
 }
+
+func TestFromEnvSecurityNostr(t *testing.T) {
+	tests := []struct {
+		name        string
+		enabled     string
+		targets     string
+		active      string
+		wantEnabled string
+		wantTargets []string
+		wantActive  bool
+	}{
+		{name: "defaults", wantEnabled: "auto"},
+		{name: "configured", enabled: "true", targets: "wss://one.example, wss://two.example", active: "true", wantEnabled: "true", wantTargets: []string{"wss://one.example", "wss://two.example"}, wantActive: true},
+		{name: "explicitly disabled", enabled: "false", wantEnabled: "false"},
+		{name: "invalid values fail closed", enabled: "sometimes", active: "sometimes", wantEnabled: "false", wantActive: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DRYDOCK_SECURITY_NOSTR_ENABLED", tt.enabled)
+			t.Setenv("DRYDOCK_SECURITY_NOSTR_PROBE_TARGETS", tt.targets)
+			t.Setenv("DRYDOCK_SECURITY_NOSTR_PROBE_ACTIVE", tt.active)
+
+			cfg := FromEnv()
+			if cfg.SecurityNostrEnabled != tt.wantEnabled {
+				t.Errorf("SecurityNostrEnabled = %q, want %q", cfg.SecurityNostrEnabled, tt.wantEnabled)
+			}
+			if len(cfg.SecurityNostrProbeTargets) != len(tt.wantTargets) {
+				t.Fatalf("SecurityNostrProbeTargets = %#v, want %#v", cfg.SecurityNostrProbeTargets, tt.wantTargets)
+			}
+			for i := range tt.wantTargets {
+				if cfg.SecurityNostrProbeTargets[i] != tt.wantTargets[i] {
+					t.Fatalf("SecurityNostrProbeTargets = %#v, want %#v", cfg.SecurityNostrProbeTargets, tt.wantTargets)
+				}
+			}
+			if cfg.SecurityNostrProbeActive != tt.wantActive {
+				t.Errorf("SecurityNostrProbeActive = %v, want %v", cfg.SecurityNostrProbeActive, tt.wantActive)
+			}
+		})
+	}
+}

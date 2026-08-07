@@ -7,6 +7,7 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"drydock/internal/reviewengine"
 	"drydock/internal/scope"
@@ -98,6 +99,7 @@ type SecurityConfig struct {
 	SCA           bool                `yaml:"sca"`
 	SecretScan    bool                `yaml:"secret_scan"`
 	Audit         SecurityAuditConfig `yaml:"audit"`
+	Nostr         NostrConfig         `yaml:"nostr"`
 }
 
 // SecurityAuditConfig controls defaults for full repository security audits.
@@ -107,6 +109,93 @@ type SecurityAuditConfig struct {
 	VerifyVotes    int    `yaml:"verify_votes"`
 	AutoOnSnapshot bool   `yaml:"auto_on_snapshot"`
 	SARIF          bool   `yaml:"sarif"`
+}
+
+// NostrConfig controls the protocol-specific Nostr security lens.
+type NostrConfig struct {
+	Enabled             string           `yaml:"enabled"`
+	MinDetectConfidence float64          `yaml:"min_detect_confidence"`
+	Roles               NostrRolesConfig `yaml:"roles"`
+	Rules               NostrRulesConfig `yaml:"rules"`
+	KnowledgePack       bool             `yaml:"knowledge_pack"`
+	AbsenceAnalysis     bool             `yaml:"absence_analysis"`
+	VerifyVotes         int              `yaml:"verify_votes"`
+	Probe               NostrProbeConfig `yaml:"probe"`
+}
+
+// NostrRolesConfig is either auto-detected roles or an explicit role list.
+type NostrRolesConfig struct {
+	Auto  bool
+	Roles []string
+}
+
+// UnmarshalYAML accepts either "auto" or a sequence of Nostr roles.
+func (c *NostrRolesConfig) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if strings.EqualFold(strings.TrimSpace(node.Value), "auto") {
+			*c = NostrRolesConfig{Auto: true}
+			return nil
+		}
+		return fmt.Errorf("roles must be \"auto\" or a role list")
+	case yaml.SequenceNode:
+		var roles []string
+		if err := node.Decode(&roles); err != nil {
+			return err
+		}
+		*c = NostrRolesConfig{Roles: roles}
+		return nil
+	default:
+		return fmt.Errorf("roles must be \"auto\" or a role list")
+	}
+}
+
+// NostrRulesConfig is either all rules, an explicit include list, or an exclude list.
+type NostrRulesConfig struct {
+	All     bool
+	Include []string
+	Exclude []string
+}
+
+// UnmarshalYAML accepts "all", a sequence of rule IDs, or {exclude: [...]}.
+func (c *NostrRulesConfig) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if strings.EqualFold(strings.TrimSpace(node.Value), "all") {
+			*c = NostrRulesConfig{All: true}
+			return nil
+		}
+		return fmt.Errorf("rules must be \"all\", a rule list, or an exclude mapping")
+	case yaml.SequenceNode:
+		var rules []string
+		if err := node.Decode(&rules); err != nil {
+			return err
+		}
+		*c = NostrRulesConfig{Include: rules}
+		return nil
+	case yaml.MappingNode:
+		var mapping map[string][]string
+		if err := node.Decode(&mapping); err != nil {
+			return err
+		}
+		if len(mapping) != 1 || mapping["exclude"] == nil {
+			return fmt.Errorf("rules mapping may contain only exclude")
+		}
+		*c = NostrRulesConfig{Exclude: mapping["exclude"]}
+		return nil
+	default:
+		return fmt.Errorf("rules must be \"all\", a rule list, or an exclude mapping")
+	}
+}
+
+// NostrProbeConfig controls optional dynamic probing. AuthorizedTargets is
+// decoded solely so repository-supplied values can be explicitly rejected.
+type NostrProbeConfig struct {
+	Enabled           bool          `yaml:"enabled"`
+	Active            bool          `yaml:"active"`
+	IUnderstand       bool          `yaml:"i_understand"`
+	AuthorizedTargets []string      `yaml:"authorized_targets"`
+	Timeout           time.Duration `yaml:"timeout"`
 }
 
 // EnsembleConfig controls multi-model ensemble review mode.
@@ -189,6 +278,18 @@ func Default() RepoConfig {
 				Depth:       "standard",
 				VerifyVotes: 3,
 				SARIF:       true,
+			},
+			Nostr: NostrConfig{
+				Enabled:             "auto",
+				MinDetectConfidence: 0.6,
+				Roles:               NostrRolesConfig{Auto: true},
+				Rules:               NostrRulesConfig{All: true},
+				KnowledgePack:       true,
+				AbsenceAnalysis:     true,
+				VerifyVotes:         2,
+				Probe: NostrProbeConfig{
+					Timeout: 30 * time.Second,
+				},
 			},
 		},
 		Ensemble: EnsembleConfig{
@@ -400,6 +501,33 @@ func Parse(data []byte) (RepoConfig, error) {
 	raw.Security.Audit.Localizer = strings.ToLower(strings.TrimSpace(raw.Security.Audit.Localizer))
 	raw.Security.Audit.Depth = strings.ToLower(strings.TrimSpace(raw.Security.Audit.Depth))
 
+	// Normalize and validate the Nostr lens. Any invalid value returns the
+	// fail-closed defaults, which leave dynamic probing disabled.
+	raw.Security.Nostr.Enabled = strings.ToLower(strings.TrimSpace(raw.Security.Nostr.Enabled))
+	switch raw.Security.Nostr.Enabled {
+	case "auto", "true", "false":
+	default:
+		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.enabled must be auto, true, or false, got %q", raw.Security.Nostr.Enabled)
+	}
+	if raw.Security.Nostr.MinDetectConfidence < 0 || raw.Security.Nostr.MinDetectConfidence > 1 {
+		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.min_detect_confidence must be in [0,1], got %f", raw.Security.Nostr.MinDetectConfidence)
+	}
+	if raw.Security.Nostr.VerifyVotes < 1 {
+		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.verify_votes must be at least 1")
+	}
+	if err := validateNostrRoles(&raw.Security.Nostr.Roles); err != nil {
+		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.roles: %w", err)
+	}
+	if err := validateNostrRules(&raw.Security.Nostr.Rules); err != nil {
+		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.rules: %w", err)
+	}
+	if len(raw.Security.Nostr.Probe.AuthorizedTargets) > 0 {
+		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.probe.authorized_targets is operator-only and cannot be set by repository config")
+	}
+	if raw.Security.Nostr.Probe.Timeout <= 0 {
+		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.probe.timeout must be greater than zero")
+	}
+
 	// Validate and default ensemble config.
 	if raw.Ensemble.Enabled {
 		if len(raw.Ensemble.Models) == 0 {
@@ -428,6 +556,72 @@ func Parse(data []byte) (RepoConfig, error) {
 	}
 
 	return raw, nil
+}
+
+func validateNostrRoles(config *NostrRolesConfig) error {
+	if config.Auto {
+		if len(config.Roles) != 0 {
+			return fmt.Errorf("auto cannot be combined with explicit roles")
+		}
+		return nil
+	}
+	if len(config.Roles) == 0 {
+		return fmt.Errorf("explicit role list must not be empty")
+	}
+	seen := make(map[string]struct{}, len(config.Roles))
+	normalized := make([]string, 0, len(config.Roles))
+	for _, role := range config.Roles {
+		role = strings.ToLower(strings.TrimSpace(role))
+		switch role {
+		case "client", "relay", "signer", "library", "dvm":
+		default:
+			return fmt.Errorf("invalid role %q", role)
+		}
+		if _, ok := seen[role]; !ok {
+			seen[role] = struct{}{}
+			normalized = append(normalized, role)
+		}
+	}
+	config.Roles = normalized
+	return nil
+}
+
+func validateNostrRules(config *NostrRulesConfig) error {
+	modes := 0
+	if config.All {
+		modes++
+	}
+	if len(config.Include) > 0 {
+		modes++
+	}
+	if len(config.Exclude) > 0 {
+		modes++
+	}
+	if modes != 1 {
+		return fmt.Errorf("select exactly one of all, include list, or exclude list")
+	}
+	seen := make(map[string]struct{})
+	normalize := func(values []string) ([]string, error) {
+		out := make([]string, 0, len(values))
+		for _, rule := range values {
+			rule = strings.ToUpper(strings.TrimSpace(rule))
+			if !strings.HasPrefix(rule, "NOSTR-") {
+				return nil, fmt.Errorf("invalid rule id %q", rule)
+			}
+			if _, ok := seen[rule]; !ok {
+				seen[rule] = struct{}{}
+				out = append(out, rule)
+			}
+		}
+		return out, nil
+	}
+	var err error
+	if len(config.Include) > 0 {
+		config.Include, err = normalize(config.Include)
+	} else if len(config.Exclude) > 0 {
+		config.Exclude, err = normalize(config.Exclude)
+	}
+	return err
 }
 
 // AllowsCategory returns true if the given category is allowed by this config.
