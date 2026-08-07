@@ -83,6 +83,8 @@ type Config struct {
 	Sec70BModel                string
 	SecClassifyBaseURL         string
 	SecClassifyModel           string
+	SecLocalizeBaseURL         string
+	SecLocalizeModel           string
 	Coder14BBaseURL            string
 	Coder14BModel              string
 	LLMAPIKey                  string
@@ -185,6 +187,8 @@ func FromEnv() Config {
 		Sec70BModel:        envOrDefault("DRYDOCK_SEC70B_MODEL", ""),
 		SecClassifyBaseURL: envOrDefault("DRYDOCK_SECCLASSIFY_BASE_URL", ""),
 		SecClassifyModel:   envOrDefault("DRYDOCK_SECCLASSIFY_MODEL", ""),
+		SecLocalizeBaseURL: envOrDefault("DRYDOCK_SECLOCALIZE_BASE_URL", ""),
+		SecLocalizeModel:   envOrDefault("DRYDOCK_SECLOCALIZE_MODEL", ""),
 		Coder14BBaseURL:    envOrDefault("DRYDOCK_CODER14B_BASE_URL", devDefault(production, defaultCoder14BBaseURL)),
 		Coder14BModel:      envOrDefault("DRYDOCK_CODER14B_MODEL", devDefault(production, defaultCoder14BModel)),
 		LLMAPIKey:          envOrDefault("DRYDOCK_LLM_API_KEY", ""),

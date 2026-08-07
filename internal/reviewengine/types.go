@@ -15,6 +15,7 @@ const (
 	RouteCoder14B    ModelRoute = "coder14b"
 	RouteSec70B      ModelRoute = "sec70b"
 	RouteSecClassify ModelRoute = "secclassify"
+	RouteSecLocalize ModelRoute = "seclocalize"
 )
 
 type PlannerOutput struct {
@@ -126,7 +127,7 @@ func ParseReviewerOutput(raw string) (ReviewerOutput, error) {
 
 func (p PlannerOutput) Validate() error {
 	switch p.ModelRoute {
-	case RouteCoder32B, RouteLLM70B, RouteCoder14B, RouteSec70B, RouteSecClassify:
+	case RouteCoder32B, RouteLLM70B, RouteCoder14B, RouteSec70B, RouteSecClassify, RouteSecLocalize:
 	default:
 		return fmt.Errorf("invalid planner model_route: %q", p.ModelRoute)
 	}

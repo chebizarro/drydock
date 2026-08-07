@@ -29,6 +29,8 @@ func TestFromEnvSecurityModelRoutes(t *testing.T) {
 	t.Setenv("DRYDOCK_SEC70B_MODEL", "security-model")
 	t.Setenv("DRYDOCK_SECCLASSIFY_BASE_URL", "http://secclassify")
 	t.Setenv("DRYDOCK_SECCLASSIFY_MODEL", "classifier-model")
+	t.Setenv("DRYDOCK_SECLOCALIZE_BASE_URL", "http://seclocalize")
+	t.Setenv("DRYDOCK_SECLOCALIZE_MODEL", "antares-model")
 
 	cfg := FromEnv()
 	if cfg.Sec70BBaseURL != "http://sec70b" || cfg.Sec70BModel != "security-model" {
@@ -36,6 +38,9 @@ func TestFromEnvSecurityModelRoutes(t *testing.T) {
 	}
 	if cfg.SecClassifyBaseURL != "http://secclassify" || cfg.SecClassifyModel != "classifier-model" {
 		t.Fatalf("unexpected secclassify config: %#v", cfg)
+	}
+	if cfg.SecLocalizeBaseURL != "http://seclocalize" || cfg.SecLocalizeModel != "antares-model" {
+		t.Fatalf("unexpected seclocalize config: %#v", cfg)
 	}
 }
 

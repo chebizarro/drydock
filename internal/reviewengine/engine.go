@@ -21,6 +21,7 @@ type Config struct {
 	Coder14B     ModelEndpoint
 	Sec70B       ModelEndpoint
 	SecClassify  ModelEndpoint
+	SecLocalize  ModelEndpoint
 	PlannerTemp  float64
 	ReviewerTemp float64
 }
@@ -189,6 +190,8 @@ func (e *Engine) routeEndpoint(route ModelRoute) (ModelEndpoint, error) {
 		return e.cfg.Sec70B, nil
 	case RouteSecClassify:
 		return e.cfg.SecClassify, nil
+	case RouteSecLocalize:
+		return e.cfg.SecLocalize, nil
 	default:
 		return ModelEndpoint{}, fmt.Errorf("unsupported model route %q", route)
 	}

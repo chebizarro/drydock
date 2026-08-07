@@ -117,6 +117,7 @@ type Dependencies struct {
 	Publisher       AuditPublisher
 	Progress        ProgressReporter
 	Tools           ToolRunner
+	Localizer       Localizer
 }
 type Config struct{ Workers int }
 type Engine struct {
@@ -161,6 +162,7 @@ type Request struct {
 	SinceCommit   string
 	EnableSCA     bool
 	EnableSecrets bool
+	Localizer     string
 	Announcement  nostr.Event
 	Requester     nostr.PubKey
 	Relays        []string
@@ -254,6 +256,7 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 
 	e.progress(ctx, auditID, "localize")
 	units := e.localize(ctx, repoPath, codeMap, files, allDeterministic, surfaceResult, req.SinceCommit)
+	units = e.applyModelLocalization(ctx, req.Localizer, codeMap, files, allDeterministic, units)
 	if len(units) > budget.MaxUnits {
 		for _, unit := range units[budget.MaxUnits:] {
 			result.DroppedUnits = append(result.DroppedUnits, unit.File)
@@ -403,6 +406,67 @@ func (e *Engine) localize(ctx context.Context, repoPath string, codeMap *codemap
 	})
 	return units
 }
+func (e *Engine) applyModelLocalization(ctx context.Context, strategy string, codeMap *codemap.Map, files []string, deterministic []reviewengine.Finding, heuristic []candidateUnit) []candidateUnit {
+	if !strings.EqualFold(strings.TrimSpace(strategy), "antares") {
+		return heuristic
+	}
+	if e.deps.Localizer == nil {
+		e.logger.Info("seclocalize unconfigured; falling back to heuristic localization")
+		return heuristic
+	}
+	cweSet := make(map[string]struct{})
+	for _, finding := range deterministic {
+		if cwe := findingCWE(finding); cwe != "CWE-000" {
+			cweSet[cwe] = struct{}{}
+		}
+	}
+	cwes := make([]string, 0, len(cweSet))
+	for cwe := range cweSet {
+		cwes = append(cwes, cwe)
+	}
+	slices.Sort(cwes)
+	if len(cwes) == 0 {
+		e.logger.Info("seclocalize has no CWE hypotheses; falling back to heuristic localization")
+		return heuristic
+	}
+	allowed := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		allowed[file] = struct{}{}
+	}
+	scores := make(map[string]int, len(heuristic))
+	for _, unit := range heuristic {
+		scores[unit.File] = unit.Score
+	}
+	for _, cwe := range cwes {
+		localized, err := e.deps.Localizer.Localize(ctx, cwe, codeMap.Top(500))
+		if err != nil {
+			e.logger.Warn("seclocalize failed; falling back to heuristic localization", "cwe", cwe, "error", err)
+			return heuristic
+		}
+		for i, file := range localized {
+			if _, ok := allowed[file]; !ok {
+				continue
+			}
+			score := 1000 - i
+			if score < 1 {
+				score = 1
+			}
+			scores[file] += score
+		}
+	}
+	units := make([]candidateUnit, 0, len(scores))
+	for file, score := range scores {
+		units = append(units, candidateUnit{File: file, Score: score})
+	}
+	sort.Slice(units, func(i, j int) bool {
+		if units[i].Score != units[j].Score {
+			return units[i].Score > units[j].Score
+		}
+		return units[i].File < units[j].File
+	})
+	return units
+}
+
 func recentFiles(ctx context.Context, repoPath, sinceCommit string) []string {
 	args := []string{"log", "--name-only", "--pretty=format:"}
 	if strings.TrimSpace(sinceCommit) != "" {

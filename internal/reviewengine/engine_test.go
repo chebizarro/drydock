@@ -68,10 +68,12 @@ func TestRouteEndpointSecurityRoutes(t *testing.T) {
 	llm70b := ModelEndpoint{BaseURL: "http://70b", Model: "70b-model"}
 	sec70b := ModelEndpoint{BaseURL: "http://sec70b", Model: "security-model"}
 	secClassify := ModelEndpoint{BaseURL: "http://secclassify", Model: "classifier-model"}
+	secLocalize := ModelEndpoint{BaseURL: "http://seclocalize", Model: "antares-model"}
 	engine := New(Config{
 		LLM70B:      llm70b,
 		Sec70B:      sec70b,
 		SecClassify: secClassify,
+		SecLocalize: secLocalize,
 	}, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 
 	got, err := engine.routeEndpoint(RouteSec70B)
@@ -89,6 +91,14 @@ func TestRouteEndpointSecurityRoutes(t *testing.T) {
 	if got != secClassify {
 		t.Fatalf("expected secclassify endpoint, got %#v", got)
 	}
+
+	got, err = engine.routeEndpoint(RouteSecLocalize)
+	if err != nil {
+		t.Fatalf("route seclocalize: %v", err)
+	}
+	if got != secLocalize {
+		t.Fatalf("expected seclocalize endpoint, got %#v", got)
+	}
 }
 
 func TestRouteEndpointSec70BFallsBackToLLM70B(t *testing.T) {
@@ -105,7 +115,7 @@ func TestRouteEndpointSec70BFallsBackToLLM70B(t *testing.T) {
 }
 
 func TestPlannerOutputAcceptsSecurityRoutes(t *testing.T) {
-	for _, route := range []ModelRoute{RouteSec70B, RouteSecClassify} {
+	for _, route := range []ModelRoute{RouteSec70B, RouteSecClassify, RouteSecLocalize} {
 		t.Run(string(route), func(t *testing.T) {
 			if err := (PlannerOutput{ChangeType: "security", ModelRoute: route}).Validate(); err != nil {
 				t.Fatalf("expected route %q to be valid: %v", route, err)
