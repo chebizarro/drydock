@@ -16,7 +16,10 @@ import (
 	"fiatjaf.com/nostr"
 )
 
-const MethodSecurityAudit = "security/audit"
+const (
+	MethodSecurityAudit      = "security/audit"
+	MethodSecurityAuditSARIF = "security/audit/sarif"
+)
 
 type SecurityAuditParams struct {
 	RepoAddr    string `json:"repo_addr"`
@@ -31,6 +34,16 @@ type SecurityAuditAccepted struct {
 	RequestEventID string `json:"request_event_id"`
 }
 
+type SecurityAuditSARIFParams struct {
+	AuditID int64 `json:"audit_id"`
+}
+
+type SecurityAuditSARIFResult struct {
+	AuditID int64           `json:"audit_id"`
+	SHA256  string          `json:"sha256"`
+	SARIF   json.RawMessage `json:"sarif"`
+}
+
 type SecurityAuditRunner interface {
 	Run(context.Context, auditengine.Request) (auditengine.Result, error)
 }
@@ -38,6 +51,7 @@ type SecurityAuditRunner interface {
 type SecurityAuditStore interface {
 	GetRepositoryAnnouncement(context.Context, string) (nostr.Event, error)
 	GetRepositoryCloneURLs(context.Context, string) ([]string, error)
+	SecurityAuditSARIFForRequester(context.Context, int64, string) ([]byte, string, error)
 }
 
 type SecurityAuditConfigLoader interface {
@@ -152,7 +166,10 @@ func (h *SecurityAuditHandler) RegisterContextVMMethods(router *Router) error {
 	if router == nil {
 		return errors.New("contextvm router is required")
 	}
-	return router.Register(MethodSecurityAudit, h.HandleSecurityAudit)
+	if err := router.Register(MethodSecurityAudit, h.HandleSecurityAudit); err != nil {
+		return err
+	}
+	return router.Register(MethodSecurityAuditSARIF, h.HandleSecurityAuditSARIF)
 }
 
 func (h *SecurityAuditHandler) HandleSecurityAudit(ctx context.Context, req Request) (any, *Error) {
@@ -210,6 +227,34 @@ func (h *SecurityAuditHandler) HandleSecurityAudit(ctx context.Context, req Requ
 		}
 	})
 	return SecurityAuditAccepted{Accepted: true, RequestEventID: requestEventID}, nil
+}
+
+func (h *SecurityAuditHandler) HandleSecurityAuditSARIF(ctx context.Context, req Request) (any, *Error) {
+	if h == nil || h.store == nil {
+		return nil, &Error{Code: ErrorInternal, Message: "security audit is not configured"}
+	}
+	params, rpcErr := ParamsAs[SecurityAuditSARIFParams](req)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if params.AuditID <= 0 {
+		return nil, &Error{Code: ErrorInvalidParams, Message: "audit_id must be positive"}
+	}
+	if req.Sender == nostr.ZeroPK {
+		return nil, &Error{Code: ErrorUnauthorized, Message: "requester pubkey is required"}
+	}
+	sarif, hash, err := h.store.SecurityAuditSARIFForRequester(ctx, params.AuditID, req.Sender.Hex())
+	if err != nil {
+		return nil, &Error{Code: ErrorNotFound, Message: "security audit SARIF not found"}
+	}
+	if !json.Valid(sarif) {
+		return nil, &Error{Code: ErrorInternal, Message: "stored security audit SARIF is invalid"}
+	}
+	return SecurityAuditSARIFResult{
+		AuditID: params.AuditID,
+		SHA256:  hash,
+		SARIF:   json.RawMessage(append([]byte(nil), sarif...)),
+	}, nil
 }
 
 func (h *SecurityAuditHandler) auditConfig(ctx context.Context, repoID, requestedDepth string) (auditengine.Depth, repoconfig.RepoConfig, error) {

@@ -100,10 +100,20 @@ func (c *CashuMintClient) ParseToken(raw string) (ParsedToken, error) {
 	if err := json.Unmarshal(entry.Proofs, &proofs); err != nil {
 		return ParsedToken{}, fmt.Errorf("parse token proofs: %w", err)
 	}
+	if len(proofs) == 0 {
+		return ParsedToken{}, errors.New("token contains no proofs")
+	}
 
-	// Sum proof amounts
+	// Sum proof amounts defensively. Exact-value melt enforcement relies on this
+	// total, so malformed, non-positive, or overflowing amounts must fail closed.
 	var total int64
 	for _, proof := range proofs {
+		if proof.Amount <= 0 {
+			return ParsedToken{}, errors.New("token proof amount must be positive")
+		}
+		if total > (1<<63-1)-proof.Amount {
+			return ParsedToken{}, errors.New("token proof amount overflow")
+		}
 		total += proof.Amount
 	}
 

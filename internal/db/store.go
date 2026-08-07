@@ -453,6 +453,49 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 9,
+		name:    "security_audit_coverage_artifact_outbox",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			for _, col := range []struct{ name, ddl string }{
+				{"sarif_artifact", "ALTER TABLE security_audits ADD COLUMN sarif_artifact BLOB"},
+				{"scan_operations_scanned", "ALTER TABLE security_audits ADD COLUMN scan_operations_scanned INTEGER NOT NULL DEFAULT 0 CHECK (scan_operations_scanned >= 0)"},
+				{"scan_operations_skipped", "ALTER TABLE security_audits ADD COLUMN scan_operations_skipped INTEGER NOT NULL DEFAULT 0 CHECK (scan_operations_skipped >= 0)"},
+				{"scan_operations_errored", "ALTER TABLE security_audits ADD COLUMN scan_operations_errored INTEGER NOT NULL DEFAULT 0 CHECK (scan_operations_errored >= 0)"},
+				{"units_dropped", "ALTER TABLE security_audits ADD COLUMN units_dropped INTEGER NOT NULL DEFAULT 0 CHECK (units_dropped >= 0)"},
+			} {
+				exists, err := hasColumn(ctx, tx, "security_audits", col.name)
+				if err != nil {
+					return fmt.Errorf("check security_audits.%s: %w", col.name, err)
+				}
+				if !exists {
+					if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+						return fmt.Errorf("add security_audits.%s: %w", col.name, err)
+					}
+				}
+			}
+			for _, ddl := range []string{
+				`CREATE TABLE IF NOT EXISTS security_audit_publication_outbox (
+					audit_id INTEGER NOT NULL,
+					event_type TEXT NOT NULL CHECK (event_type IN ('report', 'detail', 'fallback')),
+					event_id TEXT NOT NULL,
+					raw_event_json TEXT NOT NULL,
+					relays_json TEXT NOT NULL,
+					delivered_at INTEGER NOT NULL DEFAULT 0,
+					created_at INTEGER NOT NULL,
+					PRIMARY KEY (audit_id, event_type),
+					UNIQUE (event_id),
+					FOREIGN KEY (audit_id) REFERENCES security_audits(id) ON DELETE CASCADE)`,
+				`CREATE INDEX IF NOT EXISTS idx_security_audit_outbox_delivery
+					ON security_audit_publication_outbox(delivered_at, audit_id)`,
+			} {
+				if _, err := tx.ExecContext(ctx, ddl); err != nil {
+					return fmt.Errorf("apply security audit persistence ddl: %w", err)
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

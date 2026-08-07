@@ -176,6 +176,8 @@ func (s *Service) ReconcilePayout(ctx context.Context, destination string, amoun
 }
 
 const (
+	ReasonPaymentPending = "payment_pending"
+
 	AccessFreePubkey        = "free_pubkey"
 	AccessFreeMaintainer    = "free_maintainer"
 	AccessFreeTier          = "free_tier"
@@ -201,7 +203,12 @@ type AuthorizeResult struct {
 	Allowed          bool
 	AccessKind       string // free_pubkey, free_maintainer, free_tier, subscription, zap, cashu_review, cashu_subscription
 	Reason           string // machine-readable denial reason
+	Retryable        bool   // true only for non-terminal settlement state
 	ZapReceiptCursor int64  // latest receipt row observed for race-safe payment blocking
+}
+
+func paymentPending() (AuthorizeResult, error) {
+	return AuthorizeResult{Allowed: false, Reason: ReasonPaymentPending, Retryable: true}, nil
 }
 
 // AuthorizePatch checks if a patch event is authorized for review based on
@@ -351,6 +358,19 @@ func (s *Service) processTokenPayment(
 		return deny("payment_service_not_configured")
 	}
 
+	tokenHash := hashToken(token)
+	// Reconcile durable evidence before applying current mint policy or new
+	// exact-value rules. Configuration and client restrictions must not abandon
+	// proofs that an older version may already have submitted.
+	if existing, err := s.store.GetReviewPayment(ctx, patchEventID); err == nil {
+		if existing.TokenHash != tokenHash {
+			return deny("token_already_used")
+		}
+		return s.reconcileReservedPayment(ctx, existing)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AuthorizeResult{}, fmt.Errorf("get existing payment: %w", err)
+	}
+
 	parsed, err := s.mint.ParseToken(token)
 	if err != nil {
 		return deny("invalid_cashu_token")
@@ -361,19 +381,15 @@ func (s *Service) processTokenPayment(
 	if parsed.Unit != "sat" {
 		return deny("unsupported_token_unit")
 	}
-	tokenHash := hashToken(token)
 	targetPrice := paymentTargetPrice(mode, policy)
 	if targetPrice <= 0 || parsed.AmountSats < targetPrice {
 		return deny("insufficient_after_fees")
 	}
-
-	if existing, err := s.store.GetReviewPayment(ctx, patchEventID); err == nil {
-		if existing.TokenHash != tokenHash {
-			return deny("token_already_used")
-		}
-		return s.reconcileReservedPayment(ctx, existing)
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return AuthorizeResult{}, fmt.Errorf("get existing payment: %w", err)
+	// This service is a payment gate, not a Cashu wallet: it has no keyset,
+	// blinding, unblinding, or durable change-proof storage. Accept only the
+	// exact invoice amount so an over-value token can never be silently absorbed.
+	if parsed.AmountSats > targetPrice {
+		return deny("change_not_supported")
 	}
 
 	reservation := db.ReviewPaymentRecord{
@@ -396,29 +412,35 @@ func (s *Service) processTokenPayment(
 	memo := fmt.Sprintf("drydock review %s", patchEventID[:12])
 	invoice, err := s.invoice.CreateInvoice(ctx, targetPrice, memo, s.cfg.InvoiceExpiry)
 	if err != nil {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, "invoice creation failure")
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "invoice creation failure")
 		return AuthorizeResult{}, fmt.Errorf("create invoice: %w", err)
 	}
-	if err := validateInvoiceEvidence(invoice, targetPrice, time.Now().Unix()); err != nil {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, "invalid invoice response")
+	if err := validateFreshInvoiceEvidence(invoice, targetPrice, time.Now().Unix()); err != nil {
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "invalid invoice response")
 		return AuthorizeResult{}, fmt.Errorf("validate created invoice: %w", err)
 	}
 	reservation.InvoiceID, reservation.InvoiceRequest = invoice.ID, invoice.Request
 	reservation.InvoiceAmountMSats, reservation.InvoiceExpiresAt = invoice.AmountMSats, invoice.ExpiresAt
 	if err := s.store.UpsertPendingReviewPayment(ctx, reservation); err != nil {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, "persist pending payment failure")
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "persist pending payment failure")
 		return AuthorizeResult{}, fmt.Errorf("persist pending payment: %w", err)
 	}
 
 	quote, err := s.mint.CreateMeltQuote(ctx, parsed.MintURL, invoice.Request)
 	if err != nil {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, "melt quote failure")
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "melt quote failure")
 		return AuthorizeResult{}, fmt.Errorf("create melt quote: %w", err)
 	}
-	if quote.ID == "" || quote.Amount != targetPrice || quote.FeeReserve < 0 ||
-		parsed.AmountSats < quote.Amount || quote.FeeReserve > parsed.AmountSats-quote.Amount {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, "invalid or insufficient melt quote")
-		return deny("insufficient_after_fees")
+	if quote.ID == "" || quote.Amount != targetPrice || quote.FeeReserve < 0 {
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "invalid melt quote")
+		return AuthorizeResult{}, errors.New("mint returned inconsistent melt quote")
+	}
+	// A positive fee reserve requires NUT-08 blank outputs even when the token
+	// exactly covers amount+reserve, because the actual Lightning fee may be
+	// lower. Fail closed until real wallet/keyset plumbing exists.
+	if quote.FeeReserve != 0 || parsed.AmountSats != quote.Amount {
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "cashu change unsupported")
+		return deny("change_not_supported")
 	}
 	if err := s.store.MarkReviewPaymentMeltSubmitted(ctx, patchEventID, tokenHash, quote.ID, quote.Amount, quote.FeeReserve); err != nil {
 		return AuthorizeResult{}, fmt.Errorf("persist melt submission intent: %w", err)
@@ -426,11 +448,14 @@ func (s *Service) processTokenPayment(
 
 	if err := s.mint.MeltToken(ctx, parsed.MintURL, quote, parsed); err != nil {
 		if !meltMayHaveBeenSubmitted(err) {
-			s.deletePendingAfterPreMeltFailure(ctx, patchEventID, "provably not submitted melt")
+			if deleteErr := s.store.DeleteProvablyUnsubmittedMelt(ctx, patchEventID, tokenHash, quote.ID); deleteErr != nil {
+				s.logger.Warn("failed to release provably unsubmitted melt",
+					"patch_event_id", patchEventID, "quote_id", quote.ID, "error", deleteErr)
+			}
 			return deny("payment_not_submitted")
 		}
 		s.logger.Warn("melt outcome unknown; preserving payment for reconciliation", "patch_event_id", patchEventID, "quote_id", quote.ID, "error", err)
-		return deny("payment_pending")
+		return paymentPending()
 	}
 	if err := s.store.MarkReviewPaymentTokenSpent(ctx, patchEventID); err != nil {
 		return AuthorizeResult{}, fmt.Errorf("persist paid melt result: %w", err)
@@ -442,20 +467,94 @@ func (s *Service) processTokenPayment(
 	return s.reconcileReservedPayment(ctx, rec)
 }
 
+// ReconcilePaymentsResult reports durable reviews made queueable by a pass.
+// Tasks must be enqueued even when Err is non-nil for other candidate records.
+type ReconcilePaymentsResult struct {
+	Tasks    []db.ReviewTask
+	Examined int
+	Failed   int
+}
+
+// ReconcilePendingPayments polls every durable submitted melt exactly by quote;
+// proofs are never resubmitted. Keyset pagination prevents one unresolved
+// payment from starving later candidates, and authorized candidates close the
+// crash window between payment finalization and review requeue.
+func (s *Service) ReconcilePendingPayments(ctx context.Context, pageSize int) (ReconcilePaymentsResult, error) {
+	var result ReconcilePaymentsResult
+	if s.invoice == nil || s.mint == nil {
+		return result, errors.New("payment service is not configured")
+	}
+	if pageSize <= 0 || pageSize > 500 {
+		return result, errors.New("payment reconciliation page size must be between 1 and 500")
+	}
+
+	var cursor string
+	var reconcileErrs []error
+	for {
+		records, err := s.store.ListReviewPaymentRecoveryCandidates(ctx, cursor, pageSize)
+		if err != nil {
+			return result, errors.Join(append(reconcileErrs, err)...)
+		}
+		for _, rec := range records {
+			result.Examined++
+			cursor = rec.PatchEventID
+			allowed := rec.Status == "authorized"
+			if !allowed {
+				recordCtx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+				auth, err := s.reconcileReservedPayment(recordCtx, rec)
+				cancel()
+				if err != nil {
+					result.Failed++
+					reconcileErrs = append(reconcileErrs, fmt.Errorf("reconcile payment %s: %w", rec.PatchEventID, err))
+					continue
+				}
+				allowed = auth.Allowed
+			}
+			if !allowed {
+				continue
+			}
+			task, transitioned, err := s.store.RequeueReviewAfterPayment(ctx, rec.PatchEventID)
+			if err != nil {
+				result.Failed++
+				reconcileErrs = append(reconcileErrs, fmt.Errorf("requeue paid review %s: %w", rec.PatchEventID, err))
+				continue
+			}
+			if transitioned {
+				result.Tasks = append(result.Tasks, task)
+			}
+		}
+		if len(records) < pageSize {
+			break
+		}
+	}
+	return result, errors.Join(reconcileErrs...)
+}
+
 func (s *Service) reconcileReservedPayment(ctx context.Context, rec db.ReviewPaymentRecord) (AuthorizeResult, error) {
 	if rec.Status == "authorized" {
 		return AuthorizeResult{Allowed: true, AccessKind: rec.AccessKind}, nil
 	}
+	if rec.MeltState == "failed" {
+		return AuthorizeResult{Allowed: false, Reason: "payment_failed"}, nil
+	}
 	expected := Invoice{ID: rec.InvoiceID, Request: rec.InvoiceRequest, AmountMSats: rec.InvoiceAmountMSats, ExpiresAt: rec.InvoiceExpiresAt}
-	if err := validateInvoiceEvidence(expected, rec.ExpectedAmountSats, time.Now().Unix()); err != nil {
-		return AuthorizeResult{Allowed: false, Reason: "payment_pending"}, nil
+	if err := validateInvoiceContract(expected, rec.ExpectedAmountSats); err != nil {
+		return AuthorizeResult{}, fmt.Errorf("validate persisted invoice: %w", err)
 	}
 	quote := MeltQuote{ID: rec.MeltQuoteID, Amount: rec.MeltQuoteAmountSats, FeeReserve: rec.MeltFeeReserveSats}
+	// New submissions are restricted to exact-value, zero-reserve melts above.
+	// Durable rows created by older versions may contain excess input and a fee
+	// reserve; those proofs may already be spent, so reconcile them under the
+	// prior persisted contract rather than stranding the paid entitlement.
+	if quote.ID == "" || quote.Amount != rec.ExpectedAmountSats || quote.FeeReserve < 0 ||
+		rec.TokenAmountSats < quote.Amount || quote.FeeReserve > rec.TokenAmountSats-quote.Amount {
+		return AuthorizeResult{}, errors.New("persisted melt quote is inconsistent with payment")
+	}
 
 	mintPaid := rec.Status == "token_spent" && rec.MeltState == "paid"
 	if !mintPaid {
-		if rec.MeltState != "submitted" && rec.MeltState != "unpaid" {
-			return AuthorizeResult{Allowed: false, Reason: "payment_pending"}, nil
+		if rec.Status != "pending" || (rec.MeltState != "submitted" && rec.MeltState != "unpaid") {
+			return AuthorizeResult{}, fmt.Errorf("unsupported persisted payment state %s/%s", rec.Status, rec.MeltState)
 		}
 		status, err := s.mint.LookupMeltQuote(ctx, rec.MintURL, quote)
 		if err != nil {
@@ -479,6 +578,8 @@ func (s *Service) reconcileReservedPayment(ctx context.Context, rec db.ReviewPay
 		}
 	}
 
+	// Always look up settlement before applying wall-clock expiry. A payment
+	// settled on time remains valid even when reconciliation happens later.
 	settlement, err := s.invoice.LookupInvoice(ctx, expected)
 	if err != nil {
 		return AuthorizeResult{}, fmt.Errorf("lookup invoice settlement: %w", err)
@@ -486,14 +587,27 @@ func (s *Service) reconcileReservedPayment(ctx context.Context, rec db.ReviewPay
 	if err := validateInvoiceStatus(expected, settlement); err != nil {
 		return AuthorizeResult{}, fmt.Errorf("validate invoice settlement: %w", err)
 	}
-	if settlement.Settled && !mintPaid {
-		return AuthorizeResult{}, errors.New("wallet reports settlement but mint quote is not paid")
-	}
-	if !mintPaid || !settlement.Settled {
-		if !mintPaid && settlement.Expired && rec.MeltState == "unpaid" {
+	if settlement.Settled {
+		if settlement.SettledAt == 0 {
+			return paymentPending()
+		}
+		if settlement.SettledAt > expected.ExpiresAt {
+			if err := s.store.MarkReviewPaymentFailed(ctx, rec.PatchEventID); err != nil {
+				return AuthorizeResult{}, fmt.Errorf("persist late settlement failure: %w", err)
+			}
 			return AuthorizeResult{Allowed: false, Reason: "payment_failed"}, nil
 		}
-		return AuthorizeResult{Allowed: false, Reason: "payment_pending"}, nil
+		if !mintPaid {
+			return AuthorizeResult{}, errors.New("wallet reports settlement but mint quote is not paid")
+		}
+	} else {
+		if !mintPaid && rec.MeltState == "unpaid" && time.Now().Unix() >= expected.ExpiresAt {
+			if err := s.store.MarkReviewPaymentFailed(ctx, rec.PatchEventID); err != nil {
+				return AuthorizeResult{}, fmt.Errorf("persist expired payment failure: %w", err)
+			}
+			return AuthorizeResult{Allowed: false, Reason: "payment_failed"}, nil
+		}
+		return paymentPending()
 	}
 
 	accessKind, err := s.store.FinalizePaidReview(ctx, rec.PatchEventID, rec.TokenHash)
@@ -507,7 +621,7 @@ func (s *Service) reconcileReservedPayment(ctx context.Context, rec db.ReviewPay
 	return AuthorizeResult{Allowed: true, AccessKind: accessKind}, nil
 }
 
-func validateInvoiceEvidence(invoice Invoice, expectedSats, now int64) error {
+func validateInvoiceContract(invoice Invoice, expectedSats int64) error {
 	if _, err := parsePaymentHash(invoice.ID); err != nil {
 		return err
 	}
@@ -516,6 +630,16 @@ func validateInvoiceEvidence(invoice Invoice, expectedSats, now int64) error {
 	}
 	if expectedSats <= 0 || expectedSats > (1<<63-1)/1000 || invoice.AmountMSats != expectedSats*1000 {
 		return errors.New("invoice amount does not match persisted price")
+	}
+	if invoice.ExpiresAt <= 0 {
+		return errors.New("invoice has invalid expiry")
+	}
+	return nil
+}
+
+func validateFreshInvoiceEvidence(invoice Invoice, expectedSats, now int64) error {
+	if err := validateInvoiceContract(invoice, expectedSats); err != nil {
+		return err
 	}
 	if invoice.ExpiresAt <= now {
 		return errors.New("invoice is expired")
@@ -552,8 +676,8 @@ func validateInvoiceStatus(expected Invoice, status InvoiceStatus) error {
 	return nil
 }
 
-func (s *Service) deletePendingAfterPreMeltFailure(ctx context.Context, patchEventID, reason string) {
-	if err := s.store.DeletePendingReviewPayment(ctx, patchEventID); err != nil {
+func (s *Service) deletePendingAfterPreMeltFailure(ctx context.Context, patchEventID, tokenHash, reason string) {
+	if err := s.store.DeleteUnsubmittedReviewPayment(ctx, patchEventID, tokenHash); err != nil {
 		s.logger.Warn("failed to delete pending payment after pre-melt failure", "patch_event_id", patchEventID, "reason", reason, "error", err)
 	}
 }

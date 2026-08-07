@@ -147,7 +147,7 @@ func TestMarkReviewPaymentAuthorized(t *testing.T) {
 	}
 }
 
-func TestDeletePendingReviewPayment(t *testing.T) {
+func TestDeleteUnsubmittedReviewPayment(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
 
@@ -157,20 +157,95 @@ func TestDeletePendingReviewPayment(t *testing.T) {
 		RepoID:           "repo-1",
 		AuthorPubkey:     "author-1",
 		RequestedMode:    "review",
+		TokenHash:        "delete-hash",
 		InvoiceID:        "inv-1",
 		InvoiceRequest:   "lnbc...",
 		InvoiceExpiresAt: time.Now().Add(time.Hour).Unix(),
 	})
 
 	// Delete
-	if err := store.DeletePendingReviewPayment(ctx, "patch-1"); err != nil {
-		t.Fatalf("DeletePendingReviewPayment: %v", err)
+	if err := store.DeleteUnsubmittedReviewPayment(ctx, "patch-1", "delete-hash"); err != nil {
+		t.Fatalf("DeleteUnsubmittedReviewPayment: %v", err)
 	}
 
 	// Should be gone
 	_, err := store.GetReviewPayment(ctx, "patch-1")
 	if err == nil {
 		t.Fatal("expected error after delete")
+	}
+}
+
+func TestDeleteUnsubmittedReviewPayment_PreservesSubmittedMelt(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	rec := ReviewPaymentRecord{
+		PatchEventID: "submitted-patch", RepoID: "repo-1", AuthorPubkey: "author-1",
+		RequestedMode: "review", TokenHash: "submitted-hash", MintURL: "https://mint.example.com",
+		TokenAmountSats: 100, ExpectedAmountSats: 100,
+		InvoiceID: "invoice", InvoiceRequest: "lnbc1", InvoiceAmountMSats: 100000,
+		InvoiceExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}
+	if err := store.UpsertPendingReviewPayment(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, "quote", 100, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteUnsubmittedReviewPayment(ctx, rec.PatchEventID, rec.TokenHash); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetReviewPayment(ctx, rec.PatchEventID)
+	if err != nil || got.MeltState != "submitted" {
+		t.Fatalf("submitted melt was deleted or changed: rec=%+v err=%v", got, err)
+	}
+}
+
+func TestPaymentRecoveryCandidatesAndAuthorizedRequeue(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	rec := ReviewPaymentRecord{
+		PatchEventID: "recover-patch", RepoID: "repo-1", AuthorPubkey: "author-1",
+		RequestedMode: "review", TokenHash: "recover-hash", MintURL: "https://mint.example.com",
+		TokenAmountSats: 100, ExpectedAmountSats: 100,
+		InvoiceID: "invoice", InvoiceRequest: "lnbc1", InvoiceAmountMSats: 100000,
+		InvoiceExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}
+	if acquired, err := store.BeginReview(ctx, rec.PatchEventID, rec.RepoID); err != nil || !acquired {
+		t.Fatalf("BeginReview: acquired=%v err=%v", acquired, err)
+	}
+	if err := store.MarkReviewFailed(ctx, rec.PatchEventID, rec.RepoID, "payment_blocked:payment_pending"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertPendingReviewPayment(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, "quote", 100, 0); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := store.ListReviewPaymentRecoveryCandidates(ctx, "", 1)
+	if err != nil || len(candidates) != 1 || candidates[0].MeltState != "submitted" {
+		t.Fatalf("submitted candidate: records=%+v err=%v", candidates, err)
+	}
+	if err := store.MarkReviewPaymentTokenSpent(ctx, rec.PatchEventID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinalizePaidReview(ctx, rec.PatchEventID, rec.TokenHash); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err = store.ListReviewPaymentRecoveryCandidates(ctx, "", 1)
+	if err != nil || len(candidates) != 1 || candidates[0].Status != "authorized" {
+		t.Fatalf("authorized stranded candidate: records=%+v err=%v", candidates, err)
+	}
+	task, transitioned, err := store.RequeueReviewAfterPayment(ctx, rec.PatchEventID)
+	if err != nil || !transitioned || task.PatchEventID != rec.PatchEventID || task.RepoID != rec.RepoID {
+		t.Fatalf("RequeueReviewAfterPayment: task=%+v transitioned=%v err=%v", task, transitioned, err)
+	}
+	if _, transitioned, err = store.RequeueReviewAfterPayment(ctx, rec.PatchEventID); err != nil || transitioned {
+		t.Fatalf("idempotent requeue transitioned=%v err=%v", transitioned, err)
+	}
+	status, err := store.GetReviewStatus(ctx, rec.PatchEventID, rec.RepoID)
+	if err != nil || status != "pending" {
+		t.Fatalf("review status=%q err=%v", status, err)
 	}
 }
 

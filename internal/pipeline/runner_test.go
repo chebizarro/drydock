@@ -14,6 +14,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/metareview"
 	"drydock/internal/metrics"
+	"drydock/internal/payment"
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
 	"drydock/internal/repoconfig"
@@ -230,6 +231,34 @@ func TestCheckReviewStatusForceBypassesDraftAndClosed(t *testing.T) {
 		if err := runner.checkReviewStatus(ctx, normal, rootID, []string{"open"}); err == nil || !strings.HasPrefix(err.Error(), "status_skipped:") {
 			t.Fatalf("ordinary status %d error = %v, want status_skipped", kind, err)
 		}
+	}
+}
+
+func TestRetryablePaymentPendingUsesOrdinaryRequeuePath(t *testing.T) {
+	err := retryablePaymentError(payment.AuthorizeResult{
+		Reason: payment.ReasonPaymentPending, Retryable: true,
+	})
+	if err == nil || err.Error() != payment.ReasonPaymentPending || errors.Is(err, errPaymentBlockPersisted) {
+		t.Fatalf("retryable payment error = %v", err)
+	}
+	if err := retryablePaymentError(payment.AuthorizeResult{Reason: "no_payment"}); err != nil {
+		t.Fatalf("terminal denial unexpectedly used retry path: %v", err)
+	}
+
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	if acquired, err := store.BeginReview(ctx, "payment-patch", "repo-1"); err != nil || !acquired {
+		t.Fatalf("BeginReview: acquired=%v err=%v", acquired, err)
+	}
+	if err := store.MarkReviewFailed(ctx, "payment-patch", "repo-1", payment.ReasonPaymentPending); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE review_log SET updated_at=0 WHERE patch_event_id='payment-patch'`); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := store.RequeueFailedReviews(ctx, 0, 10)
+	if err != nil || len(tasks) != 1 || tasks[0].PatchEventID != "payment-patch" {
+		t.Fatalf("payment_pending was not requeued: tasks=%+v err=%v", tasks, err)
 	}
 }
 

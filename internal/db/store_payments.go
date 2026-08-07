@@ -37,7 +37,7 @@ type ReviewPaymentRecord struct {
 	MeltQuoteID         string
 	MeltQuoteAmountSats int64
 	MeltFeeReserveSats  int64
-	MeltState           string // empty, submitted, paid, unpaid
+	MeltState           string // empty, submitted, paid, unpaid, failed
 	CreatedAt           int64
 	UpdatedAt           int64
 }
@@ -169,12 +169,133 @@ func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash strin
 	return rec, nil
 }
 
-// DeletePendingReviewPayment removes a pending review payment record.
-func (s *Store) DeletePendingReviewPayment(ctx context.Context, patchEventID string) error {
+// DeleteUnsubmittedReviewPayment removes only the caller's unsubmitted
+// reservation. Submitted melt evidence is never deleted because the proofs may
+// already have reached the mint.
+func (s *Store) DeleteUnsubmittedReviewPayment(ctx context.Context, patchEventID, tokenHash string) error {
 	_, err := s.db.ExecContext(ctx, `
-		DELETE FROM review_payments WHERE patch_event_id = ? AND status = 'pending'
-	`, patchEventID)
+		DELETE FROM review_payments
+		WHERE patch_event_id = ? AND token_hash = ? AND status = 'pending' AND melt_state = ''
+	`, patchEventID, tokenHash)
 	return err
+}
+
+// DeleteProvablyUnsubmittedMelt releases a submitted-intent record only when
+// the mint client proved the HTTP request was never sent. Quote identity keeps
+// cleanup scoped to the exact attempt whose local submission failed.
+func (s *Store) DeleteProvablyUnsubmittedMelt(ctx context.Context, patchEventID, tokenHash, quoteID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM review_payments
+		WHERE patch_event_id = ? AND token_hash = ? AND melt_quote_id = ?
+		AND status = 'pending' AND melt_state = 'submitted'
+	`, patchEventID, tokenHash, quoteID)
+	return err
+}
+
+// ListReviewPaymentRecoveryCandidates returns a deterministic page of durable
+// melt records that need external reconciliation, plus already-authorized
+// payments whose reviews are still stranded in a payment-pending failure.
+func (s *Store) ListReviewPaymentRecoveryCandidates(ctx context.Context, afterPatchEventID string, limit int) ([]ReviewPaymentRecord, error) {
+	if limit <= 0 || limit > 500 {
+		return nil, errors.New("payment recovery page size must be between 1 and 500")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT p.patch_event_id, p.repo_id, p.author_pubkey, p.status, p.access_kind, p.requested_mode,
+		       COALESCE(p.token_hash, ''), p.mint_url, p.token_amount_sats, p.expected_amount_sats,
+		       p.settled_amount_sats, p.subscription_days, p.invoice_id, p.invoice_request,
+		       p.invoice_amount_msats, p.invoice_expires_at, p.melt_quote_id,
+		       p.melt_quote_amount_sats, p.melt_fee_reserve_sats, p.melt_state,
+		       p.created_at, p.updated_at
+		FROM review_payments p
+		WHERE p.patch_event_id > ? AND (
+			(p.status IN ('pending', 'token_spent') AND p.melt_state IN ('submitted', 'unpaid', 'paid'))
+			OR (p.status = 'authorized' AND EXISTS (
+				SELECT 1 FROM review_log r
+				WHERE r.patch_event_id = p.patch_event_id AND r.repo_id = p.repo_id
+				  AND r.status = 'failed'
+				  AND r.failure_reason IN ('payment_pending', 'payment_blocked:payment_pending')
+			))
+		)
+		ORDER BY p.patch_event_id
+		LIMIT ?
+	`, afterPatchEventID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query payment recovery candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var records []ReviewPaymentRecord
+	for rows.Next() {
+		var rec ReviewPaymentRecord
+		if err := rows.Scan(
+			&rec.PatchEventID, &rec.RepoID, &rec.AuthorPubkey, &rec.Status, &rec.AccessKind,
+			&rec.RequestedMode, &rec.TokenHash, &rec.MintURL, &rec.TokenAmountSats,
+			&rec.ExpectedAmountSats, &rec.SettledAmountSats, &rec.SubscriptionDays,
+			&rec.InvoiceID, &rec.InvoiceRequest, &rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt,
+			&rec.MeltQuoteID, &rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats,
+			&rec.MeltState, &rec.CreatedAt, &rec.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan payment recovery candidate: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate payment recovery candidates: %w", err)
+	}
+	return records, nil
+}
+
+// RequeueReviewAfterPayment atomically makes a payment-waiting review queueable
+// once its durable payment is authorized. It also recognizes legacy rows that
+// were permanently marked payment_blocked:payment_pending.
+func (s *Store) RequeueReviewAfterPayment(ctx context.Context, patchEventID string) (ReviewTask, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ReviewTask{}, false, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Unix()
+	result, err := tx.ExecContext(ctx, `
+		UPDATE review_log
+		SET status = 'pending', failure_reason = NULL, updated_at = ?
+		WHERE patch_event_id = ? AND status = 'failed'
+		  AND failure_reason IN ('payment_pending', 'payment_blocked:payment_pending')
+		  AND EXISTS (
+			SELECT 1 FROM review_payments p
+			WHERE p.patch_event_id = review_log.patch_event_id
+			  AND p.repo_id = review_log.repo_id
+			  AND p.status = 'authorized'
+		  )
+	`, now, patchEventID)
+	if err != nil {
+		return ReviewTask{}, false, fmt.Errorf("requeue review after payment: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return ReviewTask{}, false, err
+	}
+	if affected == 0 {
+		if err := tx.Commit(); err != nil {
+			return ReviewTask{}, false, err
+		}
+		return ReviewTask{}, false, nil
+	}
+	if affected != 1 {
+		return ReviewTask{}, false, fmt.Errorf("requeue review after payment changed %d rows", affected)
+	}
+	var task ReviewTask
+	task.PatchEventID = patchEventID
+	if err := tx.QueryRowContext(ctx, `
+		SELECT repo_id, force FROM review_log
+		WHERE patch_event_id = ? AND status = 'pending'
+	`, patchEventID).Scan(&task.RepoID, &task.Force); err != nil {
+		return ReviewTask{}, false, fmt.Errorf("read requeued payment review: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ReviewTask{}, false, err
+	}
+	return task, true, nil
 }
 
 // MarkReviewPaymentMeltSubmitted durably records the quote and submission intent.
@@ -212,6 +333,37 @@ func (s *Store) MarkReviewPaymentMeltUnpaid(ctx context.Context, patchEventID st
 		WHERE patch_event_id = ? AND status = 'pending' AND melt_state = 'submitted'
 	`, time.Now().Unix(), patchEventID)
 	return err
+}
+
+// MarkReviewPaymentFailed durably records a definitive settlement failure.
+// The token hash remains reserved because a submitted quote may have consumed
+// proofs even when the invoice evidence is terminal.
+func (s *Store) MarkReviewPaymentFailed(ctx context.Context, patchEventID string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE review_payments SET melt_state = 'failed', updated_at = ?
+		WHERE patch_event_id = ? AND (
+			(status = 'pending' AND melt_state IN ('submitted', 'unpaid'))
+			OR (status = 'token_spent' AND melt_state = 'paid')
+		)
+	`, time.Now().Unix(), patchEventID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 1 {
+		return nil
+	}
+	var meltState string
+	if err := s.db.QueryRowContext(ctx, `SELECT melt_state FROM review_payments WHERE patch_event_id=?`, patchEventID).Scan(&meltState); err != nil {
+		return err
+	}
+	if meltState == "failed" {
+		return nil
+	}
+	return fmt.Errorf("mark review payment failed: invalid state for patch %q", patchEventID)
 }
 
 // MarkReviewPaymentTokenSpent records definitive mint evidence that the quote

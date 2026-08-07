@@ -3,15 +3,20 @@ package auditengine
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"drydock/internal/codemap"
 	"drydock/internal/db"
 	"drydock/internal/nostrscan"
+	"drydock/internal/publisher"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
 	"drydock/internal/securityscan"
+	"drydock/internal/securityscan/surface"
 	"drydock/internal/securityverify"
 	"drydock/internal/testutil"
 )
@@ -180,6 +185,128 @@ func TestNewAntaresLocalizerRequiresConfiguration(t *testing.T) {
 	}
 }
 
+type coverageAuditStore struct {
+	coverage  []db.SecurityAuditCoverage
+	failed    bool
+	published bool
+}
+
+func (s *coverageAuditStore) CreateSecurityAudit(context.Context, string, string, string, string) (int64, error) {
+	return 77, nil
+}
+func (s *coverageAuditStore) StartSecurityAudit(context.Context, int64) error { return nil }
+func (s *coverageAuditStore) UpdateSecurityAuditCoverage(_ context.Context, _ int64, coverage db.SecurityAuditCoverage) error {
+	s.coverage = append(s.coverage, coverage)
+	return nil
+}
+func (s *coverageAuditStore) PublishSecurityAudit(context.Context, int64, string, string) error {
+	s.published = true
+	return nil
+}
+func (s *coverageAuditStore) FailSecurityAudit(context.Context, int64) error {
+	s.failed = true
+	return nil
+}
+func (s *coverageAuditStore) ReplaceSecurityAuditFindings(context.Context, int64, []db.SecurityAuditFinding) error {
+	return nil
+}
+func (s *coverageAuditStore) SecurityBaselineFingerprints(context.Context, string) (map[string]struct{}, error) {
+	return map[string]struct{}{}, nil
+}
+
+type fixedAuditRepo struct{ path string }
+
+func (r fixedAuditRepo) EnsureCanonicalRepo(context.Context, string, []string) (string, error) {
+	return r.path, nil
+}
+func (fixedAuditRepo) EnsureCommitAvailable(context.Context, string, string, string, []string) error {
+	return nil
+}
+func (fixedAuditRepo) CheckoutCommitOnBranch(context.Context, string, string, string) error {
+	return nil
+}
+
+type fixedAuditCodeMap struct{}
+
+func (fixedAuditCodeMap) Build(context.Context, string, string) (*codemap.Map, error) {
+	return &codemap.Map{Files: map[string]codemap.File{"main.go": {Path: "main.go"}}}, nil
+}
+
+type coverageErrorScanner struct{}
+
+func (coverageErrorScanner) ScanFiles(context.Context, string, []string, string) securityscan.ScanResult {
+	return securityscan.ScanResult{FilesScanned: 2, FilesSkipped: 1, FilesErrored: 1}
+}
+func (coverageErrorScanner) LocateSurface(context.Context, string, []string) surface.Result {
+	return surface.Result{FilesScanned: 3, FilesSkipped: 2, FilesErrored: 2}
+}
+
+type noOpAuditReviewer struct{}
+
+func (noOpAuditReviewer) Run(context.Context, reviewengine.RunInput) (reviewengine.RunOutput, error) {
+	return reviewengine.RunOutput{}, nil
+}
+
+type passAuditVerifier struct{}
+
+func (passAuditVerifier) Run(_ context.Context, findings []reviewengine.Finding) ([]reviewengine.Finding, error) {
+	return findings, nil
+}
+
+type recordingAuditPublisher struct{ called bool }
+
+func (p *recordingAuditPublisher) PublishSecurityAudit(context.Context, publisher.PublishSecurityAuditInput) (publisher.PublishSecurityAuditResult, error) {
+	p.called = true
+	return publisher.PublishSecurityAuditResult{}, nil
+}
+
+func TestRunFailsAndPersistsCoverageOnScanErrors(t *testing.T) {
+	repoPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoPath, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitForAuditTest(t, repoPath, "init", "-q")
+	runGitForAuditTest(t, repoPath, "add", "main.go")
+	runGitForAuditTest(t, repoPath, "-c", "user.name=drydock-test", "-c", "user.email=drydock@example.test", "commit", "-qm", "initial")
+
+	store := &coverageAuditStore{}
+	pub := &recordingAuditPublisher{}
+	engine := New(Config{Workers: 1, NostrEnabled: "false"}, Dependencies{
+		Repos: fixedAuditRepo{path: repoPath}, Store: store, CodeMap: fixedAuditCodeMap{},
+		Scanner: coverageErrorScanner{}, Reviewer: noOpAuditReviewer{},
+		VerifierFactory: func(int) Verifier { return passAuditVerifier{} },
+		Publisher:       pub,
+	}, nil)
+	result, err := engine.Run(context.Background(), Request{
+		RepoID: "repo", CloneURLs: []string{"https://example.test/repo.git"},
+		Depth: DepthQuick, RequestedBy: "requester",
+	})
+	if err == nil || !strings.Contains(err.Error(), "3 file scan operation(s) errored") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if pub.called || store.published {
+		t.Fatal("audit with scan errors was published")
+	}
+	if !store.failed {
+		t.Fatal("audit with scan errors was not marked failed")
+	}
+	if len(store.coverage) != 1 {
+		t.Fatalf("coverage updates = %d, want 1", len(store.coverage))
+	}
+	want := db.SecurityAuditCoverage{ScanOperationsScanned: 5, ScanOperationsSkipped: 3, ScanOperationsErrored: 3}
+	if store.coverage[0] != want || result.Coverage != want {
+		t.Fatalf("coverage persisted=%+v result=%+v want=%+v", store.coverage[0], result.Coverage, want)
+	}
+}
+
+func runGitForAuditTest(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
 func TestAuditStateMachineAndStuckRecovery(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.Open(ctx, filepath.Join(t.TempDir(), "audit.db"))
@@ -208,18 +335,33 @@ func TestAuditStateMachineAndStuckRecovery(t *testing.T) {
 	if reset != 1 {
 		t.Fatalf("reset = %d, want 1", reset)
 	}
-	if err := store.StartSecurityAudit(ctx, id); err != nil {
-		t.Fatalf("restart after recovery: %v", err)
+	if err := store.StartSecurityAudit(ctx, id); err == nil {
+		t.Fatal("pre-outbox crash was left retryable without a durable request")
 	}
-	if err := store.PublishSecurityAudit(ctx, id, "report", "sarif"); err != nil {
+	var failedState string
+	if err := store.DB().QueryRowContext(ctx, "SELECT state FROM security_audits WHERE id=?", id).Scan(&failedState); err != nil {
+		t.Fatalf("read recovered audit: %v", err)
+	}
+	if failedState != "failed" {
+		t.Fatalf("recovered pre-outbox audit state = %q, want failed", failedState)
+	}
+
+	publishID, err := store.CreateSecurityAudit(ctx, "repo", "HEAD", "deep", "requester")
+	if err != nil {
+		t.Fatalf("create publish audit: %v", err)
+	}
+	if err := store.StartSecurityAudit(ctx, publishID); err != nil {
+		t.Fatalf("start publish audit: %v", err)
+	}
+	if err := store.PublishSecurityAudit(ctx, publishID, "report", "sarif"); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	if err := store.FailSecurityAudit(ctx, id); err == nil {
+	if err := store.FailSecurityAudit(ctx, publishID); err == nil {
 		t.Fatal("published -> failed transition accepted")
 	}
 
 	var state, reportID, sarifHash string
-	if err := store.DB().QueryRowContext(ctx, "SELECT state, report_event_id, sarif_hash FROM security_audits WHERE id=?", id).Scan(&state, &reportID, &sarifHash); err != nil {
+	if err := store.DB().QueryRowContext(ctx, "SELECT state, report_event_id, sarif_hash FROM security_audits WHERE id=?", publishID).Scan(&state, &reportID, &sarifHash); err != nil {
 		t.Fatalf("read audit: %v", err)
 	}
 	if state != "published" || reportID != "report" || sarifHash != "sarif" {

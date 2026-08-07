@@ -88,6 +88,7 @@ type VerifierFactory func(votes int) Verifier
 type AuditStore interface {
 	CreateSecurityAudit(context.Context, string, string, string, string) (int64, error)
 	StartSecurityAudit(context.Context, int64) error
+	UpdateSecurityAuditCoverage(context.Context, int64, db.SecurityAuditCoverage) error
 	PublishSecurityAudit(context.Context, int64, string, string) error
 	FailSecurityAudit(context.Context, int64) error
 	ReplaceSecurityAuditFindings(context.Context, int64, []db.SecurityAuditFinding) error
@@ -192,6 +193,7 @@ type Result struct {
 	Commit        string
 	ScannedFiles  int
 	ReviewedUnits int
+	Coverage      db.SecurityAuditCoverage
 	DroppedUnits  []string
 	Findings      []reviewengine.Finding
 	NewFindings   []reviewengine.Finding
@@ -285,8 +287,14 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 
 	e.progress(ctx, auditID, "deterministic-sweep")
 	scan := e.deps.Scanner.ScanFiles(ctx, repoPath, files, "")
-	result.ScannedFiles = scan.FilesScanned
 	surfaceResult := e.deps.Scanner.LocateSurface(ctx, repoPath, files)
+	coverage := db.SecurityAuditCoverage{
+		ScanOperationsScanned: scan.FilesScanned + surfaceResult.FilesScanned,
+		ScanOperationsSkipped: scan.FilesSkipped + surfaceResult.FilesSkipped,
+		ScanOperationsErrored: scan.FilesErrored + surfaceResult.FilesErrored,
+	}
+	result.ScannedFiles = scan.FilesScanned
+	result.Coverage = coverage
 	allDeterministic := append(scanFindings(scan.Findings), e.runOptionalTools(ctx, repoPath, req)...)
 
 	var nostrContext, nostrPreamble string
@@ -297,6 +305,10 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		nostrScanner := securityscan.NewWithRuleSets(rules, nostrscan.SurfaceRules())
 		nostrPresence := nostrScanner.ScanFiles(ctx, repoPath, files, "")
 		nostrSurfaces := nostrScanner.LocateSurface(ctx, repoPath, files)
+		coverage.ScanOperationsScanned += nostrPresence.FilesScanned + nostrSurfaces.FilesScanned
+		coverage.ScanOperationsSkipped += nostrPresence.FilesSkipped + nostrSurfaces.FilesSkipped
+		coverage.ScanOperationsErrored += nostrPresence.FilesErrored + nostrSurfaces.FilesErrored
+		result.Coverage = coverage
 		surfaceResult.Locations = append(surfaceResult.Locations, nostrSurfaces.Locations...)
 		nostrFindings := auditNostrFindings(nostrPresence.Findings, files, roles, req.Nostr)
 		if req.Nostr.AbsenceAnalysis {
@@ -332,6 +344,13 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		result.ProbeEvidence = append([]nostrprobe.SecurityEvidence(nil), probeEvidence...)
 	}
 
+	if err := e.deps.Store.UpdateSecurityAuditCoverage(ctx, auditID, coverage); err != nil {
+		return result, err
+	}
+	if coverage.ScanOperationsErrored > 0 {
+		return result, fmt.Errorf("security audit incomplete: %d file scan operation(s) errored", coverage.ScanOperationsErrored)
+	}
+
 	e.progress(ctx, auditID, "localize")
 	units := e.localize(ctx, repoPath, codeMap, files, allDeterministic, surfaceResult, req.SinceCommit)
 	units = e.applyModelLocalization(ctx, req.Localizer, codeMap, files, allDeterministic, units)
@@ -341,6 +360,11 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		}
 		e.logger.Info("audit localization dropped units due to depth budget", "audit_id", auditID, "depth", req.Depth, "kept", budget.MaxUnits, "dropped", len(result.DroppedUnits), "files", result.DroppedUnits)
 		units = units[:budget.MaxUnits]
+	}
+	coverage.UnitsDropped = len(result.DroppedUnits)
+	result.Coverage = coverage
+	if err := e.deps.Store.UpdateSecurityAuditCoverage(ctx, auditID, coverage); err != nil {
+		return result, err
 	}
 	for i := range units {
 		units[i].Findings = findingsForFile(allDeterministic, units[i].File)
@@ -394,7 +418,24 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	if len(probeEvidence) > 0 {
 		tools = append(tools, publisher.AuditTool{Name: "nostr-secprobe"})
 	}
-	result.Published, err = e.deps.Publisher.PublishSecurityAudit(ctx, publisher.PublishSecurityAuditInput{Announcement: req.Announcement, Ref: ref, Commit: result.Commit, Summary: fmt.Sprintf("Security audit completed with %d new verified finding(s).", len(pubFindings)), Depth: string(req.Depth), Verified: true, Findings: pubFindings, ProbeEvidence: probeEvidence, Tools: tools, Requester: req.Requester, Relays: req.Relays})
+	complete := coverage.ScanOperationsSkipped == 0 && coverage.ScanOperationsErrored == 0 && coverage.UnitsDropped == 0
+	summary := fmt.Sprintf("Security audit completed with %d new verified finding(s).", len(pubFindings))
+	if !complete {
+		summary = fmt.Sprintf(
+			"Security audit produced %d new verified finding(s) with incomplete coverage: %d scan operation(s) skipped and %d candidate review unit(s) omitted by the %s depth budget.",
+			len(pubFindings), coverage.ScanOperationsSkipped, coverage.UnitsDropped, req.Depth,
+		)
+	}
+	result.Published, err = e.deps.Publisher.PublishSecurityAudit(ctx, publisher.PublishSecurityAuditInput{
+		AuditID: auditID, Announcement: req.Announcement, Ref: ref, Commit: result.Commit,
+		Summary: summary, Depth: string(req.Depth), Complete: complete, Verified: true,
+		Coverage: publisher.SecurityAuditCoverage{
+			ScanOperationsScanned: coverage.ScanOperationsScanned, ScanOperationsSkipped: coverage.ScanOperationsSkipped,
+			ScanOperationsErrored: coverage.ScanOperationsErrored, UnitsDropped: coverage.UnitsDropped,
+		},
+		Findings: pubFindings, ProbeEvidence: probeEvidence, Tools: tools,
+		Requester: req.Requester, Relays: req.Relays,
+	})
 	if err != nil {
 		return result, fmt.Errorf("publish security audit: %w", err)
 	}

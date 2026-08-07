@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"drydock/internal/db"
 	"drydock/internal/nostrprobe"
 
 	"fiatjaf.com/nostr"
@@ -65,27 +66,40 @@ type ProbeCounts struct {
 	Inconclusive int `json:"inconclusive"`
 }
 
+type SecurityAuditCoverage struct {
+	ScanOperationsScanned int `json:"scan_operations_scanned"`
+	ScanOperationsSkipped int `json:"scan_operations_skipped"`
+	ScanOperationsErrored int `json:"scan_operations_errored"`
+	UnitsDropped          int `json:"units_dropped"`
+}
+
 type SecurityAuditPublicContent struct {
-	SchemaVersion  int            `json:"schema_version"`
-	Ref            string         `json:"ref"`
-	GeneratedAt    int64          `json:"generated_at"`
-	Depth          string         `json:"depth"`
-	Counts         SeverityCounts `json:"counts"`
-	CWETop         []string       `json:"cwe_top"`
-	ProbeCounts    *ProbeCounts   `json:"probe_counts,omitempty"`
-	Verified       bool           `json:"verified"`
-	ReportDigest   string         `json:"report_digest"`
-	DetailDelivery string         `json:"detail_delivery"`
+	SchemaVersion  int                   `json:"schema_version"`
+	Ref            string                `json:"ref"`
+	GeneratedAt    int64                 `json:"generated_at"`
+	Depth          string                `json:"depth"`
+	Counts         SeverityCounts        `json:"counts"`
+	CWETop         []string              `json:"cwe_top"`
+	ProbeCounts    *ProbeCounts          `json:"probe_counts,omitempty"`
+	Coverage       SecurityAuditCoverage `json:"coverage"`
+	Complete       bool                  `json:"complete"`
+	Verified       bool                  `json:"verified"`
+	ReportDigest   string                `json:"report_digest"`
+	DetailDelivery string                `json:"detail_delivery"`
 }
 
 type securityAuditDetail struct {
 	SchemaVersion int                           `json:"schema_version"`
+	AuditID       int64                         `json:"audit_id"`
 	RepoAddress   string                        `json:"repo_address"`
 	Ref           string                        `json:"ref"`
 	GeneratedAt   int64                         `json:"generated_at"`
 	Findings      []SecurityAuditFinding        `json:"findings"`
 	ProbeEvidence []nostrprobe.SecurityEvidence `json:"probe_evidence,omitempty"`
+	Coverage      SecurityAuditCoverage         `json:"coverage"`
+	Complete      bool                          `json:"complete"`
 	SARIFSHA256   string                        `json:"sarif_sha256"`
+	SARIFRef      string                        `json:"sarif_ref"`
 }
 
 type PublishSecurityAuditInput struct {
@@ -94,11 +108,14 @@ type PublishSecurityAuditInput struct {
 	Announcement nostr.Event
 	// Ref scopes the addressable report. Leave empty for the latest audit of
 	// the default branch.
+	AuditID       int64
 	Ref           string
 	Commit        string
 	Summary       string
 	Depth         string
+	Complete      bool
 	Verified      bool
+	Coverage      SecurityAuditCoverage
 	Findings      []SecurityAuditFinding
 	ProbeEvidence []nostrprobe.SecurityEvidence
 	Tools         []AuditTool
@@ -119,6 +136,12 @@ type PublishSecurityAuditResult struct {
 
 func (s *Service) PublishSecurityAudit(ctx context.Context, in PublishSecurityAuditInput) (PublishSecurityAuditResult, error) {
 	var out PublishSecurityAuditResult
+	if s == nil || s.store == nil {
+		return out, errors.New("security audit publisher store is required")
+	}
+	if s.publish == nil {
+		return out, errors.New("security audit relay publisher is required")
+	}
 	repoID, repoAddress, generatedAt, relays, err := s.validateSecurityAuditInput(in)
 	if err != nil {
 		return out, err
@@ -132,35 +155,44 @@ func (s *Service) PublishSecurityAudit(ctx context.Context, in PublishSecurityAu
 	if err != nil {
 		return out, fmt.Errorf("generate SARIF: %w", err)
 	}
-	out.SARIF = sarif
-	out.SARIFSHA256 = sha256Hex(sarif)
+	sarifHash := sha256Hex(sarif)
+	complete := in.Complete &&
+		in.Coverage.ScanOperationsSkipped == 0 &&
+		in.Coverage.ScanOperationsErrored == 0 &&
+		in.Coverage.UnitsDropped == 0
 
 	detail := securityAuditDetail{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
+		AuditID:       in.AuditID,
 		RepoAddress:   repoAddress,
 		Ref:           auditCommit(in),
 		GeneratedAt:   generatedAt.Unix(),
 		Findings:      nonNilFindings(in.Findings),
 		ProbeEvidence: in.ProbeEvidence,
-		SARIFSHA256:   out.SARIFSHA256,
+		Coverage:      in.Coverage,
+		Complete:      complete,
+		SARIFSHA256:   sarifHash,
+		SARIFRef:      securityAuditSARIFRef(in.AuditID),
 	}
 	detailJSON, err := json.Marshal(detail)
 	if err != nil {
 		return out, fmt.Errorf("marshal security audit detail: %w", err)
 	}
-	out.ReportDigest = sha256Hex(detailJSON)
+	reportDigest := sha256Hex(detailJSON)
 
 	counts := countAuditSeverities(in.Findings)
 	publicContent := SecurityAuditPublicContent{
-		SchemaVersion:  1,
+		SchemaVersion:  2,
 		Ref:            auditCommit(in),
 		GeneratedAt:    generatedAt.Unix(),
 		Depth:          strings.TrimSpace(in.Depth),
 		Counts:         counts,
 		CWETop:         topCWEs(in.Findings, 3),
 		ProbeCounts:    countProbeOutcomes(in.ProbeEvidence),
+		Coverage:       in.Coverage,
+		Complete:       complete,
 		Verified:       in.Verified,
-		ReportDigest:   out.ReportDigest,
+		ReportDigest:   reportDigest,
 		DetailDelivery: "nip59",
 	}
 	if publicContent.Depth == "" {
@@ -174,20 +206,16 @@ func (s *Service) PublishSecurityAudit(ctx context.Context, in PublishSecurityAu
 	report := nostr.Event{
 		Kind:      KindSecurityAuditReport,
 		CreatedAt: nostr.Timestamp(generatedAt.Unix()),
-		Tags:      buildSecurityAuditReportTags(repoID, repoAddress, in, counts, out.ReportDigest),
+		Tags:      buildSecurityAuditReportTags(repoID, repoAddress, in, counts, reportDigest),
 		Content:   string(publicJSON),
 	}
 	if err := s.signer.SignEvent(ctx, &report); err != nil {
 		return out, fmt.Errorf("sign security audit report: %w", err)
 	}
-	out.ReportEventID = report.ID.Hex()
-
 	detailEvent, err := buildSecurityAuditGiftWrap(ctx, keyer, in.Requester, report, detailJSON)
 	if err != nil {
 		return out, err
 	}
-	out.DetailEventID = detailEvent.ID.Hex()
-
 	fallback := nostr.Event{
 		Kind:      nostr.KindComment,
 		CreatedAt: nostr.Timestamp(generatedAt.Unix()),
@@ -197,24 +225,109 @@ func (s *Service) PublishSecurityAudit(ctx context.Context, in PublishSecurityAu
 	if err := s.signer.SignEvent(ctx, &fallback); err != nil {
 		return out, fmt.Errorf("sign security audit fallback comment: %w", err)
 	}
-	out.FallbackEventID = fallback.ID.Hex()
 
-	for _, item := range []struct {
-		name  string
-		event nostr.Event
-	}{
-		{name: "public report", event: report},
-		{name: "private detail", event: detailEvent},
-		{name: "compatibility fallback", event: fallback},
-	} {
-		if err := s.publish.Publish(ctx, relays, item.event); err != nil {
-			return out, fmt.Errorf("publish security audit %s: %w", item.name, err)
-		}
+	set, err := s.store.ReserveSecurityAuditPublicationSet(ctx, in.AuditID, sarifHash, sarif, []db.SecurityAuditPublication{
+		{AuditID: in.AuditID, EventType: db.SecurityAuditPublicationReport, Event: report, Relays: relays},
+		{AuditID: in.AuditID, EventType: db.SecurityAuditPublicationDetail, Event: detailEvent, Relays: relays},
+		{AuditID: in.AuditID, EventType: db.SecurityAuditPublicationFallback, Event: fallback, Relays: relays},
+	})
+	if err != nil {
+		return out, fmt.Errorf("persist security audit publication set: %w", err)
+	}
+	out, err = securityAuditResultFromSet(set)
+	if err != nil {
+		return out, err
+	}
+	if err := deliverSecurityAuditPublicationSet(ctx, s.store, s.publish, set); err != nil {
+		return out, err
+	}
+	if err := s.store.CompleteSecurityAuditPublication(ctx, in.AuditID); err != nil {
+		return out, fmt.Errorf("complete security audit publication: %w", err)
 	}
 	return out, nil
 }
 
+// ResumeSecurityAuditPublications retries durable audit events not previously
+// acknowledged by relays, then finalizes each fully delivered audit.
+func ResumeSecurityAuditPublications(ctx context.Context, store *db.Store, relayPublisher RelayPublisher) (int, error) {
+	if store == nil || relayPublisher == nil {
+		return 0, errors.New("security audit publication recovery requires store and relay publisher")
+	}
+	sets, err := store.ListRecoverableSecurityAuditPublicationSets(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var completed int
+	var recoveryErrors []error
+	for _, set := range sets {
+		if len(set.Publications) != 3 {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("security audit %d durable publication set has %d events", set.AuditID, len(set.Publications)))
+			continue
+		}
+		if err := deliverSecurityAuditPublicationSet(ctx, store, relayPublisher, set); err != nil {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("resume security audit %d publication: %w", set.AuditID, err))
+			continue
+		}
+		if err := store.CompleteSecurityAuditPublication(ctx, set.AuditID); err != nil {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("complete resumed security audit %d: %w", set.AuditID, err))
+			continue
+		}
+		completed++
+	}
+	return completed, errors.Join(recoveryErrors...)
+}
+
+func deliverSecurityAuditPublicationSet(ctx context.Context, store *db.Store, relayPublisher RelayPublisher, set db.SecurityAuditPublicationSet) error {
+	for _, publication := range set.Publications {
+		if publication.Delivered {
+			continue
+		}
+		if err := relayPublisher.Publish(ctx, publication.Relays, publication.Event); err != nil {
+			return fmt.Errorf("publish security audit %s: %w", publication.EventType, err)
+		}
+		if err := store.MarkSecurityAuditPublicationDelivered(ctx, set.AuditID, publication.EventType); err != nil {
+			return fmt.Errorf("persist security audit %s delivery: %w", publication.EventType, err)
+		}
+	}
+	return nil
+}
+
+func securityAuditResultFromSet(set db.SecurityAuditPublicationSet) (PublishSecurityAuditResult, error) {
+	out := PublishSecurityAuditResult{
+		SARIF: append([]byte(nil), set.SARIF...), SARIFSHA256: set.SARIFHash,
+	}
+	for _, publication := range set.Publications {
+		switch publication.EventType {
+		case db.SecurityAuditPublicationReport:
+			out.ReportEventID = publication.Event.ID.Hex()
+			var content SecurityAuditPublicContent
+			if err := json.Unmarshal([]byte(publication.Event.Content), &content); err != nil {
+				return out, fmt.Errorf("decode persisted security audit report: %w", err)
+			}
+			out.ReportDigest = content.ReportDigest
+		case db.SecurityAuditPublicationDetail:
+			out.DetailEventID = publication.Event.ID.Hex()
+		case db.SecurityAuditPublicationFallback:
+			out.FallbackEventID = publication.Event.ID.Hex()
+		}
+	}
+	if out.ReportEventID == "" || out.DetailEventID == "" || out.FallbackEventID == "" || out.ReportDigest == "" {
+		return out, errors.New("persisted security audit publication set is incomplete")
+	}
+	return out, nil
+}
+
+func securityAuditSARIFRef(auditID int64) string {
+	return fmt.Sprintf("contextvm:%s?audit_id=%d", "security/audit/sarif", auditID)
+}
+
 func (s *Service) validateSecurityAuditInput(in PublishSecurityAuditInput) (string, string, time.Time, []string, error) {
+	if in.AuditID <= 0 {
+		return "", "", time.Time{}, nil, errors.New("security audit id is required")
+	}
+	if in.Coverage.ScanOperationsScanned < 0 || in.Coverage.ScanOperationsSkipped < 0 || in.Coverage.ScanOperationsErrored < 0 || in.Coverage.UnitsDropped < 0 {
+		return "", "", time.Time{}, nil, errors.New("security audit coverage cannot be negative")
+	}
 	if in.Announcement.Kind != 30617 {
 		return "", "", time.Time{}, nil, fmt.Errorf("repository announcement kind = %d, want 30617", in.Announcement.Kind)
 	}
@@ -329,14 +442,19 @@ func buildSecurityAuditFallbackContent(summary string, public SecurityAuditPubli
 		summary = "Security audit completed."
 	}
 	return fmt.Sprintf(
-		"%s\n\nFindings: critical %d, high %d, medium %d, low %d, info %d. Verified: %t. Report digest: %s",
+		"%s\n\nFindings: critical %d, high %d, medium %d, low %d, info %d. Complete: %t. Verified: %t. Coverage: scanned %d, skipped %d, errored %d, dropped %d. Report digest: %s",
 		summary,
 		public.Counts.Critical,
 		public.Counts.High,
 		public.Counts.Medium,
 		public.Counts.Low,
 		public.Counts.Info,
+		public.Complete,
 		public.Verified,
+		public.Coverage.ScanOperationsScanned,
+		public.Coverage.ScanOperationsSkipped,
+		public.Coverage.ScanOperationsErrored,
+		public.Coverage.UnitsDropped,
 		public.ReportDigest,
 	)
 }

@@ -76,6 +76,8 @@ type fakeMintClient struct {
 	tokens       map[string]ParsedToken
 	meltedTokens map[string]bool
 	quoteStates  map[string]string
+	quoteAmount  int64
+	feeReserve   int64
 	meltErr      error
 	meltCalls    int
 }
@@ -90,7 +92,13 @@ func (f *fakeMintClient) ParseToken(raw string) (ParsedToken, error) {
 }
 
 func (f *fakeMintClient) CreateMeltQuote(ctx context.Context, mintURL, bolt11 string) (MeltQuote, error) {
-	return MeltQuote{ID: "quote_" + bolt11, Amount: 100, FeeReserve: 5}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	amount := f.quoteAmount
+	if amount == 0 {
+		amount = 100
+	}
+	return MeltQuote{ID: "quote_" + bolt11, Amount: amount, FeeReserve: f.feeReserve}, nil
 }
 
 func (f *fakeMintClient) MeltToken(ctx context.Context, mintURL string, quote MeltQuote, token ParsedToken) error {
@@ -382,7 +390,7 @@ func TestAuthorizePatch_CashuMeltRequiresSettledInvoice(t *testing.T) {
 	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
 		MintURL:    "https://mint.example.com",
 		Unit:       "sat",
-		AmountSats: 110,
+		AmountSats: 100,
 		Raw:        token,
 	}
 
@@ -403,8 +411,8 @@ func TestAuthorizePatch_CashuMeltRequiresSettledInvoice(t *testing.T) {
 	if result.Allowed {
 		t.Fatal("expected unsettled invoice lookup to deny access")
 	}
-	if result.Reason != "payment_pending" {
-		t.Fatalf("expected reason payment_pending, got %q", result.Reason)
+	if result.Reason != ReasonPaymentPending || !result.Retryable {
+		t.Fatalf("expected retryable payment_pending, got reason=%q retryable=%v", result.Reason, result.Retryable)
 	}
 
 	rec, err := store.GetReviewPayment(context.Background(), event.ID.Hex())
@@ -428,7 +436,7 @@ func TestAuthorizePatch_CashuMeltAuthorizesWhenInvoiceSettled(t *testing.T) {
 	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
 		MintURL:    "https://mint.example.com",
 		Unit:       "sat",
-		AmountSats: 110,
+		AmountSats: 100,
 		Raw:        token,
 	}
 
@@ -476,7 +484,7 @@ func TestAuthorizePatch_CashuMeltReconcilesAfterSettlement(t *testing.T) {
 	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
 		MintURL:    "https://mint.example.com",
 		Unit:       "sat",
-		AmountSats: 110,
+		AmountSats: 100,
 		Raw:        token,
 	}
 	event := nostr.Event{
@@ -490,8 +498,8 @@ func TestAuthorizePatch_CashuMeltReconcilesAfterSettlement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first AuthorizePatch: %v", err)
 	}
-	if result.Allowed || result.Reason != "payment_pending" {
-		t.Fatalf("expected recoverable payment_pending denial, got allowed=%v reason=%q", result.Allowed, result.Reason)
+	if result.Allowed || result.Reason != ReasonPaymentPending || !result.Retryable {
+		t.Fatalf("expected retryable payment_pending denial, got allowed=%v reason=%q retryable=%v", result.Allowed, result.Reason, result.Retryable)
 	}
 	rec, err := store.GetReviewPayment(context.Background(), event.ID.Hex())
 	if err != nil {
@@ -523,7 +531,7 @@ func TestAuthorizePatch_ConcurrentDuplicateTokenDeniedCleanly(t *testing.T) {
 	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
 		MintURL:    "https://mint.example.com",
 		Unit:       "sat",
-		AmountSats: 110,
+		AmountSats: 100,
 		Raw:        token,
 	}
 	policy := repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100}
@@ -583,7 +591,7 @@ func TestAuthorizePatch_SubscriptionRecordsInvoicedAmount(t *testing.T) {
 	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
 		MintURL:    "https://mint.example.com",
 		Unit:       "sat",
-		AmountSats: 150,
+		AmountSats: 100,
 		Raw:        token,
 	}
 	event := nostr.Event{
@@ -621,7 +629,7 @@ func TestAuthorizePatch_MeltFailureBeforeSendReleasesReservation(t *testing.T) {
 	defer store.Close()
 	mint := svc.mint.(*fakeMintClient)
 	token := "cashuAbefore-send"
-	mint.tokens[token] = ParsedToken{MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 110, Raw: token}
+	mint.tokens[token] = ParsedToken{MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 100, Raw: token}
 	mint.meltErr = &MeltSubmissionError{MayHaveSubmitted: false, Err: errors.New("fault before send")}
 	event := nostr.Event{ID: mustParseID("9999999999999999999999999999999999999999999999999999999999999999"), PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), Tags: nostr.Tags{{"cashu", token}}}
 
@@ -642,14 +650,14 @@ func TestAuthorizePatch_AmbiguousMeltPreservedAndReconciledWithoutRemelt(t *test
 	defer store.Close()
 	mint := svc.mint.(*fakeMintClient)
 	token := "cashuAafter-send"
-	mint.tokens[token] = ParsedToken{MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 110, Raw: token}
+	mint.tokens[token] = ParsedToken{MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 100, Raw: token}
 	mint.meltErr = &MeltSubmissionError{MayHaveSubmitted: true, Err: errors.New("response lost after send")}
 	event := nostr.Event{ID: mustParseID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"), PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), Tags: nostr.Tags{{"cashu", token}}}
 	policy := repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100}
 
 	result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", policy)
-	if err != nil || result.Allowed || result.Reason != "payment_pending" {
-		t.Fatalf("expected preserved ambiguous payment, result=%+v err=%v", result, err)
+	if err != nil || result.Allowed || result.Reason != ReasonPaymentPending || !result.Retryable {
+		t.Fatalf("expected preserved retryable ambiguous payment, result=%+v err=%v", result, err)
 	}
 	rec, err := store.GetReviewPayment(context.Background(), event.ID.Hex())
 	if err != nil {
@@ -678,6 +686,194 @@ func TestExtractPaymentTag_NoTag(t *testing.T) {
 	_, _, err := extractPaymentTag(event)
 	if err == nil || err.Error() != "no_payment" {
 		t.Errorf("expected no_payment error, got %v", err)
+	}
+}
+
+func TestAuthorizePatch_RejectsCashuChangeWithoutWalletSupport(t *testing.T) {
+	t.Run("over-value token rejected before external calls", func(t *testing.T) {
+		svc, store := setupTestService(t)
+		defer store.Close()
+		token := "cashuAovervalue"
+		svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
+			MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 101, Raw: token,
+		}
+		event := nostr.Event{
+			ID:     mustParseID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2"),
+			PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+			Tags:   nostr.Tags{{"cashu", token}},
+		}
+		result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100})
+		if err != nil || result.Allowed || result.Reason != "change_not_supported" || result.Retryable {
+			t.Fatalf("unexpected over-value result=%+v err=%v", result, err)
+		}
+		if svc.invoice.(*fakeInvoiceProvider).createCalls() != 0 || svc.mint.(*fakeMintClient).meltCallCount() != 0 {
+			t.Fatal("over-value token reached an external payment call")
+		}
+	})
+
+	t.Run("positive fee reserve rejected before melt", func(t *testing.T) {
+		svc, store := setupTestService(t)
+		defer store.Close()
+		mint := svc.mint.(*fakeMintClient)
+		mint.feeReserve = 1
+		token := "cashuAfeechange"
+		mint.tokens[token] = ParsedToken{
+			MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 100, Raw: token,
+		}
+		event := nostr.Event{
+			ID:     mustParseID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3"),
+			PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+			Tags:   nostr.Tags{{"cashu", token}},
+		}
+		result, err := svc.AuthorizePatch(context.Background(), event, "repo/test", repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100})
+		if err != nil || result.Allowed || result.Reason != "change_not_supported" {
+			t.Fatalf("unexpected fee-reserve result=%+v err=%v", result, err)
+		}
+		if mint.meltCallCount() != 0 {
+			t.Fatal("fee-reserve quote must not submit proofs without change outputs")
+		}
+		if _, err := store.GetReviewPayment(context.Background(), event.ID.Hex()); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("unsubmitted reservation was not released: %v", err)
+		}
+	})
+}
+
+func TestReconcilePendingPayments_FinalizesTimelySettlementAfterExpiryAndRequeues(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+	ctx := context.Background()
+	token := "cashuAdurable-reconcile"
+	mint := svc.mint.(*fakeMintClient)
+	mint.tokens[token] = ParsedToken{
+		MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 100, Raw: token,
+	}
+	event := nostr.Event{
+		ID:     mustParseID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4"),
+		PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		Tags:   nostr.Tags{{"cashu", token}},
+	}
+	if acquired, err := store.BeginReview(ctx, event.ID.Hex(), "repo/test"); err != nil || !acquired {
+		t.Fatalf("BeginReview: acquired=%v err=%v", acquired, err)
+	}
+	result, err := svc.AuthorizePatch(ctx, event, "repo/test", repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100})
+	if err != nil || result.Reason != ReasonPaymentPending || !result.Retryable {
+		t.Fatalf("initial payment result=%+v err=%v", result, err)
+	}
+	if err := store.MarkReviewFailed(ctx, event.ID.Hex(), "repo/test", ReasonPaymentPending); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.GetReviewPayment(ctx, event.ID.Hex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	expiresAt := now - 10
+	if _, err := store.DB().ExecContext(ctx, `UPDATE review_payments SET invoice_expires_at=? WHERE patch_event_id=?`, expiresAt, event.ID.Hex()); err != nil {
+		t.Fatal(err)
+	}
+	svc.invoice.(*fakeInvoiceProvider).setInvoiceStatus(rec.InvoiceID, InvoiceStatus{
+		Settled: true, SettledAt: expiresAt - 1,
+	})
+
+	reconciled, err := svc.ReconcilePendingPayments(ctx, 10)
+	if err != nil {
+		t.Fatalf("ReconcilePendingPayments: %v", err)
+	}
+	if reconciled.Examined != 1 || len(reconciled.Tasks) != 1 || reconciled.Tasks[0].PatchEventID != event.ID.Hex() {
+		t.Fatalf("unexpected reconciliation result: %+v", reconciled)
+	}
+	paymentRec, err := store.GetReviewPayment(ctx, event.ID.Hex())
+	if err != nil || paymentRec.Status != "authorized" {
+		t.Fatalf("payment not authorized: rec=%+v err=%v", paymentRec, err)
+	}
+	status, err := store.GetReviewStatus(ctx, event.ID.Hex(), "repo/test")
+	if err != nil || status != "pending" {
+		t.Fatalf("review not requeued: status=%q err=%v", status, err)
+	}
+}
+
+func TestReconcileReservedPayment_AllowsLegacySubmittedValueContract(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+	ctx := context.Background()
+	invoice, err := svc.invoice.CreateInvoice(ctx, 100, "legacy payment", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.invoice.(*fakeInvoiceProvider).setInvoiceStatus(invoice.ID, InvoiceStatus{
+		Settled: true, SettledAt: time.Now().Unix(),
+	})
+	token := "cashuAlegacy-overvalue"
+	event := nostr.Event{
+		ID:     mustParseID("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+		PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		Tags:   nostr.Tags{{"cashu", token}},
+	}
+	rec := db.ReviewPaymentRecord{
+		PatchEventID: event.ID.Hex(), RepoID: "repo/test", AuthorPubkey: event.PubKey.Hex(),
+		RequestedMode: "review", TokenHash: hashToken(token), MintURL: "https://mint.example.com",
+		TokenAmountSats: 105, ExpectedAmountSats: 100,
+		InvoiceID: invoice.ID, InvoiceRequest: invoice.Request, InvoiceAmountMSats: invoice.AmountMSats,
+		InvoiceExpiresAt: invoice.ExpiresAt,
+	}
+	if err := store.UpsertPendingReviewPayment(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, "legacy-quote", 100, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkReviewPaymentTokenSpent(ctx, rec.PatchEventID); err != nil {
+		t.Fatal(err)
+	}
+	rec, err = store.GetReviewPayment(ctx, rec.PatchEventID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Current policy would reject this over-value token for a new melt. The
+	// existing durable submission must still reconcile and grant entitlement.
+	result, err := svc.AuthorizePatch(ctx, event, "repo/test", repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100})
+	if err != nil || !result.Allowed || result.AccessKind != AccessCashuReview {
+		t.Fatalf("legacy paid reconciliation result=%+v err=%v", result, err)
+	}
+}
+
+func TestAuthorizePatch_LateSettlementFailsClosed(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+	ctx := context.Background()
+	token := "cashuAlate-settlement"
+	svc.mint.(*fakeMintClient).tokens[token] = ParsedToken{
+		MintURL: "https://mint.example.com", Unit: "sat", AmountSats: 100, Raw: token,
+	}
+	event := nostr.Event{
+		ID:     mustParseID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5"),
+		PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		Tags:   nostr.Tags{{"cashu", token}},
+	}
+	policy := repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100}
+	if result, err := svc.AuthorizePatch(ctx, event, "repo/test", policy); err != nil || result.Reason != ReasonPaymentPending {
+		t.Fatalf("initial result=%+v err=%v", result, err)
+	}
+	rec, err := store.GetReviewPayment(ctx, event.ID.Hex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().Unix() - 10
+	if _, err := store.DB().ExecContext(ctx, `UPDATE review_payments SET invoice_expires_at=? WHERE patch_event_id=?`, expiresAt, event.ID.Hex()); err != nil {
+		t.Fatal(err)
+	}
+	svc.invoice.(*fakeInvoiceProvider).setInvoiceStatus(rec.InvoiceID, InvoiceStatus{Settled: true, SettledAt: expiresAt + 1})
+	result, err := svc.AuthorizePatch(ctx, event, "repo/test", policy)
+	if err != nil || result.Allowed || result.Reason != "payment_failed" || result.Retryable {
+		t.Fatalf("late settlement result=%+v err=%v", result, err)
+	}
+	failed, err := store.GetReviewPayment(ctx, event.ID.Hex())
+	if err != nil || failed.MeltState != "failed" {
+		t.Fatalf("terminal failure was not durable: rec=%+v err=%v", failed, err)
+	}
+	reconciled, err := svc.ReconcilePendingPayments(ctx, 10)
+	if err != nil || reconciled.Examined != 0 {
+		t.Fatalf("terminal payment remained a recovery candidate: result=%+v err=%v", reconciled, err)
 	}
 }
 

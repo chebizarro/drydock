@@ -107,11 +107,16 @@ func main() {
 		KeyPrefix:   "marketplace-feedback:",
 	}, rateLimitStore)
 
-	// Reset any entries stuck in "reviewing" from a prior crash
+	// Reset any entries stuck in active states from a prior crash.
 	if n, err := store.ResetStuckReviews(ctx); err != nil {
 		logger.Warn("failed to reset stuck reviews", "error", err)
 	} else if n > 0 {
 		logger.Info("reset stuck reviews to pending", "count", n)
+	}
+	if n, err := store.ResetStuckAudits(ctx); err != nil {
+		logger.Warn("failed to reset stuck security audits", "error", err)
+	} else if n > 0 {
+		logger.Info("recovered stuck security audits", "count", n)
 	}
 
 	// --- Signer (shared NIP-46 client, with local nsec for development only) ---
@@ -192,6 +197,11 @@ func main() {
 		writeRelays = cfg.Relays
 	}
 	relayPub := publisher.NewNostrRelayPublisher(pool, logger)
+	if n, err := publisher.ResumeSecurityAuditPublications(ctx, store, relayPub); err != nil {
+		logger.Warn("security audit publication recovery incomplete", "completed", n, "error", err)
+	} else if n > 0 {
+		logger.Info("resumed durable security audit publications", "count", n)
+	}
 	var auditPub *publisher.AuditPublisher
 	if signer != nil {
 		auditPub = publisher.NewAuditPublisher(signer, relayPub, writeRelays, logger)
@@ -734,6 +744,44 @@ func main() {
 			}
 		}
 	}()
+
+	// --- Background Cashu settlement reconciliation (every minute) ---
+	// Submitted proofs are never sent again: this loop only polls durable quote
+	// and invoice evidence, then makes newly authorized reviews queueable.
+	if pipelineRunner != nil && invoiceProvider != nil {
+		reconcilePayments := func() {
+			result, err := paymentSvc.ReconcilePendingPayments(ctx, 100)
+			for _, task := range result.Tasks {
+				select {
+				case processor.ReviewQueue <- task:
+				default:
+					logger.Warn("review queue full after payment reconciliation; row remains pending",
+						"patch_event_id", task.PatchEventID)
+				}
+			}
+			if len(result.Tasks) > 0 {
+				logger.Info("reconciled pending Cashu payments",
+					"examined", result.Examined, "requeued", len(result.Tasks), "failed", result.Failed)
+			}
+			if err != nil {
+				logger.Warn("Cashu payment reconciliation pass had errors",
+					"examined", result.Examined, "failed", result.Failed, "error", err)
+			}
+		}
+		reconcilePayments()
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					reconcilePayments()
+				}
+			}
+		}()
+	}
 
 	// --- Background failed-review requeue sweep (every 10 minutes) ---
 	// Recovers tasks that failed due to transient issues (queue overflow,

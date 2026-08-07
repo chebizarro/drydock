@@ -14,8 +14,11 @@ import (
 )
 
 type auditTestStore struct {
-	announcement nostr.Event
-	cloneURLs    []string
+	announcement   nostr.Event
+	cloneURLs      []string
+	sarif          []byte
+	sarifHash      string
+	sarifRequester string
 }
 
 func (s auditTestStore) GetRepositoryAnnouncement(context.Context, string) (nostr.Event, error) {
@@ -24,6 +27,13 @@ func (s auditTestStore) GetRepositoryAnnouncement(context.Context, string) (nost
 
 func (s auditTestStore) GetRepositoryCloneURLs(context.Context, string) ([]string, error) {
 	return append([]string(nil), s.cloneURLs...), nil
+}
+
+func (s auditTestStore) SecurityAuditSARIFForRequester(_ context.Context, _ int64, requester string) ([]byte, string, error) {
+	if requester != s.sarifRequester || len(s.sarif) == 0 {
+		return nil, "", errors.New("not found")
+	}
+	return append([]byte(nil), s.sarif...), s.sarifHash, nil
 }
 
 type auditTestConfigLoader struct {
@@ -162,6 +172,33 @@ func TestSecurityAuditMethodPublishesFailure(t *testing.T) {
 		t.Fatalf("published feedback count = %d, want progress + failure", len(published.events))
 	}
 	assertAuditFeedback(t, published.events[1], requestEvent.ID.Hex(), requester.Hex(), "failed", "error")
+}
+
+func TestSecurityAuditSARIFMethodAuthorizesRequester(t *testing.T) {
+	requester := nostr.GetPublicKey(nostr.Generate())
+	store := auditTestStore{
+		sarif: []byte(`{"version":"2.1.0","runs":[]}`), sarifHash: "abc123",
+		sarifRequester: requester.Hex(),
+	}
+	handler := NewSecurityAuditHandler(nil, store, nil, nil, nil, nil)
+	params, _ := json.Marshal(SecurityAuditSARIFParams{AuditID: 42})
+	result, rpcErr := handler.HandleSecurityAuditSARIF(context.Background(), Request{
+		Sender: requester, Msg: Message{Params: params},
+	})
+	if rpcErr != nil {
+		t.Fatalf("HandleSecurityAuditSARIF error: %+v", rpcErr)
+	}
+	got, ok := result.(SecurityAuditSARIFResult)
+	if !ok || got.AuditID != 42 || got.SHA256 != "abc123" || !json.Valid(got.SARIF) {
+		t.Fatalf("unexpected SARIF result: %#v", result)
+	}
+
+	_, rpcErr = handler.HandleSecurityAuditSARIF(context.Background(), Request{
+		Sender: nostr.GetPublicKey(nostr.Generate()), Msg: Message{Params: params},
+	})
+	if rpcErr == nil || rpcErr.Code != ErrorNotFound {
+		t.Fatalf("unauthorized retrieval error = %+v, want not found", rpcErr)
+	}
 }
 
 func TestSecurityAuditMethodRejectsInvalidDepth(t *testing.T) {

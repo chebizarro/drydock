@@ -207,6 +207,39 @@ func TestParseToken_EmptyToken(t *testing.T) {
 	}
 }
 
+func TestParseToken_RejectsInvalidProofAmounts(t *testing.T) {
+	encode := func(proofs []map[string]any) string {
+		t.Helper()
+		data := map[string]any{
+			"token": []map[string]any{{"mint": "https://mint.example.com", "proofs": proofs}},
+			"unit":  "sat",
+		}
+		raw, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "cashuA" + strings.TrimRight(base64.URLEncoding.EncodeToString(raw), "=")
+	}
+	tests := []struct {
+		name   string
+		proofs []map[string]any
+		want   string
+	}{
+		{name: "empty", proofs: []map[string]any{}, want: "no proofs"},
+		{name: "zero", proofs: []map[string]any{{"amount": int64(0)}}, want: "positive"},
+		{name: "negative", proofs: []map[string]any{{"amount": int64(-1)}}, want: "positive"},
+		{name: "overflow", proofs: []map[string]any{{"amount": int64(1<<63 - 1)}, {"amount": int64(1)}}, want: "overflow"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewCashuMintClient(0).ParseToken(encode(tt.proofs))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ParseToken error=%v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseToken_DefaultUnit(t *testing.T) {
 	tokenData := map[string]any{
 		"token": []map[string]any{

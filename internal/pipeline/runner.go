@@ -51,6 +51,16 @@ type CodeIndexer interface {
 
 var errPaymentBlockPersisted = errors.New("review payment blocked")
 
+func retryablePaymentError(auth payment.AuthorizeResult) error {
+	if !auth.Retryable {
+		return nil
+	}
+	if auth.Reason != payment.ReasonPaymentPending {
+		return fmt.Errorf("invalid retryable payment reason %q", auth.Reason)
+	}
+	return errors.New(payment.ReasonPaymentPending)
+}
+
 // PaymentAuthorizer gates reviews according to the repository payment policy.
 type PaymentAuthorizer interface {
 	AuthorizePatch(ctx context.Context, patchEvent nostr.Event, repoID string, policy repoconfig.PaymentsConfig) (payment.AuthorizeResult, error)
@@ -328,6 +338,11 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 					"access_kind", auth.AccessKind)
 				paymentAuthorized = true
 				break
+			}
+			if pendingErr := retryablePaymentError(auth); pendingErr != nil {
+				// The worker records this canonical reason as an ordinary failed
+				// review, so the durable retry sweep can pick it up.
+				return pendingErr
 			}
 			advanced, err := r.store.MarkReviewPaymentBlocked(ctx, task.PatchEventID, task.RepoID, auth.Reason, auth.ZapReceiptCursor)
 			if err != nil {

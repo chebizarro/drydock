@@ -82,6 +82,30 @@ func TestMarkReviewPaymentBlockedUsesZapCursor(t *testing.T) {
 	if err != nil || status != "failed" {
 		t.Fatalf("blocked review status = %q, %v", status, err)
 	}
+	// Repeating the same terminal observation is idempotent.
+	if advanced, err = store.MarkReviewPaymentBlocked(ctx, blockedPatch, "owner:blocked", "no_payment", 0); err != nil || advanced {
+		t.Fatalf("idempotent payment block: advanced=%v err=%v", advanced, err)
+	}
+
+	const pendingPatch = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	if acquired, err = store.BeginReview(ctx, pendingPatch, "owner:pending"); err != nil || !acquired {
+		t.Fatalf("BeginReview pending = %v, %v", acquired, err)
+	}
+	if err := store.MarkReviewFailed(ctx, pendingPatch, "owner:pending", "payment_pending"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE review_log SET updated_at=0 WHERE patch_event_id=?`, pendingPatch); err != nil {
+		t.Fatal(err)
+	}
+	if tasks, err := store.RequeueFailedReviews(ctx, 0, 1); err != nil || len(tasks) != 1 {
+		t.Fatalf("requeue pending payment: tasks=%+v err=%v", tasks, err)
+	}
+	if advanced, err = store.MarkReviewPaymentBlocked(ctx, pendingPatch, "owner:pending", "payment_failed", 0); err != nil || advanced {
+		t.Fatalf("block pending retry: advanced=%v err=%v", advanced, err)
+	}
+	if status, err = store.GetReviewStatus(ctx, pendingPatch, "owner:pending"); err != nil || status != "failed" {
+		t.Fatalf("pending retry terminal status=%q err=%v", status, err)
+	}
 
 	const racingPatch = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	acquired, err = store.BeginReview(ctx, racingPatch, "owner:racing")

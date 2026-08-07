@@ -138,6 +138,11 @@ CREATE TABLE IF NOT EXISTS security_audits (
     CHECK (state IN ('pending', 'running', 'published', 'failed')),
   report_event_id TEXT,
   sarif_hash TEXT,
+  sarif_artifact BLOB,
+  scan_operations_scanned INTEGER NOT NULL DEFAULT 0 CHECK (scan_operations_scanned >= 0),
+  scan_operations_skipped INTEGER NOT NULL DEFAULT 0 CHECK (scan_operations_skipped >= 0),
+  scan_operations_errored INTEGER NOT NULL DEFAULT 0 CHECK (scan_operations_errored >= 0),
+  units_dropped INTEGER NOT NULL DEFAULT 0 CHECK (units_dropped >= 0),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -145,6 +150,21 @@ CREATE INDEX IF NOT EXISTS idx_security_audits_repo_ref
   ON security_audits(repo_id, ref);
 CREATE INDEX IF NOT EXISTS idx_security_audits_state
   ON security_audits(state);
+
+CREATE TABLE IF NOT EXISTS security_audit_publication_outbox (
+  audit_id INTEGER NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN ('report', 'detail', 'fallback')),
+  event_id TEXT NOT NULL,
+  raw_event_json TEXT NOT NULL,
+  relays_json TEXT NOT NULL,
+  delivered_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (audit_id, event_type),
+  UNIQUE (event_id),
+  FOREIGN KEY (audit_id) REFERENCES security_audits(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_security_audit_outbox_delivery
+  ON security_audit_publication_outbox(delivered_at, audit_id);
 
 CREATE TABLE IF NOT EXISTS security_findings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

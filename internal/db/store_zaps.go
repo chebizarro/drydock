@@ -125,7 +125,9 @@ func (s *Store) FindZapReceiptAtLeast(ctx context.Context, patchEventID string, 
 }
 
 // MarkReviewPaymentBlocked records a permanent payment denial only when no
-// receipt arrived after the authorization attempt observed its cursor.
+// receipt arrived after the authorization attempt observed its cursor. Both
+// reviewing and pending are accepted because durable retry sweeps make a failed
+// payment review pending before re-enqueueing it.
 // advanced is true when the caller must retry authorization instead.
 func (s *Store) MarkReviewPaymentBlocked(ctx context.Context, patchEventID, repoID, reason string, observedCursor int64) (advanced bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -147,7 +149,7 @@ func (s *Store) MarkReviewPaymentBlocked(ctx context.Context, patchEventID, repo
 
 	result, err := tx.ExecContext(ctx, `UPDATE review_log
 		SET status='failed', failure_reason=?, updated_at=?
-		WHERE patch_event_id=? AND repo_id=? AND status='reviewing'`,
+		WHERE patch_event_id=? AND repo_id=? AND status IN ('reviewing', 'pending')`,
 		"payment_blocked:"+reason, time.Now().Unix(), patchEventID, repoID)
 	if err != nil {
 		return false, fmt.Errorf("mark review payment blocked: %w", err)
@@ -156,8 +158,17 @@ func (s *Store) MarkReviewPaymentBlocked(ctx context.Context, patchEventID, repo
 	if err != nil {
 		return false, fmt.Errorf("payment block rows affected: %w", err)
 	}
-	if affected != 1 {
-		return false, fmt.Errorf("mark review payment blocked: expected reviewing row, changed %d", affected)
+	if affected == 0 {
+		var status, failureReason string
+		if err := tx.QueryRowContext(ctx, `SELECT status, COALESCE(failure_reason, '')
+			FROM review_log WHERE patch_event_id=? AND repo_id=?`, patchEventID, repoID).Scan(&status, &failureReason); err != nil {
+			return false, fmt.Errorf("read existing payment block: %w", err)
+		}
+		if status != "failed" || failureReason != "payment_blocked:"+reason {
+			return false, fmt.Errorf("mark review payment blocked: row is %s/%s", status, failureReason)
+		}
+	} else if affected != 1 {
+		return false, fmt.Errorf("mark review payment blocked: changed %d rows", affected)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit review payment block: %w", err)
