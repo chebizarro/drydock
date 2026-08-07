@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"drydock/internal/nostrprobe"
+
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/keyer"
 	"fiatjaf.com/nostr/nip59"
@@ -46,6 +48,9 @@ func TestPublishSecurityAuditEventsKeepDetailPrivate(t *testing.T) {
 			{Name: "drydock", Version: "abc123"},
 			{Name: "sec70b", Version: "served-model"},
 		},
+		ProbeEvidence: []nostrprobe.SecurityEvidence{{
+			RuleID: nostrprobe.RuleRelaySignature, Status: nostrprobe.StatusFail, Target: "wss://private-target.example",
+		}},
 		Findings: []SecurityAuditFinding{{
 			RuleID:      "SQL-INJECTION",
 			CWE:         "CWE-89",
@@ -84,10 +89,10 @@ func TestPublishSecurityAuditEventsKeepDetailPrivate(t *testing.T) {
 	if report.ID.Hex() != result.ReportEventID || wrapped.ID.Hex() != result.DetailEventID || fallback.ID.Hex() != result.FallbackEventID {
 		t.Fatal("result event IDs do not match published events")
 	}
-	if strings.Contains(report.Content, "query.go") || strings.Contains(report.Content, "attacker-controlled") || strings.Contains(report.Content, "request.id") {
+	if strings.Contains(report.Content, "query.go") || strings.Contains(report.Content, "attacker-controlled") || strings.Contains(report.Content, "request.id") || strings.Contains(report.Content, "private-target.example") {
 		t.Fatalf("public report leaked finding detail: %s", report.Content)
 	}
-	if strings.Contains(fallback.Content, "query.go") || strings.Contains(fallback.Content, "attacker-controlled") || strings.Contains(fallback.Content, "request.id") {
+	if strings.Contains(fallback.Content, "query.go") || strings.Contains(fallback.Content, "attacker-controlled") || strings.Contains(fallback.Content, "request.id") || strings.Contains(fallback.Content, "private-target.example") {
 		t.Fatalf("fallback comment leaked finding detail: %s", fallback.Content)
 	}
 
@@ -95,7 +100,7 @@ func TestPublishSecurityAuditEventsKeepDetailPrivate(t *testing.T) {
 	if err := json.Unmarshal([]byte(report.Content), &public); err != nil {
 		t.Fatalf("decode public report: %v", err)
 	}
-	if public.SchemaVersion != 1 || public.Ref != "abc123" || public.DetailDelivery != "nip59" || public.Counts.High != 1 {
+	if public.SchemaVersion != 1 || public.Ref != "abc123" || public.DetailDelivery != "nip59" || public.Counts.High != 1 || public.ProbeCounts == nil || public.ProbeCounts.Fail != 1 {
 		t.Fatalf("unexpected public content: %#v", public)
 	}
 	if len(public.CWETop) != 1 || public.CWETop[0] != "CWE-89" {
@@ -130,6 +135,9 @@ func TestPublishSecurityAuditEventsKeepDetailPrivate(t *testing.T) {
 	}
 	if len(detail.Findings) != 1 || detail.Findings[0].File != "internal/db/query.go" || detail.Findings[0].Taint != "request.id -> query" {
 		t.Fatalf("private detail missing sensitive finding fields: %#v", detail)
+	}
+	if len(detail.ProbeEvidence) != 1 || detail.ProbeEvidence[0].Target != "wss://private-target.example" {
+		t.Fatalf("private detail missing probe target: %#v", detail.ProbeEvidence)
 	}
 	if got := sha256Hex([]byte(rumor.Content)); got != result.ReportDigest {
 		t.Fatalf("detail digest = %s, want %s", got, result.ReportDigest)

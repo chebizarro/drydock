@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"drydock/internal/nostrprobe"
+
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip59"
 )
@@ -57,6 +59,12 @@ type SeverityCounts struct {
 	Info     int `json:"info"`
 }
 
+type ProbeCounts struct {
+	Pass         int `json:"pass"`
+	Fail         int `json:"fail"`
+	Inconclusive int `json:"inconclusive"`
+}
+
 type SecurityAuditPublicContent struct {
 	SchemaVersion  int            `json:"schema_version"`
 	Ref            string         `json:"ref"`
@@ -64,18 +72,20 @@ type SecurityAuditPublicContent struct {
 	Depth          string         `json:"depth"`
 	Counts         SeverityCounts `json:"counts"`
 	CWETop         []string       `json:"cwe_top"`
+	ProbeCounts    *ProbeCounts   `json:"probe_counts,omitempty"`
 	Verified       bool           `json:"verified"`
 	ReportDigest   string         `json:"report_digest"`
 	DetailDelivery string         `json:"detail_delivery"`
 }
 
 type securityAuditDetail struct {
-	SchemaVersion int                    `json:"schema_version"`
-	RepoAddress   string                 `json:"repo_address"`
-	Ref           string                 `json:"ref"`
-	GeneratedAt   int64                  `json:"generated_at"`
-	Findings      []SecurityAuditFinding `json:"findings"`
-	SARIFSHA256   string                 `json:"sarif_sha256"`
+	SchemaVersion int                           `json:"schema_version"`
+	RepoAddress   string                        `json:"repo_address"`
+	Ref           string                        `json:"ref"`
+	GeneratedAt   int64                         `json:"generated_at"`
+	Findings      []SecurityAuditFinding        `json:"findings"`
+	ProbeEvidence []nostrprobe.SecurityEvidence `json:"probe_evidence,omitempty"`
+	SARIFSHA256   string                        `json:"sarif_sha256"`
 }
 
 type PublishSecurityAuditInput struct {
@@ -84,15 +94,16 @@ type PublishSecurityAuditInput struct {
 	Announcement nostr.Event
 	// Ref scopes the addressable report. Leave empty for the latest audit of
 	// the default branch.
-	Ref       string
-	Commit    string
-	Summary   string
-	Depth     string
-	Verified  bool
-	Findings  []SecurityAuditFinding
-	Tools     []AuditTool
-	Requester nostr.PubKey
-	Relays    []string
+	Ref           string
+	Commit        string
+	Summary       string
+	Depth         string
+	Verified      bool
+	Findings      []SecurityAuditFinding
+	ProbeEvidence []nostrprobe.SecurityEvidence
+	Tools         []AuditTool
+	Requester     nostr.PubKey
+	Relays        []string
 	// GeneratedAt is optional; zero uses the current time.
 	GeneratedAt time.Time
 }
@@ -130,6 +141,7 @@ func (s *Service) PublishSecurityAudit(ctx context.Context, in PublishSecurityAu
 		Ref:           auditCommit(in),
 		GeneratedAt:   generatedAt.Unix(),
 		Findings:      nonNilFindings(in.Findings),
+		ProbeEvidence: in.ProbeEvidence,
 		SARIFSHA256:   out.SARIFSHA256,
 	}
 	detailJSON, err := json.Marshal(detail)
@@ -146,6 +158,7 @@ func (s *Service) PublishSecurityAudit(ctx context.Context, in PublishSecurityAu
 		Depth:          strings.TrimSpace(in.Depth),
 		Counts:         counts,
 		CWETop:         topCWEs(in.Findings, 3),
+		ProbeCounts:    countProbeOutcomes(in.ProbeEvidence),
 		Verified:       in.Verified,
 		ReportDigest:   out.ReportDigest,
 		DetailDelivery: "nip59",
@@ -333,6 +346,24 @@ func auditCommit(in PublishSecurityAuditInput) string {
 		return commit
 	}
 	return strings.TrimSpace(in.Ref)
+}
+
+func countProbeOutcomes(evidence []nostrprobe.SecurityEvidence) *ProbeCounts {
+	if len(evidence) == 0 {
+		return nil
+	}
+	counts := &ProbeCounts{}
+	for _, item := range evidence {
+		switch item.Status {
+		case nostrprobe.StatusPass:
+			counts.Pass++
+		case nostrprobe.StatusFail:
+			counts.Fail++
+		default:
+			counts.Inconclusive++
+		}
+	}
+	return counts
 }
 
 func countAuditSeverities(findings []SecurityAuditFinding) SeverityCounts {

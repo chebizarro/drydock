@@ -461,7 +461,12 @@ func main() {
 		classifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel}
 		feedback := contextvm.NewAuditFeedbackReporter(signer, relayPub, writeRelays)
 		auditEngine := auditengine.New(
-			auditengine.Config{Workers: cfg.SecurityAuditWorkers, NostrEnabled: cfg.SecurityNostrEnabled},
+			auditengine.Config{
+				Workers:           cfg.SecurityAuditWorkers,
+				NostrEnabled:      cfg.SecurityNostrEnabled,
+				NostrProbeTargets: cfg.SecurityNostrProbeTargets,
+				NostrProbeActive:  cfg.SecurityNostrProbeActive,
+			},
 			auditengine.Dependencies{
 				Repos:          repoManager,
 				Store:          store,

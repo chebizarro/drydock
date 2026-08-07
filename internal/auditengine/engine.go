@@ -22,6 +22,7 @@ import (
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/metrics"
+	"drydock/internal/nostrprobe"
 	"drydock/internal/nostrscan"
 	"drydock/internal/nostrscan/knowledge"
 	"drydock/internal/publisher"
@@ -103,6 +104,10 @@ type ToolRunner interface {
 	Run(context.Context, string, ...string) ([]byte, error)
 }
 
+type NostrProber interface {
+	Run(context.Context, nostrprobe.Config) ([]nostrprobe.SecurityEvidence, error)
+}
+
 type osToolRunner struct{}
 
 func (osToolRunner) LookPath(name string) (string, error) { return exec.LookPath(name) }
@@ -122,10 +127,13 @@ type Dependencies struct {
 	Progress        ProgressReporter
 	Tools           ToolRunner
 	Localizer       Localizer
+	NostrProber     NostrProber
 }
 type Config struct {
-	Workers      int
-	NostrEnabled string
+	Workers           int
+	NostrEnabled      string
+	NostrProbeTargets []string
+	NostrProbeActive  bool
 }
 type Engine struct {
 	cfg    Config
@@ -156,6 +164,9 @@ func New(cfg Config, deps Dependencies, logger *slog.Logger) *Engine {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if deps.NostrProber == nil {
+		deps.NostrProber = nostrprobe.New(nil, nostrprobe.NewBinaryBackend(deps.Tools, logger), logger)
+	}
 	return &Engine{cfg: cfg, deps: deps, logger: logger}
 }
 
@@ -184,6 +195,7 @@ type Result struct {
 	DroppedUnits  []string
 	Findings      []reviewengine.Finding
 	NewFindings   []reviewengine.Finding
+	ProbeEvidence []nostrprobe.SecurityEvidence
 	Published     publisher.PublishSecurityAuditResult
 }
 type candidateUnit struct {
@@ -278,6 +290,7 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	allDeterministic := append(scanFindings(scan.Findings), e.runOptionalTools(ctx, repoPath, req)...)
 
 	var nostrContext, nostrPreamble string
+	var probeEvidence []nostrprobe.SecurityEvidence
 	if nostrActive {
 		roles := auditNostrRoles(nostrProfile.Roles, req.Nostr)
 		rules := auditNostrRules(nostrscan.PresenceRulesForRoles(roles), req.Nostr)
@@ -304,6 +317,19 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		if req.Nostr.VerifyVotes > budget.VerifyVotes {
 			budget.VerifyVotes = req.Nostr.VerifyVotes
 		}
+		probeEvidence, err = e.deps.NostrProber.Run(ctx, nostrprobe.Config{
+			Enabled:           req.Nostr.Probe.Enabled,
+			Active:            req.Nostr.Probe.Active && e.cfg.NostrProbeActive,
+			IUnderstand:       req.Nostr.Probe.IUnderstand,
+			Targets:           append([]string(nil), e.cfg.NostrProbeTargets...),
+			AuthorizedTargets: append([]string(nil), e.cfg.NostrProbeTargets...),
+			Timeout:           req.Nostr.Probe.Timeout,
+		})
+		if err != nil {
+			e.logger.Warn("optional nostr dynamic probing failed; continuing audit", "error", err)
+			probeEvidence = nil
+		}
+		result.ProbeEvidence = append([]nostrprobe.SecurityEvidence(nil), probeEvidence...)
 	}
 
 	e.progress(ctx, auditID, "localize")
@@ -330,6 +356,7 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	}
 	result.ReviewedUnits = len(units)
 	verified = reviewengine.DeduplicateFindings(verified)
+	verified = nostrprobe.Corroborate(verified, probeEvidence)
 	result.Findings = verified
 	for _, finding := range verified {
 		metrics.SecurityFindings.With(findingCWE(finding), finding.Severity).Inc()
@@ -363,7 +390,11 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	for _, finding := range result.NewFindings {
 		pubFindings = append(pubFindings, publisher.SecurityAuditFinding{CWE: findingCWE(finding), Severity: finding.Severity, Message: finding.Explanation, File: finding.File, Line: finding.Line, Evidence: finding.Evidence, Remediation: finding.Suggestion, Confidence: finding.Confidence})
 	}
-	result.Published, err = e.deps.Publisher.PublishSecurityAudit(ctx, publisher.PublishSecurityAuditInput{Announcement: req.Announcement, Ref: ref, Commit: result.Commit, Summary: fmt.Sprintf("Security audit completed with %d new verified finding(s).", len(pubFindings)), Depth: string(req.Depth), Verified: true, Findings: pubFindings, Tools: []publisher.AuditTool{{Name: "drydock-securityscan"}, {Name: "drydock-sec70b"}}, Requester: req.Requester, Relays: req.Relays})
+	tools := []publisher.AuditTool{{Name: "drydock-securityscan"}, {Name: "drydock-sec70b"}}
+	if len(probeEvidence) > 0 {
+		tools = append(tools, publisher.AuditTool{Name: "nostr-secprobe"})
+	}
+	result.Published, err = e.deps.Publisher.PublishSecurityAudit(ctx, publisher.PublishSecurityAuditInput{Announcement: req.Announcement, Ref: ref, Commit: result.Commit, Summary: fmt.Sprintf("Security audit completed with %d new verified finding(s).", len(pubFindings)), Depth: string(req.Depth), Verified: true, Findings: pubFindings, ProbeEvidence: probeEvidence, Tools: tools, Requester: req.Requester, Relays: req.Relays})
 	if err != nil {
 		return result, fmt.Errorf("publish security audit: %w", err)
 	}
