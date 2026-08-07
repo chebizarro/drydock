@@ -25,6 +25,10 @@ import (
 
 // --- Mocks ---
 
+type allowAllRegistry struct{}
+
+func (allowAllRegistry) Contains(string) bool { return true }
+
 type mockRepoService struct {
 	result repo.PrepareResult
 	err    error
@@ -161,7 +165,7 @@ func TestProcessEndToEndPersistsAndPublishesReview(t *testing.T) {
 		SupersededTTL:       7 * 24 * time.Hour,
 	}, store, testSigner{sk: nostr.Generate()}, relayPub, logger)
 
-	runner := New(Config{Workers: 1}, store, repoSvc, contextbuilder.NewDefault(), engine, pubSvc, nil, make(chan db.ReviewTask), logger)
+	runner := New(Config{Workers: 1}, store, repoSvc, contextbuilder.NewDefault(), engine, pubSvc, nil, make(chan db.ReviewTask), logger, WithMonitoringRegistry(allowAllRegistry{}))
 	if err := runner.process(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}); err != nil {
 		t.Fatalf("process failed: %v", err)
 	}
@@ -259,6 +263,68 @@ func TestRetryablePaymentPendingUsesOrdinaryRequeuePath(t *testing.T) {
 	tasks, err := store.RequeueFailedReviews(ctx, 0, 10)
 	if err != nil || len(tasks) != 1 || tasks[0].PatchEventID != "payment-patch" {
 		t.Fatalf("payment_pending was not requeued: tasks=%+v err=%v", tasks, err)
+	}
+}
+
+type mutableMonitoringRegistry struct {
+	allowed bool
+}
+
+func (r *mutableMonitoringRegistry) Contains(string) bool { return r.allowed }
+
+func TestReactiveMonitoringGateFailsClosedAndRechecksBeforePublication(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	owner := nostr.GetPublicKey(nostr.Generate()).Hex()
+	repoID := owner + ":repo"
+	task := db.ReviewTask{
+		PatchEventID: "reactive-patch",
+		RepoID:       repoID,
+		Invocation:   db.ReviewInvocationReactive,
+	}
+	acquired, err := store.BeginReviewWithClaim(ctx, task.PatchEventID, task.RepoID, db.ReviewClaim{Invocation: task.Invocation})
+	if err != nil || !acquired {
+		t.Fatalf("claim reactive review: acquired=%v err=%v", acquired, err)
+	}
+
+	registry := &mutableMonitoringRegistry{allowed: true}
+	runner := &Runner{store: store, logger: testLogger(), monitoring: registry}
+	if err := runner.requireReactiveMonitoring(ctx, task, "pipeline_start"); err != nil {
+		t.Fatalf("monitored review rejected at start: %v", err)
+	}
+
+	registry.allowed = false
+	if err := runner.requireReactiveMonitoring(ctx, task, "pre_publication"); !errors.Is(err, errReactiveReviewSkipped) {
+		t.Fatalf("removed review error = %v", err)
+	}
+	if reason, ok, err := store.GetReviewSkip(ctx, task.PatchEventID, task.RepoID); err != nil || !ok || reason != "monitoring_removed" {
+		t.Fatalf("pre-publication durable skip = %q ok=%v err=%v", reason, ok, err)
+	}
+
+	startupTask := db.ReviewTask{
+		PatchEventID: "startup-without-list",
+		RepoID:       repoID,
+		Invocation:   db.ReviewInvocationReactive,
+	}
+	acquired, err = store.BeginReviewWithClaim(ctx, startupTask.PatchEventID, startupTask.RepoID, db.ReviewClaim{Invocation: startupTask.Invocation})
+	if err != nil || !acquired {
+		t.Fatalf("claim startup review: acquired=%v err=%v", acquired, err)
+	}
+	startupRunner := &Runner{store: store, logger: testLogger()}
+	if err := startupRunner.requireReactiveMonitoring(ctx, startupTask, "pipeline_start"); !errors.Is(err, errReactiveReviewSkipped) {
+		t.Fatalf("startup without list error = %v", err)
+	}
+	if reason, ok, err := store.GetReviewSkip(ctx, startupTask.PatchEventID, startupTask.RepoID); err != nil || !ok || reason != "monitoring_removed" {
+		t.Fatalf("startup durable skip = %q ok=%v err=%v", reason, ok, err)
+	}
+
+	onDemand := db.ReviewTask{
+		PatchEventID: "on-demand",
+		RepoID:       repoID,
+		Invocation:   db.ReviewInvocationContextVM,
+	}
+	if err := startupRunner.requireReactiveMonitoring(ctx, onDemand, "pipeline_start"); err != nil {
+		t.Fatalf("on-demand review was incorrectly monitoring-gated: %v", err)
 	}
 }
 

@@ -304,6 +304,10 @@ func TestPatchReviewRequestPaidAccessAuthorizesForce(t *testing.T) {
 	if authorizer.calls != 1 || len(queue.tasks) != 1 || !queue.tasks[0].Force {
 		t.Fatalf("paid force did not enqueue forced task: calls=%d tasks=%+v", authorizer.calls, queue.tasks)
 	}
+	task := queue.tasks[0]
+	if task.Invocation != db.ReviewInvocationIDE || task.RequesterPubkey != requester.Hex() || task.OrderID != "req-1" {
+		t.Fatalf("IDE invocation metadata = %+v", task)
+	}
 }
 
 func TestPatchReviewRequestDeniesUnpaidTargetBeforeEnqueue(t *testing.T) {

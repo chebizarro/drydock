@@ -12,10 +12,22 @@ import (
 	"drydock/internal/contextvm"
 	"drydock/internal/db"
 	"drydock/internal/ingest"
+	"drydock/internal/revieworder"
 	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )
+
+type staticMonitoring bool
+
+func (m staticMonitoring) Contains(string) bool { return bool(m) }
+
+func newMonitoredProcessor(store *db.Store, matcher scope.Matcher, opts ...func(*ingest.Processor)) *ingest.Processor {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	orders := revieworder.New(revieworder.Config{}, store, matcher, staticMonitoring(true), nil, nil, logger)
+	opts = append(opts, ingest.WithReviewOrders(orders))
+	return ingest.NewProcessor(store, logger, opts...)
+}
 
 // signEvent signs the event with the given secret key (sets ID, PubKey, Sig).
 func signEvent(t *testing.T, sk nostr.SecretKey, event *nostr.Event) {
@@ -28,7 +40,7 @@ func signEvent(t *testing.T, sk nostr.SecretKey, event *nostr.Event) {
 func TestProcessorRejectsInvalidSignature(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
-	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	processor := newMonitoredProcessor(store, scope.Matcher{})
 
 	// Create an event with no valid signature (forged event)
 	event := nostr.Event{
@@ -61,7 +73,7 @@ func TestProcessorRejectsIDMismatchBeforeDispatch(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	repoSK := nostr.Generate()
 	patchSK := nostr.Generate()
-	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	processor := newMonitoredProcessor(store, scope.Matcher{})
 
 	repoEvt := nostr.Event{
 		Kind:      30617,
@@ -136,7 +148,7 @@ func TestProcessorRejectsIDMismatchBeforeDispatch(t *testing.T) {
 func TestProcessorRejectsFutureTimestamp(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
-	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	processor := newMonitoredProcessor(store, scope.Matcher{})
 	sk := nostr.Generate()
 
 	event := nostr.Event{
@@ -166,7 +178,7 @@ func TestProcessorDedupesByEventID(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	sk := nostr.Generate()
 
-	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	processor := newMonitoredProcessor(store, scope.Matcher{})
 	event := nostr.Event{
 		Kind:      30617,
 		CreatedAt: nostr.Now(),
@@ -208,7 +220,7 @@ func TestProcessorCreatesPatchReviewGateOnce(t *testing.T) {
 	repoSK := nostr.Generate()
 	patchSK := nostr.Generate()
 
-	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	processor := newMonitoredProcessor(store, scope.Matcher{})
 
 	// First, seed the repo announcement so the patch has a valid repo_id
 	repoEvt := nostr.Event{
@@ -286,11 +298,7 @@ func TestProcessorAppliesRepositoryOwnerScopeBeforeReview(t *testing.T) {
 			if !test.allowed {
 				allowedOwner = nostr.GetPublicKey(nostr.Generate()).Hex()
 			}
-			processor := ingest.NewProcessor(
-				store,
-				slog.New(slog.NewJSONHandler(io.Discard, nil)),
-				ingest.WithRepositoryScope(scope.NewMatcher(nil, []string{allowedOwner})),
-			)
+			processor := newMonitoredProcessor(store, scope.NewMatcher(nil, []string{allowedOwner}))
 
 			repoEvt := nostr.Event{
 				Kind:      30617,
@@ -346,7 +354,7 @@ func TestProcessorAppliesRepositoryOwnerScopeBeforeReview(t *testing.T) {
 func TestProcessorSkipsPatchWhenSnapshotAlreadyContainsTip(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
-	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	processor := newMonitoredProcessor(store, scope.Matcher{})
 
 	repoSK := nostr.Generate()
 	patchSK := nostr.Generate()
@@ -410,7 +418,7 @@ func TestProcessorSkipsPatchWhenSnapshotAlreadyContainsTip(t *testing.T) {
 func TestProcessorSkipsWhenRootStatusClosed(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
-	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	processor := newMonitoredProcessor(store, scope.Matcher{})
 
 	repoSK := nostr.Generate()
 	patchSK := nostr.Generate()
@@ -478,7 +486,7 @@ func TestProcessorSkipsWhenRootStatusClosed(t *testing.T) {
 func TestProcessorIgnoresUnauthorizedClosedStatus(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
-	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	processor := newMonitoredProcessor(store, scope.Matcher{})
 
 	repoSK := nostr.Generate()
 	patchSK := nostr.Generate()
@@ -547,7 +555,7 @@ func TestProcessorIgnoresUnauthorizedClosedStatus(t *testing.T) {
 func TestProcessorUsesEAsRootForPRUpdates(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
-	processor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	processor := newMonitoredProcessor(store, scope.Matcher{})
 
 	repoSK := nostr.Generate()
 	patchSK := nostr.Generate()
@@ -741,11 +749,22 @@ func TestProcessorMarksTaskForRetryWhenQueueFull(t *testing.T) {
 		t.Fatalf("insert ingested repo event: %v", err)
 	}
 
-	// Create processor with a tiny queue to test overflow.
-	smallProcessor := ingest.NewProcessor(store, slog.New(slog.NewJSONHandler(io.Discard, nil)))
-	// Fill the queue completely.
-	for i := 0; i < cap(smallProcessor.ReviewQueue); i++ {
-		smallProcessor.ReviewQueue <- db.ReviewTask{PatchEventID: "filler", RepoID: "filler"}
+	// Create a queue of size one and fill it with a first accepted patch.
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	orders := revieworder.New(revieworder.Config{QueueSize: 1}, store, scope.Matcher{}, staticMonitoring(true), nil, nil, logger)
+	smallProcessor := ingest.NewProcessor(store, logger, ingest.WithReviewOrders(orders))
+	first := nostr.Event{
+		Kind:      1617,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo-1"},
+			{"e", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "", "root"},
+		},
+		Content: "diff one",
+	}
+	signEvent(t, patchSK, &first)
+	if err := smallProcessor.ProcessEvent(ctx, first, "wss://relay.test"); err != nil {
+		t.Fatalf("fill review queue: %v", err)
 	}
 
 	patch := nostr.Event{

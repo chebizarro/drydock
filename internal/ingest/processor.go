@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"drydock/internal/contextvm"
@@ -13,6 +14,7 @@ import (
 	"drydock/internal/eventkind"
 	"drydock/internal/metrics"
 	"drydock/internal/monitoring"
+	"drydock/internal/revieworder"
 	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
@@ -46,15 +48,25 @@ type MonitoringHandler interface {
 	ApplyDeletion(ctx context.Context, event nostr.Event) (bool, error)
 }
 
+// ReviewOrderer owns reactive admission and the durable review queue.
+type ReviewOrderer interface {
+	SubmitReactive(context.Context, nostr.Event, scope.RepositoryRef) (revieworder.SubmissionResult, error)
+	EnqueueClaimed(context.Context, db.ReviewTask, string) error
+	Queue() <-chan db.ReviewTask
+}
+
 // ContextVMResponder publishes ContextVM JSON-RPC responses.
 type ContextVMResponder interface {
 	SendResponseToEvent(ctx context.Context, requestEventID, id string, result any, rpcErr *contextvm.Error, recipients ...nostr.PubKey) error
 }
 
 type Processor struct {
-	store              *db.Store
-	logger             *slog.Logger
-	ReviewQueue        chan db.ReviewTask
+	store  *db.Store
+	logger *slog.Logger
+	// ReviewQueue is a deprecated receive-only view retained for callers while
+	// revieworder.Service owns the underlying channel.
+	ReviewQueue        <-chan db.ReviewTask
+	reviewOrders       ReviewOrderer
 	conversation       ConversationHandler
 	codeChat           CodeChatHandler
 	ideGateway         IDEGatewayHandler
@@ -63,7 +75,6 @@ type Processor struct {
 	contextVMRouter    *contextvm.Router
 	contextVMResponder ContextVMResponder
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
-	repositoryScope    scope.Matcher
 	servicePubkey      string
 	trustedZappers     map[string]struct{}
 	maxEventFutureSkew time.Duration
@@ -98,10 +109,10 @@ func WithLocalAutofixAuthor(pubkey string) func(*Processor) {
 	}
 }
 
-// WithRepositoryScope configures operator repository and owner allowlists.
-func WithRepositoryScope(matcher scope.Matcher) func(*Processor) {
+// WithReviewOrders configures shared reactive admission and queue ownership.
+func WithReviewOrders(service ReviewOrderer) func(*Processor) {
 	return func(p *Processor) {
-		p.repositoryScope = matcher
+		p.reviewOrders = service
 	}
 }
 
@@ -159,12 +170,14 @@ func NewProcessor(store *db.Store, logger *slog.Logger, opts ...func(*Processor)
 	p := &Processor{
 		store:              store,
 		logger:             logger,
-		ReviewQueue:        make(chan db.ReviewTask, 256),
 		maxEventFutureSkew: maxEventFutureSkew,
 		maxEventPastAge:    maxEventPastAge,
 	}
 	for _, opt := range opts {
 		opt(p)
+	}
+	if p.reviewOrders != nil {
+		p.ReviewQueue = p.reviewOrders.Queue()
 	}
 	return p
 }
@@ -243,21 +256,12 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 				"pubkey", p.localAutofixPubKey)
 			return nil
 		}
-		repoID := db.RepoIDFromPatch(event)
-		if repoID == "" {
-			p.logger.Warn("patch event missing resolvable repository pointer", "event_id", event.ID.Hex(), "kind", int(event.Kind))
+		repository, err := repositoryRefFromPatch(event)
+		if err != nil {
+			p.logger.Warn("patch event missing unique canonical repository pointer", "event_id", event.ID.Hex(), "kind", int(event.Kind), "error", err)
 			return nil
 		}
-		if p.repositoryScope.Enabled() {
-			ownerPubkey, err := p.store.GetRepositoryOwnerPubkey(ctx, repoID)
-			if err != nil {
-				return err
-			}
-			if !p.repositoryScope.Allows(repoID, ownerPubkey) {
-				p.logger.Debug("skipping patch outside repository scope", "event_id", event.ID.Hex(), "repo_id", repoID, "owner_pubkey", ownerPubkey)
-				return nil
-			}
-		}
+		repoID := repository.RepositoryID
 		stale, reason, err := p.store.IsPatchStaleBySnapshot(ctx, event)
 		if err != nil {
 			return err
@@ -275,18 +279,12 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 			return nil
 		}
 
-		acquired, err := p.store.BeginReview(ctx, event.ID.Hex(), repoID, false)
-		if err != nil {
-			if errors.Is(err, db.ErrReviewAlreadyPublished) {
-				p.logger.Debug("skipping already-published review target", "event_id", event.ID.Hex(), "repo_id", repoID)
-				return nil
-			}
-			return err
+		if p.reviewOrders == nil {
+			p.logger.Info("reactive review disabled: review order service is not configured", "event_id", event.ID.Hex(), "repo_id", repoID)
+			return nil
 		}
-		if acquired {
-			return p.EnqueueReview(ctx, db.ReviewTask{PatchEventID: event.ID.Hex(), RepoID: repoID}, "patch")
-		}
-		return nil
+		_, err = p.reviewOrders.SubmitReactive(ctx, event, repository)
+		return err
 	case eventkind.ZapReceipt:
 		if p.servicePubkey == "" {
 			return nil
@@ -304,7 +302,10 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 			p.logger.Info("accepted zap receipt", "event_id", receipt.EventID, "patch_event_id", receipt.PatchEventID, "amount_msat", receipt.AmountMSat, "trusted_zapper_allowlist", len(p.trustedZappers) > 0)
 		}
 		for _, task := range tasks {
-			if err := p.EnqueueReview(ctx, task, "zap_receipt"); err != nil {
+			if p.reviewOrders == nil {
+				return errors.New("review order service is not configured")
+			}
+			if err := p.reviewOrders.EnqueueClaimed(ctx, task, "zap_receipt"); err != nil {
 				return err
 			}
 		}
@@ -367,26 +368,6 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 		return nil
 	default:
 		return nil
-	}
-}
-
-// EnqueueReview submits an already-claimed review task and preserves queue-full
-// failures for the durable retry sweep.
-func (p *Processor) EnqueueReview(ctx context.Context, task db.ReviewTask, source string) error {
-	select {
-	case p.ReviewQueue <- task:
-		metrics.ReviewQueuePushed.Inc()
-		metrics.ReviewQueueDepth.Inc()
-		p.logger.Info("queued patch review", "event_id", task.PatchEventID, "repo_id", task.RepoID, "source", source)
-		return nil
-	default:
-		metrics.ReviewQueueFull.Inc()
-		queueErr := errors.New("review queue full")
-		p.logger.Warn("review queue full, marking task for retry", "event_id", task.PatchEventID, "repo_id", task.RepoID, "source", source)
-		if err := p.store.MarkReviewFailed(ctx, task.PatchEventID, task.RepoID, queueErr.Error()); err != nil {
-			return errors.Join(queueErr, fmt.Errorf("mark review failed: %w", err))
-		}
-		return queueErr
 	}
 }
 
@@ -493,6 +474,26 @@ func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, rela
 		return nil
 	}
 	return p.contextVMResponder.SendResponseToEvent(ctx, event.ID.Hex(), resp.ID, resp.Result, resp.Error, event.PubKey)
+}
+
+func repositoryRefFromPatch(event nostr.Event) (scope.RepositoryRef, error) {
+	var repository scope.RepositoryRef
+	count := 0
+	for _, tag := range event.Tags {
+		if len(tag) < 2 || tag[0] != "a" || !strings.HasPrefix(strings.TrimSpace(tag[1]), "30617:") {
+			continue
+		}
+		ref, err := scope.ParseRepositoryRef(tag[1])
+		if err != nil {
+			return scope.RepositoryRef{}, err
+		}
+		count++
+		repository = ref
+	}
+	if count != 1 {
+		return scope.RepositoryRef{}, errors.New("patch must contain exactly one canonical 30617 repository address")
+	}
+	return repository, nil
 }
 
 func eventTimestampPlausibleForKind(kind nostr.Kind, ts nostr.Timestamp, maxFutureSkew, maxPastAge time.Duration) bool {

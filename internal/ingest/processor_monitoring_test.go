@@ -9,11 +9,13 @@ import (
 
 	"drydock/internal/ingest"
 	"drydock/internal/monitoring"
+	"drydock/internal/revieworder"
+	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )
 
-func TestProcessorPersistsOldMonitoredListAndDeletionWithoutChangingReviewGate(t *testing.T) {
+func TestProcessorAppliesLiveMonitoredListToReactiveAdmission(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
 	operatorSK := nostr.Generate()
@@ -22,10 +24,13 @@ func TestProcessorPersistsOldMonitoredListAndDeletionWithoutChangingReviewGate(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	orders := revieworder.New(revieworder.Config{}, store, scope.Matcher{}, registry, nil, nil, logger)
 	processor := ingest.NewProcessor(
 		store,
-		slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		logger,
 		ingest.WithMonitoring(registry),
+		ingest.WithReviewOrders(orders),
 	)
 
 	repo := "30617:" + nostr.GetPublicKey(nostr.Generate()).Hex() + ":repo"
@@ -44,6 +49,22 @@ func TestProcessorPersistsOldMonitoredListAndDeletionWithoutChangingReviewGate(t
 	if !registry.Contains(repo) {
 		t.Fatalf("old current list was not applied: %#v", registry.Snapshot())
 	}
+	monitoredPatch := nostr.Event{
+		Kind: 1617, CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{{"a", repo}}, Content: "monitored diff",
+	}
+	signEvent(t, nostr.Generate(), &monitoredPatch)
+	if err := processor.ProcessEvent(ctx, monitoredPatch, "wss://relay.test"); err != nil {
+		t.Fatalf("process monitored patch: %v", err)
+	}
+	select {
+	case task := <-orders.Queue():
+		if task.PatchEventID != monitoredPatch.ID.Hex() {
+			t.Fatalf("queued task = %+v", task)
+		}
+	default:
+		t.Fatal("live list addition did not admit reactive patch")
+	}
 	complete, err := store.IsIngestHandlerComplete(ctx, list.ID.Hex())
 	if err != nil || !complete {
 		t.Fatalf("list completion: complete=%v err=%v", complete, err)
@@ -61,6 +82,26 @@ func TestProcessorPersistsOldMonitoredListAndDeletionWithoutChangingReviewGate(t
 	snapshot := registry.Snapshot()
 	if !snapshot.Initialized || !snapshot.Deleted || registry.Contains(repo) {
 		t.Fatalf("deletion snapshot: %#v", snapshot)
+	}
+	removedPatch := nostr.Event{
+		Kind: 1617, CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{{"a", repo}}, Content: "removed diff",
+	}
+	signEvent(t, nostr.Generate(), &removedPatch)
+	if err := processor.ProcessEvent(ctx, removedPatch, "wss://relay.test"); err != nil {
+		t.Fatalf("process removed patch: %v", err)
+	}
+	select {
+	case task := <-orders.Queue():
+		t.Fatalf("removed repository patch was queued: %+v", task)
+	default:
+	}
+	ref, err := scope.ParseRepositoryRef(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason, ok, err := store.GetReviewSkip(ctx, removedPatch.ID.Hex(), ref.RepositoryID); err != nil || !ok || reason != "not_monitored" {
+		t.Fatalf("removed repository durable skip = %q ok=%v err=%v", reason, ok, err)
 	}
 
 	// Handler completion makes relay redelivery idempotent.

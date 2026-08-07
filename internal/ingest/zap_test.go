@@ -8,10 +8,16 @@ import (
 	"testing"
 
 	"drydock/internal/db"
+	"drydock/internal/revieworder"
+	"drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 	"github.com/btcsuite/btcd/btcutil/bech32"
 )
+
+type allowAllMonitoring struct{}
+
+func (allowAllMonitoring) Contains(string) bool { return true }
 
 // testBolt11 returns a syntactically decodable 1u (100,000 msat) invoice.
 func testBolt11(t *testing.T) string {
@@ -190,10 +196,13 @@ func TestZapReceiptLateRequeuesPaymentBlockedReview(t *testing.T) {
 
 	zapperKey := nostr.Generate()
 	payerKey := nostr.Generate()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	orders := revieworder.New(revieworder.Config{}, store, scope.Matcher{}, allowAllMonitoring{}, nil, nil, logger)
 	processor := NewProcessor(
 		store,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger,
 		WithZapReceipts(serviceKey.Hex(), []string{nostr.GetPublicKey(zapperKey).Hex()}),
+		WithReviewOrders(orders),
 	)
 	receipt := nostr.Event{
 		Kind: 9735, CreatedAt: nostr.Now(),

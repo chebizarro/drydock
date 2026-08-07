@@ -217,6 +217,7 @@ func TestIntegrationFullPipelineProcess(t *testing.T) {
 		Config{Workers: 1},
 		store, repoSvc, ctxBuilder, engine, pubSvc, metaSvc,
 		queue, logger,
+		WithMonitoringRegistry(allowAllRegistry{}),
 	)
 
 	// Process the review task directly
@@ -363,7 +364,7 @@ func TestIntegrationMalformedReviewerJSONIsRepairedAndPublished(t *testing.T) {
 		SupersededTTL:       7 * 24 * time.Hour,
 	}, store, testSigner{sk: nostr.Generate()}, relayPub, logger)
 
-	runner := New(Config{Workers: 1}, store, repoSvc, ctxBuilder, engine, pubSvc, nil, make(chan db.ReviewTask), logger)
+	runner := New(Config{Workers: 1}, store, repoSvc, ctxBuilder, engine, pubSvc, nil, make(chan db.ReviewTask), logger, WithMonitoringRegistry(allowAllRegistry{}))
 	if err := runner.process(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}); err != nil {
 		t.Fatalf("process failed: %v", err)
 	}
@@ -483,6 +484,7 @@ func TestIntegrationApplyFailurePublishesHint(t *testing.T) {
 		Config{Workers: 1},
 		store, repoSvc, ctxBuilder, engine, pubSvc, nil,
 		queue, logger,
+		WithMonitoringRegistry(allowAllRegistry{}),
 	)
 
 	// process should return an error (patch doesn't apply)

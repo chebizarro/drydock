@@ -40,6 +40,7 @@ import (
 	"drydock/internal/ratelimit"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
+	"drydock/internal/revieworder"
 	"drydock/internal/scope"
 	"drydock/internal/securityreview"
 	"drydock/internal/securityscan"
@@ -557,6 +558,17 @@ func main() {
 
 	// --- Event handlers registered before subscribing ---
 	repositoryScope := scope.NewMatcher(cfg.RepoAllowlist, cfg.RepoOwnerAllowlist)
+	var reactiveRegistry revieworder.MonitoringRegistry
+	if monitoredRepos != nil {
+		reactiveRegistry = monitoredRepos
+	}
+	reviewOrders := revieworder.New(
+		revieworder.Config{}, store, repositoryScope, reactiveRegistry, repoSvc, paymentSvc, logger,
+	)
+	processorOpts = append(processorOpts, ingest.WithReviewOrders(reviewOrders))
+	if monitoredRepos == nil {
+		logger.Warn("reactive review disabled: no monitored repositories author is configured")
+	}
 	var ideHandler *idegateway.Handler
 	if signer != nil && qdrantClient != nil && embedClient != nil {
 		if keyer, ok := signer.(codechat.Keyer); ok {
@@ -609,12 +621,11 @@ func main() {
 	}
 
 	processorOpts = append(processorOpts,
-		ingest.WithRepositoryScope(repositoryScope),
 		ingest.WithTimingPolicy(cfg.ListenerMaxFutureSkew, cfg.ListenerMaxEventAge),
 	)
 	processor := ingest.NewProcessor(store, logger, processorOpts...)
 	if ideHandler != nil {
-		ideHandler.SetReviewEnqueuer(processor)
+		ideHandler.SetReviewEnqueuer(reviewOrders)
 	}
 	listenerOpts := []listener.Option{listener.WithPool(pool), listener.WithStore(store)}
 	if giftWrapOpener != nil {
@@ -640,6 +651,9 @@ func main() {
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityScanner(secScanner))
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityReviewer(securityStage))
 		pipelineOpts = append(pipelineOpts, pipeline.WithActivityHeartbeat(healthSrv.RecordActivity))
+		if monitoredRepos != nil {
+			pipelineOpts = append(pipelineOpts, pipeline.WithMonitoringRegistry(monitoredRepos))
+		}
 		if paymentSvc != nil {
 			pipelineOpts = append(pipelineOpts, pipeline.WithPaymentAuthorizer(paymentSvc))
 		}
@@ -659,7 +673,7 @@ func main() {
 			engine,
 			pubSvc,
 			metaSvc,
-			processor.ReviewQueue,
+			reviewOrders.Queue(),
 			logger,
 			pipelineOpts...,
 		)
@@ -682,6 +696,17 @@ func main() {
 	errCh := make(chan error, 3)
 	var listenerRunning atomic.Bool
 	var pipelineRunning atomic.Bool
+	if monitoredRepos != nil {
+		if err := healthSrv.AddReadinessFunc("monitored_repositories", func(context.Context) error {
+			if !monitoredRepos.Snapshot().Initialized {
+				return fmt.Errorf("no authoritative monitored repositories list has been loaded")
+			}
+			return nil
+		}); err != nil {
+			logger.Error("failed to register monitored repositories readiness check", "error", err)
+			os.Exit(1)
+		}
+	}
 	if err := healthSrv.AddReadinessFunc("listener", func(context.Context) error {
 		if !listenerRunning.Load() {
 			return fmt.Errorf("listener is not running")
@@ -786,11 +811,9 @@ func main() {
 		reconcilePayments := func() {
 			result, err := paymentSvc.ReconcilePendingPayments(ctx, 100)
 			for _, task := range result.Tasks {
-				select {
-				case processor.ReviewQueue <- task:
-				default:
-					logger.Warn("review queue full after payment reconciliation; row remains pending",
-						"patch_event_id", task.PatchEventID)
+				if enqueueErr := reviewOrders.EnqueueRecovered(ctx, task, "payment_reconciliation"); enqueueErr != nil {
+					logger.Warn("failed to enqueue review after payment reconciliation",
+						"patch_event_id", task.PatchEventID, "error", enqueueErr)
 				}
 			}
 			if len(result.Tasks) > 0 {
@@ -829,11 +852,9 @@ func main() {
 		} else if len(tasks) > 0 {
 			logger.Info("loading pending reviews into queue at startup", "count", len(tasks))
 			for _, task := range tasks {
-				select {
-				case processor.ReviewQueue <- task:
-				default:
-					logger.Warn("review queue full during startup fill; row remains pending for sweep",
-						"patch_event_id", task.PatchEventID)
+				if enqueueErr := reviewOrders.EnqueueRecovered(ctx, task, "startup_recovery"); enqueueErr != nil {
+					logger.Warn("failed to enqueue pending review during startup recovery",
+						"patch_event_id", task.PatchEventID, "error", enqueueErr)
 				}
 			}
 		}
@@ -852,9 +873,8 @@ func main() {
 						logger.Warn("stale pending review sweep error", "error", err)
 					} else {
 						for _, task := range tasks {
-							select {
-							case processor.ReviewQueue <- task:
-							default:
+							if enqueueErr := reviewOrders.EnqueueRecovered(ctx, task, "stale_pending_sweep"); enqueueErr != nil {
+								logger.Debug("stale pending review enqueue deferred", "patch_event_id", task.PatchEventID, "error", enqueueErr)
 							}
 						}
 					}
@@ -866,11 +886,8 @@ func main() {
 						metrics.ReviewsRequeued.Add(int64(len(tasks)))
 						logger.Info("requeued failed reviews", "count", len(tasks))
 						for _, task := range tasks {
-							select {
-							case processor.ReviewQueue <- task:
-							default:
-								logger.Warn("review queue still full during requeue",
-									"patch_event_id", task.PatchEventID)
+							if enqueueErr := reviewOrders.EnqueueRecovered(ctx, task, "failed_review_sweep"); enqueueErr != nil {
+								logger.Warn("failed review enqueue deferred", "patch_event_id", task.PatchEventID, "error", enqueueErr)
 							}
 						}
 					}

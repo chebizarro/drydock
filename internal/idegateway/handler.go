@@ -163,7 +163,7 @@ func WithPaymentAuthorizer(authorizer PaymentAuthorizer) func(*Handler) {
 	return func(h *Handler) { h.paymentAuth = authorizer }
 }
 
-// SetReviewEnqueuer completes startup wiring after the ingest processor exists.
+// SetReviewEnqueuer completes startup wiring with the shared queue owner.
 // It must be called before the listener starts.
 func (h *Handler) SetReviewEnqueuer(enqueuer ReviewEnqueuer) {
 	h.reviewEnqueuer = enqueuer
@@ -460,7 +460,13 @@ func (h *Handler) processPatchReviewRequest(ctx context.Context, event nostr.Eve
 		}
 	}
 
-	acquired, err := h.store.BeginReview(ctx, patchRec.EventID, patchRec.RepoID, req.Force)
+	claim := db.ReviewClaim{
+		Force:           req.Force,
+		Invocation:      db.ReviewInvocationIDE,
+		RequesterPubkey: event.PubKey.Hex(),
+		OrderID:         req.RequestID,
+	}
+	acquired, err := h.store.BeginReviewWithClaim(ctx, patchRec.EventID, patchRec.RepoID, claim)
 	if errors.Is(err, db.ErrReviewAlreadyPublished) {
 		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorConflict, Message: "review target was already published"}
 	}
@@ -470,7 +476,14 @@ func (h *Handler) processPatchReviewRequest(ctx context.Context, event nostr.Eve
 	if !acquired {
 		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorConflict, Message: "review target is already in progress or permanently skipped"}
 	}
-	task := db.ReviewTask{PatchEventID: patchRec.EventID, RepoID: patchRec.RepoID, Force: req.Force}
+	task := db.ReviewTask{
+		PatchEventID:    patchRec.EventID,
+		RepoID:          patchRec.RepoID,
+		Force:           req.Force,
+		Invocation:      db.ReviewInvocationIDE,
+		RequesterPubkey: event.PubKey.Hex(),
+		OrderID:         req.RequestID,
+	}
 	if err := h.reviewEnqueuer.EnqueueReview(ctx, task, "contextvm_review_request"); err != nil {
 		return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: fmt.Sprintf("enqueue review: %v", err)}
 	}

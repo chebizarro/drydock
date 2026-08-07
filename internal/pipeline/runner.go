@@ -21,6 +21,7 @@ import (
 	"drydock/internal/repo"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
+	"drydock/internal/scope"
 	"drydock/internal/securityreview"
 	"drydock/internal/securityscan"
 	"drydock/internal/tracing"
@@ -49,7 +50,10 @@ type CodeIndexer interface {
 	IndexRepo(ctx context.Context, repoPath, repoID string) error
 }
 
-var errPaymentBlockPersisted = errors.New("review payment blocked")
+var (
+	errPaymentBlockPersisted = errors.New("review payment blocked")
+	errReactiveReviewSkipped = errors.New("reactive review skipped because repository is no longer monitored")
+)
 
 func retryablePaymentError(auth payment.AuthorizeResult) error {
 	if !auth.Retryable {
@@ -59,6 +63,11 @@ func retryablePaymentError(auth payment.AuthorizeResult) error {
 		return fmt.Errorf("invalid retryable payment reason %q", auth.Reason)
 	}
 	return errors.New(payment.ReasonPaymentPending)
+}
+
+// MonitoringRegistry exposes the live reactive-review membership projection.
+type MonitoringRegistry interface {
+	Contains(repositoryAddress string) bool
 }
 
 // PaymentAuthorizer gates reviews according to the repository payment policy.
@@ -85,6 +94,7 @@ type Runner struct {
 	secScanner       *securityscan.Scanner
 	securityReviewer SecurityReviewStage
 	paymentAuth      PaymentAuthorizer
+	monitoring       MonitoringRegistry
 	queue            <-chan db.ReviewTask
 	workers          int
 	logger           *slog.Logger
@@ -154,6 +164,13 @@ func WithSecurityReviewer(stage SecurityReviewStage) func(*Runner) {
 func WithPaymentAuthorizer(auth PaymentAuthorizer) func(*Runner) {
 	return func(r *Runner) {
 		r.paymentAuth = auth
+	}
+}
+
+// WithMonitoringRegistry configures the live fail-closed reactive gate.
+func WithMonitoringRegistry(registry MonitoringRegistry) func(*Runner) {
+	return func(r *Runner) {
+		r.monitoring = registry
 	}
 }
 
@@ -241,15 +258,22 @@ func (r *Runner) work(ctx context.Context, id int) {
 			})
 			taskLog := tracing.Logger(taskCtx, log)
 
-			taskLog.Info("processing review task")
+			taskLog.Info("processing review task", "invocation", task.Invocation)
 			if err := r.process(taskCtx, task); err != nil {
-				metrics.ReviewsFinished.With("failed").Inc()
-				taskLog.Error("review pipeline failed",
-					"error", err,
-					"elapsed_ms", tracing.Elapsed(taskCtx).Milliseconds())
-				if !errors.Is(err, errPaymentBlockPersisted) {
-					if markErr := r.store.MarkReviewFailed(ctx, task.PatchEventID, task.RepoID, err.Error()); markErr != nil {
-						taskLog.Error("failed to mark review as failed", "error", markErr)
+				if errors.Is(err, errReactiveReviewSkipped) {
+					metrics.ReviewsFinished.With("skipped").Inc()
+					taskLog.Info("reactive review skipped after monitoring change",
+						"error", err,
+						"elapsed_ms", tracing.Elapsed(taskCtx).Milliseconds())
+				} else {
+					metrics.ReviewsFinished.With("failed").Inc()
+					taskLog.Error("review pipeline failed",
+						"error", err,
+						"elapsed_ms", tracing.Elapsed(taskCtx).Milliseconds())
+					if !errors.Is(err, errPaymentBlockPersisted) {
+						if markErr := r.store.MarkReviewFailed(ctx, task.PatchEventID, task.RepoID, err.Error()); markErr != nil {
+							taskLog.Error("failed to mark review as failed", "error", markErr)
+						}
 					}
 				}
 			} else {
@@ -271,6 +295,10 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	timer := tracing.NewPipelineTimer(ctx, r.logger)
 	defer timer.Summary()
 
+	if err := r.requireReactiveMonitoring(ctx, task, "pipeline_start"); err != nil {
+		return err
+	}
+
 	// 1. Prepare repo + apply patch series
 	var prep repo.PrepareResult
 	var prepErr error
@@ -281,6 +309,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	if prepErr != nil {
 		// Publish a review comment about the apply failure so the patch author gets feedback
 		if prep.FailureHint != "" && r.pubSvc != nil {
+			if gateErr := r.requireReactiveMonitoring(ctx, task, "pre_publication"); gateErr != nil {
+				return gateErr
+			}
 			r.publishApplyFailure(ctx, task, prep.FailureHint)
 		}
 		return fmt.Errorf("prepare patch series: %w", prepErr)
@@ -422,6 +453,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	if len(changedFiles) == 0 && len(bundle.ExcludedFiles) > 0 {
 		// All changed files were excluded by repo policy — skip LLM call and
 		// publish an explicit policy-skip review instead of failing.
+		if err := r.requireReactiveMonitoring(ctx, task, "pre_publication"); err != nil {
+			return err
+		}
 		reviewEventID, pubErr := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
 			PatchEventID:         task.PatchEventID,
 			RepoID:               task.RepoID,
@@ -570,6 +604,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 10. Publish review
 	var reviewEventID string
 	if err := timer.Time(tracing.StagePublish, func() error {
+		if err := r.requireReactiveMonitoring(ctx, task, "pre_publication"); err != nil {
+			return err
+		}
 		var pubErr error
 		reviewEventID, pubErr = r.pubSvc.PublishReview(ctx, publisher.PublishInput{
 			PatchEventID:         task.PatchEventID,
@@ -670,6 +707,20 @@ func (r *Runner) indexSourceCode(ctx context.Context, repoPath, repoID string, l
 		return fmt.Errorf("code indexing: %w", err)
 	}
 	return nil
+}
+
+func (r *Runner) requireReactiveMonitoring(ctx context.Context, task db.ReviewTask, stage string) error {
+	if task.Invocation != "" && task.Invocation != db.ReviewInvocationReactive {
+		return nil
+	}
+	repositoryAddress := fmt.Sprintf("%d:%s", scope.RepositoryAnnouncementKind, task.RepoID)
+	if _, err := scope.ParseRepositoryRef(repositoryAddress); err == nil && r.monitoring != nil && r.monitoring.Contains(repositoryAddress) {
+		return nil
+	}
+	if err := r.store.MarkReviewSkipped(ctx, task.PatchEventID, task.RepoID, "monitoring_removed"); err != nil {
+		return fmt.Errorf("persist reactive monitoring skip at %s: %w", stage, err)
+	}
+	return fmt.Errorf("%w at %s", errReactiveReviewSkipped, stage)
 }
 
 func (r *Runner) publishApplyFailure(ctx context.Context, task db.ReviewTask, hint string) {
