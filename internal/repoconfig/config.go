@@ -34,6 +34,7 @@ type RepoConfig struct {
 	Status       StatusConfig   `yaml:"status"`
 	AutoFix      AutoFixConfig  `yaml:"autofix"`
 	Payments     PaymentsConfig `yaml:"payments"`
+	Security     SecurityConfig `yaml:"security"`
 	Ensemble     EnsembleConfig `yaml:"ensemble"`
 	Instructions string         `yaml:"instructions"`
 }
@@ -80,6 +81,32 @@ func (c PaymentsConfig) MaintainersAreFree() bool {
 // AcceptsZaps reports whether NIP-57 zap receipts may authorize reviews.
 func (c PaymentsConfig) AcceptsZaps() bool {
 	return c.Enabled && (c.AcceptZaps == nil || *c.AcceptZaps)
+}
+
+// SecurityConfig controls the repository security review lens and its gating policy.
+type SecurityConfig struct {
+	Enabled       bool                `yaml:"enabled"`
+	GateSeverity  string              `yaml:"gate_severity"`
+	MinConfidence float64             `yaml:"min_confidence"`
+	ReviewerRoute string              `yaml:"reviewer_route"`
+	ClassifyRoute string              `yaml:"classify_route"`
+	VerifyVotes   int                 `yaml:"verify_votes"`
+	CWETaxonomy   bool                `yaml:"cwe_taxonomy"`
+	SAST          bool                `yaml:"sast"`
+	Taint         bool                `yaml:"taint"`
+	Surface       bool                `yaml:"surface"`
+	SCA           bool                `yaml:"sca"`
+	SecretScan    bool                `yaml:"secret_scan"`
+	Audit         SecurityAuditConfig `yaml:"audit"`
+}
+
+// SecurityAuditConfig controls defaults for full repository security audits.
+type SecurityAuditConfig struct {
+	Localizer      string `yaml:"localizer"`
+	Depth          string `yaml:"depth"`
+	VerifyVotes    int    `yaml:"verify_votes"`
+	AutoOnSnapshot bool   `yaml:"auto_on_snapshot"`
+	SARIF          bool   `yaml:"sarif"`
 }
 
 // EnsembleConfig controls multi-model ensemble review mode.
@@ -144,6 +171,26 @@ func Default() RepoConfig {
 			FreeForMaintainers: &freeForMaintainers,
 			AcceptZaps:         &acceptZaps,
 		},
+		Security: SecurityConfig{
+			Enabled:       false,
+			GateSeverity:  "high",
+			MinConfidence: 0.90,
+			ReviewerRoute: "sec70b",
+			ClassifyRoute: "secclassify",
+			VerifyVotes:   1,
+			CWETaxonomy:   true,
+			SAST:          true,
+			Taint:         true,
+			Surface:       true,
+			SCA:           false,
+			SecretScan:    false,
+			Audit: SecurityAuditConfig{
+				Localizer:   "heuristic",
+				Depth:       "standard",
+				VerifyVotes: 3,
+				SARIF:       true,
+			},
+		},
 		Ensemble: EnsembleConfig{
 			Enabled:          false,
 			Models:           []string{"coder32b", "llm70b"},
@@ -162,6 +209,7 @@ func Parse(data []byte) (RepoConfig, error) {
 	}
 
 	var raw RepoConfig
+	raw.Security = Default().Security
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&raw); err != nil {
@@ -336,6 +384,21 @@ func Parse(data []byte) (RepoConfig, error) {
 			return Default(), fmt.Errorf(".drydock.yaml: payments subscription requires both subscription_price_sats and subscription_days")
 		}
 	}
+
+	// Normalize and validate security gating fields. The security defaults are
+	// installed before decoding so omitted true-valued fields remain enabled
+	// while explicit false values are preserved.
+	raw.Security.GateSeverity = strings.ToLower(strings.TrimSpace(raw.Security.GateSeverity))
+	if !reviewengine.IsValidSeverity(raw.Security.GateSeverity) {
+		return Default(), fmt.Errorf(".drydock.yaml: invalid security.gate_severity %q", raw.Security.GateSeverity)
+	}
+	if raw.Security.MinConfidence < 0 || raw.Security.MinConfidence > 1 {
+		return Default(), fmt.Errorf(".drydock.yaml: security.min_confidence must be in [0,1], got %f", raw.Security.MinConfidence)
+	}
+	raw.Security.ReviewerRoute = strings.TrimSpace(raw.Security.ReviewerRoute)
+	raw.Security.ClassifyRoute = strings.TrimSpace(raw.Security.ClassifyRoute)
+	raw.Security.Audit.Localizer = strings.ToLower(strings.TrimSpace(raw.Security.Audit.Localizer))
+	raw.Security.Audit.Depth = strings.ToLower(strings.TrimSpace(raw.Security.Audit.Depth))
 
 	// Validate and default ensemble config.
 	if raw.Ensemble.Enabled {
