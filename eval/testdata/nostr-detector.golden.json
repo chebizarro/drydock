@@ -1,0 +1,260 @@
+[
+  {
+    "fixture": "testdata/nostr/client/fixed",
+    "profile": {
+      "is_nostr": true,
+      "confidence": 0.85,
+      "roles": [
+        "client"
+      ],
+      "evidence": [
+        {
+          "kind": "role",
+          "name": "client",
+          "path": "client.go",
+          "line": 1,
+          "detail": "client subscription marker"
+        },
+        {
+          "kind": "protocol",
+          "name": "nip-reference",
+          "path": "client.go",
+          "line": 3,
+          "weight": 0.15,
+          "detail": "NIP-01"
+        },
+        {
+          "kind": "structural",
+          "name": "nip01-event-shape",
+          "path": "client.go",
+          "line": 4,
+          "weight": 0.65,
+          "detail": "id,pubkey,created_at,kind,tags,content,sig"
+        },
+        {
+          "kind": "dependency",
+          "name": "github.com/nbd-wtf/go-nostr",
+          "path": "go.mod",
+          "line": 5,
+          "weight": 0.7,
+          "detail": "Nostr dependency in go.mod"
+        }
+      ]
+    }
+  },
+  {
+    "fixture": "testdata/nostr/client/vulnerable",
+    "profile": {
+      "is_nostr": true,
+      "confidence": 0.85,
+      "roles": [
+        "client"
+      ],
+      "evidence": [
+        {
+          "kind": "role",
+          "name": "client",
+          "path": "client.go",
+          "line": 1,
+          "detail": "client subscription marker"
+        },
+        {
+          "kind": "protocol",
+          "name": "nip-reference",
+          "path": "client.go",
+          "line": 3,
+          "weight": 0.15,
+          "detail": "NIP-01"
+        },
+        {
+          "kind": "structural",
+          "name": "nip01-event-shape",
+          "path": "client.go",
+          "line": 4,
+          "weight": 0.65,
+          "detail": "id,pubkey,created_at,kind,tags,content,sig"
+        },
+        {
+          "kind": "dependency",
+          "name": "github.com/nbd-wtf/go-nostr",
+          "path": "go.mod",
+          "line": 5,
+          "weight": 0.7,
+          "detail": "Nostr dependency in go.mod"
+        }
+      ]
+    }
+  },
+  {
+    "fixture": "testdata/nostr/relay/fixed",
+    "profile": {
+      "is_nostr": true,
+      "confidence": 0.85,
+      "roles": [
+        "relay"
+      ],
+      "evidence": [
+        {
+          "kind": "dependency",
+          "name": "github.com/nbd-wtf/go-nostr",
+          "path": "go.mod",
+          "line": 5,
+          "weight": 0.7,
+          "detail": "Nostr dependency in go.mod"
+        },
+        {
+          "kind": "role",
+          "name": "relay",
+          "path": "relay.go",
+          "line": 1,
+          "detail": "relay implementation marker"
+        },
+        {
+          "kind": "protocol",
+          "name": "nip-reference",
+          "path": "relay.go",
+          "line": 3,
+          "weight": 0.15,
+          "detail": "NIP-01"
+        },
+        {
+          "kind": "structural",
+          "name": "nip01-event-shape",
+          "path": "relay.go",
+          "line": 4,
+          "weight": 0.65,
+          "detail": "id,pubkey,created_at,kind,tags,content,sig"
+        },
+        {
+          "kind": "protocol",
+          "name": "message-verbs",
+          "path": "relay.go",
+          "line": 12,
+          "weight": 0.25,
+          "detail": "EVENT,OK"
+        }
+      ]
+    }
+  },
+  {
+    "fixture": "testdata/nostr/relay/vulnerable",
+    "profile": {
+      "is_nostr": true,
+      "confidence": 0.85,
+      "roles": [
+        "relay"
+      ],
+      "evidence": [
+        {
+          "kind": "dependency",
+          "name": "github.com/nbd-wtf/go-nostr",
+          "path": "go.mod",
+          "line": 5,
+          "weight": 0.7,
+          "detail": "Nostr dependency in go.mod"
+        },
+        {
+          "kind": "role",
+          "name": "relay",
+          "path": "relay.go",
+          "line": 1,
+          "detail": "relay implementation marker"
+        },
+        {
+          "kind": "protocol",
+          "name": "nip-reference",
+          "path": "relay.go",
+          "line": 3,
+          "weight": 0.15,
+          "detail": "NIP-01"
+        },
+        {
+          "kind": "structural",
+          "name": "nip01-event-shape",
+          "path": "relay.go",
+          "line": 4,
+          "weight": 0.65,
+          "detail": "id,pubkey,created_at,kind,tags,content,sig"
+        },
+        {
+          "kind": "protocol",
+          "name": "message-verbs",
+          "path": "relay.go",
+          "line": 12,
+          "weight": 0.25,
+          "detail": "EVENT,OK"
+        }
+      ]
+    }
+  },
+  {
+    "fixture": "testdata/nostr/signer/fixed",
+    "profile": {
+      "is_nostr": true,
+      "confidence": 0.8,
+      "roles": [
+        "signer"
+      ],
+      "evidence": [
+        {
+          "kind": "dependency",
+          "name": "github.com/nbd-wtf/go-nostr",
+          "path": "go.mod",
+          "line": 5,
+          "weight": 0.7,
+          "detail": "Nostr dependency in go.mod"
+        },
+        {
+          "kind": "role",
+          "name": "signer",
+          "path": "signer.go",
+          "line": 1,
+          "detail": "signing/key marker"
+        },
+        {
+          "kind": "protocol",
+          "name": "nip-reference",
+          "path": "signer.go",
+          "line": 3,
+          "weight": 0.15,
+          "detail": "NIP-46"
+        }
+      ]
+    }
+  },
+  {
+    "fixture": "testdata/nostr/signer/vulnerable",
+    "profile": {
+      "is_nostr": true,
+      "confidence": 0.8,
+      "roles": [
+        "signer"
+      ],
+      "evidence": [
+        {
+          "kind": "dependency",
+          "name": "github.com/nbd-wtf/go-nostr",
+          "path": "go.mod",
+          "line": 5,
+          "weight": 0.7,
+          "detail": "Nostr dependency in go.mod"
+        },
+        {
+          "kind": "role",
+          "name": "signer",
+          "path": "signer.go",
+          "line": 1,
+          "detail": "signing/key marker"
+        },
+        {
+          "kind": "protocol",
+          "name": "nip-reference",
+          "path": "signer.go",
+          "line": 3,
+          "weight": 0.15,
+          "detail": "NIP-46"
+        }
+      ]
+    }
+  }
+]
