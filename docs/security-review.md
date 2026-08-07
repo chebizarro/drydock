@@ -36,7 +36,7 @@ This design adds security review as a distinct concern with two entry points:
 | Context | `contextbuilder` 8-layer, `Provider` interface, token-budgeted | No security-surface map, no code-map/call-graph cache, no repo-wide mode |
 | Scope | Per-patch/PR only (diff-driven) | No whole-repo audit flow |
 | Config | `.drydock.yaml` (`review`, `ensemble`, `status`, `autofix`, …) | No `security` section |
-| Protocol | kinds 1111 / 1617-1619 / 1630-1633 / 25910 / 7000 / 1059 | No audit request method, no findings-report kind |
+| Protocol | kinds 1111 / 1617-1619 / 1630-1633 / 25910 / 1059 | Audit requests and progress now use ContextVM; NIP-90 kind 7000 is retired |
 
 The good news: the two pathways are mostly *composition* of existing seams — a new `Provider` or two, a new `ModelRoute`, a new pipeline stage, one ContextVM method, and a `.drydock.yaml` section — plus one genuinely new subsystem (the repo-wide audit orchestrator) that still reuses `contextbuilder`, `reviewengine`, and `publisher`.
 
@@ -221,7 +221,7 @@ Follows `docs/event-kinds.md` conventions and the `AGENTS.md` event-driven rules
 | Kind | Standard | Use |
 |---|---|---|
 | 25910 | ContextVM | New method `security/audit` (request) — subscribed on `#p` = drydock pubkey, `#method` filter |
-| 7000 | NIP-90 | Audit progress + completion feedback, tagged to the request `e` id |
+| 25910 | ContextVM | `security/audit/progress` notification (no JSON-RPC ID), addressed to the requester and tagged to the request `e` ID |
 | 30619 | NIP-34-adjacent addressable | **New** security audit report (addressable: `30619:<drydock-pubkey>:<repo-id>:<ref>`), public summary + severity counts + SARIF hash |
 | 1059 | NIP-59 gift wrap | Private detailed findings (file/line/evidence/taint) to the requester; only the `p` routing tag is public |
 | 1111 | NIP-22 | Per-finding security comments on PR/patch threads (Pathway B), same as today |
@@ -302,7 +302,7 @@ Sized for `bd` issues (this project tracks work in beads, not markdown TODOs —
 
 **Phase 3 — Pathway A (deep audit)**
 - `auditengine`: orchestrator, budgeting, worker pool, baseline diffing.
-- `contextvm`: `security/audit` method; `listener`/`idegateway` subscription + kind 7000 progress.
+- `contextvm`: `security/audit` request plus one-way `security/audit/progress` notifications on kind 25910.
 - `publisher`: kind 30619 report + gift-wrapped 1059 detail + SARIF artifact.
 - `db`: `security_audits` / `security_findings` / `security_baseline`.
 - Optional Antares localizer route.

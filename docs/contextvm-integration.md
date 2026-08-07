@@ -1,204 +1,182 @@
 # ContextVM Integration
 
-Drydock uses ContextVM as its application command protocol over Nostr. ContextVM messages are JSON-RPC 2.0 envelopes carried in Nostr kind `25910` events. Nostr provides relay delivery, signatures, identity, and routing tags; ContextVM provides method names, request IDs, responses, and errors.
+Drydock uses JSON-RPC 2.0 envelopes in Nostr kind `25910` for application intent. Nostr provides authenticated identity, relay delivery, and routing tags; ContextVM provides methods, parameters, correlation, results, and errors. The protocol is generic: Loom and other orderers call the same methods without Drydock containing Loom-specific event kinds or code.
 
-## Event Kind
+Private messages may be carried as NIP-59 gift wraps. The visible outer event is kind `1059`; the verified unsigned inner rumor is kind `25910`. Plain signed kind-25910 events are also supported.
 
-| Kind | Name | Purpose |
-|------|------|---------|
-| 25910 | ContextVM JSON-RPC | Application commands for review, fixes, and marketplace coordination |
+## Requests and Notifications
 
-Private ContextVM payloads should be transported through NIP-59 gift-wrap. In that case, the visible outer event is kind `1059` and the wrapped inner event is kind `25910`.
+A **request** has a non-empty JSON-RPC `id`. Drydock returns exactly one response with the same `id` and an `e` tag naming the request event.
 
-## Supported Methods
+A **notification** omits `id`. It is one-way and never produces a JSON-RPC response, including when it is unknown, malformed, unauthorized, rate-limited, or duplicated. Nostr event IDs provide delivery deduplication.
 
-| Method | Direction | Purpose |
-|--------|-----------|---------|
-| `review/request` | IDE or requester → Drydock | Request diagnostics for a file, selection, patch, or review target |
-| `review/apply-fix` | IDE or requester → Drydock | Request an auto-fix patch for a diagnostic or finding |
-| `marketplace/assign` | Drydock → Reviewer | Offer a review assignment |
-| `marketplace/accept` | Reviewer → Drydock | Accept a review assignment |
-| `marketplace/reject` | Reviewer → Drydock | Reject a review assignment with a reason |
+| Method | Shape | Direction | Purpose |
+|--------|-------|-----------|---------|
+| `review/request` | request | IDE → Drydock | Session-bound inline or stored-patch review |
+| `review/apply-fix` | request | IDE → Drydock | Apply an IDE diagnostic fix |
+| `review/order` | request | Any authenticated orderer → Drydock | Session-independent stored-patch order |
+| `marketplace/assign` | request | Drydock/orderer → Reviewer | Offer an assignment |
+| `marketplace/accept` | request | Reviewer → Drydock | Accept an assignment |
+| `marketplace/reject` | request | Reviewer → Drydock | Reject an assignment |
+| `marketplace/complete` | request | Reviewer → Drydock | Correlate a published review and trigger payout |
+| `marketplace/feedback` | notification | Assignment requester → Drydock | Rate a completed review |
+| `security/audit` | request | Requester → Drydock | Start a whole-repository audit |
+| `security/audit/sarif` | request | Original requester → Drydock | Retrieve authorized SARIF |
+| `security/audit/progress` | notification | Drydock → Requester | Report audit progress or terminal state |
 
-## JSON-RPC Request Format
+## Generic Review Orders
+
+`review/order` invokes the normal review pipeline without an IDE session and without requiring membership in the monitored-repositories list. The target must still pass the static repository/owner security ceiling, canonical repository policy, payment preflight, and force authorization.
+
+### Request
 
 ```json
 {
   "kind": 25910,
   "content": {
     "jsonrpc": "2.0",
-    "id": "req-01HZX...",
-    "method": "review/request",
+    "id": "order-01HZX...",
+    "method": "review/order",
     "params": {
-      "session_id": "session-uuid",
-      "request_id": "req-01HZX...",
-      "patch_event_id": "<nip-34-event-id>",
-      "force": true
+      "patch_event_id": "<stored-kind-1617-1619-event-id>",
+      "repo_addr": "30617:<owner-pubkey>:<identifier>",
+      "force": false
     }
   },
   "tags": [
-    ["p", "<recipient-pubkey>"],
-    ["session", "session-uuid"],
-    ["request", "req-01HZX..."],
-    ["method", "review/request"]
+    ["p", "<drydock-pubkey>"],
+    ["e", "<patch-event-id>"],
+    ["a", "30617:<owner-pubkey>:<identifier>"],
+    ["method", "review/order"],
+    ["expiration", "1714003200"]
   ]
 }
 ```
 
 Rules:
 
-- `content.jsonrpc` MUST be `"2.0"`.
-- `content.id` MUST be present for requests that expect a response.
-- `content.method` MUST be one of the supported methods.
-- `content.params` MUST be an object.
-- `review/request` MUST include `p`, `session`, and `request` tags matching its parameters/envelope; `method` is recommended for subscription routing.
+- `id`, `patch_event_id`, exactly one matching `p`, `e`, `method`, and `expiration` tag are required.
+- Expiration must be in the future and no more than 15 minutes after event creation.
+- `patch_event_id` must already be stored and must contain exactly one canonical kind-30617 `a` tag.
+- `repo_addr` and the event `a` tag are optional, but when present they must match each other and the stored patch.
+- Address-only orders are rejected because a repository address does not identify a deterministic diff.
+- A missing patch or repository announcement returns not found.
+- The authenticated sender is the requester. Callers cannot supply another requester identity.
 
-## JSON-RPC Response Format
+Drydock checks the static repository/owner allowlists before consulting payment. A paid order may bypass **monitoring membership**, but payment never bypasses the static security ceiling. Repository payment policy is loaded from the canonical base branch. An authorized `force` bypasses only root-status gating.
 
-Successful responses use `result` and the same `id` as the request:
+### Accepted Response
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "order-01HZX...",
+  "result": {
+    "accepted": true,
+    "order_id": "order-01HZX...",
+    "request_event_id": "<original-event-id>",
+    "patch_event_id": "<patch-event-id>",
+    "repo_addr": "30617:<owner-pubkey>:<identifier>",
+    "forced": false,
+    "state": "queued"
+  }
+}
+```
+
+Acceptance is durable intake, not completion. `state` is `queued` when the in-memory wake-up was emitted and `retry_pending` when a queue-full condition left the durable task for recovery. The pipeline publishes results through the normal NIP-34 comment flow.
+
+The pair `(requester pubkey, JSON-RPC id)` is the immutable order key. Exact retries return the original receipt. Reusing the key for different parameters, or concurrently ordering a target already claimed by another order, returns conflict. Receipt creation and review claiming are atomic, and restart recovery preserves invocation, requester, order ID, and force metadata.
+
+## IDE Review Requests
+
+`review/request` remains session-bound. Inline mode reviews the supplied diff synchronously. Stored-patch mode validates session ownership and then delegates scope, payment, durable claiming, and queueing to the same review-order service.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `session_id` | yes | Active session owned by the signer |
+| `request_id` | optional | Defaults to the JSON-RPC ID |
+| `diff` | inline mode | Unified diff |
+| `changed_files` | optional | Paths for inline diagnostics |
+| `patch_event_id` | stored-patch mode | Stored NIP-34 patch/PR |
+| `force` | optional | Authorized root-status bypass in stored-patch mode |
+
+## Marketplace Feedback Notification
 
 ```json
 {
   "kind": 25910,
   "content": {
     "jsonrpc": "2.0",
-    "id": "req-01HZX...",
-    "result": {
-      "diagnostics": []
+    "method": "marketplace/feedback",
+    "params": {
+      "review_event_id": "<completed-review-event-id>",
+      "rating": 5,
+      "helpful": true,
+      "accurate": true,
+      "comment": "Useful review"
     }
   },
   "tags": [
-    ["p", "<requester-pubkey>"],
-    ["e", "<request-event-id>"],
-    ["t", "drydock"],
-    ["method", "review/request"]
+    ["p", "<drydock-pubkey>"],
+    ["e", "<completed-review-event-id>"],
+    ["method", "marketplace/feedback"],
+    ["expiration", "1714003200"]
   ]
 }
 ```
 
-Error responses use `error` and the same `id` when available:
+The notification must omit `id`; `method` and `e` tags must match the payload. Expiration is optional, but when present it must be current and within the 15-minute lifetime. Comments are limited to 4096 bytes and ratings to 1–5.
+
+Drydock derives the rater from the authenticated sender and the reviewer from the completed assignment. Only the assignment requester may rate it. Feedback is rate-limited per sender. The first valid write wins; later deliveries or competing feedback events are idempotent and do not recalculate reputation twice. Invalid or unauthorized notifications are handled without a response, while transient storage failures remain retryable by relay redelivery.
+
+This notification is the clean replacement for NIP-90 kind `7000`. Kind `7000` is ignored.
+
+## Security Audit Progress Notification
 
 ```json
 {
-  "kind": 25910,
-  "content": {
-    "jsonrpc": "2.0",
-    "id": "req-01HZX...",
-    "error": {
-      "code": -32602,
-      "message": "Invalid params",
-      "data": {
-        "field": "file",
-        "reason": "required"
-      }
-    }
-  },
-  "tags": [
-    ["p", "<requester-pubkey>"],
-    ["e", "<request-event-id>"],
-    ["t", "drydock"],
-    ["method", "review/request"]
-  ]
+  "jsonrpc": "2.0",
+  "method": "security/audit/progress",
+  "params": {
+    "audit_id": 42,
+    "request_event_id": "<security-audit-request-event-id>",
+    "phase": "published",
+    "status": "success",
+    "occurred_at": 1714003000
+  }
 }
 ```
 
-## Method Parameters
+Drydock addresses the notification to the audit requester and adds an `e` tag for the original request. Status is `processing`, `success`, or `error`; success and error are terminal. Consumers deduplicate by event ID, never regress a terminal state to processing, and order otherwise by `occurred_at` then event ID. Progress delivery is advisory: durable audit state and SARIF remain authoritative.
 
-### `review/request`
+## Errors
 
-`review/request` has two modes. Inline IDE mode reviews the supplied diff synchronously and returns diagnostics. Patch-target mode names a stored NIP-34 patch/PR and queues the normal asynchronous review pipeline.
+| Code | Name | Meaning |
+|------|------|---------|
+| -32700 | Parse error | Invalid JSON |
+| -32600 | Invalid request | Malformed envelope or request missing an ID |
+| -32601 | Method not found | Unsupported request method |
+| -32602 | Invalid params | Invalid fields or target consistency |
+| -32603 | Internal error | Transient/internal processing failure |
+| -32001 | Unauthorized | Static ceiling, sender, or force authorization failed |
+| -32002 | Not found | Patch, repository, session, assignment, or artifact missing |
+| -32003 | Conflict | Immutable idempotency or active-target conflict |
+| -32004 | Expired | Request expired |
+| -32005 | Rate limited | Sender exceeded its configured window |
+| -32006 | Payment required | Payment preflight denied; data includes safe reason/retryability |
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Active IDE/requester session owned by the event signer |
-| `request_id` | string | optional | Correlation ID; defaults to the JSON-RPC `id` |
-| `diff` | string | inline mode | Unified diff of uncommitted changes |
-| `changed_files` | string[] | optional | Changed paths used by inline diagnostics |
-| `full_review` | boolean | optional | Inline review preference |
-| `patch_event_id` | string | patch mode | Stored NIP-34 patch or PR event ID |
-| `force` | boolean | optional | Request an authorized bypass of the root-status gate; valid only in patch mode |
+## Subscription and Privacy Guidance
 
-Patch-target requests use the stored patch event as authoritative and ignore inline diff fields. Before `BeginReview` and enqueue, Drydock:
-
-1. verifies the requester owns the referenced session;
-2. applies the operator repository/repository-owner scope matcher;
-3. loads `.drydock.yaml` from the canonical repository base and applies its payment policy;
-4. authorizes `force`, when requested; and
-5. durably records the task, including `Force`, before enqueueing it.
-
-A forced request is allowed when the requester can author repository status (`CanStatusAuthor`: root author, repository owner, or maintainer) **or** the target has paid access. Paid access kinds are `subscription`, `zap`, `cashu_review`, and `cashu_subscription`; free pubkeys, free-maintainer access, and free-tier quota do not authorize force. Payment is currently an entitlement attached to the target patch, not proof that the ContextVM sender personally paid.
-
-`force` bypasses only the pipeline root-status gate. Scope, payment, repository preparation, and all review/publication policies still apply. It permits explicit reviews of draft, applied/merged, or closed roots and can reopen a prior `status_skipped:` target. Already reviewing or published targets return conflict. A successful patch-mode response is a queued acknowledgement (`queued: true`, `patch_event_id`, and `forced`); review results are published asynchronously through the normal NIP-34 flow.
-
-### `review/apply-fix`
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | optional | IDE or requester session ID |
-| `fix_id` | string | required | Fix identifier returned by review diagnostics |
-| `file` | string | optional | Relative file path to patch |
-| `diagnostic_id` | string | optional | Diagnostic or finding identifier |
-
-### `marketplace/assign`
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `assignment_id` | string | required | Stable assignment identifier |
-| `patch_event_id` | string | required | Patch or PR event to review |
-| `repo_id` | string | required | Repository identifier |
-| `languages` | string[] | optional | Languages detected in the patch |
-| `domains` | string[] | optional | Requested review domains |
-| `price_sats` | integer | optional | Offered price in sats |
-| `deadline` | integer | optional | Unix timestamp deadline |
-
-### `marketplace/accept`
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `assignment_id` | string | required | Assignment being accepted |
-| `estimated_time` | string | optional | Reviewer's estimated turnaround |
-
-### `marketplace/reject`
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `assignment_id` | string | required | Assignment being rejected |
-| `reason` | string | optional | Human-readable rejection reason |
-
-## Error Codes
-
-Drydock uses JSON-RPC standard codes plus application-specific negative codes.
-
-| Code | Name | Description |
-|------|------|-------------|
-| -32700 | Parse error | `content` is not valid JSON |
-| -32600 | Invalid request | JSON-RPC envelope is malformed |
-| -32601 | Method not found | Unsupported ContextVM method |
-| -32602 | Invalid params | Missing or invalid method parameters |
-| -32603 | Internal error | Drydock failed while processing the request |
-| -32001 | Unauthorized | Sender is not allowed to invoke the method |
-| -32002 | Not found | Referenced session, fix, assignment, or patch was not found |
-| -32003 | Conflict | Request conflicts with current assignment or session state |
-| -32004 | Expired | Request or assignment has expired |
-| -32005 | Rate limited | Sender exceeded allowed request rate |
-
-## Tag Conventions
-
-| Tag | Purpose |
-|-----|---------|
-| `p` | Recipient pubkey for routing |
-| `e` | Related request, assignment, patch, or response event |
-| `a` | Addressable session, repository, or profile reference |
-| `t` | Topic tags such as `drydock`, `review`, or `marketplace` |
-| `method` | ContextVM method name for efficient subscriptions |
-| `expiration` | Unix timestamp after which relays may discard the event |
-
-## Subscription Guidance
-
-Participants subscribe by recipient and method, for example:
+Subscribe by recipient and method:
 
 ```json
-{"kinds": [25910], "#p": ["<my-pubkey>"], "#method": ["review/request"]}
+{"kinds":[25910],"#p":["<my-pubkey>"],"#method":["review/order","marketplace/feedback","security/audit/progress"]}
 ```
 
-Use event IDs for deduplication and JSON-RPC IDs for command correlation. Do not poll relays for responses; keep subscriptions open and react to matching events.
+Gift-wrap subscriptions are recipient-scoped:
+
+```json
+{"kinds":[1059],"#p":["<my-pubkey>"]}
+```
+
+Use gift wrapping for source, diagnostics, assignments, payment-sensitive metadata, and private security results. Keep only recipient routing on the outer wrapper. Use Nostr event IDs for deduplication, JSON-RPC IDs for request correlation, and persistent subscriptions rather than polling.

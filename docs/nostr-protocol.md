@@ -6,11 +6,13 @@ Drydock integrates with Nostr as both a consumer and producer of signed events. 
 
 | Kind | NIP | Name | Drydock Role |
 |------|-----|------|-------------|
+| 5 | NIP-09 | Deletion | Removes the exact operator-authored monitored-repositories list |
+| 30001 | NIP-51 | Named list | Live operator control plane for repositories eligible for reactive review |
 | 30617 | NIP-34 | Repository announcement | Repository registry — extracts clone URLs, relay hints, and metadata |
 | 30618 | NIP-34 | Repository state snapshot | Staleness gate — if a patch's tip commit is already in the latest snapshot, the review is skipped |
-| 1617 | NIP-34 | Patch event | **Primary review trigger** — contains unified diff in `content` |
-| 1618 | NIP-34 | PR (pull request) event | PR tip review trigger — `content` is a cover letter; the reviewed diff is computed from git (see below) |
-| 1619 | NIP-34 | PR update event | Review trigger — diff computed like 1618; uses `E` tag to find root PR for comment threading |
+| 1617 | NIP-34 | Patch event | Reactive candidate when its repository is monitored; diff is in `content` |
+| 1618 | NIP-34 | PR event | Reactive candidate when monitored; reviewed diff is computed from git |
+| 1619 | NIP-34 | PR update | Reactive candidate when monitored; uses `E` for comment threading |
 | 1621 | NIP-34 | PR revision | Monitored and stored; not directly reviewed |
 | 1111 | NIP-22 | Comment | Review output kind; also ingested for thread cache |
 | 1630 | NIP-34 | Status: open | Root status tracking — reviewed automatically (default) |
@@ -20,8 +22,7 @@ Drydock integrates with Nostr as both a consumer and producer of signed events. 
 | 1985 | NIP-32 | Label | Monitored and stored |
 | 30078 | NIP-78 | Application data | IDE session state and replaceable Drydock client state |
 | 31990 | NIP-89 | Handler/reviewer profile | Reviewer capability profiles for marketplace discovery |
-| 25910 | ContextVM | JSON-RPC transport | Review, fix, assignment, accept, and reject commands |
-| 7000 | NIP-90 | Job feedback | Marketplace feedback and review completion feedback |
+| 25910 | ContextVM | JSON-RPC transport | Review/order, IDE, marketplace, feedback, audit, and progress messages |
 | 9735 | NIP-57 | Zap receipt | Payment proof addressed to Drydock and linked to a patch/PR event |
 | 1059 | NIP-59 | Gift wrap | Encrypted wrapper for private Drydock events |
 
@@ -30,6 +31,20 @@ Drydock integrates with Nostr as both a consumer and producer of signed events. 
 Kind `9735` receipts are public payment proofs. Drydock requires a `p` tag matching its signer pubkey, an `e` tag naming the patch/PR event, a positive amount from `amount` or `bolt11`, and—when configured—a receipt author in `DRYDOCK_TRUSTED_ZAPPERS`. Repository policy compares the receipt millisatoshis with `payments.price_sats * 1000` and can disable this path with `payments.accept_zaps: false`.
 
 A receipt received after a review was recorded as `payment_blocked` clears that failure and re-enqueues the review. Receipts received before the patch remain stored for authorization when the patch reaches the pipeline.
+
+## Reactive Monitoring and On-Demand Ordering
+
+Drydock has two independent invocation modes:
+
+1. **Reactive:** kinds `1617`, `1618`, and `1619` are admitted only when their unique kind-30617 repository `a` tag is present in the active operator-authored NIP-51 list.
+2. **On demand:** an authenticated `review/order` request names a stored patch. It may be outside the monitored list, which makes the method usable by Loom and other generic ContextVM orderers.
+
+The monitored list is kind `30001`, authored by `DRYDOCK_MONITORED_REPOS_AUTHOR`, with `d=drydock:monitored-repositories:v1` and zero or more canonical repository `a` tags. Drydock follows NIP-01 replacement ordering (newer timestamp, then lower event ID), ignores foreign/malformed/stale revisions, accepts an explicit empty list, honors an exact kind-5 deletion, and accepts a newer recreation. List and deletion filters have no `since` so the current control-plane state is recoverable independently of the listener cursor.
+
+The static `DRYDOCK_REPO_ALLOWLIST` and `DRYDOCK_REPO_OWNER_ALLOWLIST` are a hard security ceiling across both modes. Monitoring membership does not bypass them, and payment does not bypass them. Within the ceiling, a paid on-demand order bypasses monitoring membership but still uses canonical repository payment policy. Reactive membership is checked at intake and again before work/publication so live removal prevents stale queued reactive work from publishing.
+
+With no configured author in development, reactive review is disabled. In production the author is required. When configured, readiness remains false until an authoritative list, empty list, or deletion is loaded.
+
 
 ## Review Diff Derivation
 
@@ -63,11 +78,12 @@ Automatic reviews respect the root's current NIP-34 status at review time
 | kind 1631 (applied/merged) | Never |
 | kind 1632 (closed) | Never |
 
-Status-gated skips are permanent (not retried by the failed-review sweep); a
-later status change back to open triggers reviews normally. An authorized
-ContextVM `review/request` with `force: true` can explicitly bypass this status
-gate, including for a prior `status_skipped:` target, while scope and payment
-gates still apply. See [ContextVM Integration](contextvm-integration.md) and
+Status-gated skips are permanent (not retried by the failed-review sweep). A
+later status change back to open makes future patch/update events and new
+on-demand orders eligible; it does not by itself re-enqueue a previously skipped patch. An authorized
+ContextVM `review/request` or `review/order` with `force: true` can explicitly
+bypass this status gate, including for a prior `status_skipped:` target, while
+the static security ceiling and payment gates still apply. See [ContextVM Integration](contextvm-integration.md) and
 [Per-Repository Configuration](repo-config.md).
 
 ## Kind 0 Profile
@@ -92,11 +108,13 @@ Drydock avoids bespoke one-off event kinds for application commands. The mapping
 | Reviewer profile | 30620 | 31990 (NIP-89) |
 | Marketplace assignment | 1660 | 25910 (ContextVM JSON-RPC) |
 | Marketplace accept/reject | 1661, 1662 | 25910 (ContextVM JSON-RPC) |
-| Marketplace feedback | 1663 | 7000 (NIP-90 feedback) |
+| Marketplace feedback | 1663 / NIP-90 7000 | 25910 (`marketplace/feedback` notification) |
+| Generic stored-patch order | none | 25910 (`review/order` request) |
+| Audit progress | NIP-90 7000 | 25910 (`security/audit/progress` notification) |
 
 ## ContextVM JSON-RPC Transport (kind 25910)
 
-ContextVM messages use kind `25910` with JSON-RPC 2.0 in the event `content`. Nostr supplies identity, signatures, relay transport, and routing tags; ContextVM supplies method names, parameters, correlation IDs, responses, and errors.
+ContextVM messages use kind `25910` with JSON-RPC 2.0 in the event `content`. Nostr supplies identity, signatures, relay transport, and routing tags; ContextVM supplies methods, parameters, correlation, results, and errors. Requests contain an `id` and receive a correlated response. Notifications omit `id` and never receive a response. Drydock's notifications are `marketplace/feedback` and `security/audit/progress`; NIP-90 kind `7000` is ignored after the clean cut.
 
 Example request:
 
@@ -135,19 +153,17 @@ Example response:
     }
   },
   "tags": [
-    ["p", "<requester-pubkey>"],
     ["e", "<request-event-id>"],
-    ["t", "drydock"],
-    ["method", "review/request"]
+    ["p", "<requester-pubkey>"]
   ]
 }
 ```
 
-Supported methods are documented in [ContextVM Integration](contextvm-integration.md).
+Supported methods are documented in [ContextVM Integration](contextvm-integration.md). Method filters are appropriate for incoming requests and notifications. Responses carry `e` and `p` tags but no `method` tag, so response consumers subscribe by recipient and correlate the JSON-RPC ID and request-event `e` tag.
 
 ## Encryption (NIP-59 Gift Wrap)
 
-Private IDE, review, fix, marketplace assignment, acceptance, and rejection payloads should be protected with NIP-59 gift-wrap. The outer visible event is a gift-wrap event (`1059`) addressed to the recipient; the sealed rumor inside carries the Drydock event such as kind `25910`.
+Private IDE, review/order, fix, marketplace request/feedback, and security-audit payloads should be protected with NIP-59 gift-wrap. The outer visible event is a gift-wrap event (`1059`) addressed to the recipient; the sealed rumor inside carries the Drydock event such as kind `25910`.
 
 Use gift-wrap when event content includes source code, diagnostics, assignment details, reviewer decisions, or payment-sensitive metadata. Public discovery data, such as NIP-89 reviewer profiles (`31990`), may remain unwrapped when the reviewer intends it to be discoverable.
 
@@ -237,15 +253,7 @@ Drydock determines how to thread review comments based on the patch event's kind
 
 ## Publishing Guard
 
-The publisher includes an explicit check that prevents accidentally emitting status events:
-
-```go
-if summaryEvent.Kind == 1631 || summaryEvent.Kind == 1632 {
-    return "", errors.New("publisher must not emit status events 1631/1632")
-}
-```
-
-Drydock only publishes kind 1111 (comment) events. It never sets status (applied, closed) on behalf of repository maintainers.
+`PublishReview` rejects all NIP-34 status kinds so comment construction cannot accidentally emit status. Separately, the opt-in status publisher may emit authorized kind `1630` advisory state when repository policy and finding thresholds allow it. Drydock never publishes applied/merged (`1631`) or closed (`1632`) status on behalf of maintainers.
 
 ## Signing
 
@@ -270,6 +278,7 @@ resets it to the configured lookback boundary on startup and resumes from
 there.
 
 This means:
-- No events are missed across restarts
-- A small window of events may be re-delivered (deduplicated by `ingested_events` primary key)
-- If the high-water-mark is older than the configured lookback, the lookback window takes precedence
+- General event intake does not miss events across restarts
+- A small window may be re-delivered and is deduplicated by `ingested_events`
+- Catch-up resumes from the high-water mark minus overlap, bounded to at most `DRYDOCK_LISTENER_MAX_EVENT_AGE` of history
+- Monitored-list and exact deletion subscriptions deliberately omit `since`; the persisted replacement winner, not the general cursor, controls reactive readiness

@@ -26,11 +26,10 @@ The Drydock marketplace connects patch authors with specialized human reviewers.
 | Kind | Name | Publisher | Description |
 |------|------|-----------|-------------|
 | 31990 | Reviewer Profile | Reviewer | NIP-89 handler profile advertising reviewer capabilities |
-| 25910 | ContextVM JSON-RPC | Drydock / Reviewer | Assignment, accept, and reject methods |
-| 7000 | Review Feedback | Author / Drydock | NIP-90 feedback for completed review quality and marketplace outcomes |
-| 1059 | NIP-59 Gift Wrap | Any private participant | Encrypted envelope for private marketplace commands |
+| 25910 | ContextVM JSON-RPC | Drydock / Reviewer / Requester | Assignment, accept, reject, complete, and feedback methods |
+| 1059 | NIP-59 Gift Wrap | Any private participant | Encrypted envelope for private marketplace requests and notifications |
 
-Deprecated mappings: `30620` is replaced by NIP-89 kind `31990`; `1660`, `1661`, and `1662` are replaced by ContextVM messages on kind `25910`; `1663` is replaced by NIP-90 feedback kind `7000`.
+Deprecated mappings: `30620` is replaced by NIP-89 kind `31990`; `1660`–`1663` and NIP-90 kind `7000` are replaced by ContextVM messages on kind `25910`. Kind `7000` is not subscribed to or routed.
 
 ## Reviewer Registration
 
@@ -42,47 +41,39 @@ Reviewers publish a NIP-89 handler/reviewer profile. The event is addressable an
 {
   "kind": 31990,
   "content": {
-    "name": "Alice Security",
-    "display_name": "Alice Security",
-    "about": "Security-focused Go, Rust, and Python reviewer",
-    "picture": "https://example.com/alice.png",
-    "nip90": true,
-    "drydock": {
-      "languages": ["go", "rust", "python"],
-      "domains": ["security", "cryptography", "performance"],
-      "availability": "available",
-      "price_per_review": 5000,
-      "payout_destination": "lnbc...",
-      "max_concurrent": 3,
-      "response_time": "4h"
-    }
+    "pubkey": "<reviewer-pubkey>",
+    "max_concurrent": 3,
+    "response_time": "4h"
   },
   "tags": [
     ["d", "drydock-reviewer"],
-    ["k", "1111"],
-    ["k", "7000"],
-    ["t", "code-reviewer"],
-    ["t", "security-expert"],
-    ["t", "go"],
-    ["t", "rust"],
-    ["t", "python"]
+    ["k", "25910"],
+    ["name", "Alice Security"],
+    ["about", "Security-focused Go, Rust, and Python reviewer"],
+    ["drydock:languages", "go", "rust", "python"],
+    ["drydock:domains", "security", "cryptography", "performance"],
+    ["drydock:availability", "available"],
+    ["drydock:price", "5000"],
+    ["drydock:payout", "lnbc..."],
+    ["drydock:methods", "marketplace/assign", "marketplace/accept", "marketplace/reject", "marketplace/complete", "marketplace/feedback"]
   ]
 }
 ```
 
 ### Profile Fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` / `display_name` | string | Human-readable reviewer name |
-| `about` | string | Public reviewer summary |
-| `drydock.languages` | string[] | Programming languages (lowercase) |
-| `drydock.domains` | string[] | Expertise areas (security, performance, api-design, etc.) |
-| `drydock.availability` | string | `available`, `busy`, or `unavailable` |
-| `drydock.price_per_review` | int | Price in satoshis (0 = free) |
-| `drydock.payout_destination` | string | Fresh BOLT11 invoice used for reviewer payout |
-| `drydock.max_concurrent` | int | Maximum simultaneous assignments |
-| `drydock.response_time` | string | Typical response time (e.g., "2h", "24h") |
+| Field/Tag | Type | Description |
+|-----------|------|-------------|
+| content `pubkey` | string | Reviewer public key; the authenticated event author remains authoritative |
+| content `max_concurrent` | int | Maximum simultaneous assignments |
+| content `response_time` | string | Typical response time, such as `4h` |
+| `name` / `about` | tag | Human-readable identity and summary |
+| `drydock:languages` | multi-value tag | Lowercase programming languages |
+| `drydock:domains` | multi-value tag | Expertise areas |
+| `drydock:availability` | tag | `available`, `busy`, or `unavailable` |
+| `drydock:price` | tag | Price per review in satoshis |
+| `drydock:payout` | tag | Fresh BOLT11 payout destination |
+| `drydock:methods` | multi-value tag | Supported ContextVM marketplace methods |
 
 ## Patch Routing
 
@@ -120,6 +111,7 @@ Marketplace commands use kind `25910` with JSON-RPC 2.0 payloads.
 | `marketplace/accept` | Reviewer → Drydock | Accepts an assignment |
 | `marketplace/reject` | Reviewer → Drydock | Declines an assignment with a reason |
 | `marketplace/complete` | Reviewer → Drydock | Authenticates a published review event and triggers payout/reconciliation |
+| `marketplace/feedback` | Assignment requester → Drydock | One-way authenticated rating notification; no response |
 
 See [ContextVM Integration](contextvm-integration.md) for the shared request, response, and error format.
 
@@ -160,11 +152,7 @@ A `marketplace/complete` request contains `assignment_id` and `review_event_id`.
   },
   "tags": [
     ["p", "<reviewer-pubkey>"],
-    ["e", "<patch-event-id>"],
-    ["a", "30617:<repo-naddr>"],
-    ["t", "drydock"],
-    ["method", "marketplace/assign"],
-    ["expiration", "1714003200"]
+    ["method", "marketplace/assign"]
   ]
 }
 ```
@@ -237,50 +225,49 @@ volume_bonus = 1 - (1 / (1 + completed_reviews / 10))
 overall_score = (acceptance_rate × 0.4) + (rating_normalized × 0.4) + (volume_bonus × 0.2)
 ```
 
-### Feedback Event (kind 7000)
+### Feedback Notification (`marketplace/feedback` on kind 25910)
 
-After a review is completed, the patch author can rate it with NIP-90 feedback:
+After completion, the assignment requester may rate the review with a one-way ContextVM notification:
 
 ```json
 {
-  "kind": 7000,
-  "content": "Excellent review, found a critical security issue",
+  "kind": 25910,
+  "content": {
+    "jsonrpc": "2.0",
+    "method": "marketplace/feedback",
+    "params": {
+      "review_event_id": "<review-event-id>",
+      "rating": 5,
+      "helpful": true,
+      "accurate": true,
+      "comment": "Excellent review; it found a critical issue"
+    }
+  },
   "tags": [
-    ["status", "success"],
+    ["p", "<drydock-pubkey>"],
     ["e", "<review-event-id>"],
-    ["p", "<reviewer-pubkey>"],
-    ["rating", "5"],
-    ["helpful", "true"],
-    ["accurate", "true"],
-    ["t", "drydock"],
-    ["t", "review-feedback"]
+    ["method", "marketplace/feedback"],
+    ["expiration", "1714003200"]
   ]
 }
 ```
+
+The JSON-RPC `id` is omitted, so Drydock sends no response. The signed event sender must be the durable assignment requester; the reviewer is derived from the completed assignment and cannot be supplied by the caller. The `e` and `method` tags must match the payload. Ratings are 1–5 and comments are limited to 4096 bytes.
+
+Feedback is rate-limited per sender. The first valid feedback write wins; duplicate relay delivery or a competing later event is idempotent and does not update reputation twice. Transient storage failures remain eligible for relay redelivery. NIP-90 kind `7000` is retired and ignored after the clean cut.
 
 ## Configuration
 
 ### Server Environment Variables
 
+Marketplace feedback uses the global relay configuration and these per-sender limits:
+
 ```bash
-# Enable marketplace
-DRYDOCK_MARKETPLACE_ENABLED=true
-
-# Default relays for marketplace events
-DRYDOCK_MARKETPLACE_RELAYS="wss://relay.damus.io,wss://nos.lol"
-
-# Maximum reviewers to assign per patch
-DRYDOCK_MARKETPLACE_MAX_REVIEWERS=2
-
-# Assignment timeout (time to accept/reject)
-DRYDOCK_MARKETPLACE_ASSIGNMENT_TIMEOUT=2h
-
-# Default review deadline
-DRYDOCK_MARKETPLACE_DEFAULT_DEADLINE=24h
-
-# Minimum reputation to receive assignments
-DRYDOCK_MARKETPLACE_MIN_REPUTATION=0.3
+DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS=100
+DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW=24h
 ```
+
+Marketplace routing is composed whenever the signed runtime is enabled; there is no separate `DRYDOCK_MARKETPLACE_ENABLED` switch. Assignment count, timeout, deadline, and minimum reputation currently use the defaults wired by `cmd/drydock`, not environment variables.
 
 ### Routing Criteria
 
@@ -391,6 +378,6 @@ CREATE TABLE review_feedback (
 ## Future Enhancements
 
 - **Web-of-Trust Integration**: Use NIP-02 follows for trust scoring
-- **Escrow Payments**: Hold funds until review completion
+- **Escrow Policy Extensions**: Add configurable dispute windows and partial-release rules beyond the current completion-triggered payout flow
 - **Reviewer Verification**: On-chain attestations of expertise
 - **Dispute Resolution**: Mechanism for contested reviews

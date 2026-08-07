@@ -22,14 +22,30 @@ cp .env.example .env
 | `DRYDOCK_REPO_CACHE_MAX_COUNT` | integer | `50` | Maximum number of cached repositories before LRU eviction. Set to `0` to disable count-based eviction. |
 | `DRYDOCK_REPO_CACHE_MAX_SIZE_MB` | integer | `10240` | Maximum total cache size in MB (default 10 GB). Set to `0` to disable size-based eviction. |
 
-## Repository Scoping
+## Repository Monitoring and Security Ceiling
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DRYDOCK_REPO_ALLOWLIST` | comma-separated repository IDs | *(empty)* | Repositories eligible for review, as `npub:identifier` or `64-character-hex-pubkey:identifier`. |
-| `DRYDOCK_REPO_OWNER_ALLOWLIST` | comma-separated public keys | *(empty)* | Repository announcement owners whose repositories are eligible for review. Accepts npub or 64-character hex public keys. |
+| `DRYDOCK_MONITORED_REPOS_AUTHOR` | public key | *(empty)* | Hex or npub identity that authors the NIP-51 kind-30001 `drydock:monitored-repositories:v1` list. Required in production; when absent in development, reactive review is disabled. |
+| `DRYDOCK_REPO_ALLOWLIST` | comma-separated repository IDs | *(empty)* | Optional hard security ceiling, as `npub:identifier` or `64-character-hex-pubkey:identifier`. |
+| `DRYDOCK_REPO_OWNER_ALLOWLIST` | comma-separated public keys | *(empty)* | Optional hard security ceiling by repository-announcement owner. Accepts npub or hex. |
 
-When both allowlists are empty, Drydock reviews all repositories. Otherwise, a patch is reviewed when either its repository ID or the owner from its stored repository announcement is allowlisted.
+These settings have separate roles. The operator-authored NIP-51 list controls **automatic reactive** review of kinds 1617/1618/1619 and updates live. The static repository/owner allowlists are a security ceiling applied to both reactive work and on-demand orders. A target is inside the ceiling when either its repository ID or announcement owner matches; empty static allowlists impose no additional ceiling.
+
+Reactive processing is fail-closed until an authoritative list state is loaded. A valid empty list or deletion intentionally disables reactive review and satisfies readiness. The control-plane subscription is not bounded by the listener high-water mark, and the winning list revision is restored from SQLite on restart. Paid `review/order` requests may target repositories outside the monitored list, but never outside the static ceiling.
+
+The list contract is kind `30001`, authored by `DRYDOCK_MONITORED_REPOS_AUTHOR`, with exactly one `d` tag equal to `drydock:monitored-repositories:v1` and zero or more canonical kind-30617 repository `a` tags. Publish this list before deploying the new binary.
+
+## ContextVM Rate Limits
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_REVIEW_ORDER_RATE_LIMIT_REQUESTS` | integer | `20` | Maximum new generic `review/order` requests per requester and window. Idempotent receipt retries do not consume quota. |
+| `DRYDOCK_REVIEW_ORDER_RATE_LIMIT_WINDOW` | duration | `1h` | Generic order rate-limit window. |
+| `DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS` | integer | `100` | Maximum marketplace feedback notifications per sender and window. |
+| `DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW` | duration | `24h` | Marketplace feedback rate-limit window. |
+
+Both request counts must be at least 1 and both windows must be positive. Limits are backed by the configured rate-limit store; backend failures deny processing rather than silently allowing traffic.
 
 ## Payment Service
 
@@ -184,7 +200,7 @@ are omitted with a warning.
 
 Endpoints:
 - `GET /healthz` — Always returns `200 OK`. Use as a liveness probe.
-- `GET /readyz` — Returns `200 OK` when the service is started and the database is reachable. Returns `503` during startup or if the DB is unreachable. Use as a readiness probe.
+- `GET /readyz` — Returns `200 OK` when the service is started, the database is reachable, and (when `DRYDOCK_MONITORED_REPOS_AUTHOR` is configured) an authoritative monitored-list state has loaded. Returns `503` otherwise. A valid empty or deleted list counts as authoritative.
 
 ## Evaluation
 

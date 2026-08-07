@@ -10,8 +10,8 @@ Drydock is a Go-based NIP-34 automated code review agent. The core review pipeli
                         │  wss://relay.damus.io  wss://nos.lol   │
                         └──────┬──────────────────────▲───────────┘
                                │ subscribe            │ publish
-                               │ NIP-34, 30078,       │ 1111, 25910,
-                               │ 25910, 31990         │ 7000
+                               │ NIP-34/51, 30078,    │ 1111, 25910,
+                               │ 25910, 31990         │ 30619/4903
                                ▼                      │
 ┌──────────────────────────────────────────────────────┴──────────┐
 │                        drydock-core                             │
@@ -66,15 +66,32 @@ IDE / Editor
            ▼
       IDE Gateway ──▶ Review Pipeline ──▶ Publisher ──kind 25910 result/error──▶ IDE / Editor
 
+Generic Review Orderer (including Loom)
+    └─ kind 25910  ContextVM review/order (plain or gift-wrapped)
+           │
+           ▼
+      Review Order Service ──▶ durable claim + payment ──▶ Review Pipeline
+
 Reviewer Marketplace
     │
     ├─ kind 31990  NIP-89 reviewer profiles for discovery
-    ├─ kind 25910  ContextVM marketplace/assign, accept, reject
-    └─ kind 7000   NIP-90 feedback and completion feedback
+    └─ kind 25910  ContextVM assign/accept/reject/complete requests
+                    + marketplace/feedback notifications
            │
            ▼
       Marketplace Router ──▶ Reviewers ──▶ Review Pipeline / Publisher
 ```
+
+## Dual Invocation Model
+
+Repository eligibility has two axes:
+
+- `monitoring.Registry` is a persisted atomic projection of the operator's NIP-51 kind-30001 `drydock:monitored-repositories:v1` list. It controls only automatic NIP-34 review and changes live.
+- The static repository/owner matcher is a hard security ceiling for reactive, IDE, and generic stored-patch review admission. Empty static allowlists allow all, but they do not enable reactive work without a valid monitored-list state.
+
+`revieworder.Service` owns durable review claiming and the bounded wake-up queue for all stored-patch paths. Reactive intake must pass monitoring plus the ceiling. IDE stored-patch requests and generic ContextVM `review/order` bypass monitoring but still pass the ceiling, canonical repository payment policy, and force authorization. Loom interoperability comes from this generic ContextVM contract; Drydock does not subscribe to Loom-local kinds.
+
+A queue send is only a wake-up hint. Claims, ContextVM receipts, invocation metadata, and skipped states live in SQLite. Queue-full orders report `retry_pending`, and startup/failed-review recovery re-enqueues the durable task. Reactive membership is rechecked before work and before publication, so a live removal cannot publish already queued reactive work.
 
 ## Service Topology
 
@@ -97,10 +114,10 @@ Drydock models Nostr events in four protocol layers:
 
 | Layer | Purpose | Drydock Examples |
 |-------|---------|------------------|
-| Observable | Public facts that can be indexed and reacted to | NIP-34 patches/PRs (`1617`, `1618`, `1619`), comments (`1111`), marketplace feedback (`7000`) |
-| Intent | Commands or decisions addressed to a participant | ContextVM kind `25910` methods such as `review/request`, `review/apply-fix`, `marketplace/assign`, `marketplace/accept`, `marketplace/reject` |
-| Collection | Discoverable addressable records | NIP-89 reviewer profiles (`31990`) and NIP-34 repository announcements (`30617`) |
-| State | Replaceable current state | NIP-78 IDE sessions (`30078`) and repository snapshots (`30618`) |
+| Observable | Public facts that can be indexed and reacted to | NIP-34 patches/PRs (`1617`–`1619`), comments (`1111`), security reports (`30619`, `4903`) |
+| Intent | Addressed requests and one-way notifications | ContextVM `review/order`, IDE and marketplace requests, `marketplace/feedback`, and `security/audit/progress` on `25910` |
+| Collection | Discoverable addressable records | Reviewer profiles (`31990`), repository announcements (`30617`), and the operator monitored list (`30001`) |
+| State | Replaceable or durable current state | NIP-78 IDE sessions (`30078`), repository snapshots (`30618`), review/order receipts in SQLite |
 
 Private intent payloads should be wrapped with NIP-59 gift-wrap (`1059`) while keeping only non-sensitive routing tags visible.
 
@@ -109,8 +126,10 @@ Private intent payloads should be wrapped with NIP-59 gift-wrap (`1059`) while k
 | Package | Responsibility |
 |---------|---------------|
 | `listener` | Subscribes to Nostr relays, receives events, manages high-water-mark for restart resilience |
-| `ingest` | Verifies signatures, deduplicates events, filters stale/closed patches, enqueues review tasks |
-| `pipeline` | Worker pool that orchestrates the full review lifecycle for each patch |
+| `ingest` | Verifies signatures, deduplicates events, applies monitoring control-plane events, and routes protocol messages |
+| `monitoring` | Persists and atomically projects the winning operator-authored NIP-51 list |
+| `revieworder` | Applies reactive/on-demand policy, atomically claims work, stores receipts, and owns the bounded queue |
+| `pipeline` | Worker pool that orchestrates review lifecycle and rechecks reactive membership |
 | `contextbuilder` | Builds deterministic context bundles with a 64K token budget across 8 priority layers; workspace boundary detection for monorepos |
 | `symbols` | Tree-sitter AST parsing for 9 languages (Go, Python, JS, TS, Rust, C, C++, Java, Ruby) — extracts declarations from changed files |
 | `reviewengine` | Two-stage LLM pipeline: planner selects a model route, reviewer produces findings |
@@ -123,7 +142,7 @@ Private intent payloads should be wrapped with NIP-59 gift-wrap (`1059`) while k
 | `embedding` | HTTP client for OpenAI-compatible embedding endpoints |
 | `nipingest` | Markdown NIP spec ingestion: chunk by heading, embed, upsert to Qdrant with content-hash dedup |
 | `idegateway` | IDE session and ContextVM review/fix protocol handler for kinds `30078` and `25910` |
-| `marketplace` | Reviewer discovery and assignment routing using kinds `31990`, `25910`, and `7000` |
+| `marketplace` | Reviewer discovery plus ContextVM assignment, completion, and authenticated feedback routing |
 | `lspbridge` | Shared types + HTTP client for the LSP bridge sidecar |
 | `lspbridge/server` | LSP bridge HTTP server: process lifecycle manager, JSON-RPC 2.0 over stdio |
 | `db` | SQLite storage with WAL mode, migrations, and all state management queries |
@@ -137,13 +156,15 @@ Trace of a single patch event from relay to published review:
 
 1. **Receive** — `listener.Service.Run` calls `pool.SubscribeManyNotifyClosed` with a filter for [NIP-34 event kinds](nostr-protocol.md). The pool delivers events on a channel.
 
-2. **Ingest** — `ingest.Processor.ProcessEvent` is called for each event:
-   - Rejects events with invalid signatures (`event.VerifySignature()`)
-   - Inserts into `ingested_events` (idempotent; duplicates are skipped)
-   - For patch kinds (1617/1618/1619): checks staleness against `repository_snapshots`, checks if the root is closed via `root_statuses`, then calls `store.BeginReview` to acquire a review slot
-   - Sends a `ReviewTask` to the pipeline channel (buffer: 256)
+2. **Ingest** — `ingest.Processor.ProcessEvent` verifies signatures (or a verified gift-wrap rumor), deduplicates events, persists repository/patch state, and routes ContextVM requests versus notifications. Kind-30001 list replacements and exact kind-5 deletions update `monitoring.Registry` atomically.
 
-3. **Pipeline** — `pipeline.Runner.work` picks up the task:
+3. **Admit** — `revieworder.Service` applies invocation-aware policy:
+   - reactive patch: require current monitoring membership and the static ceiling;
+   - IDE/generic order: require a stored unique patch target and the static ceiling, but not monitoring membership;
+   - load canonical repository payment policy, authorize force, atomically store the claim/order receipt, then emit a bounded queue wake-up;
+   - persist `not_monitored` or `monitoring_removed` terminal skips; static-ceiling rejection occurs before a claim.
+
+4. **Pipeline** — `pipeline.Runner.work` picks up the durable task:
    - `repo.Service.PreparePatchSeries` — clones or fetches the repository; for kind 1617 applies the patch series to a throwaway branch, for kind 1618/1619 checks out the PR tip and computes the diff against its merge-base with the default branch (in the canonical clone, so a fork cannot pick the diff base)
    - **Status gate** — re-checks the root's current NIP-34 status against the repo's `review.statuses` config (open by default, drafts opt-in, merged/closed never); status skips are permanent
    - `contextbuilder.Builder.Build` — detects workspace boundaries, assembles context layers within token budget; the pipeline fails closed if the deterministic changed-file set is empty
@@ -151,7 +172,7 @@ Trace of a single patch event from relay to published review:
    - `publisher.Service.PublishReview` — builds kind 1111 events (labeled with the model the endpoint actually served), signs them, fans out to relays
    - `metareview.Service.RunAsync` — asynchronous quality evaluation (non-blocking)
 
-4. **Publish** — The publisher resolves target relays (patch-seen relays + repo announcement relays + defaults), constructs summary and detail comment events, signs each, and publishes.
+5. **Publish** — The publisher resolves target relays (patch-seen relays + repo announcement relays + defaults), constructs summary and detail comment events, signs each, and publishes.
 
 ## Context Builder Data Flow
 
@@ -218,26 +239,29 @@ The `review_log` table tracks each review through a state machine:
 
 ```
                  ┌──────────┐
-                 │ pending  │ ← BeginReview (unique patch_event_id + repo_id)
-                 └────┬─────┘
-                      │ pipeline picks up task
-                      ▼
-                 ┌──────────┐
-                 │reviewing │
-                 └──┬───┬───┘
-        success ────┘   └──── failure
-                ▼              ▼
-          ┌──────────┐  ┌──────────┐
-          │published │  │  failed  │
-          └──────────┘  └──────────┘
+                 │ pending  │ ← atomic review/order claim
+                 └──┬────┬──┘
+        admission/  │    │ pipeline picks up task
+        live removal│    ▼
+             ▼      │ ┌──────────┐
+        ┌─────────┐ │ │reviewing │
+        │ skipped │ │ └──┬───┬───┘
+        └─────────┘ │    │   │
+                    │ success failure
+                    ▼       ▼
+              ┌──────────┐ ┌──────────┐
+              │published │ │  failed  │
+              └──────────┘ └──────────┘
 ```
 
 **Recovery**: On startup, `store.ResetStuckReviews` moves any rows stuck in `reviewing` back to `pending`. This handles crashes mid-review.
 
 ## Concurrency Model
 
-- **Listener**: Single goroutine reading from the Nostr pool channel. Events are processed synchronously in `ProcessEvent`, then dispatched to the review queue channel.
-- **Pipeline workers**: `N` goroutines (configurable via `DRYDOCK_PIPELINE_WORKERS`, default 2). Each reads from the shared review queue. Workers drain on context cancellation via `sync.WaitGroup`.
+- **Listener**: Reads relay events, opens verified gift wraps, and synchronously hands events to ingest before advancing the cursor.
+- **Monitoring**: Registry updates are serialized for persistence and publish immutable atomic snapshots for lock-free membership reads.
+- **Review ordering**: One bounded channel owned by `revieworder.Service`; durable claims remain authoritative when a wake-up cannot be queued.
+- **Pipeline workers**: `N` goroutines (configurable via `DRYDOCK_PIPELINE_WORKERS`, default 2). Each reads from the shared review-order queue. Workers drain on context cancellation via `sync.WaitGroup`.
 - **Meta-review**: Spawned as individual goroutines by `RunAsync`, gated by a `semaphore.Weighted` with `MaxConcurrent` (default 10).
 - **Repo locks**: Per-repository `sync.Mutex` stored in a `sync.Map` prevents concurrent git operations on the same repo path.
 
@@ -255,7 +279,11 @@ All state is stored in SQLite with WAL mode, foreign keys, and `busy_timeout=500
 | `review_events` | Published review comment events |
 | `thread_cache` | Thread membership tracking by root event ID |
 | `root_statuses` | Status events (kinds 1630–1633) for closed/applied filtering |
-| `review_log` | Review state machine (`pending → reviewing → published \| failed`) |
+| `review_log` | Invocation-aware review state (`pending → reviewing → published \| failed \| skipped`) with requester/order metadata |
+| `review_orders` | Immutable ContextVM order receipts keyed by requester and JSON-RPC ID |
+| `review_skips` | Durable terminal skip reasons |
+| `monitored_repository_list_state` | Winning list/deletion revision and raw event |
+| `monitored_repository_members` | Active canonical repository addresses |
 | `meta_review_log` | Meta-review results with context hashes |
 | `meta_review_routes` | Feedback routing decisions from meta-reviews |
 | `few_shot_reviews` | Positive/negative few-shot examples for prompt improvement |

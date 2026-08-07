@@ -99,7 +99,7 @@ When the user saves a file or triggers manual review, the IDE sends a ContextVM 
 
 ### 3. Review Response
 
-Drydock responds on kind `25910` with the same JSON-RPC `id`:
+Drydock responds on kind `25910` with the same JSON-RPC `id`. Responses are routed by `p` and correlated by the request-event `e` tag; they do not carry a `method` tag:
 
 ```json
 {
@@ -122,10 +122,8 @@ Drydock responds on kind `25910` with the same JSON-RPC `id`:
     }
   },
   "tags": [
-    ["p", "<user-pubkey>"],
     ["e", "<request-event-id>"],
-    ["t", "drydock"],
-    ["method", "review/request"]
+    ["p", "<user-pubkey>"]
   ]
 }
 ```
