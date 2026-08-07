@@ -819,7 +819,7 @@ func TestReconcileReservedPayment_AllowsLegacySubmittedValueContract(t *testing.
 	if err := store.UpsertPendingReviewPayment(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, "legacy-quote", 100, 5); err != nil {
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, rec.ReservationAttemptID, "legacy-quote", 100, 5); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MarkReviewPaymentTokenSpent(ctx, rec.PatchEventID); err != nil {
@@ -874,6 +874,32 @@ func TestAuthorizePatch_LateSettlementFailsClosed(t *testing.T) {
 	reconciled, err := svc.ReconcilePendingPayments(ctx, 10)
 	if err != nil || reconciled.Examined != 0 {
 		t.Fatalf("terminal payment remained a recovery candidate: result=%+v err=%v", reconciled, err)
+	}
+}
+
+func TestReconcilePendingPayments_ReleasesExpiredPreSubmissionReservation(t *testing.T) {
+	svc, store := setupTestService(t)
+	defer store.Close()
+	ctx := context.Background()
+	rec := db.ReviewPaymentRecord{
+		PatchEventID: "crashed-before-submit", RepoID: "repo/test", AuthorPubkey: "author",
+		RequestedMode: "review", TokenHash: "crashed-token", MintURL: "https://mint.example.com",
+		TokenAmountSats: 100, ExpectedAmountSats: 100,
+		ReservationAttemptID: "crashed-attempt", ReservationExpiresAt: time.Now().Add(-time.Minute).Unix(),
+	}
+	if err := store.ReserveReviewPaymentToken(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := svc.ReconcilePendingPayments(ctx, 10)
+	if err != nil || result.Examined != 0 {
+		t.Fatalf("reconcile result=%+v err=%v", result, err)
+	}
+	if _, err := store.GetReviewPayment(ctx, rec.PatchEventID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expired pre-submission reservation was not released: %v", err)
+	}
+	if svc.mint.(*fakeMintClient).meltCallCount() != 0 {
+		t.Fatal("recovery must not submit proofs without the original token")
 	}
 }
 

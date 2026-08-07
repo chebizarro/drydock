@@ -10,6 +10,7 @@ package payment
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -366,7 +367,19 @@ func (s *Service) processTokenPayment(
 		if existing.TokenHash != tokenHash {
 			return deny("token_already_used")
 		}
-		return s.reconcileReservedPayment(ctx, existing)
+		if existing.Status == "pending" && existing.MeltState == "" {
+			released, releaseErr := s.store.DeleteExpiredUnsubmittedReviewPayment(
+				ctx, patchEventID, tokenHash, existing.ReservationAttemptID, time.Now().Unix(),
+			)
+			if releaseErr != nil {
+				return AuthorizeResult{}, fmt.Errorf("release expired payment reservation: %w", releaseErr)
+			}
+			if !released {
+				return paymentPending()
+			}
+		} else {
+			return s.reconcileReservedPayment(ctx, existing)
+		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return AuthorizeResult{}, fmt.Errorf("get existing payment: %w", err)
 	}
@@ -392,16 +405,28 @@ func (s *Service) processTokenPayment(
 		return deny("change_not_supported")
 	}
 
+	attemptID, err := newReservationAttemptID()
+	if err != nil {
+		return AuthorizeResult{}, fmt.Errorf("create payment reservation attempt: %w", err)
+	}
+	leaseDuration := 3 * s.cfg.Timeout
+	if leaseDuration < time.Minute {
+		leaseDuration = time.Minute
+	}
 	reservation := db.ReviewPaymentRecord{
 		PatchEventID: patchEventID, RepoID: repoID, AuthorPubkey: authorPubkey,
 		RequestedMode: mode, TokenHash: tokenHash, MintURL: parsed.MintURL,
 		TokenAmountSats: parsed.AmountSats, ExpectedAmountSats: targetPrice,
-		SubscriptionDays: policy.SubscriptionDays,
+		SubscriptionDays:     policy.SubscriptionDays,
+		ReservationAttemptID: attemptID, ReservationExpiresAt: time.Now().Add(leaseDuration).Unix(),
 	}
 	if err := s.store.ReserveReviewPaymentToken(ctx, reservation); err != nil {
 		if errors.Is(err, db.ErrTokenHashAlreadyReserved) {
 			reserved, lookupErr := s.store.GetReviewPaymentByTokenHash(ctx, tokenHash)
 			if lookupErr == nil && reserved.PatchEventID == patchEventID {
+				if reserved.Status == "pending" && reserved.MeltState == "" {
+					return paymentPending()
+				}
 				return s.reconcileReservedPayment(ctx, reserved)
 			}
 			return deny("token_already_used")
@@ -412,43 +437,43 @@ func (s *Service) processTokenPayment(
 	memo := fmt.Sprintf("drydock review %s", patchEventID[:12])
 	invoice, err := s.invoice.CreateInvoice(ctx, targetPrice, memo, s.cfg.InvoiceExpiry)
 	if err != nil {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "invoice creation failure")
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, attemptID, "invoice creation failure")
 		return AuthorizeResult{}, fmt.Errorf("create invoice: %w", err)
 	}
 	if err := validateFreshInvoiceEvidence(invoice, targetPrice, time.Now().Unix()); err != nil {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "invalid invoice response")
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, attemptID, "invalid invoice response")
 		return AuthorizeResult{}, fmt.Errorf("validate created invoice: %w", err)
 	}
 	reservation.InvoiceID, reservation.InvoiceRequest = invoice.ID, invoice.Request
 	reservation.InvoiceAmountMSats, reservation.InvoiceExpiresAt = invoice.AmountMSats, invoice.ExpiresAt
 	if err := s.store.UpsertPendingReviewPayment(ctx, reservation); err != nil {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "persist pending payment failure")
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, attemptID, "persist pending payment failure")
 		return AuthorizeResult{}, fmt.Errorf("persist pending payment: %w", err)
 	}
 
 	quote, err := s.mint.CreateMeltQuote(ctx, parsed.MintURL, invoice.Request)
 	if err != nil {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "melt quote failure")
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, attemptID, "melt quote failure")
 		return AuthorizeResult{}, fmt.Errorf("create melt quote: %w", err)
 	}
 	if quote.ID == "" || quote.Amount != targetPrice || quote.FeeReserve < 0 {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "invalid melt quote")
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, attemptID, "invalid melt quote")
 		return AuthorizeResult{}, errors.New("mint returned inconsistent melt quote")
 	}
 	// A positive fee reserve requires NUT-08 blank outputs even when the token
 	// exactly covers amount+reserve, because the actual Lightning fee may be
 	// lower. Fail closed until real wallet/keyset plumbing exists.
 	if quote.FeeReserve != 0 || parsed.AmountSats != quote.Amount {
-		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, "cashu change unsupported")
+		s.deletePendingAfterPreMeltFailure(ctx, patchEventID, tokenHash, attemptID, "cashu change unsupported")
 		return deny("change_not_supported")
 	}
-	if err := s.store.MarkReviewPaymentMeltSubmitted(ctx, patchEventID, tokenHash, quote.ID, quote.Amount, quote.FeeReserve); err != nil {
+	if err := s.store.MarkReviewPaymentMeltSubmitted(ctx, patchEventID, tokenHash, attemptID, quote.ID, quote.Amount, quote.FeeReserve); err != nil {
 		return AuthorizeResult{}, fmt.Errorf("persist melt submission intent: %w", err)
 	}
 
 	if err := s.mint.MeltToken(ctx, parsed.MintURL, quote, parsed); err != nil {
 		if !meltMayHaveBeenSubmitted(err) {
-			if deleteErr := s.store.DeleteProvablyUnsubmittedMelt(ctx, patchEventID, tokenHash, quote.ID); deleteErr != nil {
+			if deleteErr := s.store.DeleteProvablyUnsubmittedMelt(ctx, patchEventID, tokenHash, attemptID, quote.ID); deleteErr != nil {
 				s.logger.Warn("failed to release provably unsubmitted melt",
 					"patch_event_id", patchEventID, "quote_id", quote.ID, "error", deleteErr)
 			}
@@ -486,6 +511,10 @@ func (s *Service) ReconcilePendingPayments(ctx context.Context, pageSize int) (R
 	}
 	if pageSize <= 0 || pageSize > 500 {
 		return result, errors.New("payment reconciliation page size must be between 1 and 500")
+	}
+
+	if _, err := s.store.DeleteExpiredUnsubmittedReviewPayments(ctx, time.Now().Unix()); err != nil {
+		return result, fmt.Errorf("release expired payment reservations: %w", err)
 	}
 
 	var cursor string
@@ -676,10 +705,18 @@ func validateInvoiceStatus(expected Invoice, status InvoiceStatus) error {
 	return nil
 }
 
-func (s *Service) deletePendingAfterPreMeltFailure(ctx context.Context, patchEventID, tokenHash, reason string) {
-	if err := s.store.DeleteUnsubmittedReviewPayment(ctx, patchEventID, tokenHash); err != nil {
+func (s *Service) deletePendingAfterPreMeltFailure(ctx context.Context, patchEventID, tokenHash, attemptID, reason string) {
+	if err := s.store.DeleteUnsubmittedReviewPayment(ctx, patchEventID, tokenHash, attemptID); err != nil {
 		s.logger.Warn("failed to delete pending payment after pre-melt failure", "patch_event_id", patchEventID, "reason", reason, "error", err)
 	}
+}
+
+func newReservationAttemptID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id[:]), nil
 }
 
 func paymentTargetPrice(mode string, policy repoconfig.PaymentsConfig) int64 {

@@ -345,6 +345,8 @@ CREATE TABLE IF NOT EXISTS review_payments (
   melt_quote_amount_sats INTEGER NOT NULL DEFAULT 0,
   melt_fee_reserve_sats INTEGER NOT NULL DEFAULT 0,
   melt_state TEXT NOT NULL DEFAULT '',
+  reservation_attempt_id TEXT NOT NULL DEFAULT '',
+  reservation_expires_at INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

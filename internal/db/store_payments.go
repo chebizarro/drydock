@@ -18,28 +18,30 @@ var ErrTokenHashAlreadyReserved = errors.New("payment token hash already reserve
 
 // ReviewPaymentRecord represents a review payment authorization record.
 type ReviewPaymentRecord struct {
-	PatchEventID        string
-	RepoID              string
-	AuthorPubkey        string
-	Status              string // pending, token_spent, authorized
-	AccessKind          string // free_tier, subscription, cashu_review, cashu_subscription
-	RequestedMode       string // review, subscription
-	TokenHash           string
-	MintURL             string
-	TokenAmountSats     int64
-	ExpectedAmountSats  int64
-	SettledAmountSats   int64
-	SubscriptionDays    int
-	InvoiceID           string
-	InvoiceRequest      string
-	InvoiceAmountMSats  int64
-	InvoiceExpiresAt    int64
-	MeltQuoteID         string
-	MeltQuoteAmountSats int64
-	MeltFeeReserveSats  int64
-	MeltState           string // empty, submitted, paid, unpaid, failed
-	CreatedAt           int64
-	UpdatedAt           int64
+	PatchEventID         string
+	RepoID               string
+	AuthorPubkey         string
+	Status               string // pending, token_spent, authorized
+	AccessKind           string // free_tier, subscription, cashu_review, cashu_subscription
+	RequestedMode        string // review, subscription
+	TokenHash            string
+	MintURL              string
+	TokenAmountSats      int64
+	ExpectedAmountSats   int64
+	SettledAmountSats    int64
+	SubscriptionDays     int
+	InvoiceID            string
+	InvoiceRequest       string
+	InvoiceAmountMSats   int64
+	InvoiceExpiresAt     int64
+	MeltQuoteID          string
+	MeltQuoteAmountSats  int64
+	MeltFeeReserveSats   int64
+	MeltState            string // empty, submitted, paid, unpaid, failed
+	ReservationAttemptID string
+	ReservationExpiresAt int64
+	CreatedAt            int64
+	UpdatedAt            int64
 }
 
 // SubscriptionRecord represents an active payment subscription.
@@ -62,7 +64,8 @@ func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (Revi
 		       COALESCE(token_hash, ''), mint_url, token_amount_sats, expected_amount_sats,
 		       settled_amount_sats, subscription_days, invoice_id, invoice_request, invoice_amount_msats,
 		       invoice_expires_at, melt_quote_id, melt_quote_amount_sats,
-		       melt_fee_reserve_sats, melt_state, created_at, updated_at
+		       melt_fee_reserve_sats, melt_state, reservation_attempt_id, reservation_expires_at,
+		       created_at, updated_at
 		FROM review_payments
 		WHERE patch_event_id = ?
 	`, patchEventID).Scan(
@@ -71,7 +74,7 @@ func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (Revi
 		&rec.ExpectedAmountSats, &rec.SettledAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
 		&rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt, &rec.MeltQuoteID,
 		&rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats, &rec.MeltState,
-		&rec.CreatedAt, &rec.UpdatedAt,
+		&rec.ReservationAttemptID, &rec.ReservationExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
 		return ReviewPaymentRecord{}, err
@@ -90,11 +93,11 @@ func (s *Store) ReserveReviewPaymentToken(ctx context.Context, rec ReviewPayment
 			patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
 			token_hash, mint_url, token_amount_sats, expected_amount_sats, subscription_days,
 			invoice_id, invoice_request, invoice_amount_msats, invoice_expires_at,
-			created_at, updated_at
-		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, ?, ?, '', '', 0, 0, ?, ?)
+			reservation_attempt_id, reservation_expires_at, created_at, updated_at
+		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, ?, ?, '', '', 0, 0, ?, ?, ?, ?)
 	`, rec.PatchEventID, rec.RepoID, rec.AuthorPubkey, rec.RequestedMode,
 		rec.TokenHash, rec.MintURL, rec.TokenAmountSats, rec.ExpectedAmountSats,
-		rec.SubscriptionDays, now, now)
+		rec.SubscriptionDays, rec.ReservationAttemptID, rec.ReservationExpiresAt, now, now)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
 			return ErrTokenHashAlreadyReserved
@@ -112,8 +115,8 @@ func (s *Store) UpsertPendingReviewPayment(ctx context.Context, rec ReviewPaymen
 			patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
 			token_hash, mint_url, token_amount_sats, expected_amount_sats, subscription_days,
 			invoice_id, invoice_request, invoice_amount_msats, invoice_expires_at,
-			created_at, updated_at
-		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			reservation_attempt_id, reservation_expires_at, created_at, updated_at
+		) VALUES (?, ?, ?, 'pending', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(patch_event_id) DO UPDATE SET
 			expected_amount_sats = excluded.expected_amount_sats,
 			subscription_days = excluded.subscription_days,
@@ -124,10 +127,11 @@ func (s *Store) UpsertPendingReviewPayment(ctx context.Context, rec ReviewPaymen
 			updated_at = excluded.updated_at
 		WHERE review_payments.status = 'pending'
 		  AND review_payments.token_hash = excluded.token_hash
+		  AND review_payments.reservation_attempt_id = excluded.reservation_attempt_id
 	`, rec.PatchEventID, rec.RepoID, rec.AuthorPubkey, rec.RequestedMode,
 		rec.TokenHash, rec.MintURL, rec.TokenAmountSats, rec.ExpectedAmountSats,
 		rec.SubscriptionDays, rec.InvoiceID, rec.InvoiceRequest, rec.InvoiceAmountMSats,
-		rec.InvoiceExpiresAt, now, now)
+		rec.InvoiceExpiresAt, rec.ReservationAttemptID, rec.ReservationExpiresAt, now, now)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
 			return ErrTokenHashAlreadyReserved
@@ -152,7 +156,8 @@ func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash strin
 		       COALESCE(token_hash, ''), mint_url, token_amount_sats, expected_amount_sats,
 		       settled_amount_sats, subscription_days, invoice_id, invoice_request, invoice_amount_msats,
 		       invoice_expires_at, melt_quote_id, melt_quote_amount_sats,
-		       melt_fee_reserve_sats, melt_state, created_at, updated_at
+		       melt_fee_reserve_sats, melt_state, reservation_attempt_id, reservation_expires_at,
+		       created_at, updated_at
 		FROM review_payments
 		WHERE token_hash = ?
 	`, tokenHash).Scan(
@@ -161,7 +166,7 @@ func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash strin
 		&rec.ExpectedAmountSats, &rec.SettledAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
 		&rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt, &rec.MeltQuoteID,
 		&rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats, &rec.MeltState,
-		&rec.CreatedAt, &rec.UpdatedAt,
+		&rec.ReservationAttemptID, &rec.ReservationExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
 		return ReviewPaymentRecord{}, err
@@ -172,23 +177,52 @@ func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash strin
 // DeleteUnsubmittedReviewPayment removes only the caller's unsubmitted
 // reservation. Submitted melt evidence is never deleted because the proofs may
 // already have reached the mint.
-func (s *Store) DeleteUnsubmittedReviewPayment(ctx context.Context, patchEventID, tokenHash string) error {
+func (s *Store) DeleteUnsubmittedReviewPayment(ctx context.Context, patchEventID, tokenHash, attemptID string) error {
 	_, err := s.db.ExecContext(ctx, `
 		DELETE FROM review_payments
-		WHERE patch_event_id = ? AND token_hash = ? AND status = 'pending' AND melt_state = ''
-	`, patchEventID, tokenHash)
+		WHERE patch_event_id = ? AND token_hash = ? AND reservation_attempt_id = ?
+		  AND status = 'pending' AND melt_state = ''
+	`, patchEventID, tokenHash, attemptID)
 	return err
+}
+
+// DeleteExpiredUnsubmittedReviewPayment releases one expired attempt. The
+// attempt fence prevents a stale owner from deleting a replacement reservation.
+func (s *Store) DeleteExpiredUnsubmittedReviewPayment(ctx context.Context, patchEventID, tokenHash, attemptID string, now int64) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM review_payments
+		WHERE patch_event_id = ? AND token_hash = ? AND reservation_attempt_id = ?
+		  AND status = 'pending' AND melt_state = '' AND reservation_expires_at <= ?
+	`, patchEventID, tokenHash, attemptID, now)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
+}
+
+// DeleteExpiredUnsubmittedReviewPayments releases crashed pre-submission
+// attempts. Submitted rows are excluded regardless of age.
+func (s *Store) DeleteExpiredUnsubmittedReviewPayments(ctx context.Context, now int64) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM review_payments
+		WHERE status = 'pending' AND melt_state = '' AND reservation_expires_at <= ?
+	`, now)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // DeleteProvablyUnsubmittedMelt releases a submitted-intent record only when
 // the mint client proved the HTTP request was never sent. Quote identity keeps
 // cleanup scoped to the exact attempt whose local submission failed.
-func (s *Store) DeleteProvablyUnsubmittedMelt(ctx context.Context, patchEventID, tokenHash, quoteID string) error {
+func (s *Store) DeleteProvablyUnsubmittedMelt(ctx context.Context, patchEventID, tokenHash, attemptID, quoteID string) error {
 	_, err := s.db.ExecContext(ctx, `
 		DELETE FROM review_payments
-		WHERE patch_event_id = ? AND token_hash = ? AND melt_quote_id = ?
+		WHERE patch_event_id = ? AND token_hash = ? AND reservation_attempt_id = ? AND melt_quote_id = ?
 		AND status = 'pending' AND melt_state = 'submitted'
-	`, patchEventID, tokenHash, quoteID)
+	`, patchEventID, tokenHash, attemptID, quoteID)
 	return err
 }
 
@@ -205,7 +239,7 @@ func (s *Store) ListReviewPaymentRecoveryCandidates(ctx context.Context, afterPa
 		       p.settled_amount_sats, p.subscription_days, p.invoice_id, p.invoice_request,
 		       p.invoice_amount_msats, p.invoice_expires_at, p.melt_quote_id,
 		       p.melt_quote_amount_sats, p.melt_fee_reserve_sats, p.melt_state,
-		       p.created_at, p.updated_at
+		       p.reservation_attempt_id, p.reservation_expires_at, p.created_at, p.updated_at
 		FROM review_payments p
 		WHERE p.patch_event_id > ? AND (
 			(p.status IN ('pending', 'token_spent') AND p.melt_state IN ('submitted', 'unpaid', 'paid'))
@@ -233,7 +267,8 @@ func (s *Store) ListReviewPaymentRecoveryCandidates(ctx context.Context, afterPa
 			&rec.ExpectedAmountSats, &rec.SettledAmountSats, &rec.SubscriptionDays,
 			&rec.InvoiceID, &rec.InvoiceRequest, &rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt,
 			&rec.MeltQuoteID, &rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats,
-			&rec.MeltState, &rec.CreatedAt, &rec.UpdatedAt,
+			&rec.MeltState, &rec.ReservationAttemptID, &rec.ReservationExpiresAt,
+			&rec.CreatedAt, &rec.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan payment recovery candidate: %w", err)
 		}
@@ -301,7 +336,7 @@ func (s *Store) RequeueReviewAfterPayment(ctx context.Context, patchEventID stri
 // MarkReviewPaymentMeltSubmitted durably records the quote and submission intent.
 // It must commit before the mint call so a crash or ambiguous transport error can
 // be reconciled without ever submitting the proofs a second time.
-func (s *Store) MarkReviewPaymentMeltSubmitted(ctx context.Context, patchEventID, tokenHash string, quoteID string, quoteAmount, feeReserve int64) error {
+func (s *Store) MarkReviewPaymentMeltSubmitted(ctx context.Context, patchEventID, tokenHash, attemptID string, quoteID string, quoteAmount, feeReserve int64) error {
 	if quoteID == "" || quoteAmount <= 0 || feeReserve < 0 {
 		return errors.New("invalid melt quote evidence")
 	}
@@ -310,8 +345,10 @@ func (s *Store) MarkReviewPaymentMeltSubmitted(ctx context.Context, patchEventID
 		UPDATE review_payments
 		SET melt_quote_id = ?, melt_quote_amount_sats = ?, melt_fee_reserve_sats = ?,
 		    melt_state = 'submitted', updated_at = ?
-		WHERE patch_event_id = ? AND token_hash = ? AND status = 'pending' AND melt_state = ''
-	`, quoteID, quoteAmount, feeReserve, now, patchEventID, tokenHash)
+		WHERE patch_event_id = ? AND token_hash = ? AND reservation_attempt_id = ?
+		  AND status = 'pending' AND melt_state = ''
+		  AND (reservation_expires_at = 0 OR reservation_expires_at > ?)
+	`, quoteID, quoteAmount, feeReserve, now, patchEventID, tokenHash, attemptID, now)
 	if err != nil {
 		return err
 	}

@@ -39,6 +39,75 @@ func TestReserveReviewPaymentToken_DuplicateHashReturnsSentinel(t *testing.T) {
 	}
 }
 
+func TestExpiredReservationAttemptIsReleasedAndStaleOwnerIsFenced(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	now := time.Now().Unix()
+	old := ReviewPaymentRecord{
+		PatchEventID: "patch-lease", RepoID: "repo-1", AuthorPubkey: "author-1",
+		RequestedMode: "review", TokenHash: "lease-hash", MintURL: "https://mint.example.com",
+		TokenAmountSats: 100, ExpectedAmountSats: 100,
+		ReservationAttemptID: "old-attempt", ReservationExpiresAt: now - 1,
+	}
+	if err := store.ReserveReviewPaymentToken(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	released, err := store.DeleteExpiredUnsubmittedReviewPayment(ctx, old.PatchEventID, old.TokenHash, old.ReservationAttemptID, now)
+	if err != nil || !released {
+		t.Fatalf("release expired reservation: released=%v err=%v", released, err)
+	}
+
+	current := old
+	current.ReservationAttemptID = "new-attempt"
+	current.ReservationExpiresAt = now + 60
+	if err := store.ReserveReviewPaymentToken(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, old.PatchEventID, old.TokenHash, old.ReservationAttemptID, "stale-quote", 100, 0); err == nil {
+		t.Fatal("stale attempt unexpectedly recorded melt submission")
+	}
+	if err := store.DeleteUnsubmittedReviewPayment(ctx, old.PatchEventID, old.TokenHash, old.ReservationAttemptID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetReviewPayment(ctx, current.PatchEventID)
+	if err != nil || got.ReservationAttemptID != current.ReservationAttemptID || got.MeltState != "" {
+		t.Fatalf("replacement reservation was changed by stale owner: rec=%+v err=%v", got, err)
+	}
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, current.PatchEventID, current.TokenHash, current.ReservationAttemptID, "current-quote", 100, 0); err != nil {
+		t.Fatalf("current attempt could not submit: %v", err)
+	}
+}
+
+func TestDeleteExpiredUnsubmittedReviewPaymentsPreservesLiveAndSubmitted(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	now := time.Now().Unix()
+	for _, rec := range []ReviewPaymentRecord{
+		{PatchEventID: "expired", RepoID: "repo", AuthorPubkey: "author", RequestedMode: "review", TokenHash: "expired-hash", ReservationAttemptID: "expired-attempt", ReservationExpiresAt: now - 1},
+		{PatchEventID: "live", RepoID: "repo", AuthorPubkey: "author", RequestedMode: "review", TokenHash: "live-hash", ReservationAttemptID: "live-attempt", ReservationExpiresAt: now + 60},
+		{PatchEventID: "submitted", RepoID: "repo", AuthorPubkey: "author", RequestedMode: "review", TokenHash: "submitted-hash", TokenAmountSats: 100, ExpectedAmountSats: 100, ReservationAttemptID: "submitted-attempt", ReservationExpiresAt: now + 60},
+	} {
+		if err := store.ReserveReviewPaymentToken(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "submitted", "submitted-hash", "submitted-attempt", "quote", 100, 0); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := store.DeleteExpiredUnsubmittedReviewPayments(ctx, now)
+	if err != nil || deleted != 1 {
+		t.Fatalf("expired cleanup deleted=%d err=%v", deleted, err)
+	}
+	if _, err := store.GetReviewPayment(ctx, "expired"); err == nil {
+		t.Fatal("expired reservation was not released")
+	}
+	for _, patchID := range []string{"live", "submitted"} {
+		if _, err := store.GetReviewPayment(ctx, patchID); err != nil {
+			t.Fatalf("reservation %q was incorrectly deleted: %v", patchID, err)
+		}
+	}
+}
+
 func TestUpsertAndGetReviewPayment(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
@@ -126,7 +195,7 @@ func TestMarkReviewPaymentAuthorized(t *testing.T) {
 		t.Fatalf("expected initial status 'pending', got %q", got.Status)
 	}
 
-	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "patch-1", "hash123", "quote-1", 100, 1); err != nil {
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "patch-1", "hash123", "", "quote-1", 100, 1); err != nil {
 		t.Fatalf("MarkReviewPaymentMeltSubmitted: %v", err)
 	}
 	if err := store.MarkReviewPaymentTokenSpent(ctx, "patch-1"); err != nil {
@@ -164,7 +233,7 @@ func TestDeleteUnsubmittedReviewPayment(t *testing.T) {
 	})
 
 	// Delete
-	if err := store.DeleteUnsubmittedReviewPayment(ctx, "patch-1", "delete-hash"); err != nil {
+	if err := store.DeleteUnsubmittedReviewPayment(ctx, "patch-1", "delete-hash", ""); err != nil {
 		t.Fatalf("DeleteUnsubmittedReviewPayment: %v", err)
 	}
 
@@ -188,10 +257,10 @@ func TestDeleteUnsubmittedReviewPayment_PreservesSubmittedMelt(t *testing.T) {
 	if err := store.UpsertPendingReviewPayment(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, "quote", 100, 0); err != nil {
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, rec.ReservationAttemptID, "quote", 100, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteUnsubmittedReviewPayment(ctx, rec.PatchEventID, rec.TokenHash); err != nil {
+	if err := store.DeleteUnsubmittedReviewPayment(ctx, rec.PatchEventID, rec.TokenHash, rec.ReservationAttemptID); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.GetReviewPayment(ctx, rec.PatchEventID)
@@ -219,7 +288,7 @@ func TestPaymentRecoveryCandidatesAndAuthorizedRequeue(t *testing.T) {
 	if err := store.UpsertPendingReviewPayment(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, "quote", 100, 0); err != nil {
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, rec.ReservationAttemptID, "quote", 100, 0); err != nil {
 		t.Fatal(err)
 	}
 	candidates, err := store.ListReviewPaymentRecoveryCandidates(ctx, "", 1)
@@ -397,7 +466,7 @@ func TestMarkReviewPaymentTokenSpent(t *testing.T) {
 		t.Fatalf("UpsertPendingReviewPayment: %v", err)
 	}
 
-	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "patch-1", "hash123", "quote-1", 100, 1); err != nil {
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "patch-1", "hash123", "", "quote-1", 100, 1); err != nil {
 		t.Fatalf("MarkReviewPaymentMeltSubmitted: %v", err)
 	}
 	// Mark token as spent
@@ -450,7 +519,7 @@ func TestFinalizePaidReview_SubscriptionIsAtomicAndIdempotent(t *testing.T) {
 	if err := store.UpsertPendingReviewPayment(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, "quote", 100, 5); err != nil {
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, rec.PatchEventID, rec.TokenHash, rec.ReservationAttemptID, "quote", 100, 5); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MarkReviewPaymentTokenSpent(ctx, rec.PatchEventID); err != nil {
@@ -525,7 +594,7 @@ func TestIsTokenHashUsed(t *testing.T) {
 	}
 
 	// Mark as definitively paid and authorized.
-	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "patch-1", "newhash123", "quote-1", 100, 1); err != nil {
+	if err := store.MarkReviewPaymentMeltSubmitted(ctx, "patch-1", "newhash123", "", "quote-1", 100, 1); err != nil {
 		t.Fatalf("MarkReviewPaymentMeltSubmitted: %v", err)
 	}
 	if err := store.MarkReviewPaymentTokenSpent(ctx, "patch-1"); err != nil {

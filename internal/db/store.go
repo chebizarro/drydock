@@ -496,6 +496,32 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 10,
+		name:    "review_payment_reservation_leases",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			for _, col := range []struct{ name, ddl string }{
+				{"reservation_attempt_id", "ALTER TABLE review_payments ADD COLUMN reservation_attempt_id TEXT NOT NULL DEFAULT ''"},
+				{"reservation_expires_at", "ALTER TABLE review_payments ADD COLUMN reservation_expires_at INTEGER NOT NULL DEFAULT 0"},
+			} {
+				exists, err := hasColumn(ctx, tx, "review_payments", col.name)
+				if err != nil {
+					return fmt.Errorf("check review_payments.%s: %w", col.name, err)
+				}
+				if !exists {
+					if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+						return fmt.Errorf("add review_payments.%s: %w", col.name, err)
+					}
+				}
+			}
+			// Existing unsubmitted reservations predate leases and are safe to
+			// release on the first reconciliation pass.
+			_, err := tx.ExecContext(ctx, `UPDATE review_payments
+				SET reservation_expires_at = updated_at
+				WHERE status = 'pending' AND melt_state = '' AND reservation_expires_at = 0`)
+			return err
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
