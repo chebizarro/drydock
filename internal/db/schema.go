@@ -128,6 +128,53 @@ CREATE TABLE IF NOT EXISTS review_log (
 );
 CREATE INDEX IF NOT EXISTS idx_review_log_status ON review_log(status);
 
+CREATE TABLE IF NOT EXISTS security_audits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  depth TEXT NOT NULL CHECK (depth IN ('quick', 'standard', 'deep')),
+  requested_by TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending'
+    CHECK (state IN ('pending', 'running', 'published', 'failed')),
+  report_event_id TEXT,
+  sarif_hash TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_security_audits_repo_ref
+  ON security_audits(repo_id, ref);
+CREATE INDEX IF NOT EXISTS idx_security_audits_state
+  ON security_audits(state);
+
+CREATE TABLE IF NOT EXISTS security_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  audit_id INTEGER NOT NULL,
+  file TEXT NOT NULL,
+  line INTEGER NOT NULL CHECK (line >= 0),
+  cwe TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+  verified INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0, 1)),
+  refute_votes INTEGER NOT NULL DEFAULT 0 CHECK (refute_votes >= 0),
+  fingerprint TEXT NOT NULL,
+  FOREIGN KEY (audit_id) REFERENCES security_audits(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_security_findings_audit
+  ON security_findings(audit_id);
+CREATE INDEX IF NOT EXISTS idx_security_findings_fingerprint
+  ON security_findings(fingerprint);
+
+CREATE TABLE IF NOT EXISTS security_baseline (
+  repo_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  wontfix INTEGER NOT NULL DEFAULT 0 CHECK (wontfix IN (0, 1)),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (repo_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_security_baseline_fingerprint
+  ON security_baseline(fingerprint);
+
 CREATE TABLE IF NOT EXISTS repository_snapshots (
   repo_id TEXT PRIMARY KEY,
   snapshot_event_id TEXT NOT NULL,
