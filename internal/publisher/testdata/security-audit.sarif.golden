@@ -1,0 +1,94 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "drydock",
+          "version": "test-ref",
+          "rules": [
+            {
+              "id": "SQL-INJECTION",
+              "shortDescription": {
+                "text": "CWE-89 security finding"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "CWE-89"
+                ]
+              }
+            },
+            {
+              "id": "CWE-78",
+              "shortDescription": {
+                "text": "CWE-78 security finding"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "CWE-78"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "SQL-INJECTION",
+          "level": "error",
+          "message": {
+            "text": "Untrusted input reaches SQL execution."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "internal/db/query.go"
+                },
+                "region": {
+                  "startLine": 42,
+                  "endLine": 44
+                }
+              }
+            }
+          ],
+          "properties": {
+            "severity": "critical",
+            "cwe": "CWE-89",
+            "evidence": "db.Query builds SQL with user input",
+            "taint": "request.id -\u003e fmt.Sprintf -\u003e db.Query",
+            "remediation": "Use placeholders.",
+            "confidence": 0.99
+          }
+        },
+        {
+          "ruleId": "CWE-78",
+          "level": "warning",
+          "message": {
+            "text": "Command arguments are not constrained."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "internal/run/exec.go"
+                },
+                "region": {
+                  "startLine": 17
+                }
+              }
+            }
+          ],
+          "properties": {
+            "severity": "medium",
+            "cwe": "CWE-78",
+            "evidence": "request command reaches exec.Command"
+          }
+        }
+      ]
+    }
+  ]
+}
