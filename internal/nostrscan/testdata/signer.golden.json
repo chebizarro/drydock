@@ -1,0 +1,32 @@
+{
+  "is_nostr": true,
+  "confidence": 0.8,
+  "roles": [
+    "signer"
+  ],
+  "evidence": [
+    {
+      "kind": "dependency",
+      "name": "fiatjaf.com/nostr",
+      "path": "go.mod",
+      "line": 5,
+      "weight": 0.7,
+      "detail": "Nostr dependency in go.mod"
+    },
+    {
+      "kind": "role",
+      "name": "signer",
+      "path": "signer.go",
+      "line": 1,
+      "detail": "signing/key marker"
+    },
+    {
+      "kind": "protocol",
+      "name": "nostr-bech32",
+      "path": "signer.go",
+      "line": 3,
+      "weight": 0.25,
+      "detail": "nsec1 bech32 prefix"
+    }
+  ]
+}

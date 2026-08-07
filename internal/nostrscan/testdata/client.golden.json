@@ -1,0 +1,40 @@
+{
+  "is_nostr": true,
+  "confidence": 0.8,
+  "roles": [
+    "client"
+  ],
+  "evidence": [
+    {
+      "kind": "dependency",
+      "name": "nostr-tools",
+      "path": "package.json",
+      "line": 4,
+      "weight": 0.7,
+      "detail": "Nostr dependency in package.json"
+    },
+    {
+      "kind": "protocol",
+      "name": "relay-url",
+      "path": "src/client.ts",
+      "line": 1,
+      "weight": 0.2,
+      "detail": "wss://relay.example"
+    },
+    {
+      "kind": "protocol",
+      "name": "message-verbs",
+      "path": "src/client.ts",
+      "line": 2,
+      "weight": 0.25,
+      "detail": "REQ,EOSE"
+    },
+    {
+      "kind": "role",
+      "name": "client",
+      "path": "src/client.ts",
+      "line": 2,
+      "detail": "client subscription marker"
+    }
+  ]
+}

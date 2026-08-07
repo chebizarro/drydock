@@ -1,0 +1,32 @@
+{
+  "is_nostr": true,
+  "confidence": 0.8,
+  "roles": [
+    "relay"
+  ],
+  "evidence": [
+    {
+      "kind": "dependency",
+      "name": "nostr-sdk",
+      "path": "Cargo.toml",
+      "line": 6,
+      "weight": 0.7,
+      "detail": "Nostr dependency in cargo.toml"
+    },
+    {
+      "kind": "role",
+      "name": "relay",
+      "path": "src/relay.rs",
+      "line": 1,
+      "detail": "relay implementation marker"
+    },
+    {
+      "kind": "protocol",
+      "name": "message-verbs",
+      "path": "src/relay.rs",
+      "line": 2,
+      "weight": 0.25,
+      "detail": "EVENT,OK,AUTH"
+    }
+  ]
+}

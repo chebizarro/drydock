@@ -1,0 +1,48 @@
+{
+  "is_nostr": true,
+  "confidence": 0.8,
+  "roles": [
+    "dvm"
+  ],
+  "evidence": [
+    {
+      "kind": "dependency",
+      "name": "nostrsdk",
+      "path": "Package.swift",
+      "line": 6,
+      "weight": 0.7,
+      "detail": "Nostr dependency in package.swift"
+    },
+    {
+      "kind": "protocol",
+      "name": "nip-reference",
+      "path": "Sources/DVM.swift",
+      "line": 1,
+      "weight": 0.15,
+      "detail": "NIP-90"
+    },
+    {
+      "kind": "role",
+      "name": "dvm",
+      "path": "Sources/DVM.swift",
+      "line": 1,
+      "detail": "DVM/NIP-90 marker"
+    },
+    {
+      "kind": "protocol",
+      "name": "event-kind",
+      "path": "Sources/DVM.swift",
+      "line": 2,
+      "weight": 0.15,
+      "detail": "kind 5000"
+    },
+    {
+      "kind": "protocol",
+      "name": "message-verbs",
+      "path": "Sources/DVM.swift",
+      "line": 3,
+      "weight": 0.25,
+      "detail": "EVENT,REQ"
+    }
+  ]
+}

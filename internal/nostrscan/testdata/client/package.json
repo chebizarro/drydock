@@ -1,0 +1,6 @@
+{
+  "name": "sample-client",
+  "dependencies": {
+    "nostr-tools": "^2.0.0"
+  }
+}

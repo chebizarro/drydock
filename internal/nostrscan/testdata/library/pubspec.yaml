@@ -1,0 +1,3 @@
+name: sample_nostr_library
+dependencies:
+  nostr_tools: ^1.0.0
