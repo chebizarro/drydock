@@ -265,6 +265,61 @@ func TestPipelinePureHelpers(t *testing.T) {
 		}
 	})
 
+	t.Run("statusPublishParameters_security_gate", func(t *testing.T) {
+		cfg := repoconfig.Default()
+		cfg.Status.Enabled = true
+		cfg.Status.OpenSeverityFloor = "critical"
+		cfg.Status.MinConfidence = 0.99
+		cfg.Security.GateSeverity = "high"
+		cfg.Security.MinConfidence = 0.90
+		confirmed := reviewengine.Finding{Category: "security", Severity: "high", Confidence: 0.95}
+		ordinary := reviewengine.Finding{Category: "correctness", Severity: "critical", Confidence: 1}
+		findings, confidence, policy := statusPublishParameters([]reviewengine.Finding{ordinary, confirmed}, []reviewengine.Finding{confirmed}, cfg)
+		if len(findings) != 1 || findings[0] != confirmed {
+			t.Fatalf("status findings = %#v, want confirmed security finding only", findings)
+		}
+		if confidence != 0.95 || policy.OpenSeverityFloor != "high" || policy.MinConfidence != 0.90 || !policy.Enabled {
+			t.Fatalf("unexpected security status parameters: confidence=%v policy=%#v", confidence, policy)
+		}
+	})
+
+	t.Run("statusPublishParameters_non_gating_security_remains_comment_only", func(t *testing.T) {
+		cfg := repoconfig.Default()
+		cfg.Status.Enabled = true
+		cfg.Security.GateSeverity = "high"
+		cfg.Security.MinConfidence = 0.90
+		lowConfidence := reviewengine.Finding{Category: "security", Severity: "critical", Confidence: 0.89}
+		lowSeverity := reviewengine.Finding{Category: "security", Severity: "medium", Confidence: 0.99}
+		unverified := reviewengine.Finding{Category: "security", Severity: "critical", Confidence: 1}
+		findings, _, policy := statusPublishParameters(
+			[]reviewengine.Finding{lowConfidence, lowSeverity, unverified},
+			[]reviewengine.Finding{lowConfidence, lowSeverity},
+			cfg,
+		)
+		if len(findings) != 0 {
+			t.Fatalf("non-gating security findings affected status: %#v", findings)
+		}
+		if policy.OpenSeverityFloor != cfg.Status.OpenSeverityFloor {
+			t.Fatalf("policy = %#v, want ordinary status policy", policy)
+		}
+	})
+
+	t.Run("statusPublishParameters_preserves_non_security_semantics", func(t *testing.T) {
+		cfg := repoconfig.Default()
+		cfg.Status.Enabled = true
+		cfg.Status.OpenSeverityFloor = "high"
+		cfg.Status.MinConfidence = 0.8
+		securityComment := reviewengine.Finding{Category: "security", Severity: "critical", Confidence: 1}
+		correctness := reviewengine.Finding{Category: "correctness", Severity: "high", Confidence: 0.9}
+		findings, confidence, policy := statusPublishParameters([]reviewengine.Finding{securityComment, correctness}, nil, cfg)
+		if len(findings) != 1 || findings[0] != correctness {
+			t.Fatalf("ordinary status findings = %#v", findings)
+		}
+		if confidence != 0.9 || policy.OpenSeverityFloor != "high" || policy.MinConfidence != 0.8 {
+			t.Fatalf("unexpected ordinary status parameters: confidence=%v policy=%#v", confidence, policy)
+		}
+	})
+
 	t.Run("reviewStatusAllowed", func(t *testing.T) {
 		cases := []struct {
 			name      string

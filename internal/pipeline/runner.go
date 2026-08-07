@@ -579,6 +579,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		"findings", len(filteredReview.Findings),
 	)
 
+	statusFindings, statusConfidence, statusPolicy := statusPublishParameters(filteredReview.Findings, verifiedSecurityFindings, repoCfg)
+
 	// 11b. Publish NIP-34 review status event. A configured status output is
 	// part of task completion: returning its error lets the existing review
 	// retry path reuse the durable review outbox and retry status idempotently.
@@ -589,15 +591,11 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 				RepoID:        task.RepoID,
 				ReviewEventID: reviewEventID,
 				Summary:       filteredReview.Summary,
-				Findings:      filteredReview.Findings,
+				Findings:      statusFindings,
 				Model:         modelName(result, r.engine),
-				Confidence:    confidence,
+				Confidence:    statusConfidence,
 				Superseded:    superseded,
-				Policy: publisher.StatusPolicy{
-					Enabled:           repoCfg.Status.Enabled,
-					OpenSeverityFloor: repoCfg.Status.OpenSeverityFloor,
-					MinConfidence:     repoCfg.Status.MinConfidence,
-				},
+				Policy:        statusPolicy,
 			})
 			if statusErr != nil {
 				return statusErr
@@ -854,6 +852,40 @@ func meanConfidence(findings []reviewengine.Finding) float64 {
 		sum += f.Confidence
 	}
 	return sum / float64(len(findings))
+}
+
+// statusPublishParameters keeps unverified security findings out of status
+// decisions. Confirmed security findings use the security gate thresholds;
+// all other findings retain the existing status block semantics.
+func statusPublishParameters(all, verifiedSecurity []reviewengine.Finding, cfg repoconfig.RepoConfig) ([]reviewengine.Finding, float64, publisher.StatusPolicy) {
+	securityGates := make([]reviewengine.Finding, 0, len(verifiedSecurity))
+	for _, finding := range verifiedSecurity {
+		if !cfg.AllowsSeverity(finding.Severity) || !cfg.AllowsCategory("security") {
+			continue
+		}
+		if finding.Confidence >= cfg.Security.MinConfidence && reviewengine.IsAtOrAboveSeverity(finding.Severity, cfg.Security.GateSeverity) {
+			securityGates = append(securityGates, finding)
+		}
+	}
+	if len(securityGates) > 0 {
+		return securityGates, meanConfidence(securityGates), publisher.StatusPolicy{
+			Enabled:           cfg.Status.Enabled,
+			OpenSeverityFloor: cfg.Security.GateSeverity,
+			MinConfidence:     cfg.Security.MinConfidence,
+		}
+	}
+
+	nonSecurity := make([]reviewengine.Finding, 0, len(all))
+	for _, finding := range all {
+		if finding.Category != "security" {
+			nonSecurity = append(nonSecurity, finding)
+		}
+	}
+	return nonSecurity, meanConfidence(nonSecurity), publisher.StatusPolicy{
+		Enabled:           cfg.Status.Enabled,
+		OpenSeverityFloor: cfg.Status.OpenSeverityFloor,
+		MinConfidence:     cfg.Status.MinConfidence,
+	}
 }
 
 func (r *Runner) checkReviewStatus(ctx context.Context, task db.ReviewTask, rootID string, allowedStatuses []string) error {
