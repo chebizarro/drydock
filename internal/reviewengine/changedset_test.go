@@ -5,6 +5,8 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+
+	"drydock/internal/targetidentity"
 )
 
 func TestFilterFindingsToChangedFiles(t *testing.T) {
@@ -18,7 +20,10 @@ func TestFilterFindingsToChangedFiles(t *testing.T) {
 	}
 	changed := []string{"src/lib/html.ts", "package.json"}
 
-	kept := filterFindingsToChangedFiles(findings, changed, logger, "test")
+	kept, err := filterFindingsToChangedFiles(findings, changed, targetidentity.Envelope{}, "", "", logger, "test")
+	if err != nil {
+		t.Fatalf("filter findings: %v", err)
+	}
 	if len(kept) != 3 {
 		t.Fatalf("expected 3 kept findings, got %d: %+v", len(kept), kept)
 	}
@@ -29,8 +34,19 @@ func TestFilterFindingsToChangedFiles(t *testing.T) {
 	}
 
 	// Empty changed set: no-op (eval harnesses without a deterministic set).
-	if got := filterFindingsToChangedFiles(findings, nil, logger, "test"); len(got) != len(findings) {
-		t.Fatalf("expected no filtering with empty changed set, got %d", len(got))
+	if got, err := filterFindingsToChangedFiles(findings, nil, targetidentity.Envelope{}, "", "", logger, "test"); err != nil || len(got) != len(findings) {
+		t.Fatalf("expected no filtering with empty changed set, got %d, err %v", len(got), err)
+	}
+}
+
+func TestFilterFindingsRefusesMismatchedTargetEnvelope(t *testing.T) {
+	envelope := targetidentity.New("repo", "root", "patch", "sha256:remote", "base", "tip", "", "prepared diff", "bundle")
+	got, err := filterFindingsToChangedFiles([]Finding{{File: "main.go"}}, []string{"main.go"}, envelope, "different diff", "bundle", nil, "test")
+	if err == nil {
+		t.Fatalf("expected target envelope mismatch, got findings %+v", got)
+	}
+	if got != nil {
+		t.Fatalf("mismatched envelope passed output: %+v", got)
 	}
 }
 

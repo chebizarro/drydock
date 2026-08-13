@@ -81,6 +81,9 @@ func initRepoInCanonicalCache(t *testing.T, cacheDir, repoID string) string {
 	os.WriteFile(filepath.Join(repoPath, "main.go"), []byte("package main\n"), 0o644)
 	gitRun(t, repoPath, "add", "main.go")
 	gitRun(t, repoPath, "commit", "-m", "initial")
+	// Production cache entries always have an origin; use the repository itself
+	// so fetch --all remains local in integration tests.
+	gitRun(t, repoPath, "remote", "add", "origin", ".")
 
 	return repoPath
 }

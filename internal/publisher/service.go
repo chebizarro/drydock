@@ -14,6 +14,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
+	"drydock/internal/targetidentity"
 
 	"fiatjaf.com/nostr"
 )
@@ -42,6 +43,7 @@ type PublishInput struct {
 	Findings             []reviewengine.Finding
 	Model                string
 	ContextHash          string
+	TargetEnvelope       targetidentity.Envelope
 	Confidence           float64
 	ContextLayersUsed    []string
 	ContextLayersDropped []string
@@ -84,6 +86,21 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	}
 	if strings.TrimSpace(in.RepoID) == "" {
 		return "", errors.New("repo id is required")
+	}
+	if in.TargetEnvelope != (targetidentity.Envelope{}) {
+		if err := in.TargetEnvelope.Validate(); err != nil {
+			return "", fmt.Errorf("invalid target identity envelope: %w", err)
+		}
+		envelopeHash, err := in.TargetEnvelope.Hash()
+		if err != nil {
+			return "", err
+		}
+		if envelopeHash != in.ContextHash {
+			return "", fmt.Errorf("context hash %s does not match target identity envelope %s", in.ContextHash, envelopeHash)
+		}
+		if in.TargetEnvelope.RepoID != in.RepoID || in.TargetEnvelope.PatchEventID != strings.ToLower(in.PatchEventID) {
+			return "", errors.New("publication target does not match target identity envelope")
+		}
 	}
 
 	priorEventID, status, err := s.store.GetReviewEventIDAndStatus(ctx, in.PatchEventID, in.RepoID)
@@ -401,10 +418,19 @@ func footer(in PublishInput) string {
 	used := strings.Join(in.ContextLayersUsed, ", ")
 	dropped := strings.Join(in.ContextLayersDropped, ", ")
 	excluded := strings.Join(in.ExcludedFiles, ", ")
-	// mandatory: keep field present even when empty
+	envelope := in.TargetEnvelope
+	if envelope == (targetidentity.Envelope{}) {
+		envelope = targetidentity.Envelope{
+			RepoID: in.RepoID, PatchEventID: in.PatchEventID,
+			BaseCommit: in.BaseCommit, TipCommit: in.TipCommit, DiffSHA256: in.DiffSHA256,
+		}
+	}
+	// mandatory: keep every field present even when empty
 	return fmt.Sprintf(
-		"\n\n---\nmodel: %s\ncontext-hash: %s\npatch-event-id: %s\nrepo-id: %s\nreview-mode: automated\nconfidence: %.2f\ncontext-layers-used: %s\ncontext-layers-dropped: %s\nexcluded-files: %s\n",
-		in.Model, in.ContextHash, in.PatchEventID, in.RepoID, in.Confidence, used, dropped, excluded,
+		"\n\n---\nmodel: %s\ncontext-hash: %s\nrepo-id: %s\nroot-id: %s\npatch-event-id: %s\ncanonical-remote-identity: %s\nbase-commit: %s\ntip-commit: %s\ndiff-sha256: %s\nbundle-sha256: %s\nreview-mode: automated\nconfidence: %.2f\ncontext-layers-used: %s\ncontext-layers-dropped: %s\nexcluded-files: %s\n",
+		in.Model, in.ContextHash, envelope.RepoID, envelope.RootID, envelope.PatchEventID,
+		envelope.CanonicalRemoteIdentity, envelope.BaseCommit, envelope.TipCommit,
+		envelope.DiffSHA256, envelope.BundleSHA256, in.Confidence, used, dropped, excluded,
 	)
 }
 

@@ -32,12 +32,13 @@ type PrepareResult struct {
 	// Diff and its provenance fields are populated for PR-style events
 	// (kind 1618/1619), whose event content is a cover letter rather than a
 	// diff. They remain empty for kind 1617 patch series.
-	Diff       string
-	BaseCommit string
-	TipCommit  string
-	DiffSHA256 string
-	DiffFiles  int
-	DiffBytes  int64
+	Diff                    string
+	BaseCommit              string
+	TipCommit               string
+	DiffSHA256              string
+	CanonicalRemoteIdentity string
+	DiffFiles               int
+	DiffBytes               int64
 }
 
 func NewService(store *db.Store, manager *Manager, logger *slog.Logger) *Service {
@@ -107,6 +108,10 @@ func (s *Service) preparePatchRevision(ctx context.Context, rec db.PatchEventRec
 	if err != nil {
 		return PrepareResult{}, err
 	}
+	canonicalRemoteIdentity, err := s.manager.remoteIdentity(ctx, lease.repoPath)
+	if err != nil {
+		return PrepareResult{}, err
+	}
 	baseConfig, cfgErr := s.manager.ReadFileAtDefaultRef(ctx, lease.repoPath, ".drydock.yaml")
 	if cfgErr != nil {
 		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
@@ -158,6 +163,7 @@ func (s *Service) preparePatchRevision(ctx context.Context, rec db.PatchEventRec
 	result := PrepareResult{
 		RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
 		RootID: rec.RootID, AppliedIDs: applied, BaseRepoConfig: baseConfig, workspace: workspace,
+		BaseCommit: baseCommit, CanonicalRemoteIdentity: canonicalRemoteIdentity,
 	}
 	s.logger.Info("prepared patch revision in isolated worktree",
 		"patch_event_id", rec.EventID, "repo_id", rec.RepoID,
@@ -204,6 +210,10 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 			fmt.Errorf("ensure canonical repo for review: %w", err)
 	}
 	canonicalOwned := true
+	canonicalRemoteIdentity, err := s.manager.remoteIdentity(ctx, canonicalLease.repoPath)
+	if err != nil {
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID}, err
+	}
 	defer func() {
 		if canonicalOwned {
 			canonicalLease.release()
@@ -289,7 +299,8 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 		RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: diffResult.TipCommit, RootID: rec.RootID,
 		AppliedIDs: []string{target.ID.Hex()}, BaseRepoConfig: baseConfig, workspace: workspace,
 		Diff: diffResult.Diff, BaseCommit: diffResult.BaseCommit, TipCommit: diffResult.TipCommit,
-		DiffSHA256: diffResult.SHA256, DiffFiles: diffResult.FileCount, DiffBytes: diffResult.ByteCount,
+		DiffSHA256: diffResult.SHA256, CanonicalRemoteIdentity: canonicalRemoteIdentity,
+		DiffFiles: diffResult.FileCount, DiffBytes: diffResult.ByteCount,
 	}
 	s.logger.Info("prepared PR tip in isolated worktree",
 		"patch_event_id", rec.EventID, "repo_id", rec.RepoID, "worktree", workspace.path,

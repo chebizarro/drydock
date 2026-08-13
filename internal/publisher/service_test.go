@@ -11,6 +11,7 @@ import (
 
 	"drydock/internal/db"
 	"drydock/internal/reviewengine"
+	"drydock/internal/targetidentity"
 
 	"fiatjaf.com/nostr"
 )
@@ -63,13 +64,19 @@ func TestPublishReviewSummaryAndHighDetail(t *testing.T) {
 		DefaultRelays:       []string{"wss://fallback.example"},
 		DetailSeverityFloor: "high",
 	}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	envelope := targetidentity.New(repoID, patchID, patchID, "sha256:remote", strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 64), "ignored", "bundle")
+	contextHash, err := envelope.Hash()
+	if err != nil {
+		t.Fatalf("hash target envelope: %v", err)
+	}
 
 	eventID, err := svc.PublishReview(ctx, PublishInput{
 		PatchEventID:      patchID,
 		RepoID:            repoID,
 		Summary:           "Looks good overall.",
 		Model:             "qwen2.5-coder-32b-instruct-q4_k_m",
-		ContextHash:       "abc123",
+		ContextHash:       contextHash,
+		TargetEnvelope:    envelope,
 		Confidence:        0.82,
 		ContextLayersUsed: []string{"patch", "modified-files"},
 		BaseCommit:        strings.Repeat("a", 40),
@@ -96,6 +103,11 @@ func TestPublishReviewSummaryAndHighDetail(t *testing.T) {
 		}
 		if !strings.Contains(c.event.Content, "context-layers-dropped:") {
 			t.Fatalf("missing mandatory context-layers-dropped footer field")
+		}
+		for _, field := range []string{"repo-id: " + repoID, "root-id: " + patchID, "patch-event-id: " + patchID, "canonical-remote-identity: sha256:remote", "base-commit: " + strings.Repeat("a", 40), "tip-commit: " + strings.Repeat("b", 40), "diff-sha256: " + strings.Repeat("c", 64), "bundle-sha256: " + envelope.BundleSHA256} {
+			if !strings.Contains(c.event.Content, field) {
+				t.Fatalf("missing target envelope footer field %q in %s", field, c.event.Content)
+			}
 		}
 		assertHasTag(t, c.event.Tags, "E")
 		assertHasTag(t, c.event.Tags, "K")

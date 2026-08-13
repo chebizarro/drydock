@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,9 +18,29 @@ import (
 	"time"
 
 	"drydock/internal/metrics"
+	"drydock/internal/targetidentity"
 
 	"fiatjaf.com/nostr"
 )
+
+func (m *Manager) remoteIdentity(ctx context.Context, repoPath string) (string, error) {
+	validatedPath, err := m.validateRepoPath(repoPath)
+	if err != nil {
+		return "", err
+	}
+	mu := m.getRepoLock(validatedPath)
+	mu.Lock()
+	defer mu.Unlock()
+	out, err := m.runGit(ctx, validatedPath, "remote", "get-url", "--all", "origin")
+	if err != nil {
+		return "", fmt.Errorf("read prepared repository origin identity: %w", err)
+	}
+	identity := targetidentity.RemoteIdentity(strings.Split(out, "\n"))
+	if identity == "" {
+		return "", errors.New("prepared repository origin identity is empty")
+	}
+	return identity, nil
+}
 
 type Manager struct {
 	baseDir      string

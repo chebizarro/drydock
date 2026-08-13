@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strings"
 	"sync/atomic"
+
+	"drydock/internal/targetidentity"
 )
 
 type ModelEndpoint struct {
@@ -27,9 +29,11 @@ type Config struct {
 }
 
 type RunInput struct {
-	ContextBundle string
-	ChangedFiles  []string
-	FewShot       []string
+	ContextBundle  string
+	PatchDiff      string
+	TargetEnvelope targetidentity.Envelope
+	ChangedFiles   []string
+	FewShot        []string
 	// ReviewerRoute, when set, overrides the planner-selected reviewer route.
 	ReviewerRoute ModelRoute
 	// ReviewerSystemPromptOverride, if non-empty, replaces the default base
@@ -113,7 +117,10 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	if err != nil {
 		return RunOutput{}, err
 	}
-	review.Findings = filterFindingsToChangedFiles(review.Findings, in.ChangedFiles, e.logger, "reviewer")
+	review.Findings, err = filterFindingsToChangedFiles(review.Findings, in.ChangedFiles, in.TargetEnvelope, in.PatchDiff, in.ContextBundle, e.logger, "reviewer")
+	if err != nil {
+		return RunOutput{}, err
+	}
 
 	// Generate walkthrough (using planner model — lightweight 14B)
 	walkthrough, walkthroughStatus := e.generateWalkthrough(ctx, in)

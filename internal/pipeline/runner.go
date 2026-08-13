@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +23,7 @@ import (
 	"drydock/internal/scope"
 	"drydock/internal/securityreview"
 	"drydock/internal/securityscan"
+	"drydock/internal/targetidentity"
 	"drydock/internal/tracing"
 
 	"fiatjaf.com/nostr"
@@ -323,8 +323,25 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// stage, then remove and prune it even if the task context was cancelled.
 	defer r.repoSvc.CleanupPreparedReview(ctx, prep)
 
+	if prep.RepoID != task.RepoID {
+		return fmt.Errorf("prepared target identity mismatch: task repo %s, prepared %s", task.RepoID, prep.RepoID)
+	}
+	if prep.CanonicalRemoteIdentity == "" {
+		return fmt.Errorf("prepared target identity missing canonical remote for repo %s", task.RepoID)
+	}
+	preparedPatch := false
+	for _, eventID := range prep.AppliedIDs {
+		if strings.EqualFold(eventID, task.PatchEventID) {
+			preparedPatch = true
+			break
+		}
+	}
+	if !preparedPatch {
+		return fmt.Errorf("prepared target identity mismatch: patch event %s was not prepared", task.PatchEventID)
+	}
+
 	// Persist PR diff provenance before any context construction or publication.
-	if prep.BaseCommit != "" || prep.TipCommit != "" || prep.DiffSHA256 != "" {
+	if prep.DiffSHA256 != "" {
 		if err := r.store.RecordReviewDiffProvenance(ctx, task.PatchEventID, task.RepoID, prep.BaseCommit, prep.TipCommit, prep.DiffSHA256); err != nil {
 			return fmt.Errorf("persist PR diff provenance: %w", err)
 		}
@@ -350,9 +367,18 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	if err != nil {
 		return fmt.Errorf("get patch event: %w", err)
 	}
+	if !strings.EqualFold(patchRec.EventID, task.PatchEventID) {
+		return fmt.Errorf("loaded patch identity mismatch: task %s, record %s", task.PatchEventID, patchRec.EventID)
+	}
+	if prep.RootID != patchRec.RootID {
+		return fmt.Errorf("prepared target identity mismatch: patch root %s, prepared %s", patchRec.RootID, prep.RootID)
+	}
 	var patchEvent nostr.Event
 	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
 		return fmt.Errorf("decode patch event: %w", err)
+	}
+	if !strings.EqualFold(patchEvent.ID.Hex(), task.PatchEventID) {
+		return fmt.Errorf("decoded patch identity mismatch: task %s, event %s", task.PatchEventID, patchEvent.ID.Hex())
 	}
 
 	// 1c2. Status gate: reviews run automatically only for roots whose
@@ -463,6 +489,18 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		}
 	}
 
+	targetEnvelope := targetidentity.New(
+		task.RepoID, patchRec.RootID, task.PatchEventID, prep.CanonicalRemoteIdentity,
+		prep.BaseCommit, prep.TipCommit, prep.DiffSHA256, patchDiffContent, bundle.Content,
+	)
+	if err := targetEnvelope.VerifyMaterials(patchDiffContent, bundle.Content); err != nil {
+		return fmt.Errorf("verify prepared target envelope: %w", err)
+	}
+	ctxHash, err := targetEnvelope.Hash()
+	if err != nil {
+		return fmt.Errorf("hash target identity envelope: %w", err)
+	}
+
 	// 5. Extract changed files from the context bundle (used for few-shot, engine, etc.).
 	changedFiles := bundle.ChangedFiles
 	if len(changedFiles) == 0 && len(bundle.ExcludedFiles) > 0 {
@@ -476,7 +514,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			RepoID:               task.RepoID,
 			Summary:              "This patch only modifies files excluded by repository review policy, so no automated review was run.",
 			Model:                "none",
-			ContextHash:          fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content))),
+			ContextHash:          ctxHash,
+			TargetEnvelope:       targetEnvelope,
 			ContextLayersUsed:    bundle.LayersUsed,
 			ContextLayersDropped: bundle.LayersDropped,
 			ExcludedFiles:        bundle.ExcludedFiles,
@@ -530,6 +569,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 6b. Run review engine (single model or ensemble mode)
 	runInput := reviewengine.RunInput{
 		ContextBundle:                bundle.Content,
+		PatchDiff:                    patchDiffContent,
+		TargetEnvelope:               targetEnvelope,
 		ChangedFiles:                 changedFiles,
 		FewShot:                      fewShot,
 		ReviewerSystemPromptOverride: promptOverride,
@@ -602,15 +643,19 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		}
 	}
 
-	// 7. Compute context hash
-	ctxHash := fmt.Sprintf("%x", sha256.Sum256([]byte(bundle.Content)))
-
 	// 7b. Deduplicate scanner findings with LLM findings, then apply review policy.
 	llmFindings := append(result.Review.Findings, verifiedSecurityFindings...)
 	mergedFindings := securityscan.DeduplicateFindings(scanFindings, llmFindings)
 	mergedReview := result.Review
 	mergedReview.Findings = mergedFindings
 	filteredReview := applyReviewPolicy(mergedReview, repoCfg)
+	filteredReview, result.Walkthrough, err = reviewengine.FilterOutputToChangedFiles(
+		filteredReview, result.Walkthrough, changedFiles, targetEnvelope,
+		patchDiffContent, bundle.Content, log,
+	)
+	if err != nil {
+		return fmt.Errorf("final target identity filter: %w", err)
+	}
 
 	// 8. Compute mean confidence
 	confidence := meanConfidence(filteredReview.Findings)
@@ -641,6 +686,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			Findings:             filteredReview.Findings,
 			Model:                modelName(result, r.engine),
 			ContextHash:          ctxHash,
+			TargetEnvelope:       targetEnvelope,
 			Confidence:           confidence,
 			ContextLayersUsed:    bundle.LayersUsed,
 			ContextLayersDropped: bundle.LayersDropped,

@@ -1,8 +1,11 @@
 package reviewengine
 
 import (
+	"fmt"
 	"log/slog"
 	"strings"
+
+	"drydock/internal/targetidentity"
 )
 
 // changedSet is a normalized membership set of deterministically parsed
@@ -41,10 +44,15 @@ func normalizeReviewPath(p string) string {
 // authoritative for what changed. Findings without a file path are kept.
 // No-op when the changed set is empty (callers without a deterministic set,
 // e.g. eval harnesses).
-func filterFindingsToChangedFiles(findings []Finding, changed []string, logger *slog.Logger, label string) []Finding {
+func filterFindingsToChangedFiles(findings []Finding, changed []string, envelope targetidentity.Envelope, patchDiff, contextBundle string, logger *slog.Logger, label string) ([]Finding, error) {
+	if envelope != (targetidentity.Envelope{}) {
+		if err := envelope.VerifyMaterials(patchDiff, contextBundle); err != nil {
+			return nil, fmt.Errorf("refuse changed-file output for mismatched target envelope: %w", err)
+		}
+	}
 	set := newChangedSet(changed)
 	if set == nil {
-		return findings
+		return findings, nil
 	}
 	kept := make([]Finding, 0, len(findings))
 	var dropped []string
@@ -59,12 +67,23 @@ func filterFindingsToChangedFiles(findings []Finding, changed []string, logger *
 		logger.Warn("dropped findings referencing unchanged files",
 			"label", label, "dropped", dropped, "changed_files", changed)
 	}
-	return kept
+	return kept, nil
 }
 
 // filterWalkthroughToChangedFiles drops walkthrough file summaries whose
 // paths are not in the deterministic changed-file set, preventing contextual
 // documentation from being presented as modified files.
+// FilterOutputToChangedFiles applies the final target-integrity boundary after
+// all LLM, security-review, and scanner findings have been merged.
+func FilterOutputToChangedFiles(review ReviewerOutput, walkthrough WalkthroughOutput, changed []string, envelope targetidentity.Envelope, patchDiff, contextBundle string, logger *slog.Logger) (ReviewerOutput, WalkthroughOutput, error) {
+	findings, err := filterFindingsToChangedFiles(review.Findings, changed, envelope, patchDiff, contextBundle, logger, "final")
+	if err != nil {
+		return ReviewerOutput{}, WalkthroughOutput{}, err
+	}
+	review.Findings = findings
+	return review, filterWalkthroughToChangedFiles(walkthrough, changed, logger), nil
+}
+
 func filterWalkthroughToChangedFiles(w WalkthroughOutput, changed []string, logger *slog.Logger) WalkthroughOutput {
 	set := newChangedSet(changed)
 	if set == nil {
