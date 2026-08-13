@@ -56,6 +56,9 @@ type Input struct {
 	ChangedFiles     []string
 	LocalReview      reviewengine.ReviewerOutput
 	SecurityFindings []SecurityFinding
+	DiscoveryTrace   any
+	AgentTrace       reviewengine.ReviewerTrace
+	EnsembleTraces   []reviewengine.EnsembleReviewerTrace
 }
 
 type Result struct {
@@ -418,6 +421,14 @@ func metaReviewUserPrompt(in Input, maxInputBytes int) string {
 	if len(in.SecurityFindings) > 0 {
 		securityJSON, _ := json.Marshal(AnalyzeSecurityFindings(in.SecurityFindings))
 		prompt += "\n\nSecurity review verification analysis JSON:\n" + string(securityJSON)
+	}
+	tracePayload := struct {
+		Discovery any                                  `json:"discovery,omitempty"`
+		Reviewer  reviewengine.ReviewerTrace           `json:"reviewer,omitempty"`
+		Ensemble  []reviewengine.EnsembleReviewerTrace `json:"ensemble,omitempty"`
+	}{Discovery: in.DiscoveryTrace, Reviewer: in.AgentTrace, Ensemble: in.EnsembleTraces}
+	if traceJSON, err := json.Marshal(tracePayload); err == nil && string(traceJSON) != "{}" {
+		prompt += "\n\nAgent trace metadata JSON:\n" + string(traceJSON)
 	}
 	return prompt
 }

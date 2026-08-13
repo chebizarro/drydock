@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"drydock/internal/agenticreview"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/eventkind"
@@ -20,11 +21,13 @@ import (
 	"drydock/internal/repo"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
+	"drydock/internal/reviewsession"
 	"drydock/internal/scope"
 	"drydock/internal/securityreview"
 	"drydock/internal/securityscan"
 	"drydock/internal/targetidentity"
 	"drydock/internal/tracing"
+	"drydock/internal/workspacesnapshot"
 
 	"fiatjaf.com/nostr"
 )
@@ -85,6 +88,7 @@ type Runner struct {
 	repoSvc                 *repo.Service
 	ctxBuilder              *contextbuilder.Builder
 	engine                  *reviewengine.Engine
+	agenticSvc              *agenticreview.Service
 	pubSvc                  *publisher.Service
 	metaSvc                 *metareview.Service
 	promptRefiner           PromptRefiner
@@ -100,6 +104,7 @@ type Runner struct {
 	logger                  *slog.Logger
 	activityHook            func()
 	applyFailurePublication string
+	agenticReviewFallback   bool
 
 	// Narrow function seams keep failure handling testable without replacing the
 	// concrete services used by the rest of the pipeline.
@@ -111,12 +116,22 @@ type Runner struct {
 type Config struct {
 	Workers                 int
 	ApplyFailurePublication string
+	// AgenticReviewFallback explicitly keeps the legacy deterministic
+	// Builder.Build + Engine.Run path available during rollout.
+	AgenticReviewFallback bool
 }
 
 const (
 	ApplyFailurePublicationNotice   = "notice"
 	ApplyFailurePublicationSuppress = "suppress"
 )
+
+// WithAgenticReviewService enables the default two-phase agentic review path.
+func WithAgenticReviewService(service *agenticreview.Service) func(*Runner) {
+	return func(r *Runner) {
+		r.agenticSvc = service
+	}
+}
 
 // WithPromptRefiner sets an optional prompt refinement service on the runner.
 // When set, the runner uses the active versioned reviewer prompt for each review.
@@ -220,6 +235,7 @@ func New(
 		workers:                 workers,
 		logger:                  logger,
 		applyFailurePublication: applyFailurePublication,
+		agenticReviewFallback:   cfg.AgenticReviewFallback,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -487,21 +503,78 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return fmt.Errorf("verify checkout before context build: %w", err)
 	}
 
-	// 4. Build context bundle (with repo-config overrides)
+	// 4. Analyze the patch once through the shared facade. This is the
+	// authoritative changed-file/exclusion set for preparation and few-shot
+	// retrieval, independent of model behavior.
+	analysis, err := contextbuilder.NewPatchFacade().Analyze(contextbuilder.PatchAnalysisRequest{
+		Diff: patchDiffContent, ExcludePaths: repoCfg.Context.ExcludePaths,
+	})
+	if err != nil {
+		return fmt.Errorf("analyze review patch: %w", err)
+	}
+	authoritativePatch := analysis.FilteredDiff
+	patchDiffContent = authoritativePatch
+	buildInput := contextbuilder.BuildInput{
+		PatchEventContent: authoritativePatch, RepoPath: prep.RepoPath, RepoID: task.RepoID,
+		TokenBudgetOverride: repoCfg.Context.TokenBudget, ExcludePaths: repoCfg.Context.ExcludePaths,
+		DisableDocs: !repoCfg.DocsEnabled(),
+	}
+
 	var bundle contextbuilder.ContextBundle
+	if len(analysis.ChangedFiles) == 0 && len(analysis.ExcludedFiles) > 0 {
+		bundle = contextbuilder.ContextBundle{
+			Content:       "No reviewable changes remain after repository path exclusions.",
+			ExcludedFiles: append([]string(nil), analysis.ExcludedFiles...),
+		}
+	}
+	var prepared *agenticreview.PreparedReview
+	releasePrepared := func() {}
 	if err := timer.Time(tracing.StageContextBuild, func() error {
-		var buildErr error
-		bundle, buildErr = r.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
-			PatchEventContent:   patchDiffContent,
-			RepoPath:            prep.RepoPath,
-			RepoID:              task.RepoID,
-			TokenBudgetOverride: repoCfg.Context.TokenBudget,
-			ExcludePaths:        repoCfg.Context.ExcludePaths,
-			DisableDocs:         !repoCfg.DocsEnabled(),
+		if repoCfg.Context.TokenBudget < 0 {
+			return fmt.Errorf("invalid negative context token budget")
+		}
+		if bundle.Content != "" {
+			return nil // pipeline-owned exclusion-only decision; no model call
+		}
+		if r.agenticReviewFallback {
+			var buildErr error
+			bundle, buildErr = r.ctxBuilder.Build(ctx, buildInput)
+			return buildErr
+		}
+		if r.agenticSvc == nil {
+			return fmt.Errorf("agentic review service is required unless the explicit rollout fallback is enabled")
+		}
+		var prepareErr error
+		prepared, prepareErr = r.agenticSvc.Prepare(ctx, agenticreview.PrepareInput{
+			Mode: reviewsession.ModePatch,
+			Snapshot: agenticreview.SnapshotSpec{
+				Kind: workspacesnapshot.KindPinnedGit, RepoPath: prep.RepoPath,
+				Ref: prep.ExpectedCommit, PatchRef: task.PatchEventID, Allowlist: analysis.ChangedFiles,
+			},
+			Patch: authoritativePatch, BuildInput: buildInput,
+			Target: agenticreview.TargetInput{
+				RepoID: task.RepoID, RootID: patchRec.RootID, PatchEventID: task.PatchEventID,
+				CanonicalRemoteIdentity: prep.CanonicalRemoteIdentity, BaseCommit: prep.BaseCommit,
+				TipCommit: prep.TipCommit, PreparedDiffSHA256: targetidentity.SHA256(authoritativePatch),
+			},
 		})
-		return buildErr
+		if prepareErr == nil {
+			bundle = prepared.Bundle()
+			bundle.ExcludedFiles = append([]string(nil), analysis.ExcludedFiles...)
+		}
+		return prepareErr
 	}); err != nil {
-		return fmt.Errorf("build context: %w", err)
+		return fmt.Errorf("prepare agentic context: %w", err)
+	}
+	if prepared != nil {
+		released := false
+		releasePrepared = func() {
+			if !released {
+				r.agenticSvc.ReleasePrepared(prepared)
+				released = true
+			}
+		}
+		defer releasePrepared()
 	}
 	for _, status := range bundle.LayerStatuses {
 		metrics.ContextLayersByStatus.With(status.Status).Inc()
@@ -512,9 +585,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 
 	targetEnvelope := targetidentity.New(
 		task.RepoID, patchRec.RootID, task.PatchEventID, prep.CanonicalRemoteIdentity,
-		prep.BaseCommit, prep.TipCommit, prep.DiffSHA256, patchDiffContent, bundle.Content,
+		prep.BaseCommit, prep.TipCommit, targetidentity.SHA256(authoritativePatch), authoritativePatch, bundle.Content,
 	)
-	if err := targetEnvelope.VerifyMaterials(patchDiffContent, bundle.Content); err != nil {
+	if err := targetEnvelope.VerifyMaterials(authoritativePatch, bundle.Content); err != nil {
 		return fmt.Errorf("verify prepared target envelope: %w", err)
 	}
 	ctxHash, err := targetEnvelope.Hash()
@@ -603,20 +676,34 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	var result reviewengine.RunOutput
 	if err := timer.Time(tracing.StageLLMReview, func() error {
 		var reviewErr error
-		if repoCfg.Ensemble.Enabled {
-			ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
-			result, reviewErr = r.engine.RunEnsemble(ctx, runInput, ensembleCfg)
-			if reviewErr != nil {
-				return fmt.Errorf("ensemble review engine: %w", reviewErr)
+		if r.agenticReviewFallback {
+			if repoCfg.Ensemble.Enabled {
+				ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
+				result, reviewErr = r.engine.RunEnsemble(ctx, runInput, ensembleCfg)
+			} else {
+				result, reviewErr = r.engine.Run(ctx, runInput)
 			}
-			log.Info("ensemble review completed",
-				"models", len(ensembleCfg.Models),
-				"findings", len(result.Review.Findings))
 		} else {
-			result, reviewErr = r.engine.Run(ctx, runInput)
-			if reviewErr != nil {
-				return fmt.Errorf("review engine: %w", reviewErr)
+			if prepared == nil {
+				return fmt.Errorf("agentic review preparation is missing")
 			}
+			options := agenticreview.ReviewOptions{
+				ReviewerSystemPromptOverride: promptOverride,
+				AdditionalInstructions:       repoCfg.PromptInstructions(), FewShot: fewShot,
+				SkipWalkthrough: !repoCfg.WalkthroughEnabled(),
+			}
+			if repoCfg.Ensemble.Enabled {
+				ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
+				options.Ensemble = &ensembleCfg
+			}
+			result, reviewErr = r.agenticSvc.ReviewPrepared(ctx, prepared, options)
+		}
+		if reviewErr != nil {
+			return fmt.Errorf("review engine: %w", reviewErr)
+		}
+		if repoCfg.Ensemble.Enabled {
+			log.Info("ensemble review completed",
+				"models", len(repoCfg.Ensemble.Models), "findings", len(result.Review.Findings))
 		}
 		return nil
 	}); err != nil {
@@ -775,17 +862,28 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		}
 	}
 
-	// 12. Async meta-review (non-blocking, uses filtered review)
+	// All filesystem-dependent stages are complete. Release the retained
+	// prepared-snapshot lease before the asynchronous meta-review begins.
+	releasePrepared()
+
+	// 12. Async meta-review (non-blocking, uses filtered review and agent trace metadata).
 	if r.metaSvc != nil {
+		var discoveryTrace any
+		if prepared != nil {
+			discoveryTrace = prepared.DiscoveryTrace()
+		}
 		r.metaSvc.RunAsync(ctx, metareview.Input{
 			PatchEventID:     task.PatchEventID,
 			RepoID:           task.RepoID,
-			PatchDiff:        patchDiffContent,
+			PatchDiff:        authoritativePatch,
 			ContextBundle:    bundle.Content,
 			ContextHash:      ctxHash,
 			ChangedFiles:     changedFiles,
 			LocalReview:      filteredReview,
 			SecurityFindings: metareview.ConfirmedSecurityFindings(verifiedSecurityFindings),
+			DiscoveryTrace:   discoveryTrace,
+			AgentTrace:       result.ReviewerTrace,
+			EnsembleTraces:   append([]reviewengine.EnsembleReviewerTrace(nil), result.EnsembleStatus.ReviewerTraces...),
 		})
 	}
 

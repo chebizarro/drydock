@@ -124,6 +124,7 @@ type Config struct {
 	DashboardBearerToken       string
 	PipelineWorkers            int
 	ApplyFailurePublication    string
+	AgenticReviewFallback      bool
 	SecurityEnabled            bool
 	SecurityAuditWorkers       int
 	SecurityNostrEnabled       string
@@ -243,6 +244,7 @@ func FromEnv() Config {
 		DashboardBearerToken:       envOrDefault("DRYDOCK_DASHBOARD_BEARER_TOKEN", ""),
 		PipelineWorkers:            parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
 		ApplyFailurePublication:    strings.ToLower(strings.TrimSpace(envOrDefault("DRYDOCK_APPLY_FAILURE_PUBLICATION", "notice"))),
+		AgenticReviewFallback:      parseBoolOrDefault(envOrDefault("DRYDOCK_AGENTIC_REVIEW_FALLBACK", "false"), false),
 		SecurityEnabled:            parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_ENABLED", "false"), false),
 		SecurityAuditWorkers:       parseIntOrDefault(envOrDefault("DRYDOCK_SECURITY_AUDIT_WORKERS", "2"), 2),
 		SecurityNostrEnabled:       parseNostrEnabled(envOrDefault("DRYDOCK_SECURITY_NOSTR_ENABLED", "auto")),
@@ -300,6 +302,7 @@ func configuredEnv() map[string]bool {
 		"DRYDOCK_META_API_KEY",
 		"DRYDOCK_META_MAX_INPUT_BYTES",
 		"DRYDOCK_APPLY_FAILURE_PUBLICATION",
+		"DRYDOCK_AGENTIC_REVIEW_FALLBACK",
 		"DRYDOCK_QDRANT_URL",
 		"DRYDOCK_QDRANT_API_KEY",
 		"DRYDOCK_EMBED_BASE_URL",

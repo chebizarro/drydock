@@ -153,6 +153,22 @@ func TestMetaReviewAnalyzesSecurityVerifyOutcomes(t *testing.T) {
 	}
 }
 
+func TestMetaReviewPromptIncludesAgentTrace(t *testing.T) {
+	prompt := metaReviewUserPrompt(Input{
+		PatchDiff: "patch", ContextBundle: "context",
+		DiscoveryTrace: map[string]any{"fallback_reason": "loop_exhaustion"},
+		AgentTrace: reviewengine.ReviewerTrace{
+			Turns: 4, ToolCalls: 7, EvidenceToolCallIDs: []string{"evidence-1"},
+			StopReason: "review_submitted",
+		},
+	}, 4096)
+	for _, want := range []string{"Agent trace metadata JSON", `"turns":4`, `"tool_calls":7`, `"evidence_tool_call_ids":["evidence-1"]`, `"stop_reason":"review_submitted"`, `"fallback_reason":"loop_exhaustion"`} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("agent trace prompt missing %s: %s", want, prompt)
+		}
+	}
+}
+
 func TestMetaReviewPromptBudgetsRealSizeInputs(t *testing.T) {
 	diff := strings.Repeat("+large patch line\n", 200_000) + "PATCH_END"
 	bundle := strings.Repeat("context layer\n", 100_000) + "CONTEXT_END"

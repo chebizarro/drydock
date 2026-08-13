@@ -6,11 +6,14 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"drydock/internal/agenticreview"
+	"drydock/internal/agenttools"
 	"drydock/internal/auditengine"
 	"drydock/internal/circuitbreaker"
 	"drydock/internal/codechat"
@@ -41,6 +44,7 @@ import (
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
 	"drydock/internal/revieworder"
+	"drydock/internal/reviewsession"
 	"drydock/internal/scope"
 	"drydock/internal/securityreview"
 	"drydock/internal/securityscan"
@@ -48,6 +52,7 @@ import (
 	"drydock/internal/signing"
 	"drydock/internal/symbols"
 	"drydock/internal/vectorstore"
+	"drydock/internal/workspacesnapshot"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip11"
@@ -463,6 +468,44 @@ func main() {
 		ReviewerTemp: 0.2,
 	}, llmClient, logger)
 	engine.UseModelIdentity(modelIdentity)
+
+	// --- Shared agentic review service ---
+	agentCounter, err := contextbuilder.NewRequiredTiktokenCounter("cl100k_base")
+	if err != nil {
+		logger.Error("failed to initialize authoritative agentic tokenizer", "error", err)
+		os.Exit(1)
+	}
+	snapshotManager, err := workspacesnapshot.NewManager(workspacesnapshot.Config{
+		StorageRoot: filepath.Join(cfg.RepoCacheDir, "review-snapshots"),
+	})
+	if err != nil {
+		logger.Error("failed to initialize review snapshots", "error", err)
+		os.Exit(1)
+	}
+	sessionStore, err := reviewsession.NewSQLiteStore(store.DB(), nil)
+	if err != nil {
+		logger.Error("failed to initialize review sessions", "error", err)
+		os.Exit(1)
+	}
+	agentRegistry := agenttools.NewRegistry()
+	discovery, err := agenticreview.NewDiscovery(agenticreview.DiscoveryConfig{
+		Client: llmClient, Registry: agentRegistry, Counter: agentCounter, Builder: ctxBuilder,
+		BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey),
+		Model: cfg.Coder32BModel, Temperature: 0.1,
+	})
+	if err != nil {
+		logger.Error("failed to initialize agentic discovery", "error", err)
+		os.Exit(1)
+	}
+	agenticReviewSvc, err := agenticreview.NewService(agenticreview.ServiceConfig{
+		Snapshots: snapshotManager, Sessions: sessionStore, Discovery: discovery,
+		Engine: engine, Client: llmClient, Registry: agentRegistry, Counter: agentCounter,
+	})
+	if err != nil {
+		logger.Error("failed to initialize agentic review service", "error", err)
+		os.Exit(1)
+	}
+
 	securityStage := securityreview.New(
 		engine,
 		llmClient,
@@ -657,6 +700,7 @@ func main() {
 	if pubSvc != nil {
 		var pipelineOpts []func(*pipeline.Runner)
 		pipelineOpts = append(pipelineOpts, pipeline.WithPromptRefiner(prSvc))
+		pipelineOpts = append(pipelineOpts, pipeline.WithAgenticReviewService(agenticReviewSvc))
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityScanner(secScanner))
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityReviewer(securityStage))
 		pipelineOpts = append(pipelineOpts, pipeline.WithActivityHeartbeat(healthSrv.RecordActivity))
@@ -678,6 +722,7 @@ func main() {
 			pipeline.Config{
 				Workers:                 cfg.PipelineWorkers,
 				ApplyFailurePublication: cfg.ApplyFailurePublication,
+				AgenticReviewFallback:   cfg.AgenticReviewFallback,
 			},
 			store,
 			repoSvc,

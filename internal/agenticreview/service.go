@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"drydock/internal/agenttools"
@@ -152,6 +153,8 @@ type preparedState struct {
 	trace          DiscoveryTrace
 	artifacts      []agenttools.SelectionArtifact
 	sessionCapable bool
+	prepareLeaseID string
+	releaseOnce    sync.Once
 }
 
 type PreparedReview struct{ state *preparedState }
@@ -230,6 +233,20 @@ func (s *Service) Prepare(ctx context.Context, input PrepareInput) (*PreparedRev
 	if err != nil {
 		return nil, err
 	}
+	operationID, err := reviewsession.NewChatID()
+	if err != nil {
+		return nil, err
+	}
+	prepareLease, err := s.snapshots.Acquire(snapshot.ID, "prepare:"+operationID, input.Snapshot.TTL)
+	if err != nil {
+		return nil, err
+	}
+	keepLease := false
+	defer func() {
+		if !keepLease {
+			s.snapshots.Release(prepareLease.ID)
+		}
+	}()
 	discovered, err := s.discovery.Run(ctx, DiscoveryInput{
 		Snapshot: snapshot, Patch: filteredPatch, ChangedFiles: analysis.ChangedFiles,
 		BuildInput: input.BuildInput,
@@ -245,12 +262,28 @@ func (s *Service) Prepare(ctx context.Context, input PrepareInput) (*PreparedRev
 	if err := envelope.VerifyMaterials(filteredPatch, discovered.Bundle.Content); err != nil {
 		return nil, fmt.Errorf("agentic review: bind prepared target: %w", err)
 	}
-	return &PreparedReview{state: &preparedState{
+	prepared := &PreparedReview{state: &preparedState{
 		serviceNonce: s.nonce, mode: input.Mode, snapshot: snapshot,
 		bundle: cloneContextBundle(discovered.Bundle), patch: filteredPatch, envelope: envelope,
 		trace: discovered.Trace, artifacts: append([]agenttools.SelectionArtifact(nil), discovered.Artifacts...),
-		sessionCapable: discovered.SessionCapable,
-	}}, nil
+		sessionCapable: discovered.SessionCapable, prepareLeaseID: prepareLease.ID,
+	}}
+	keepLease = true
+	return prepared, nil
+}
+
+// ReleasePrepared releases the orchestration lease retained by Prepare. It is
+// idempotent; active sessions retain their own independent snapshot leases.
+func (s *Service) ReleasePrepared(prepared *PreparedReview) {
+	if prepared == nil || prepared.state == nil || prepared.state.serviceNonce != s.nonce {
+		return
+	}
+	state := prepared.state
+	state.releaseOnce.Do(func() {
+		if state.prepareLeaseID != "" {
+			s.snapshots.Release(state.prepareLeaseID)
+		}
+	})
 }
 
 type ReviewOptions struct {

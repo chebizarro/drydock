@@ -217,7 +217,7 @@ func TestIntegrationFullPipelineProcess(t *testing.T) {
 	// 8. Build and run pipeline
 	queue := make(chan db.ReviewTask, 1)
 	runner := New(
-		Config{Workers: 1},
+		Config{Workers: 1, AgenticReviewFallback: true},
 		store, repoSvc, ctxBuilder, engine, pubSvc, metaSvc,
 		queue, logger,
 		WithMonitoringRegistry(allowAllRegistry{}),
@@ -367,7 +367,7 @@ func TestIntegrationMalformedReviewerJSONIsRepairedAndPublished(t *testing.T) {
 		SupersededTTL:       7 * 24 * time.Hour,
 	}, store, testSigner{sk: nostr.Generate()}, relayPub, logger)
 
-	runner := New(Config{Workers: 1}, store, repoSvc, ctxBuilder, engine, pubSvc, nil, make(chan db.ReviewTask), logger, WithMonitoringRegistry(allowAllRegistry{}))
+	runner := New(Config{Workers: 1, AgenticReviewFallback: true}, store, repoSvc, ctxBuilder, engine, pubSvc, nil, make(chan db.ReviewTask), logger, WithMonitoringRegistry(allowAllRegistry{}))
 	if err := runner.process(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}); err != nil {
 		t.Fatalf("process failed: %v", err)
 	}
@@ -484,7 +484,7 @@ func TestIntegrationApplyFailurePublishesOperationalNotice(t *testing.T) {
 
 	queue := make(chan db.ReviewTask, 1)
 	runner := New(
-		Config{Workers: 1},
+		Config{Workers: 1, AgenticReviewFallback: true},
 		store, repoSvc, ctxBuilder, engine, pubSvc, nil,
 		queue, logger,
 		WithMonitoringRegistry(allowAllRegistry{}),
