@@ -10,6 +10,7 @@ import (
 
 	"drydock/internal/agenttools"
 	"drydock/internal/contextbuilder"
+	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
 	"drydock/internal/workspacesnapshot"
 )
@@ -134,6 +135,7 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 	if !isExhaustion(loopErr) {
 		return DiscoveryResult{Trace: DiscoveryTrace{Loop: loopResult.Trace}}, loopErr
 	}
+	metrics.AgenticLoopExhaustionFallbacks.Inc()
 	trace := DiscoveryTrace{
 		Loop: loopResult.Trace, FallbackReason: FallbackLoopExhaustion,
 		FallbackError: loopErr.Error(),
@@ -161,6 +163,11 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 	fallback.ChangedFiles = append([]string(nil), changedFiles...)
 	gated, err := agenttools.GateBundle(fallback, d.config.Counter, d.config.TokenBudget, d.config.Headroom)
 	if err != nil {
+		reason := "error"
+		if errors.Is(err, agenttools.ErrBudgetExceeded) {
+			reason = "budget_exceeded"
+		}
+		metrics.AgenticFinalizationFailures.With(reason).Inc()
 		return DiscoveryResult{Trace: trace}, fmt.Errorf("agentic review: deterministic exhaustion fallback gate: %w", err)
 	}
 	return DiscoveryResult{Bundle: gated, Trace: trace}, nil

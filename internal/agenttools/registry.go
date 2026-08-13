@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"drydock/internal/contextbuilder"
+	"drydock/internal/metrics"
 	"drydock/internal/workspacesnapshot"
 )
 
@@ -229,12 +230,14 @@ func (r *Registry) available(name string, scope *Scope) bool {
 func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result, error) {
 	if invocation.Scope == nil || invocation.Scope.Snapshot == nil || invocation.Scope.ID == "" ||
 		invocation.Name == "" || invocation.ToolCallID == "" {
+		recordToolCall(invocation.Name, "error")
 		return Result{}, ErrInvalidInvocation
 	}
 	if len(invocation.Arguments) == 0 {
 		invocation.Arguments = json.RawMessage(`{}`)
 	}
 	if !json.Valid(invocation.Arguments) {
+		recordToolCall(invocation.Name, "error")
 		return Result{}, fmt.Errorf("%w: arguments are not valid JSON", ErrInvalidInvocation)
 	}
 
@@ -242,9 +245,11 @@ func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result,
 	tool, ok := r.tools[invocation.Name]
 	r.mu.RUnlock()
 	if !ok {
+		recordToolCall("unknown", "error")
 		return Result{}, ErrUnknownTool
 	}
 	if !roleAllows(invocation.Scope.Role, tool.definition.Capability) {
+		recordToolCall(invocation.Name, "denied")
 		return Result{}, fmt.Errorf("%w: role %s cannot call %s", ErrCapabilityDenied, invocation.Scope.Role, invocation.Name)
 	}
 
@@ -254,21 +259,25 @@ func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result,
 	if cached, replayed := r.replay[replayKey]; replayed {
 		r.mu.Unlock()
 		if cached.digest != digest {
+			recordToolCall(invocation.Name, "error")
 			return Result{}, ErrReplayConflict
 		}
 		result := cloneResult(cached.result)
 		result.Replay = true
+		recordToolResult(invocation.Name, result)
 		return result, nil
 	}
 	if flight, running := r.flights[replayKey]; running {
 		if flight.digest != digest {
 			r.mu.Unlock()
+			recordToolCall(invocation.Name, "error")
 			return Result{}, ErrReplayConflict
 		}
 		done := flight.done
 		r.mu.Unlock()
 		select {
 		case <-ctx.Done():
+			recordToolCall(invocation.Name, "error")
 			return Result{}, ctx.Err()
 		case <-done:
 		}
@@ -276,10 +285,12 @@ func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result,
 		cached, ok := r.replay[replayKey]
 		r.mu.RUnlock()
 		if !ok {
+			recordToolCall(invocation.Name, "error")
 			return Result{}, fmt.Errorf("agent tools: replayed invocation failed before caching")
 		}
 		result := cloneResult(cached.result)
 		result.Replay = true
+		recordToolResult(invocation.Name, result)
 		return result, nil
 	}
 	flight := &replayFlight{digest: digest, done: make(chan struct{})}
@@ -292,6 +303,7 @@ func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result,
 		delete(r.flights, replayKey)
 		close(flight.done)
 		r.mu.Unlock()
+		recordToolCall(invocation.Name, "error")
 		return Result{}, err
 	}
 	limit := tool.definition.MaxResultBytes
@@ -305,7 +317,23 @@ func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result,
 	delete(r.flights, replayKey)
 	close(flight.done)
 	r.mu.Unlock()
+	recordToolResult(invocation.Name, result)
 	return result, nil
+}
+
+func recordToolResult(name string, result Result) {
+	outcome := "ok"
+	if result.IsError {
+		outcome = "error"
+	}
+	recordToolCall(name, outcome)
+}
+
+func recordToolCall(name, outcome string) {
+	if name == "" {
+		name = "unknown"
+	}
+	metrics.AgenticToolCalls.With(name, outcome).Inc()
 }
 
 func (r *Registry) ClearScopeReplay(scopeID string) {

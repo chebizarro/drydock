@@ -8,6 +8,7 @@ import (
 
 	"drydock/internal/agenttools"
 	"drydock/internal/contextbuilder"
+	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
 )
 
@@ -105,6 +106,7 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 	}
 
 	trace := LoopTrace{}
+	defer observeLoopMetrics(&trace, limits)
 	for trace.Turns < limits.MaxTurns {
 		if err := ctx.Err(); err != nil {
 			trace.StopReason = StopTransportError
@@ -200,6 +202,23 @@ func normalizeLoopLimits(limits LoopLimits) LoopLimits {
 		limits.MaxModelContext = defaults.MaxModelContext
 	}
 	return limits
+}
+
+func observeLoopMetrics(trace *LoopTrace, limits LoopLimits) {
+	if trace == nil || trace.StopReason == "" {
+		return
+	}
+	metrics.AgenticLoopTurns.Add(int64(trace.Turns))
+	metrics.AgenticStopReasons.With(string(trace.StopReason)).Inc()
+	if limits.MaxTurns > 0 {
+		metrics.AgenticBudgetUtilization.With("turns").Observe(float64(trace.Turns) / float64(limits.MaxTurns))
+	}
+	if limits.MaxToolCalls > 0 {
+		metrics.AgenticBudgetUtilization.With("tool_calls").Observe(float64(trace.ToolCalls) / float64(limits.MaxToolCalls))
+	}
+	if limits.MaxCumulativeTokens > 0 {
+		metrics.AgenticBudgetUtilization.With("cumulative_tokens").Observe(float64(trace.CumulativeTokens) / float64(limits.MaxCumulativeTokens))
+	}
 }
 
 func serializedRequestTokens(request reviewengine.CompletionRequest, counter contextbuilder.TokenCounter) (int, error) {

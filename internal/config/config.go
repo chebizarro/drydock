@@ -77,66 +77,91 @@ type Config struct {
 	ProfileBannerPath string
 	BlossomServers    []string // media servers for profile image uploads
 
-	PlannerBaseURL             string
-	PlannerModel               string
-	Coder32BBaseURL            string
-	Coder32BModel              string
-	LLM70BBaseURL              string
-	LLM70BModel                string
-	Sec70BBaseURL              string
-	Sec70BModel                string
-	SecClassifyBaseURL         string
-	SecClassifyModel           string
-	SecLocalizeBaseURL         string
-	SecLocalizeModel           string
-	Coder14BBaseURL            string
-	Coder14BModel              string
-	LLMAPIKey                  string
-	PlannerAPIKey              string
-	Coder32BAPIKey             string
-	LLM70BAPIKey               string
-	Coder14BAPIKey             string
-	MetaAPIKey                 string
-	SignerBunkerURL            string
-	SignerNsec                 string
-	SignerNsecFile             string
-	DevMode                    bool
-	ChartroomURL               string
-	ChartroomToken             string
-	ChartroomCorpusIDs         []string
-	ChartroomSourceIDs         []string
-	QdrantURL                  string
-	QdrantAPIKey               string
-	QdrantCollections          vectorstore.CollectionNames
-	QdrantResultsPerCollection int
-	EmbedBaseURL               string
-	EmbedModel                 string
-	EmbedAPIKey                string
-	EmbedDimension             int
-	PaymentNWCURI              string
-	PaymentTrustedMints        []string
-	LSPBridgeURL               string
-	MetaBaseURL                string
-	MetaModel                  string
-	MetaMaxInputBytes          int
-	EvalDatasetPath            string
-	HealthAddr                 string
-	DashboardBearerToken       string
-	PipelineWorkers            int
-	ApplyFailurePublication    string
-	AgenticReviewFallback      bool
-	IDEAgenticTimeout          time.Duration
-	SecurityEnabled            bool
-	SecurityAuditWorkers       int
-	SecurityNostrEnabled       string
-	SecurityNostrProbeTargets  []string
-	SecurityNostrProbeActive   bool
-	CodeChatLimit              int
-	CodeChatWindow             time.Duration
-	ReviewOrderLimit           int
-	ReviewOrderWindow          time.Duration
-	FeedbackLimit              int
-	FeedbackWindow             time.Duration
+	PlannerBaseURL                      string
+	PlannerModel                        string
+	Coder32BBaseURL                     string
+	Coder32BModel                       string
+	LLM70BBaseURL                       string
+	LLM70BModel                         string
+	Sec70BBaseURL                       string
+	Sec70BModel                         string
+	SecClassifyBaseURL                  string
+	SecClassifyModel                    string
+	SecLocalizeBaseURL                  string
+	SecLocalizeModel                    string
+	Coder14BBaseURL                     string
+	Coder14BModel                       string
+	LLMAPIKey                           string
+	PlannerAPIKey                       string
+	Coder32BAPIKey                      string
+	LLM70BAPIKey                        string
+	Coder14BAPIKey                      string
+	MetaAPIKey                          string
+	SignerBunkerURL                     string
+	SignerNsec                          string
+	SignerNsecFile                      string
+	DevMode                             bool
+	ChartroomURL                        string
+	ChartroomToken                      string
+	ChartroomCorpusIDs                  []string
+	ChartroomSourceIDs                  []string
+	QdrantURL                           string
+	QdrantAPIKey                        string
+	QdrantCollections                   vectorstore.CollectionNames
+	QdrantResultsPerCollection          int
+	EmbedBaseURL                        string
+	EmbedModel                          string
+	EmbedAPIKey                         string
+	EmbedDimension                      int
+	PaymentNWCURI                       string
+	PaymentTrustedMints                 []string
+	LSPBridgeURL                        string
+	MetaBaseURL                         string
+	MetaModel                           string
+	MetaMaxInputBytes                   int
+	EvalDatasetPath                     string
+	HealthAddr                          string
+	DashboardBearerToken                string
+	PipelineWorkers                     int
+	ApplyFailurePublication             string
+	AgenticReviewFallback               bool
+	AgenticDiscoveryBaseURL             string
+	AgenticDiscoveryModel               string
+	AgenticDiscoveryAPIKey              string
+	AgenticDiscoveryMaxTurns            int
+	AgenticDiscoveryMaxToolCalls        int
+	AgenticDiscoveryMaxCumulativeTokens int
+	AgenticReviewerMaxTurns             int
+	AgenticReviewerMaxToolCalls         int
+	AgenticReviewerMaxCumulativeTokens  int
+	AgenticMaxToolResultBytes           int
+	AgenticMaxModelContext              int
+	AgenticPackageTokenBudget           int
+	AgenticTokenHeadroom                float64
+	AgenticHistoryTokenBudget           int
+	SnapshotStoragePath                 string
+	SnapshotTTL                         time.Duration
+	SnapshotLeaseTTL                    time.Duration
+	ReviewSessionLifetime               time.Duration
+	SnapshotGCInterval                  time.Duration
+	IDEAgenticTimeout                   time.Duration
+	MCPHTTPEnabled                      bool
+	MCPHTTPAddr                         string
+	MCPHTTPBearerToken                  string
+	MCPHTTPSessionID                    string
+	MCPMaxRequestBodyBytes              int64
+	MCPShutdownTimeout                  time.Duration
+	SecurityEnabled                     bool
+	SecurityAuditWorkers                int
+	SecurityNostrEnabled                string
+	SecurityNostrProbeTargets           []string
+	SecurityNostrProbeActive            bool
+	CodeChatLimit                       int
+	CodeChatWindow                      time.Duration
+	ReviewOrderLimit                    int
+	ReviewOrderWindow                   time.Duration
+	FeedbackLimit                       int
+	FeedbackWindow                      time.Duration
 }
 
 func FromEnv() Config {
@@ -229,35 +254,60 @@ func FromEnv() Config {
 			FewShot:     envOrDefault("DRYDOCK_QDRANT_COLLECTION_FEW_SHOT", defaultCollections.FewShot),
 			CodeChunks:  envOrDefault("DRYDOCK_QDRANT_COLLECTION_CODE_CHUNKS", defaultCollections.CodeChunks),
 		},
-		QdrantResultsPerCollection: parseIntOrDefault(envOrDefault("DRYDOCK_QDRANT_RESULTS_PER_COLLECTION", "3"), 3),
-		EmbedBaseURL:               envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
-		EmbedModel:                 envOrDefault("DRYDOCK_EMBED_MODEL", devDefault(production, defaultEmbedModel)),
-		EmbedAPIKey:                envOrDefault("DRYDOCK_EMBED_API_KEY", ""),
-		EmbedDimension:             parseIntOrDefault(envOrDefault("DRYDOCK_EMBED_DIMENSION", "768"), 768),
-		PaymentNWCURI:              envOrDefault("DRYDOCK_NWC_CONNECTION_STRING", ""),
-		PaymentTrustedMints:        paymentTrustedMints(),
-		LSPBridgeURL:               envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
-		MetaBaseURL:                envOrDefault("DRYDOCK_META_BASE_URL", devDefault(production, defaultMetaBaseURL)),
-		MetaModel:                  envOrDefault("DRYDOCK_META_MODEL", devDefault(production, defaultMetaModel)),
-		MetaMaxInputBytes:          parseIntOrDefault(envOrDefault("DRYDOCK_META_MAX_INPUT_BYTES", "131072"), defaultMetaMaxInputBytes),
-		EvalDatasetPath:            envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
-		HealthAddr:                 envOrDefault("DRYDOCK_HEALTH_ADDR", "127.0.0.1:8081"),
-		DashboardBearerToken:       envOrDefault("DRYDOCK_DASHBOARD_BEARER_TOKEN", ""),
-		PipelineWorkers:            parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
-		ApplyFailurePublication:    strings.ToLower(strings.TrimSpace(envOrDefault("DRYDOCK_APPLY_FAILURE_PUBLICATION", "notice"))),
-		AgenticReviewFallback:      parseBoolOrDefault(envOrDefault("DRYDOCK_AGENTIC_REVIEW_FALLBACK", "false"), false),
-		IDEAgenticTimeout:          parseDurationOrDefault(envOrDefault("DRYDOCK_IDE_AGENTIC_TIMEOUT", "10m"), 10*time.Minute),
-		SecurityEnabled:            parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_ENABLED", "false"), false),
-		SecurityAuditWorkers:       parseIntOrDefault(envOrDefault("DRYDOCK_SECURITY_AUDIT_WORKERS", "2"), 2),
-		SecurityNostrEnabled:       parseNostrEnabled(envOrDefault("DRYDOCK_SECURITY_NOSTR_ENABLED", "auto")),
-		SecurityNostrProbeTargets:  splitCSV(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_TARGETS", "")),
-		SecurityNostrProbeActive:   parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_ACTIVE", "false"), false),
-		CodeChatLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "20"), 20),
-		CodeChatWindow:             parseDurationOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "1h"), time.Hour),
-		ReviewOrderLimit:           parseIntOrDefault(envOrDefault("DRYDOCK_REVIEW_ORDER_RATE_LIMIT_REQUESTS", "20"), 20),
-		ReviewOrderWindow:          parseDurationOrDefault(envOrDefault("DRYDOCK_REVIEW_ORDER_RATE_LIMIT_WINDOW", "1h"), time.Hour),
-		FeedbackLimit:              parseIntOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "100"), 100),
-		FeedbackWindow:             parseDurationOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW", "24h"), 24*time.Hour),
+		QdrantResultsPerCollection:          parseIntOrDefault(envOrDefault("DRYDOCK_QDRANT_RESULTS_PER_COLLECTION", "3"), 3),
+		EmbedBaseURL:                        envOrDefault("DRYDOCK_EMBED_BASE_URL", ""),
+		EmbedModel:                          envOrDefault("DRYDOCK_EMBED_MODEL", devDefault(production, defaultEmbedModel)),
+		EmbedAPIKey:                         envOrDefault("DRYDOCK_EMBED_API_KEY", ""),
+		EmbedDimension:                      parseIntOrDefault(envOrDefault("DRYDOCK_EMBED_DIMENSION", "768"), 768),
+		PaymentNWCURI:                       envOrDefault("DRYDOCK_NWC_CONNECTION_STRING", ""),
+		PaymentTrustedMints:                 paymentTrustedMints(),
+		LSPBridgeURL:                        envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
+		MetaBaseURL:                         envOrDefault("DRYDOCK_META_BASE_URL", devDefault(production, defaultMetaBaseURL)),
+		MetaModel:                           envOrDefault("DRYDOCK_META_MODEL", devDefault(production, defaultMetaModel)),
+		MetaMaxInputBytes:                   parseIntOrDefault(envOrDefault("DRYDOCK_META_MAX_INPUT_BYTES", "131072"), defaultMetaMaxInputBytes),
+		EvalDatasetPath:                     envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
+		HealthAddr:                          envOrDefault("DRYDOCK_HEALTH_ADDR", "127.0.0.1:8081"),
+		DashboardBearerToken:                envOrDefault("DRYDOCK_DASHBOARD_BEARER_TOKEN", ""),
+		PipelineWorkers:                     parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
+		ApplyFailurePublication:             strings.ToLower(strings.TrimSpace(envOrDefault("DRYDOCK_APPLY_FAILURE_PUBLICATION", "notice"))),
+		AgenticReviewFallback:               parseBoolOrDefault(envOrDefault("DRYDOCK_AGENTIC_REVIEW_FALLBACK", "false"), false),
+		AgenticDiscoveryBaseURL:             envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_BASE_URL", envOrDefault("DRYDOCK_CODER32B_BASE_URL", devDefault(production, defaultCoder32BBaseURL))),
+		AgenticDiscoveryModel:               envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MODEL", envOrDefault("DRYDOCK_CODER32B_MODEL", devDefault(production, defaultCoder32BModel))),
+		AgenticDiscoveryAPIKey:              envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_API_KEY", envOrDefault("DRYDOCK_CODER32B_API_KEY", "")),
+		AgenticDiscoveryMaxTurns:            parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MAX_TURNS", "24"), 24),
+		AgenticDiscoveryMaxToolCalls:        parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MAX_TOOL_CALLS", "96"), 96),
+		AgenticDiscoveryMaxCumulativeTokens: parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MAX_CUMULATIVE_TOKENS", "256000"), 256000),
+		AgenticReviewerMaxTurns:             parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_REVIEWER_MAX_TURNS", "20"), 20),
+		AgenticReviewerMaxToolCalls:         parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_REVIEWER_MAX_TOOL_CALLS", "96"), 96),
+		AgenticReviewerMaxCumulativeTokens:  parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_REVIEWER_MAX_CUMULATIVE_TOKENS", "384000"), 384000),
+		AgenticMaxToolResultBytes:           parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_MAX_TOOL_RESULT_BYTES", "16384"), 16*1024),
+		AgenticMaxModelContext:              parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_MAX_MODEL_CONTEXT", "256000"), 256000),
+		AgenticPackageTokenBudget:           parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET", "64000"), 64_000),
+		AgenticTokenHeadroom:                parseFloatOrDefault(envOrDefault("DRYDOCK_AGENTIC_TOKEN_HEADROOM", "0.10"), 0.10),
+		AgenticHistoryTokenBudget:           parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_HISTORY_TOKEN_BUDGET", "64000"), 64_000),
+		SnapshotStoragePath:                 envOrDefault("DRYDOCK_REVIEW_SNAPSHOT_STORAGE_PATH", ""),
+		SnapshotTTL:                         parseDurationOrDefault(envOrDefault("DRYDOCK_REVIEW_SNAPSHOT_TTL", "24h"), 24*time.Hour),
+		SnapshotLeaseTTL:                    parseDurationOrDefault(envOrDefault("DRYDOCK_REVIEW_SNAPSHOT_LEASE_TTL", "24h"), 24*time.Hour),
+		ReviewSessionLifetime:               parseDurationOrDefault(envOrDefault("DRYDOCK_REVIEW_SESSION_LIFETIME", "24h"), 24*time.Hour),
+		SnapshotGCInterval:                  parseDurationOrDefault(envOrDefault("DRYDOCK_REVIEW_SNAPSHOT_GC_INTERVAL", "15m"), 15*time.Minute),
+		IDEAgenticTimeout:                   parseDurationOrDefault(envOrDefault("DRYDOCK_IDE_AGENTIC_TIMEOUT", "10m"), 10*time.Minute),
+		MCPHTTPEnabled:                      parseBoolOrDefault(envOrDefault("DRYDOCK_MCP_HTTP_ENABLED", "false"), false),
+		MCPHTTPAddr:                         envOrDefault("DRYDOCK_MCP_HTTP_ADDR", "127.0.0.1:8090"),
+		MCPHTTPBearerToken:                  envOrDefault("DRYDOCK_MCP_HTTP_BEARER_TOKEN", ""),
+		MCPHTTPSessionID:                    envOrDefault("DRYDOCK_MCP_HTTP_SESSION_ID", ""),
+		MCPMaxRequestBodyBytes:              int64(parseIntOrDefault(envOrDefault("DRYDOCK_MCP_MAX_REQUEST_BODY_BYTES", "4194304"), 4*1024*1024)),
+		MCPShutdownTimeout:                  parseDurationOrDefault(envOrDefault("DRYDOCK_MCP_SHUTDOWN_TIMEOUT", "30s"), 30*time.Second),
+		SecurityEnabled:                     parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_ENABLED", "false"), false),
+		SecurityAuditWorkers:                parseIntOrDefault(envOrDefault("DRYDOCK_SECURITY_AUDIT_WORKERS", "2"), 2),
+		SecurityNostrEnabled:                parseNostrEnabled(envOrDefault("DRYDOCK_SECURITY_NOSTR_ENABLED", "auto")),
+		SecurityNostrProbeTargets:           splitCSV(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_TARGETS", "")),
+		SecurityNostrProbeActive:            parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_ACTIVE", "false"), false),
+		CodeChatLimit:                       parseIntOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "20"), 20),
+		CodeChatWindow:                      parseDurationOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "1h"), time.Hour),
+		ReviewOrderLimit:                    parseIntOrDefault(envOrDefault("DRYDOCK_REVIEW_ORDER_RATE_LIMIT_REQUESTS", "20"), 20),
+		ReviewOrderWindow:                   parseDurationOrDefault(envOrDefault("DRYDOCK_REVIEW_ORDER_RATE_LIMIT_WINDOW", "1h"), time.Hour),
+		FeedbackLimit:                       parseIntOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS", "100"), 100),
+		FeedbackWindow:                      parseDurationOrDefault(envOrDefault("DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW", "24h"), 24*time.Hour),
 	}
 }
 
@@ -305,7 +355,32 @@ func configuredEnv() map[string]bool {
 		"DRYDOCK_META_MAX_INPUT_BYTES",
 		"DRYDOCK_APPLY_FAILURE_PUBLICATION",
 		"DRYDOCK_AGENTIC_REVIEW_FALLBACK",
+		"DRYDOCK_AGENTIC_DISCOVERY_BASE_URL",
+		"DRYDOCK_AGENTIC_DISCOVERY_MODEL",
+		"DRYDOCK_AGENTIC_DISCOVERY_API_KEY",
+		"DRYDOCK_AGENTIC_DISCOVERY_MAX_TURNS",
+		"DRYDOCK_AGENTIC_DISCOVERY_MAX_TOOL_CALLS",
+		"DRYDOCK_AGENTIC_DISCOVERY_MAX_CUMULATIVE_TOKENS",
+		"DRYDOCK_AGENTIC_REVIEWER_MAX_TURNS",
+		"DRYDOCK_AGENTIC_REVIEWER_MAX_TOOL_CALLS",
+		"DRYDOCK_AGENTIC_REVIEWER_MAX_CUMULATIVE_TOKENS",
+		"DRYDOCK_AGENTIC_MAX_TOOL_RESULT_BYTES",
+		"DRYDOCK_AGENTIC_MAX_MODEL_CONTEXT",
+		"DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET",
+		"DRYDOCK_AGENTIC_TOKEN_HEADROOM",
+		"DRYDOCK_AGENTIC_HISTORY_TOKEN_BUDGET",
+		"DRYDOCK_REVIEW_SNAPSHOT_STORAGE_PATH",
+		"DRYDOCK_REVIEW_SNAPSHOT_TTL",
+		"DRYDOCK_REVIEW_SNAPSHOT_LEASE_TTL",
+		"DRYDOCK_REVIEW_SESSION_LIFETIME",
+		"DRYDOCK_REVIEW_SNAPSHOT_GC_INTERVAL",
 		"DRYDOCK_IDE_AGENTIC_TIMEOUT",
+		"DRYDOCK_MCP_HTTP_ENABLED",
+		"DRYDOCK_MCP_HTTP_ADDR",
+		"DRYDOCK_MCP_HTTP_BEARER_TOKEN",
+		"DRYDOCK_MCP_HTTP_SESSION_ID",
+		"DRYDOCK_MCP_MAX_REQUEST_BODY_BYTES",
+		"DRYDOCK_MCP_SHUTDOWN_TIMEOUT",
 		"DRYDOCK_QDRANT_URL",
 		"DRYDOCK_QDRANT_API_KEY",
 		"DRYDOCK_EMBED_BASE_URL",
@@ -397,6 +472,14 @@ func parseIntOrDefault(v string, fallback int) int {
 		return fallback
 	}
 	return result
+}
+
+func parseFloatOrDefault(v string, fallback float64) float64 {
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func parseDurationOrDefault(v string, fallback time.Duration) time.Duration {
@@ -516,16 +599,54 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 		result.Errors = append(result.Errors, "DRYDOCK_META_MAX_INPUT_BYTES must be at least 1")
 	}
 
+	if c.AgenticDiscoveryMaxTurns <= 0 || c.AgenticDiscoveryMaxToolCalls <= 0 ||
+		c.AgenticDiscoveryMaxCumulativeTokens <= 0 || c.AgenticReviewerMaxTurns <= 0 ||
+		c.AgenticReviewerMaxToolCalls <= 0 || c.AgenticReviewerMaxCumulativeTokens <= 0 ||
+		c.AgenticMaxToolResultBytes <= 0 || c.AgenticMaxModelContext <= 0 ||
+		c.AgenticPackageTokenBudget <= 0 || c.AgenticHistoryTokenBudget <= 0 {
+		result.Errors = append(result.Errors, "agentic turn, tool-call, token, result, context, package, and history limits must be greater than 0")
+	}
+	if c.AgenticTokenHeadroom < 0 || c.AgenticTokenHeadroom >= 1 {
+		result.Errors = append(result.Errors, "DRYDOCK_AGENTIC_TOKEN_HEADROOM must be at least 0 and less than 1")
+	}
+	if c.SnapshotTTL <= 0 || c.SnapshotLeaseTTL <= 0 || c.ReviewSessionLifetime <= 0 ||
+		c.SnapshotGCInterval <= 0 {
+		result.Errors = append(result.Errors, "review snapshot TTLs, session lifetime, and GC interval must be greater than 0")
+	} else if c.SnapshotLeaseTTL < c.ReviewSessionLifetime {
+		result.Errors = append(result.Errors, "DRYDOCK_REVIEW_SNAPSHOT_LEASE_TTL must be at least DRYDOCK_REVIEW_SESSION_LIFETIME")
+	}
+	if c.IDEAgenticTimeout <= 0 {
+		result.Errors = append(result.Errors, "DRYDOCK_IDE_AGENTIC_TIMEOUT must be greater than 0")
+	}
+	if c.MCPHTTPEnabled {
+		if _, _, err := net.SplitHostPort(c.MCPHTTPAddr); err != nil {
+			result.Errors = append(result.Errors, "DRYDOCK_MCP_HTTP_ADDR must be a valid host:port")
+		}
+		if strings.TrimSpace(c.MCPHTTPBearerToken) == "" {
+			result.Errors = append(result.Errors, "DRYDOCK_MCP_HTTP_BEARER_TOKEN is required when MCP HTTP is enabled")
+		}
+		if len(c.MCPHTTPSessionID) != 32 {
+			result.Errors = append(result.Errors, "DRYDOCK_MCP_HTTP_SESSION_ID must identify a server-created review session")
+		}
+		if c.MCPMaxRequestBodyBytes <= 0 {
+			result.Errors = append(result.Errors, "DRYDOCK_MCP_MAX_REQUEST_BODY_BYTES must be greater than 0")
+		}
+		if c.MCPShutdownTimeout <= 0 {
+			result.Errors = append(result.Errors, "DRYDOCK_MCP_SHUTDOWN_TIMEOUT must be greater than 0")
+		}
+	}
+
 	// --- LLM endpoint checks (warnings only, as they may come online later) ---
 	llmEndpoints := map[string]struct {
 		baseURL string
 		apiKey  string
 	}{
-		"planner":  {baseURL: c.PlannerBaseURL, apiKey: c.EffectiveLLMAPIKey(c.PlannerAPIKey)},
-		"coder32b": {baseURL: c.Coder32BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.Coder32BAPIKey)},
-		"70b":      {baseURL: c.LLM70BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.LLM70BAPIKey)},
-		"coder14b": {baseURL: c.Coder14BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.Coder14BAPIKey)},
-		"meta":     {baseURL: c.MetaBaseURL, apiKey: c.EffectiveLLMAPIKey(c.MetaAPIKey)},
+		"planner":           {baseURL: c.PlannerBaseURL, apiKey: c.EffectiveLLMAPIKey(c.PlannerAPIKey)},
+		"coder32b":          {baseURL: c.Coder32BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.Coder32BAPIKey)},
+		"70b":               {baseURL: c.LLM70BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.LLM70BAPIKey)},
+		"coder14b":          {baseURL: c.Coder14BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.Coder14BAPIKey)},
+		"meta":              {baseURL: c.MetaBaseURL, apiKey: c.EffectiveLLMAPIKey(c.MetaAPIKey)},
+		"agentic-discovery": {baseURL: c.AgenticDiscoveryBaseURL, apiKey: c.EffectiveLLMAPIKey(c.AgenticDiscoveryAPIKey)},
 	}
 	for name, endpoint := range llmEndpoints {
 		baseURL := endpoint.baseURL

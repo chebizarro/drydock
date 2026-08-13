@@ -524,6 +524,48 @@ func TestValidationResult_HasErrors(t *testing.T) {
 	}
 }
 
+func TestFromEnvAgenticReviewDefaultsAndOverrides(t *testing.T) {
+	clearConfigEnv(t)
+	cfg := FromEnv()
+	if cfg.AgenticDiscoveryMaxTurns != 24 || cfg.AgenticDiscoveryMaxToolCalls != 96 ||
+		cfg.AgenticPackageTokenBudget != 64_000 || cfg.AgenticTokenHeadroom != 0.10 ||
+		cfg.IDEAgenticTimeout != 10*time.Minute || cfg.SnapshotTTL != 24*time.Hour {
+		t.Fatalf("unexpected agentic defaults: %#v", cfg)
+	}
+
+	t.Setenv("DRYDOCK_AGENTIC_DISCOVERY_MODEL", "discovery-model")
+	t.Setenv("DRYDOCK_AGENTIC_DISCOVERY_MAX_TURNS", "12")
+	t.Setenv("DRYDOCK_AGENTIC_REVIEWER_MAX_TOOL_CALLS", "48")
+	t.Setenv("DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET", "32000")
+	t.Setenv("DRYDOCK_AGENTIC_TOKEN_HEADROOM", "0.2")
+	t.Setenv("DRYDOCK_REVIEW_SNAPSHOT_STORAGE_PATH", "/tmp/drydock-test-snapshots")
+	cfg = FromEnv()
+	if cfg.AgenticDiscoveryModel != "discovery-model" || cfg.AgenticDiscoveryMaxTurns != 12 ||
+		cfg.AgenticReviewerMaxToolCalls != 48 || cfg.AgenticPackageTokenBudget != 32_000 ||
+		cfg.AgenticTokenHeadroom != 0.2 || cfg.SnapshotStoragePath != "/tmp/drydock-test-snapshots" {
+		t.Fatalf("unexpected agentic overrides: %#v", cfg)
+	}
+}
+
+func TestValidateMCPHTTPRequiresServerBinding(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("DRYDOCK_MCP_HTTP_ENABLED", "true")
+	cfg := FromEnv()
+	result := cfg.Validate(context.Background())
+	if !hasErrorContaining(result, "DRYDOCK_MCP_HTTP_BEARER_TOKEN") ||
+		!hasErrorContaining(result, "DRYDOCK_MCP_HTTP_SESSION_ID") {
+		t.Fatalf("missing MCP binding errors: %#v", result.Errors)
+	}
+
+	t.Setenv("DRYDOCK_MCP_HTTP_BEARER_TOKEN", "secret")
+	t.Setenv("DRYDOCK_MCP_HTTP_SESSION_ID", "0123456789abcdef0123456789abcdef")
+	cfg = FromEnv()
+	result = cfg.Validate(context.Background())
+	if hasErrorContaining(result, "DRYDOCK_MCP_") {
+		t.Fatalf("valid MCP HTTP config rejected: %#v", result.Errors)
+	}
+}
+
 func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
@@ -552,6 +594,33 @@ func clearConfigEnv(t *testing.T) {
 		"DRYDOCK_META_MODEL",
 		"DRYDOCK_META_API_KEY",
 		"DRYDOCK_META_MAX_INPUT_BYTES",
+		"DRYDOCK_AGENTIC_REVIEW_FALLBACK",
+		"DRYDOCK_AGENTIC_DISCOVERY_BASE_URL",
+		"DRYDOCK_AGENTIC_DISCOVERY_MODEL",
+		"DRYDOCK_AGENTIC_DISCOVERY_API_KEY",
+		"DRYDOCK_AGENTIC_DISCOVERY_MAX_TURNS",
+		"DRYDOCK_AGENTIC_DISCOVERY_MAX_TOOL_CALLS",
+		"DRYDOCK_AGENTIC_DISCOVERY_MAX_CUMULATIVE_TOKENS",
+		"DRYDOCK_AGENTIC_REVIEWER_MAX_TURNS",
+		"DRYDOCK_AGENTIC_REVIEWER_MAX_TOOL_CALLS",
+		"DRYDOCK_AGENTIC_REVIEWER_MAX_CUMULATIVE_TOKENS",
+		"DRYDOCK_AGENTIC_MAX_TOOL_RESULT_BYTES",
+		"DRYDOCK_AGENTIC_MAX_MODEL_CONTEXT",
+		"DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET",
+		"DRYDOCK_AGENTIC_TOKEN_HEADROOM",
+		"DRYDOCK_AGENTIC_HISTORY_TOKEN_BUDGET",
+		"DRYDOCK_REVIEW_SNAPSHOT_STORAGE_PATH",
+		"DRYDOCK_REVIEW_SNAPSHOT_TTL",
+		"DRYDOCK_REVIEW_SNAPSHOT_LEASE_TTL",
+		"DRYDOCK_REVIEW_SESSION_LIFETIME",
+		"DRYDOCK_REVIEW_SNAPSHOT_GC_INTERVAL",
+		"DRYDOCK_IDE_AGENTIC_TIMEOUT",
+		"DRYDOCK_MCP_HTTP_ENABLED",
+		"DRYDOCK_MCP_HTTP_ADDR",
+		"DRYDOCK_MCP_HTTP_BEARER_TOKEN",
+		"DRYDOCK_MCP_HTTP_SESSION_ID",
+		"DRYDOCK_MCP_MAX_REQUEST_BODY_BYTES",
+		"DRYDOCK_MCP_SHUTDOWN_TIMEOUT",
 		"DRYDOCK_QDRANT_URL",
 		"DRYDOCK_QDRANT_API_KEY",
 		"DRYDOCK_EMBED_BASE_URL",

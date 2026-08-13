@@ -631,7 +631,7 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 	scope.MaxResultBytes = r.config.Limits.MaxToolResultBytes
 	defer r.config.Registry.ClearScopeReplay(runID)
 
-	definitions := r.config.Registry.List(role)
+	definitions := r.config.Registry.ListForScope(scope)
 	tools := make([]reviewengine.ToolSchema, 0, len(definitions))
 	for _, definition := range definitions {
 		tools = append(tools, reviewengine.ToolSchema{
@@ -655,6 +655,7 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 
 	limits := r.config.Limits
 	trace := LoopTrace{}
+	defer observeLoopMetrics(&trace, limits)
 	emptyNudged := false
 	servedModel := ""
 	var transcript []reviewengine.CompletionMessage

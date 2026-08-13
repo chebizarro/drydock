@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"drydock/internal/contextbuilder"
+	"drydock/internal/metrics"
 	"drydock/internal/workspacesnapshot"
 )
 
@@ -308,20 +309,28 @@ func (s *Selection) Status() SelectionStatus {
 	return status
 }
 
-func (s *Selection) Finalize(ctx context.Context) (contextbuilder.ContextBundle, error) {
+func (s *Selection) Finalize(ctx context.Context) (bundle contextbuilder.ContextBundle, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer func() {
+		if err != nil {
+			metrics.AgenticFinalizationFailures.With(finalizationFailureReason(err)).Inc()
+			if errors.Is(err, workspacesnapshot.ErrHashMismatch) {
+				metrics.AgenticSnapshotCorruption.Inc()
+			}
+		}
+	}()
 	if s.finalized {
 		return cloneBundle(s.bundle), nil
 	}
-	if err := s.snapshot.Verify(); err != nil {
+	if err = s.snapshot.Verify(); err != nil {
 		return contextbuilder.ContextBundle{}, fmt.Errorf("agent tools: verify snapshot before finalization: %w", err)
 	}
 	content, err := s.renderLocked(ctx)
 	if err != nil {
 		return contextbuilder.ContextBundle{}, err
 	}
-	bundle := contextbuilder.ContextBundle{
+	bundle = contextbuilder.ContextBundle{
 		Content: content, TokenBudget: s.tokenBudget,
 		LayersUsed:   []string{contextbuilder.LayerPatchDiff, contextbuilder.LayerFileContext, "agent-selection"},
 		ChangedFiles: append([]string(nil), s.changedFiles...),
@@ -430,7 +439,26 @@ func GateBundle(bundle contextbuilder.ContextBundle, counter contextbuilder.Toke
 	}
 	bundle.TokenBudget = tokenBudget
 	bundle.TokenCount = exact
+	if limit > 0 {
+		metrics.AgenticBudgetUtilization.With("context_package").Observe(float64(exact) / float64(limit))
+	}
 	return bundle, nil
+}
+
+func finalizationFailureReason(err error) string {
+	switch {
+	case errors.Is(err, ErrBudgetExceeded):
+		return "budget_exceeded"
+	case errors.Is(err, workspacesnapshot.ErrHashMismatch):
+		return "snapshot_corruption"
+	case errors.Is(err, contextbuilder.ErrTokenCounterRequired),
+		errors.Is(err, ErrAuthoritativeTokenCounterRequired):
+		return "tokenizer"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "cancelled"
+	default:
+		return "error"
+	}
 }
 
 func effectiveTokenLimit(budget int, headroom float64) int {

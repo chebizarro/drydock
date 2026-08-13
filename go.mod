@@ -10,6 +10,7 @@ require (
 	git.sharegap.net/cascadia/nostr-secprobe v0.2.0
 	github.com/bluekeyes/go-gitdiff v0.7.1
 	github.com/btcsuite/btcd/btcutil v1.1.5
+	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
 	golang.org/x/sync v0.20.0
@@ -32,7 +33,6 @@ require (
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/mailru/easyjson v0.9.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/modelcontextprotocol/go-sdk v1.7.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect

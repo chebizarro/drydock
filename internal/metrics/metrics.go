@@ -217,6 +217,16 @@ var (
 	AutoFixPublishFailures  = &Counter{}
 	AutoFixSkipped          = &Counter{}
 
+	// Agentic review
+	AgenticLoopTurns               = &Counter{}
+	AgenticToolCalls               = NewCounterVec2() // labels: tool, outcome
+	AgenticBudgetUtilization       = NewSummaryVec()  // label: turns, tool_calls, cumulative_tokens, context_package
+	AgenticFinalizationFailures    = NewCounterVec()  // label: reason
+	AgenticLoopExhaustionFallbacks = &Counter{}
+	AgenticSessionConflicts        = NewCounterVec() // label: version, idempotency, active
+	AgenticSnapshotCorruption      = &Counter{}
+	AgenticStopReasons             = NewCounterVec() // label: stop reason
+
 	// Ensemble mode
 	EnsembleReviewsRun     = &Counter{}
 	EnsembleModelsUsed     = NewCounterVec() // label: model route
@@ -428,6 +438,24 @@ func writeMetrics(w io.Writer) {
 		"Failed auto-fix patch publishes.", AutoFixPublishFailures)
 	writeCounter(w, "drydock_autofix_skipped_total",
 		"Auto-fix skipped (disabled, no eligible findings, etc).", AutoFixSkipped)
+
+	// Agentic review
+	writeCounter(w, "drydock_agentic_loop_turns_total",
+		"Total model turns executed by agentic discovery and reviewer loops.", AgenticLoopTurns)
+	writeCounterVec2(w, "drydock_agentic_tool_calls_total",
+		"Agent tool calls by canonical tool name and outcome.", "tool", "outcome", AgenticToolCalls)
+	writeSummaryVec(w, "drydock_agentic_budget_utilization_ratio",
+		"Agentic budget utilization ratio by budget dimension.", "budget", AgenticBudgetUtilization)
+	writeCounterVec(w, "drydock_agentic_finalization_failures_total",
+		"Context finalization failures by reason.", "reason", AgenticFinalizationFailures)
+	writeCounter(w, "drydock_agentic_loop_exhaustion_fallbacks_total",
+		"Discovery loop exhaustions that invoked deterministic fallback.", AgenticLoopExhaustionFallbacks)
+	writeCounterVec(w, "drydock_agentic_session_conflicts_total",
+		"Review session continuation conflicts by type.", "type", AgenticSessionConflicts)
+	writeCounter(w, "drydock_agentic_snapshot_corruption_total",
+		"Frozen snapshot integrity failures.", AgenticSnapshotCorruption)
+	writeCounterVec(w, "drydock_agentic_stop_reasons_total",
+		"Agentic loop completions by stop reason.", "reason", AgenticStopReasons)
 
 	// Ensemble mode
 	writeCounter(w, "drydock_ensemble_reviews_run_total",

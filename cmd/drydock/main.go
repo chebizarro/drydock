@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,6 +35,7 @@ import (
 	"drydock/internal/listener"
 	"drydock/internal/lspbridge"
 	"drydock/internal/marketplace"
+	"drydock/internal/mcpserver"
 	"drydock/internal/metareview"
 	"drydock/internal/metrics"
 	"drydock/internal/monitoring"
@@ -475,8 +479,13 @@ func main() {
 		logger.Error("failed to initialize authoritative agentic tokenizer", "error", err)
 		os.Exit(1)
 	}
+	snapshotStorage := cfg.SnapshotStoragePath
+	if snapshotStorage == "" {
+		snapshotStorage = filepath.Join(cfg.RepoCacheDir, "review-snapshots")
+	}
 	snapshotManager, err := workspacesnapshot.NewManager(workspacesnapshot.Config{
-		StorageRoot: filepath.Join(cfg.RepoCacheDir, "review-snapshots"),
+		StorageRoot: snapshotStorage, SnapshotTTL: cfg.SnapshotTTL,
+		LeaseTTL: cfg.SnapshotLeaseTTL, SessionLifetime: cfg.ReviewSessionLifetime,
 	})
 	if err != nil {
 		logger.Error("failed to initialize review snapshots", "error", err)
@@ -492,10 +501,21 @@ func main() {
 		agenttools.WithLayerFacade(contextbuilder.NewLayerFacade(contextbuilder.NewBuilderOptions(builderOpts...))),
 		agenttools.WithSecurityTraceFacade(contextbuilder.NewSecurityTraceFacade(lspClient, secScanner)),
 	)
+	discoveryLimits := agenticreview.LoopLimits{
+		MaxTurns: cfg.AgenticDiscoveryMaxTurns, MaxToolCalls: cfg.AgenticDiscoveryMaxToolCalls,
+		MaxCumulativeTokens: cfg.AgenticDiscoveryMaxCumulativeTokens,
+		MaxToolResultBytes:  cfg.AgenticMaxToolResultBytes, MaxModelContext: cfg.AgenticMaxModelContext,
+	}
+	reviewerLimits := agenticreview.LoopLimits{
+		MaxTurns: cfg.AgenticReviewerMaxTurns, MaxToolCalls: cfg.AgenticReviewerMaxToolCalls,
+		MaxCumulativeTokens: cfg.AgenticReviewerMaxCumulativeTokens,
+		MaxToolResultBytes:  cfg.AgenticMaxToolResultBytes, MaxModelContext: cfg.AgenticMaxModelContext,
+	}
 	discovery, err := agenticreview.NewDiscovery(agenticreview.DiscoveryConfig{
 		Client: llmClient, Registry: agentRegistry, Counter: agentCounter, Builder: ctxBuilder,
-		BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey),
-		Model: cfg.Coder32BModel, Temperature: 0.1,
+		BaseURL: cfg.AgenticDiscoveryBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.AgenticDiscoveryAPIKey),
+		Model: cfg.AgenticDiscoveryModel, Temperature: 0.1, Limits: discoveryLimits,
+		TokenBudget: cfg.AgenticPackageTokenBudget, Headroom: cfg.AgenticTokenHeadroom,
 	})
 	if err != nil {
 		logger.Error("failed to initialize agentic discovery", "error", err)
@@ -504,10 +524,70 @@ func main() {
 	agenticReviewSvc, err := agenticreview.NewService(agenticreview.ServiceConfig{
 		Snapshots: snapshotManager, Sessions: sessionStore, Discovery: discovery,
 		Engine: engine, Client: llmClient, Registry: agentRegistry, Counter: agentCounter,
+		ReviewerLimits: reviewerLimits, HistoryTokens: cfg.AgenticHistoryTokenBudget,
 	})
 	if err != nil {
 		logger.Error("failed to initialize agentic review service", "error", err)
 		os.Exit(1)
+	}
+
+	var (
+		mcpHTTPServer   *http.Server
+		mcpHTTPListener net.Listener
+		mcpHTTPReady    atomic.Bool
+	)
+	if cfg.MCPHTTPEnabled {
+		resolveScope := func(resolveCtx context.Context) (*agenttools.Scope, error) {
+			scope, err := resolveMCPHTTPScope(resolveCtx, cfg.MCPHTTPSessionID, sessionStore, snapshotManager)
+			if err != nil {
+				return nil, err
+			}
+			scope.MaxResultBytes = cfg.AgenticMaxToolResultBytes
+			return scope, nil
+		}
+		initialScope, err := resolveScope(ctx)
+		if err != nil {
+			logger.Error("failed to resolve configured MCP review-session binding", "error", err)
+			os.Exit(1)
+		}
+		if err := initialScope.Snapshot.Verify(); err != nil {
+			if errors.Is(err, workspacesnapshot.ErrHashMismatch) {
+				metrics.AgenticSnapshotCorruption.Inc()
+			}
+			logger.Error("configured MCP snapshot binding failed integrity verification", "error", err)
+			os.Exit(1)
+		}
+		mcpHandler, err := mcpserver.NewHTTPHandler(agentRegistry, mcpserver.BearerAuthorizer{
+			Token: cfg.MCPHTTPBearerToken, Resolve: resolveScope,
+		}, mcpserver.HTTPOptions{MaxRequestBodyBytes: cfg.MCPMaxRequestBodyBytes})
+		if err != nil {
+			logger.Error("failed to initialize MCP HTTP handler", "error", err)
+			os.Exit(1)
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/mcp", mcpHandler)
+		mux.HandleFunc("/healthz", func(response http.ResponseWriter, _ *http.Request) {
+			response.WriteHeader(http.StatusOK)
+			_, _ = response.Write([]byte("ok\n"))
+		})
+		mux.HandleFunc("/readyz", func(response http.ResponseWriter, _ *http.Request) {
+			if !mcpHTTPReady.Load() {
+				http.Error(response, "not ready", http.StatusServiceUnavailable)
+				return
+			}
+			response.WriteHeader(http.StatusOK)
+			_, _ = response.Write([]byte("ready\n"))
+		})
+		mcpHTTPServer = &http.Server{
+			Addr: cfg.MCPHTTPAddr, Handler: mux,
+			ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute,
+		}
+		mcpHTTPListener, err = net.Listen("tcp", cfg.MCPHTTPAddr)
+		if err != nil {
+			logger.Error("failed to bind MCP HTTP server", "addr", cfg.MCPHTTPAddr, "error", err)
+			os.Exit(1)
+		}
+		logger.Info("MCP HTTP endpoint bound", "addr", cfg.MCPHTTPAddr, "path", "/mcp")
 	}
 
 	securityStage := securityreview.New(
@@ -755,7 +835,7 @@ func main() {
 	}
 
 	// --- Run ---
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	var listenerRunning atomic.Bool
 	var pipelineRunning atomic.Bool
 	if monitoredRepos != nil {
@@ -777,6 +857,18 @@ func main() {
 	}); err != nil {
 		logger.Error("failed to register listener readiness check", "error", err)
 		os.Exit(1)
+	}
+	if mcpHTTPServer != nil {
+		if err := healthSrv.AddReadinessFunc("mcp_http", func(checkCtx context.Context) error {
+			if !mcpHTTPReady.Load() {
+				return fmt.Errorf("MCP HTTP endpoint is not running")
+			}
+			_, err := resolveMCPHTTPScope(checkCtx, cfg.MCPHTTPSessionID, sessionStore, snapshotManager)
+			return err
+		}); err != nil {
+			logger.Error("failed to register MCP HTTP readiness check", "error", err)
+			os.Exit(1)
+		}
 	}
 	if pipelineRunner != nil {
 		if err := healthSrv.AddReadinessFunc("pipeline", func(context.Context) error {
@@ -805,6 +897,25 @@ func main() {
 		close(heartbeatStarted)
 		healthSrv.RunHeartbeat(ctx, 10*time.Second)
 	}()
+
+	mcpStarted := make(chan struct{})
+	if mcpHTTPServer != nil {
+		go func() {
+			mcpHTTPReady.Store(true)
+			close(mcpStarted)
+			defer mcpHTTPReady.Store(false)
+			err := mcpHTTPServer.Serve(mcpHTTPListener)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("MCP HTTP server: %w", err)
+				return
+			}
+			if ctx.Err() == nil {
+				errCh <- fmt.Errorf("MCP HTTP server stopped unexpectedly")
+			}
+		}()
+	} else {
+		close(mcpStarted)
+	}
 
 	listenerStarted := make(chan struct{})
 	listenerDone := make(chan struct{})
@@ -841,8 +952,11 @@ func main() {
 	}
 
 	<-heartbeatStarted
+	<-mcpStarted
 	<-listenerStarted
 	<-pipelineStarted
+
+	go runReviewLifecycle(ctx, cfg.SnapshotGCInterval, sessionStore, snapshotManager, logger)
 
 	// --- Background prompt refinement loop (checks every 5 minutes) ---
 	go func() {
@@ -975,6 +1089,14 @@ func main() {
 
 	// Mark unhealthy so load balancer stops sending traffic during drain.
 	healthSrv.SetReady(false)
+	mcpHTTPReady.Store(false)
+	if mcpHTTPServer != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.MCPShutdownTimeout)
+		if err := mcpHTTPServer.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("MCP HTTP shutdown error", "error", err)
+		}
+		shutdownCancel()
+	}
 
 	// Graceful drain: wait for pipeline and listener to finish, with a deadline.
 	const drainTimeout = 60 * time.Second
@@ -1001,6 +1123,87 @@ func main() {
 	}
 	if fatalErr != nil {
 		os.Exit(1)
+	}
+}
+
+func resolveMCPHTTPScope(ctx context.Context, chatID string, sessions *reviewsession.SQLStore, snapshots *workspacesnapshot.Manager) (*agenttools.Scope, error) {
+	if sessions == nil || snapshots == nil || strings.TrimSpace(chatID) == "" {
+		return nil, fmt.Errorf("MCP HTTP binding is unscoped")
+	}
+	loaded, err := sessions.LoadForContinuation(ctx, chatID)
+	if err != nil {
+		return nil, fmt.Errorf("load MCP review-session binding: %w", err)
+	}
+	if loaded.Session.State != reviewsession.StateActive || !time.Now().UTC().Before(loaded.Session.ExpiresAt) {
+		return nil, reviewsession.ErrExpired
+	}
+	snapshot, err := snapshots.Get(loaded.Session.Snapshot.ID)
+	if errors.Is(err, workspacesnapshot.ErrNotFound) {
+		snapshot, err = snapshots.Restore(ctx, loaded.Session.Snapshot.StoragePath,
+			loaded.Session.Snapshot.ID, loaded.Session.Snapshot.ManifestHash, loaded.Session.Snapshot.DiffHash)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve MCP snapshot binding: %w", err)
+	}
+	if snapshot.ManifestDigest() != loaded.Session.Snapshot.ManifestHash ||
+		snapshot.PatchDigest() != loaded.Session.Snapshot.DiffHash {
+		metrics.AgenticSnapshotCorruption.Inc()
+		return nil, workspacesnapshot.ErrHashMismatch
+	}
+	return agenttools.NewScope("mcp-http:"+chatID+":"+snapshot.ManifestDigest(),
+		snapshot, agenttools.RoleExternalReadonly), nil
+}
+
+func runReviewLifecycle(ctx context.Context, interval time.Duration, sessions *reviewsession.SQLStore, snapshots *workspacesnapshot.Manager, logger *slog.Logger) {
+	if interval <= 0 || sessions == nil || snapshots == nil {
+		return
+	}
+	sweep := func() {
+		active, err := sessions.ListActive(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				logger.Warn("review-session lifecycle scan failed", "error", err)
+			}
+			return
+		}
+		now := time.Now().UTC()
+		for _, session := range active {
+			if now.Before(session.ExpiresAt) || session.ActiveRequest != "" {
+				continue
+			}
+			leaseID, err := sessions.Expire(ctx, session.ChatID)
+			if err != nil {
+				if ctx.Err() == nil {
+					logger.Warn("review-session expiry failed", "chat_id", session.ChatID, "error", err)
+				}
+				continue
+			}
+			snapshots.Release(leaseID)
+		}
+		removed, err := snapshots.GC(ctx)
+		if err != nil {
+			if errors.Is(err, workspacesnapshot.ErrHashMismatch) {
+				metrics.AgenticSnapshotCorruption.Inc()
+			}
+			if ctx.Err() == nil {
+				logger.Warn("review snapshot GC failed", "error", err)
+			}
+			return
+		}
+		if len(removed) > 0 {
+			logger.Info("review snapshot GC complete", "removed", len(removed))
+		}
+	}
+	sweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
 	}
 }
 

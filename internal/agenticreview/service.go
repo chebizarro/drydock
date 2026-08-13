@@ -12,6 +12,7 @@ import (
 
 	"drydock/internal/agenttools"
 	"drydock/internal/contextbuilder"
+	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
 	"drydock/internal/reviewsession"
 	"drydock/internal/targetidentity"
@@ -99,6 +100,7 @@ func (s *Service) recoverActiveSessions(ctx context.Context) error {
 		snapshot, err := s.snapshots.Restore(ctx, session.Snapshot.StoragePath, session.Snapshot.ID,
 			session.Snapshot.ManifestHash, session.Snapshot.DiffHash)
 		if err != nil {
+			recordSnapshotCorruption(err)
 			_ = s.sessions.MarkBroken(ctx, session.ChatID, err)
 			continue
 		}
@@ -482,12 +484,14 @@ func (s *Service) Continue(ctx context.Context, input ContinueInput) (SessionRes
 			loaded.Session.Snapshot.ID, loaded.Session.Snapshot.ManifestHash, loaded.Session.Snapshot.DiffHash)
 	}
 	if err != nil {
+		recordSnapshotCorruption(err)
 		_ = s.sessions.MarkBroken(context.WithoutCancel(ctx), input.ChatID, err)
 		return SessionResult{}, err
 	}
 	if snapshot.ManifestDigest() != loaded.Session.Snapshot.ManifestHash ||
 		snapshot.PatchDigest() != loaded.Session.Snapshot.DiffHash || snapshot.Verify() != nil {
 		err = workspacesnapshot.ErrHashMismatch
+		recordSnapshotCorruption(err)
 		_ = s.sessions.MarkBroken(context.WithoutCancel(ctx), input.ChatID, err)
 		return SessionResult{}, err
 	}
@@ -504,6 +508,7 @@ func (s *Service) Continue(ctx context.Context, input ContinueInput) (SessionRes
 		LeaseID: lease.ID, ExpiresAt: lease.ExpiresAt,
 	})
 	if err != nil {
+		recordSessionConflict(err)
 		return SessionResult{}, err
 	}
 	if reservation.Replay {
@@ -601,6 +606,7 @@ func (s *Service) validatePrepared(prepared *PreparedReview) (*preparedState, er
 	}
 	state := prepared.state
 	if err := state.snapshot.Verify(); err != nil {
+		recordSnapshotCorruption(err)
 		return nil, fmt.Errorf("%w: %v", ErrInvalidPrepared, err)
 	}
 	if err := state.envelope.VerifyMaterials(state.patch, state.bundle.Content); err != nil {
@@ -615,9 +621,27 @@ func (s *Service) failReserved(input ContinueInput, cause error) error {
 }
 
 func (s *Service) breakReserved(input ContinueInput, cause error) error {
+	recordSnapshotCorruption(cause)
 	_ = s.sessions.FailTurn(context.Background(), input.ChatID, input.RequestID, cause)
 	_ = s.sessions.MarkBroken(context.Background(), input.ChatID, cause)
 	return cause
+}
+
+func recordSessionConflict(err error) {
+	switch {
+	case errors.Is(err, reviewsession.ErrVersionConflict):
+		metrics.AgenticSessionConflicts.With("version").Inc()
+	case errors.Is(err, reviewsession.ErrIdempotencyConflict):
+		metrics.AgenticSessionConflicts.With("idempotency").Inc()
+	case errors.Is(err, reviewsession.ErrActiveTurn), errors.Is(err, reviewsession.ErrRequestInProgress):
+		metrics.AgenticSessionConflicts.With("active").Inc()
+	}
+}
+
+func recordSnapshotCorruption(err error) {
+	if errors.Is(err, workspacesnapshot.ErrHashMismatch) {
+		metrics.AgenticSnapshotCorruption.Inc()
+	}
 }
 
 type sessionTranscriptSink struct {
