@@ -140,6 +140,9 @@ func TestHandlerOutputPrometheusFormat(t *testing.T) {
 	SecurityVerifyOutcomes.With("refuted").Inc()
 	SecurityFalsePositives.Inc()
 	SecurityBaselineSuppressed.Inc()
+	MetaReviewAttempts.Inc()
+	MetaReviewSuccesses.Inc()
+	MetaReviewFailures.With("parse_output").Inc()
 
 	rec := httptest.NewRecorder()
 	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -163,6 +166,9 @@ func TestHandlerOutputPrometheusFormat(t *testing.T) {
 	requireContains(t, body, `drydock_security_verify_outcomes_total{outcome="refuted"} 1`)
 	requireContains(t, body, "# TYPE drydock_security_false_positives_total counter")
 	requireContains(t, body, "# TYPE drydock_security_baseline_suppressed_total counter")
+	requireContains(t, body, "# TYPE drydock_meta_review_attempts_total counter")
+	requireContains(t, body, "# TYPE drydock_meta_review_successes_total counter")
+	requireContains(t, body, `drydock_meta_review_failures_total{stage="parse_output"} 1`)
 }
 
 func requireContains(t *testing.T, haystack, needle string) {

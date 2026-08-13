@@ -172,6 +172,11 @@ var (
 	ReviewsFinished       = NewCounterVec() // label: "published", "failed"
 	ReviewDuration        = &Summary{}      // seconds, end-to-end
 
+	// Meta-review
+	MetaReviewAttempts  = &Counter{}
+	MetaReviewSuccesses = &Counter{}
+	MetaReviewFailures  = NewCounterVec() // label: failure stage
+
 	// Workers
 	WorkersActive = &Gauge{}
 
@@ -329,6 +334,14 @@ func writeMetrics(w io.Writer) {
 		"Context layers by build status.", "status", ContextLayersByStatus)
 	writeSummary(w, "drydock_review_duration_seconds",
 		"End-to-end review duration.", ReviewDuration)
+
+	// Meta-review
+	writeCounter(w, "drydock_meta_review_attempts_total",
+		"Triggered meta-review attempts.", MetaReviewAttempts)
+	writeCounter(w, "drydock_meta_review_successes_total",
+		"Meta-review attempts that completed and were audited.", MetaReviewSuccesses)
+	writeCounterVec(w, "drydock_meta_review_failures_total",
+		"Meta-review failures by processing stage.", "stage", MetaReviewFailures)
 
 	// Workers
 	writeGauge(w, "drydock_pipeline_workers_active",

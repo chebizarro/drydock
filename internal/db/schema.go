@@ -242,6 +242,25 @@ CREATE TABLE IF NOT EXISTS repository_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_repository_snapshots_created_at ON repository_snapshots(created_at);
 
+CREATE TABLE IF NOT EXISTS meta_review_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  patch_event_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  context_hash TEXT NOT NULL DEFAULT '',
+  gate_reason TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  reused INTEGER NOT NULL DEFAULT 0 CHECK (reused IN (0, 1)),
+  status TEXT NOT NULL CHECK (status IN ('success', 'failed')),
+  failure_stage TEXT NOT NULL DEFAULT '',
+  failure_reason TEXT NOT NULL DEFAULT '',
+  response_json TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_meta_review_attempts_patch_repo
+  ON meta_review_attempts(patch_event_id, repo_id);
+CREATE INDEX IF NOT EXISTS idx_meta_review_attempts_status_created
+  ON meta_review_attempts(status, created_at);
+
 CREATE TABLE IF NOT EXISTS meta_review_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   patch_event_id TEXT NOT NULL,

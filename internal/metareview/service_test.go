@@ -2,6 +2,7 @@ package metareview
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -16,13 +17,14 @@ import (
 type fakeClient struct {
 	calls    int
 	resp     string
+	err      error
 	requests []reviewengine.ChatRequest
 }
 
 func (f *fakeClient) ChatCompletion(_ context.Context, req reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
 	f.calls++
 	f.requests = append(f.requests, req)
-	return reviewengine.ChatResult{Content: f.resp}, nil
+	return reviewengine.ChatResult{Content: f.resp}, f.err
 }
 
 func TestMetaReviewTriggersOnLowConfidenceAndStoresLog(t *testing.T) {
@@ -58,6 +60,10 @@ func TestMetaReviewTriggersOnLowConfidenceAndStoresLog(t *testing.T) {
 	}
 	if client.calls != 1 {
 		t.Fatalf("expected one meta-review call, got %d", client.calls)
+	}
+	attempt, ok, err := store.LatestMetaReviewAttempt(ctx, "patch-1", "repo-1")
+	if err != nil || !ok || attempt.Status != "success" || attempt.FailureStage != "" {
+		t.Fatalf("unexpected success attempt audit: attempt=%+v ok=%v err=%v", attempt, ok, err)
 	}
 }
 
@@ -139,6 +145,94 @@ func TestMetaReviewAnalyzesSecurityVerifyOutcomes(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("security analysis prompt missing %s: %s", want, prompt)
 		}
+	}
+}
+
+func TestMetaReviewPromptBudgetsRealSizeInputs(t *testing.T) {
+	diff := strings.Repeat("+large patch line\n", 200_000) + "PATCH_END"
+	bundle := strings.Repeat("context layer\n", 100_000) + "CONTEXT_END"
+
+	budgetedDiff, budgetedBundle := budgetMetaReviewInputs(diff, bundle, 4096)
+	if got := len(budgetedDiff) + len(budgetedBundle); got > 4096 {
+		t.Fatalf("budgeted inputs use %d bytes, want at most 4096", got)
+	}
+	for _, want := range []string{"patch truncated", "context truncated", "PATCH_END", "CONTEXT_END"} {
+		if !strings.Contains(budgetedDiff+budgetedBundle, want) {
+			t.Fatalf("budgeted prompt missing %q", want)
+		}
+	}
+
+	in := Input{PatchDiff: diff, ContextBundle: bundle}
+	first := metaReviewUserPrompt(in, 4096)
+	second := metaReviewUserPrompt(in, 4096)
+	if first != second {
+		t.Fatal("meta-review prompt budgeting is not deterministic")
+	}
+	if len(first) > 8192 {
+		t.Fatalf("bounded meta-review prompt unexpectedly large: %d bytes", len(first))
+	}
+}
+
+func TestMetaReviewAuditsSemaphoreAcquireFailure(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	svc := New(Config{
+		Endpoint:      reviewengine.ModelEndpoint{BaseURL: "http://meta", Model: "frontier"},
+		MaxConcurrent: 1,
+	}, store, &fakeClient{}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	if err := svc.sem.Acquire(ctx, 1); err != nil {
+		t.Fatalf("occupy semaphore: %v", err)
+	}
+	defer svc.sem.Release(1)
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	result, err := svc.Run(cancelled, Input{
+		PatchEventID: "queued-patch",
+		RepoID:       "repo-1",
+		LocalReview: reviewengine.ReviewerOutput{
+			Findings: []reviewengine.Finding{{Confidence: 0.2}},
+		},
+	})
+	if err == nil || !result.Triggered {
+		t.Fatalf("expected audited semaphore failure, result=%+v err=%v", result, err)
+	}
+	attempt, ok, auditErr := store.LatestMetaReviewAttempt(ctx, "queued-patch", "repo-1")
+	if auditErr != nil || !ok || attempt.Status != "failed" || attempt.FailureStage != "semaphore_acquire" {
+		t.Fatalf("unexpected semaphore attempt audit: attempt=%+v ok=%v err=%v", attempt, ok, auditErr)
+	}
+}
+
+func TestMetaReviewPersistsFailedAttemptReason(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	client := &fakeClient{err: errors.New("provider context limit exceeded")}
+	svc := New(Config{
+		Endpoint: reviewengine.ModelEndpoint{BaseURL: "http://meta", Model: "frontier"},
+	}, store, client, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	result, err := svc.Run(ctx, Input{
+		PatchEventID: "failed-patch",
+		RepoID:       "repo-1",
+		ContextHash:  "failed-hash",
+		LocalReview: reviewengine.ReviewerOutput{
+			Findings: []reviewengine.Finding{{Confidence: 0.2}},
+		},
+	})
+	if err == nil || !result.Triggered {
+		t.Fatalf("expected triggered completion failure, result=%+v err=%v", result, err)
+	}
+
+	attempt, ok, auditErr := store.LatestMetaReviewAttempt(ctx, "failed-patch", "repo-1")
+	if auditErr != nil {
+		t.Fatalf("load attempt audit: %v", auditErr)
+	}
+	if !ok || attempt.Status != "failed" || attempt.FailureStage != "completion" {
+		t.Fatalf("unexpected attempt audit: %+v", attempt)
+	}
+	if !strings.Contains(attempt.FailureReason, "context limit exceeded") || attempt.Model != "frontier" {
+		t.Fatalf("attempt did not retain failure evidence: %+v", attempt)
 	}
 }
 

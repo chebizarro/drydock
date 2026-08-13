@@ -103,8 +103,25 @@ Drydock uses OpenAI-compatible `/chat/completions` endpoints. Five model slots a
 | `DRYDOCK_LLM70B_MODEL` | string | `llama-3.3-70b-instruct-q4_k_m` | Model name for llm70b requests. |
 | `DRYDOCK_CODER14B_BASE_URL` | URL | `http://127.0.0.1:11434/v1` | Base URL for the 14B coder model (simple patches, style). |
 | `DRYDOCK_CODER14B_MODEL` | string | `qwen2.5-coder-14b-instruct-q4_k_m` | Model name for coder14b requests. |
-| `DRYDOCK_META_BASE_URL` | URL | `http://127.0.0.1:11436/v1` | Base URL for the meta-review model. |
-| `DRYDOCK_META_MODEL` | string | `llama-3.3-70b-instruct-q4_k_m` | Model name for meta-review requests. |
+| `DRYDOCK_META_BASE_URL` | URL | `http://127.0.0.1:11436/v1` | OpenAI-compatible base URL dedicated to meta-review. |
+| `DRYDOCK_META_MODEL` | string | `llama-3.3-70b-instruct-q4_k_m` | Model name for meta-review requests. The development default is a local quantized Llama model, **not** a frontier model. |
+| `DRYDOCK_META_API_KEY` | string | *(falls back to `DRYDOCK_LLM_API_KEY`)* | Dedicated bearer token for the meta-review provider. |
+| `DRYDOCK_META_MAX_INPUT_BYTES` | integer | `131072` | Combined byte budget for patch diff and context bundle in a meta-review prompt. Oversized sections are deterministically truncated with omission metadata. |
+
+For production-quality meta-review, explicitly point the dedicated slot at an
+OpenAI-compatible frontier provider rather than relying on the local
+development default:
+
+```bash
+DRYDOCK_META_BASE_URL=https://frontier-provider.example/v1
+DRYDOCK_META_MODEL=provider-frontier-model
+DRYDOCK_META_API_KEY=${FRONTIER_PROVIDER_API_KEY}
+DRYDOCK_META_MAX_INPUT_BYTES=131072
+```
+
+Use the exact model identifier served by your provider and size the input
+budget below that model's context limit, leaving room for the local-review
+JSON, system prompt, and completion.
 
 ### Model name verification
 

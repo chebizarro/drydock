@@ -555,6 +555,7 @@ func main() {
 		MinReuseJaccard:  0.85,
 		FewShotCap:       500,
 		MaxConcurrent:    2,
+		MaxInputBytes:    cfg.MetaMaxInputBytes,
 	}, store, metaClient, logger, metaOpts...)
 
 	// --- Prompt refinement (reuses the meta-review LLM endpoint) ---

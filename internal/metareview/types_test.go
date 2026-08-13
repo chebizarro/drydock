@@ -8,9 +8,48 @@ import (
 
 const validMetaReviewJSON = `{"missed_findings":[{"type":"correctness","description":"missed nil check","evidence":"foo dereferences bar","why_missed":"prompt_gap"}],"false_positives":[{"finding_index":0,"reason":"the reported issue is guarded"}],"reasoning_quality":0.8,"context_utilization":0.7,"prompt_gaps":["emphasize nil checks"],"suggested_few_shot":true}`
 
-func TestParseMetaReviewOutputForFindingsValidatesRequiredFields(t *testing.T) {
-	if _, err := ParseMetaReviewOutputForFindings(`{"missed_findings":[],"false_positives":[],"reasoning_quality":0.8,"context_utilization":0.7,"suggested_few_shot":false}`, 1); err == nil {
-		t.Fatal("expected missing prompt_gaps to be rejected")
+func TestParseMetaReviewOutputForFindingsDefaultsMissingOptionalFields(t *testing.T) {
+	out, err := ParseMetaReviewOutputForFindings(`{"reasoning_quality":"0.8"}`, 1)
+	if err != nil {
+		t.Fatalf("near-miss output rejected: %v", err)
+	}
+	if out.ReasoningQuality != 0.8 || out.MissedFindings == nil || out.FalsePositives == nil || out.PromptGaps == nil {
+		t.Fatalf("missing fields were not defaulted safely: %+v", out)
+	}
+
+	if _, err := ParseMetaReviewOutputForFindings(`{"summary":"nothing usable"}`, 1); err == nil {
+		t.Fatal("expected output with no recognized fields to be rejected")
+	}
+}
+
+func TestParseMetaReviewOutputForFindingsToleratesCorpusNearMisses(t *testing.T) {
+	raw := "```json\n" +
+		`{"missed_findings":[],"false_positives":{"finding_index":"0","reason":["guarded"]},` +
+		`"reasoning_quality":"0.8","context_utilization":["0.7"],"prompt_gaps":42,"suggested_few_shot":[true]}` +
+		"\n```"
+	out, err := ParseMetaReviewOutputForFindings(raw, 1)
+	if err != nil {
+		t.Fatalf("tolerant parse failed: %v", err)
+	}
+	if out.ReasoningQuality != 0.8 || out.ContextUtilization != 0.7 {
+		t.Fatalf("numeric strings/arrays were not coerced: %+v", out)
+	}
+	if len(out.FalsePositives) != 1 || out.FalsePositives[0].FindingIndex != 0 || out.FalsePositives[0].Reason != "guarded" {
+		t.Fatalf("scalar object or nested scalar/array slip was not coerced: %+v", out.FalsePositives)
+	}
+	if len(out.PromptGaps) != 1 || out.PromptGaps[0] != "42" || !out.SuggestedFewShot {
+		t.Fatalf("prompt gap or boolean array was not coerced: %+v", out)
+	}
+}
+
+func TestParseMetaReviewOutputRepairsInvalidEscape(t *testing.T) {
+	raw := `{"missed_findings":[],"false_positives":[],"reasoning_quality":0.8,"context_utilization":0.7,"prompt_gaps":["check \q path"],"suggested_few_shot":false}`
+	out, err := ParseMetaReviewOutput(raw)
+	if err != nil {
+		t.Fatalf("invalid escape near-miss was not repaired: %v", err)
+	}
+	if len(out.PromptGaps) != 1 || out.PromptGaps[0] != `check \q path` {
+		t.Fatalf("unexpected repaired prompt gap: %#v", out.PromptGaps)
 	}
 }
 

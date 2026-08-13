@@ -20,18 +20,19 @@ import (
 )
 
 const (
-	defaultRelays          = "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
-	defaultPlannerBaseURL  = "http://127.0.0.1:11434/v1"
-	defaultPlannerModel    = "qwen2.5-coder-14b-instruct-q4_k_m"
-	defaultCoder32BBaseURL = "http://127.0.0.1:11434/v1"
-	defaultCoder32BModel   = "qwen2.5-coder-32b-instruct-q4_k_m"
-	defaultLLM70BBaseURL   = "http://127.0.0.1:11435/v1"
-	defaultLLM70BModel     = "llama-3.3-70b-instruct-q4_k_m"
-	defaultCoder14BBaseURL = "http://127.0.0.1:11434/v1"
-	defaultCoder14BModel   = "qwen2.5-coder-14b-instruct-q4_k_m"
-	defaultMetaBaseURL     = "http://127.0.0.1:11436/v1"
-	defaultMetaModel       = "llama-3.3-70b-instruct-q4_k_m"
-	defaultEmbedModel      = "nomic-embed-text"
+	defaultRelays            = "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
+	defaultPlannerBaseURL    = "http://127.0.0.1:11434/v1"
+	defaultPlannerModel      = "qwen2.5-coder-14b-instruct-q4_k_m"
+	defaultCoder32BBaseURL   = "http://127.0.0.1:11434/v1"
+	defaultCoder32BModel     = "qwen2.5-coder-32b-instruct-q4_k_m"
+	defaultLLM70BBaseURL     = "http://127.0.0.1:11435/v1"
+	defaultLLM70BModel       = "llama-3.3-70b-instruct-q4_k_m"
+	defaultCoder14BBaseURL   = "http://127.0.0.1:11434/v1"
+	defaultCoder14BModel     = "qwen2.5-coder-14b-instruct-q4_k_m"
+	defaultMetaBaseURL       = "http://127.0.0.1:11436/v1"
+	defaultMetaModel         = "llama-3.3-70b-instruct-q4_k_m"
+	defaultMetaMaxInputBytes = 128 * 1024
+	defaultEmbedModel        = "nomic-embed-text"
 )
 
 var defaultPublicRelaySet = map[string]struct{}{
@@ -117,6 +118,7 @@ type Config struct {
 	LSPBridgeURL               string
 	MetaBaseURL                string
 	MetaModel                  string
+	MetaMaxInputBytes          int
 	EvalDatasetPath            string
 	HealthAddr                 string
 	DashboardBearerToken       string
@@ -234,6 +236,7 @@ func FromEnv() Config {
 		LSPBridgeURL:               envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
 		MetaBaseURL:                envOrDefault("DRYDOCK_META_BASE_URL", devDefault(production, defaultMetaBaseURL)),
 		MetaModel:                  envOrDefault("DRYDOCK_META_MODEL", devDefault(production, defaultMetaModel)),
+		MetaMaxInputBytes:          parseIntOrDefault(envOrDefault("DRYDOCK_META_MAX_INPUT_BYTES", "131072"), defaultMetaMaxInputBytes),
 		EvalDatasetPath:            envOrDefault("DRYDOCK_EVAL_DATASET_PATH", "eval/heldout-sample.json"),
 		HealthAddr:                 envOrDefault("DRYDOCK_HEALTH_ADDR", "127.0.0.1:8081"),
 		DashboardBearerToken:       envOrDefault("DRYDOCK_DASHBOARD_BEARER_TOKEN", ""),
@@ -293,6 +296,7 @@ func configuredEnv() map[string]bool {
 		"DRYDOCK_META_BASE_URL",
 		"DRYDOCK_META_MODEL",
 		"DRYDOCK_META_API_KEY",
+		"DRYDOCK_META_MAX_INPUT_BYTES",
 		"DRYDOCK_QDRANT_URL",
 		"DRYDOCK_QDRANT_API_KEY",
 		"DRYDOCK_EMBED_BASE_URL",
@@ -497,6 +501,10 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	// --- Database connectivity ---
 	if err := c.validateDatabase(ctx); err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("database validation failed: %v", err))
+	}
+
+	if c.MetaMaxInputBytes <= 0 {
+		result.Errors = append(result.Errors, "DRYDOCK_META_MAX_INPUT_BYTES must be at least 1")
 	}
 
 	// --- LLM endpoint checks (warnings only, as they may come online later) ---

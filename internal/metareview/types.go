@@ -3,6 +3,7 @@ package metareview
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"drydock/internal/reviewengine"
@@ -144,24 +145,299 @@ func ParseMetaReviewOutputForFindings(raw string, findingCount int) (MetaReviewO
 }
 
 func parseMetaReviewOutput(raw string, findingCount int) (MetaReviewOutput, error) {
+	candidate := extractMetaReviewJSON(raw)
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
-		return MetaReviewOutput{}, fmt.Errorf("parse meta review output: %w", err)
+	if err := json.Unmarshal([]byte(candidate), &fields); err != nil {
+		repaired := repairInvalidJSONEscapes(candidate)
+		if repairErr := json.Unmarshal([]byte(repaired), &fields); repairErr != nil {
+			return MetaReviewOutput{}, fmt.Errorf("parse meta review output: %w", err)
+		}
 	}
+	if fields == nil {
+		return MetaReviewOutput{}, fmt.Errorf("parse meta review output: expected a JSON object")
+	}
+
+	recognized := 0
 	for _, key := range []string{"missed_findings", "false_positives", "reasoning_quality", "context_utilization", "prompt_gaps", "suggested_few_shot"} {
-		if _, ok := fields[key]; !ok {
-			return MetaReviewOutput{}, fmt.Errorf("%s is required", key)
+		if _, ok := fields[key]; ok {
+			recognized++
+		}
+	}
+	if recognized == 0 {
+		return MetaReviewOutput{}, fmt.Errorf("parse meta review output: no recognized fields")
+	}
+
+	out := MetaReviewOutput{
+		MissedFindings: make([]MissedFinding, 0),
+		FalsePositives: make([]FalsePositive, 0),
+		PromptGaps:     make([]string, 0),
+	}
+	var err error
+	if rawValue, ok := fields["missed_findings"]; ok {
+		out.MissedFindings, err = parseMissedFindings(rawValue)
+		if err != nil {
+			return MetaReviewOutput{}, fmt.Errorf("missed_findings: %w", err)
+		}
+	}
+	if rawValue, ok := fields["false_positives"]; ok {
+		out.FalsePositives, err = parseFalsePositives(rawValue)
+		if err != nil {
+			return MetaReviewOutput{}, fmt.Errorf("false_positives: %w", err)
+		}
+	}
+	if rawValue, ok := fields["reasoning_quality"]; ok {
+		out.ReasoningQuality, err = parseFlexibleFloat(rawValue)
+		if err != nil {
+			return MetaReviewOutput{}, fmt.Errorf("reasoning_quality: %w", err)
+		}
+	}
+	if rawValue, ok := fields["context_utilization"]; ok {
+		out.ContextUtilization, err = parseFlexibleFloat(rawValue)
+		if err != nil {
+			return MetaReviewOutput{}, fmt.Errorf("context_utilization: %w", err)
+		}
+	}
+	if rawValue, ok := fields["prompt_gaps"]; ok {
+		out.PromptGaps, err = parseFlexibleStrings(rawValue)
+		if err != nil {
+			return MetaReviewOutput{}, fmt.Errorf("prompt_gaps: %w", err)
+		}
+	}
+	if rawValue, ok := fields["suggested_few_shot"]; ok {
+		out.SuggestedFewShot, err = parseFlexibleBool(rawValue)
+		if err != nil {
+			return MetaReviewOutput{}, fmt.Errorf("suggested_few_shot: %w", err)
 		}
 	}
 
-	var out MetaReviewOutput
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return MetaReviewOutput{}, fmt.Errorf("parse meta review output: %w", err)
-	}
 	if err := out.Validate(findingCount); err != nil {
 		return MetaReviewOutput{}, err
 	}
 	return out, nil
+}
+
+func extractMetaReviewJSON(raw string) string {
+	candidate := strings.TrimSpace(raw)
+	if strings.HasPrefix(candidate, "```") {
+		if newline := strings.IndexByte(candidate, '\n'); newline >= 0 {
+			candidate = candidate[newline+1:]
+		}
+		if fence := strings.LastIndex(candidate, "```"); fence >= 0 {
+			candidate = candidate[:fence]
+		}
+		candidate = strings.TrimSpace(candidate)
+	}
+	start := strings.IndexByte(candidate, '{')
+	end := strings.LastIndexByte(candidate, '}')
+	if start >= 0 && end > start {
+		return candidate[start : end+1]
+	}
+	return candidate
+}
+
+func repairInvalidJSONEscapes(raw string) string {
+	var out strings.Builder
+	out.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' || i+1 >= len(raw) {
+			out.WriteByte(raw[i])
+			continue
+		}
+		switch raw[i+1] {
+		case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
+			out.WriteByte(raw[i])
+		default:
+			out.WriteString(`\\`)
+		}
+	}
+	return out.String()
+}
+
+func parseMissedFindings(raw json.RawMessage) ([]MissedFinding, error) {
+	items, err := flexibleItems(raw)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]MissedFinding, 0, len(items))
+	for i, item := range items {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(item, &fields); err != nil || fields == nil {
+			return nil, fmt.Errorf("item %d must be an object", i)
+		}
+		finding := MissedFinding{}
+		if finding.Type, err = parseFlexibleString(fields["type"]); err != nil {
+			return nil, fmt.Errorf("item %d type: %w", i, err)
+		}
+		if finding.Description, err = parseFlexibleString(fields["description"]); err != nil {
+			return nil, fmt.Errorf("item %d description: %w", i, err)
+		}
+		if finding.Evidence, err = parseFlexibleString(fields["evidence"]); err != nil {
+			return nil, fmt.Errorf("item %d evidence: %w", i, err)
+		}
+		if finding.WhyMissed, err = parseFlexibleString(fields["why_missed"]); err != nil {
+			return nil, fmt.Errorf("item %d why_missed: %w", i, err)
+		}
+		out = append(out, finding)
+	}
+	return out, nil
+}
+
+func parseFalsePositives(raw json.RawMessage) ([]FalsePositive, error) {
+	items, err := flexibleItems(raw)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]FalsePositive, 0, len(items))
+	for i, item := range items {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(item, &fields); err != nil || fields == nil {
+			return nil, fmt.Errorf("item %d must be an object", i)
+		}
+		fp := FalsePositive{}
+		if fp.FindingIndex, err = parseFlexibleInt(fields["finding_index"]); err != nil {
+			return nil, fmt.Errorf("item %d finding_index: %w", i, err)
+		}
+		if fp.Reason, err = parseFlexibleString(fields["reason"]); err != nil {
+			return nil, fmt.Errorf("item %d reason: %w", i, err)
+		}
+		out = append(out, fp)
+	}
+	return out, nil
+}
+
+func parseFlexibleStrings(raw json.RawMessage) ([]string, error) {
+	items, err := flexibleItems(raw)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(items))
+	for i, item := range items {
+		value, err := parseFlexibleString(item)
+		if err != nil {
+			return nil, fmt.Errorf("item %d: %w", i, err)
+		}
+		out = append(out, value)
+	}
+	return out, nil
+}
+
+func flexibleItems(raw json.RawMessage) ([]json.RawMessage, error) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return []json.RawMessage{}, nil
+	}
+	if text[0] != '[' {
+		return []json.RawMessage{json.RawMessage(text)}, nil
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal([]byte(text), &items); err != nil {
+		return nil, err
+	}
+	if items == nil {
+		return []json.RawMessage{}, nil
+	}
+	return items, nil
+}
+
+func firstFlexibleItem(raw json.RawMessage) (json.RawMessage, error) {
+	items, err := flexibleItems(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	return items[0], nil
+}
+
+func parseFlexibleString(raw json.RawMessage) (string, error) {
+	item, err := firstFlexibleItem(raw)
+	if err != nil {
+		return "", err
+	}
+	text := strings.TrimSpace(string(item))
+	if text == "" || text == "null" {
+		return "", nil
+	}
+	var value string
+	if err := json.Unmarshal(item, &value); err == nil {
+		return value, nil
+	}
+	if text == "true" || text == "false" {
+		return text, nil
+	}
+	if _, err := strconv.ParseFloat(text, 64); err == nil {
+		return text, nil
+	}
+	return "", fmt.Errorf("expected a string-compatible scalar")
+}
+
+func parseFlexibleFloat(raw json.RawMessage) (float64, error) {
+	item, err := firstFlexibleItem(raw)
+	if err != nil {
+		return 0, err
+	}
+	text := strings.TrimSpace(string(item))
+	if text == "" || text == "null" {
+		return 0, nil
+	}
+	var encoded string
+	if err := json.Unmarshal(item, &encoded); err == nil {
+		value, parseErr := strconv.ParseFloat(strings.TrimSpace(encoded), 64)
+		if parseErr != nil {
+			return 0, parseErr
+		}
+		return value, nil
+	}
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, fmt.Errorf("expected a number or numeric string")
+	}
+	return value, nil
+}
+
+func parseFlexibleInt(raw json.RawMessage) (int, error) {
+	value, err := parseFlexibleFloat(raw)
+	if err != nil {
+		return 0, err
+	}
+	asInt := int(value)
+	if float64(asInt) != value {
+		return 0, fmt.Errorf("expected an integer")
+	}
+	return asInt, nil
+}
+
+func parseFlexibleBool(raw json.RawMessage) (bool, error) {
+	item, err := firstFlexibleItem(raw)
+	if err != nil {
+		return false, err
+	}
+	text := strings.TrimSpace(string(item))
+	if text == "" || text == "null" {
+		return false, nil
+	}
+	var value bool
+	if err := json.Unmarshal(item, &value); err == nil {
+		return value, nil
+	}
+	var encoded string
+	if err := json.Unmarshal(item, &encoded); err == nil {
+		switch strings.ToLower(strings.TrimSpace(encoded)) {
+		case "true", "1", "yes":
+			return true, nil
+		case "false", "0", "no":
+			return false, nil
+		}
+	}
+	switch text {
+	case "1":
+		return true, nil
+	case "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("expected a boolean-compatible scalar")
+	}
 }
 
 func (out MetaReviewOutput) Validate(findingCount int) error {

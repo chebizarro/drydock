@@ -9,6 +9,21 @@ import (
 	"fiatjaf.com/nostr/nip19"
 )
 
+func TestFromEnvMetaReviewConfig(t *testing.T) {
+	t.Setenv("DRYDOCK_META_BASE_URL", "https://frontier.example/v1")
+	t.Setenv("DRYDOCK_META_MODEL", "frontier-model")
+	t.Setenv("DRYDOCK_META_API_KEY", "meta-secret")
+	t.Setenv("DRYDOCK_META_MAX_INPUT_BYTES", "65536")
+
+	cfg := FromEnv()
+	if cfg.MetaBaseURL != "https://frontier.example/v1" ||
+		cfg.MetaModel != "frontier-model" ||
+		cfg.MetaAPIKey != "meta-secret" ||
+		cfg.MetaMaxInputBytes != 65536 {
+		t.Fatalf("unexpected meta-review config: %#v", cfg)
+	}
+}
+
 func TestFromEnvPRDiffLimits(t *testing.T) {
 	t.Setenv("DRYDOCK_PR_DIFF_MAX_FILES", "25")
 	t.Setenv("DRYDOCK_PR_DIFF_MAX_BYTES", "4096")
@@ -522,6 +537,7 @@ func clearConfigEnv(t *testing.T) {
 		"DRYDOCK_META_BASE_URL",
 		"DRYDOCK_META_MODEL",
 		"DRYDOCK_META_API_KEY",
+		"DRYDOCK_META_MAX_INPUT_BYTES",
 		"DRYDOCK_QDRANT_URL",
 		"DRYDOCK_QDRANT_API_KEY",
 		"DRYDOCK_EMBED_BASE_URL",

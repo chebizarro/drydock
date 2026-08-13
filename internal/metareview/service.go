@@ -3,6 +3,7 @@ package metareview
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -10,10 +11,11 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"drydock/internal/db"
 	"drydock/internal/embedding"
-	"drydock/internal/llmutil"
+	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
 	"drydock/internal/symbols"
 	"drydock/internal/vectorstore"
@@ -28,6 +30,8 @@ const (
 	ActionFlagContextBuilder    = "flag-context-builder-pattern"
 	ActionFlagModelRouting      = "flag-model-routing-review"
 	ActionQueuePromptRefinement = "queue-prompt-refinement"
+
+	DefaultMaxInputBytes = 128 * 1024
 )
 
 type LLMClient interface {
@@ -40,6 +44,7 @@ type Config struct {
 	MinReuseJaccard  float64
 	FewShotCap       int
 	MaxConcurrent    int64
+	MaxInputBytes    int
 }
 
 type Input struct {
@@ -93,6 +98,9 @@ func New(cfg Config, store *db.Store, client LLMClient, logger *slog.Logger, opt
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = 10
 	}
+	if cfg.MaxInputBytes <= 0 {
+		cfg.MaxInputBytes = DefaultMaxInputBytes
+	}
 	s := &Service{
 		cfg:    cfg,
 		store:  store,
@@ -108,25 +116,69 @@ func New(cfg Config, store *db.Store, client LLMClient, logger *slog.Logger, opt
 
 func (s *Service) RunAsync(ctx context.Context, in Input) {
 	go func() {
-		if err := s.sem.Acquire(ctx, 1); err != nil {
-			s.logger.Warn("meta-review semaphore acquire failed", "patch_event_id", in.PatchEventID, "error", err)
-			return
-		}
-		defer s.sem.Release(1)
-
 		if _, err := s.Run(ctx, in); err != nil {
 			s.logger.Error("meta-review async run failed", "patch_event_id", in.PatchEventID, "repo_id", in.RepoID, "error", err)
 		}
 	}()
 }
 
-func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
+func (s *Service) Run(ctx context.Context, in Input) (result Result, runErr error) {
 	reasons := gateReasons(in.LocalReview, in.ChangedFiles, in.SecurityFindings, s.cfg.RandomSampleRate)
 	if len(reasons) == 0 {
 		return Result{Triggered: false}, nil
 	}
+
+	result = Result{Triggered: true, Reasons: reasons}
 	changedLines := changedLineSet(in.PatchDiff)
 	gateReason := strings.Join(reasons, ",")
+	failureStage := "semaphore_acquire"
+	rawResponse := ""
+	reused := false
+	metrics.MetaReviewAttempts.Inc()
+	defer func() {
+		status := "success"
+		auditFailureStage := ""
+		failureReason := ""
+		if runErr != nil {
+			status = "failed"
+			auditFailureStage = failureStage
+			failureReason = runErr.Error()
+			metrics.MetaReviewFailures.With(failureStage).Inc()
+		}
+
+		auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		auditErr := s.store.InsertMetaReviewAttempt(auditCtx, db.MetaReviewAttempt{
+			PatchEventID:  in.PatchEventID,
+			RepoID:        in.RepoID,
+			ContextHash:   in.ContextHash,
+			GateReason:    gateReason,
+			Model:         s.cfg.Endpoint.Model,
+			Reused:        reused,
+			Status:        status,
+			FailureStage:  auditFailureStage,
+			FailureReason: failureReason,
+			ResponseJSON:  rawResponse,
+		})
+		if auditErr != nil {
+			metrics.MetaReviewFailures.With("audit_persist").Inc()
+			s.logger.Error("persist meta-review attempt failed",
+				"patch_event_id", in.PatchEventID,
+				"repo_id", in.RepoID,
+				"error", auditErr)
+			runErr = errors.Join(runErr, fmt.Errorf("persist meta-review attempt: %w", auditErr))
+			return
+		}
+		if runErr == nil {
+			metrics.MetaReviewSuccesses.Inc()
+		}
+	}()
+
+	if err := s.sem.Acquire(ctx, 1); err != nil {
+		return result, fmt.Errorf("meta-review semaphore acquire failed: %w", err)
+	}
+	defer s.sem.Release(1)
+	failureStage = "reuse_lookup"
 
 	var reuse *db.MetaReviewReuse
 	var err error
@@ -135,23 +187,30 @@ func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
 	if len(in.SecurityFindings) == 0 {
 		reuse, err = s.store.FindReusableMetaReview(ctx, in.ContextHash, changedLines, s.cfg.MinReuseJaccard)
 		if err != nil {
-			return Result{}, err
+			return result, err
 		}
 	}
 
 	var parsed MetaReviewOutput
 	if reuse != nil {
-		parsed, err = ParseMetaReviewOutputForFindings(llmutil.ExtractJSON(reuse.ResponseJSON), len(in.LocalReview.Findings))
+		reused = true
+		rawResponse = reuse.ResponseJSON
+		failureStage = "parse_reused_output"
+		parsed, err = ParseMetaReviewOutputForFindings(rawResponse, len(in.LocalReview.Findings))
 		if err != nil {
-			return Result{}, err
+			return result, err
 		}
+		failureStage = "route_reused_feedback"
 		if err := s.routeFeedback(ctx, in, parsed); err != nil {
-			return Result{}, err
+			return result, err
 		}
-		if err := s.store.InsertMetaReviewLog(ctx, in.PatchEventID, in.RepoID, in.ContextHash, changedLines, gateReason, reuse.ResponseJSON); err != nil {
-			return Result{}, err
+		failureStage = "persist_reused_result"
+		if err := s.store.InsertMetaReviewLog(ctx, in.PatchEventID, in.RepoID, in.ContextHash, changedLines, gateReason, rawResponse); err != nil {
+			return result, err
 		}
-		return Result{Triggered: true, Reused: true, Reasons: reasons, Output: &parsed}, nil
+		result.Reused = true
+		result.Output = &parsed
+		return result, nil
 	}
 
 	req := reviewengine.ChatRequest{
@@ -160,32 +219,39 @@ func (s *Service) Run(ctx context.Context, in Input) (Result, error) {
 		Model:       s.cfg.Endpoint.Model,
 		Temperature: 0.1,
 		System:      metaReviewSystemPrompt(),
-		User:        metaReviewUserPrompt(in),
+		User:        metaReviewUserPrompt(in, s.cfg.MaxInputBytes),
 	}
+	failureStage = "completion"
 	res, err := s.client.ChatCompletion(ctx, req)
 	if err != nil {
-		return Result{}, fmt.Errorf("meta-review completion failed: %w", err)
+		return result, fmt.Errorf("meta-review completion failed: %w", err)
 	}
-	raw := res.Content
-	parsed, err = ParseMetaReviewOutputForFindings(llmutil.ExtractJSON(raw), len(in.LocalReview.Findings))
+	rawResponse = res.Content
+	failureStage = "parse_output"
+	parsed, err = ParseMetaReviewOutputForFindings(rawResponse, len(in.LocalReview.Findings))
 	if err != nil {
-		return Result{}, err
+		return result, err
 	}
 
-	if err := s.store.InsertMetaReviewLog(ctx, in.PatchEventID, in.RepoID, in.ContextHash, changedLines, gateReason, raw); err != nil {
-		return Result{}, err
+	failureStage = "persist_result"
+	if err := s.store.InsertMetaReviewLog(ctx, in.PatchEventID, in.RepoID, in.ContextHash, changedLines, gateReason, rawResponse); err != nil {
+		return result, err
 	}
+	failureStage = "route_feedback"
 	if err := s.routeFeedback(ctx, in, parsed); err != nil {
-		return Result{}, err
+		return result, err
 	}
+	failureStage = "queue_prompt_gaps"
 	if err := s.queuePromptGaps(ctx, in, parsed); err != nil {
-		return Result{}, err
+		return result, err
 	}
+	failureStage = "update_few_shot"
 	if err := s.updateFewShot(ctx, in, parsed); err != nil {
-		return Result{}, err
+		return result, err
 	}
 
-	return Result{Triggered: true, Reused: false, Reasons: reasons, Output: &parsed}, nil
+	result.Output = &parsed
+	return result, nil
 }
 
 func gateReasons(local reviewengine.ReviewerOutput, changedFiles []string, securityFindings []SecurityFinding, randomRate float64) []string {
@@ -323,17 +389,94 @@ Return JSON only with keys:
 missed_findings, false_positives, reasoning_quality, context_utilization, prompt_gaps, suggested_few_shot.`
 }
 
-func metaReviewUserPrompt(in Input) string {
+func metaReviewUserPrompt(in Input, maxInputBytes int) string {
+	patchDiff, contextBundle := budgetMetaReviewInputs(in.PatchDiff, in.ContextBundle, maxInputBytes)
 	localReviewJSON, _ := json.Marshal(in.LocalReview)
 	prompt := fmt.Sprintf(
 		"Patch:\n%s\n\nContext:\n%s\n\nLocal review JSON:\n%s",
-		in.PatchDiff, in.ContextBundle, string(localReviewJSON),
+		patchDiff, contextBundle, string(localReviewJSON),
 	)
 	if len(in.SecurityFindings) > 0 {
 		securityJSON, _ := json.Marshal(AnalyzeSecurityFindings(in.SecurityFindings))
 		prompt += "\n\nSecurity review verification analysis JSON:\n" + string(securityJSON)
 	}
 	return prompt
+}
+
+func budgetMetaReviewInputs(diff, bundle string, maxBytes int) (string, string) {
+	if maxBytes <= 0 {
+		return "", ""
+	}
+	if len(diff)+len(bundle) <= maxBytes {
+		return diff, bundle
+	}
+
+	diffBudget := maxBytes * 3 / 5
+	bundleBudget := maxBytes - diffBudget
+	if len(diff) < diffBudget {
+		bundleBudget += diffBudget - len(diff)
+		diffBudget = len(diff)
+	}
+	if len(bundle) < bundleBudget {
+		diffBudget += bundleBudget - len(bundle)
+		bundleBudget = len(bundle)
+	}
+
+	return truncateMetaReviewSection(diff, diffBudget, "patch"),
+		truncateMetaReviewSection(bundle, bundleBudget, "context")
+}
+
+func truncateMetaReviewSection(content string, maxBytes int, label string) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(content) <= maxBytes {
+		return content
+	}
+
+	marker := fmt.Sprintf(
+		"\n... [drydock meta-review %s truncated; original %d bytes] ...\n",
+		label,
+		len(content),
+	)
+	if len(marker) >= maxBytes {
+		return validUTF8Prefix(marker, maxBytes)
+	}
+
+	remaining := maxBytes - len(marker)
+	headBytes := remaining * 3 / 4
+	tailBytes := remaining - headBytes
+	head := validUTF8Prefix(content, headBytes)
+	tail := validUTF8Suffix(content, tailBytes)
+	return head + marker + tail
+}
+
+func validUTF8Prefix(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end]
+}
+
+func validUTF8Suffix(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	start := len(value) - maxBytes
+	for start < len(value) && !utf8.RuneStart(value[start]) {
+		start++
+	}
+	return value[start:]
 }
 
 func changedLineSet(diff string) []string {

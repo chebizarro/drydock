@@ -68,6 +68,24 @@ type MetaReviewReuse struct {
 	ResponseJSON string
 }
 
+// MetaReviewAttempt is the durable audit record for a triggered meta-review.
+// Failed attempts retain the stage, error, and any raw model output so async
+// quality-control failures remain operator-visible.
+type MetaReviewAttempt struct {
+	ID            int64
+	PatchEventID  string
+	RepoID        string
+	ContextHash   string
+	GateReason    string
+	Model         string
+	Reused        bool
+	Status        string
+	FailureStage  string
+	FailureReason string
+	ResponseJSON  string
+	CreatedAt     int64
+}
+
 // MetaReviewSample is a meta-review record returned by SampleRecentMetaReviews.
 type MetaReviewSample struct {
 	ID           int64
@@ -1761,6 +1779,75 @@ func (s *Store) CountRepositorySnapshots(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("count repository snapshots: %w", err)
 	}
 	return n, nil
+}
+
+func (s *Store) InsertMetaReviewAttempt(ctx context.Context, attempt MetaReviewAttempt) error {
+	if attempt.Status != "success" && attempt.Status != "failed" {
+		return fmt.Errorf("insert meta review attempt: invalid status %q", attempt.Status)
+	}
+	reused := 0
+	if attempt.Reused {
+		reused = 1
+	}
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO meta_review_attempts(
+		patch_event_id, repo_id, context_hash, gate_reason, model, reused,
+		status, failure_stage, failure_reason, response_json, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		attempt.PatchEventID,
+		attempt.RepoID,
+		attempt.ContextHash,
+		attempt.GateReason,
+		attempt.Model,
+		reused,
+		attempt.Status,
+		attempt.FailureStage,
+		attempt.FailureReason,
+		attempt.ResponseJSON,
+		time.Now().Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("insert meta review attempt: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) LatestMetaReviewAttempt(ctx context.Context, patchEventID, repoID string) (MetaReviewAttempt, bool, error) {
+	var attempt MetaReviewAttempt
+	var reused int
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, patch_event_id, repo_id, context_hash, gate_reason, model,
+		reused, status, failure_stage, failure_reason, response_json, created_at
+		FROM meta_review_attempts
+		WHERE patch_event_id=? AND repo_id=?
+		ORDER BY id DESC
+		LIMIT 1`,
+		patchEventID,
+		repoID,
+	).Scan(
+		&attempt.ID,
+		&attempt.PatchEventID,
+		&attempt.RepoID,
+		&attempt.ContextHash,
+		&attempt.GateReason,
+		&attempt.Model,
+		&reused,
+		&attempt.Status,
+		&attempt.FailureStage,
+		&attempt.FailureReason,
+		&attempt.ResponseJSON,
+		&attempt.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MetaReviewAttempt{}, false, nil
+	}
+	if err != nil {
+		return MetaReviewAttempt{}, false, fmt.Errorf("latest meta review attempt: %w", err)
+	}
+	attempt.Reused = reused != 0
+	return attempt, true, nil
 }
 
 func (s *Store) InsertMetaReviewLog(ctx context.Context, patchEventID, repoID, contextHash string, changedLines []string, gateReason, responseJSON string) error {
