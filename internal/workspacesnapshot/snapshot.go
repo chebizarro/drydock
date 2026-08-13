@@ -481,6 +481,91 @@ func (s *Snapshot) List(prefix string) ([]ManifestEntry, error) {
 
 func (s *Snapshot) PatchContent() []byte { return append([]byte(nil), s.patch...) }
 
+// GitReadRequest is the closed, read-only action set exposed to agent tools.
+type GitReadRequest struct {
+	Action    string
+	Path      string
+	StartLine int
+	EndLine   int
+	Limit     int
+}
+
+// GitRead executes a read-only operation against the pinned commit. Mutable
+// copies intentionally have no live-repository fallback.
+func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, error) {
+	if s.Kind != KindPinnedGit {
+		return nil, fmt.Errorf("workspace snapshot: git.read requires a pinned git snapshot")
+	}
+	path := ""
+	if strings.TrimSpace(req.Path) != "" {
+		var err error
+		path, err = normalizePath(req.Path, false)
+		if err != nil {
+			return nil, err
+		}
+		if !pathAllowed(path, s.Allowlist) {
+			return nil, ErrOutsideScope
+		}
+	}
+	switch req.Action {
+	case "diff":
+		if len(s.patch) > 0 && path == "" {
+			return append([]byte(nil), s.patch...), nil
+		}
+		args := []string{"show", "--format=", "--no-ext-diff", "--no-textconv", s.Commit, "--"}
+		if path != "" {
+			args = append(args, path)
+		} else {
+			for _, allowed := range s.Allowlist {
+				if allowed != "." {
+					args = append(args, allowed)
+				}
+			}
+		}
+		return runGitBytes(ctx, s.repoRoot, args...)
+	case "show":
+		if path != "" {
+			return s.ReadFile(ctx, path)
+		}
+		return runGitBytes(ctx, s.repoRoot, "show", "--no-ext-diff", "--no-textconv", "--stat", "--oneline", s.Commit)
+	case "log":
+		limit := req.Limit
+		if limit <= 0 {
+			limit = 20
+		}
+		if limit > 100 {
+			limit = 100
+		}
+		args := []string{"log", "-n", strconv.Itoa(limit), "--format=%H%x09%an%x09%aI%x09%s", s.Commit, "--"}
+		if path != "" {
+			args = append(args, path)
+		} else {
+			for _, allowed := range s.Allowlist {
+				if allowed != "." {
+					args = append(args, allowed)
+				}
+			}
+		}
+		return runGitBytes(ctx, s.repoRoot, args...)
+	case "blame":
+		if path == "" {
+			return nil, fmt.Errorf("workspace snapshot: blame path is required")
+		}
+		args := []string{"blame", "--porcelain"}
+		if req.StartLine > 0 {
+			end := req.EndLine
+			if end < req.StartLine {
+				end = req.StartLine
+			}
+			args = append(args, "-L", fmt.Sprintf("%d,%d", req.StartLine, end))
+		}
+		args = append(args, s.Commit, "--", path)
+		return runGitBytes(ctx, s.repoRoot, args...)
+	default:
+		return nil, fmt.Errorf("workspace snapshot: unsupported git action %q", req.Action)
+	}
+}
+
 func (s *Snapshot) Verify() error {
 	if hashBytes(s.patch) != s.PatchHash {
 		return ErrHashMismatch
