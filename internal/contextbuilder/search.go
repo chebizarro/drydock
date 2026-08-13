@@ -10,20 +10,27 @@ import (
 	"sync"
 )
 
-// searcher wraps symbol callsite search, preferring ripgrep when available
+// Searcher wraps symbol callsite search, preferring ripgrep when available
 // and falling back to git grep.
-type searcher struct {
-	hasRg     bool
-	rgPath    string
-	initOnce  sync.Once
+type Searcher struct {
+	hasRg    bool
+	rgPath   string
+	initOnce sync.Once
 }
 
-// newSearcher creates a searcher. Call init() before first use (done lazily).
-func newSearcher() *searcher {
-	return &searcher{}
+// NewSearcher creates a Searcher. Call init() before first use (done lazily).
+func NewSearcher() *Searcher {
+	return &Searcher{}
 }
 
-func (s *searcher) init() {
+// Backward-compatible package aliases keep existing same-package providers and
+// tests source-compatible while external callers use the exported facade.
+type searcher = Searcher
+type searchHit = SearchHit
+
+func newSearcher() *Searcher { return NewSearcher() }
+
+func (s *Searcher) init() {
 	s.initOnce.Do(func() {
 		path, err := exec.LookPath("rg")
 		if err == nil {
@@ -35,7 +42,7 @@ func (s *searcher) init() {
 
 // SearchSymbol finds callsites of a symbol in the repo, returning file:line:content lines.
 // When workspaceRoots are provided, only those directories are searched.
-func (s *searcher) SearchSymbol(ctx context.Context, repoPath, symbol string, workspaceRoots []string) (string, error) {
+func (s *Searcher) SearchSymbol(ctx context.Context, repoPath, symbol string, workspaceRoots []string) (string, error) {
 	s.init()
 
 	if s.hasRg {
@@ -47,7 +54,7 @@ func (s *searcher) SearchSymbol(ctx context.Context, repoPath, symbol string, wo
 
 // SearchSymbolTests finds test-related callsites of a symbol.
 // When workspaceRoots are provided, only those directories are searched.
-func (s *searcher) SearchSymbolTests(ctx context.Context, repoPath, symbol string, workspaceRoots []string) (string, error) {
+func (s *Searcher) SearchSymbolTests(ctx context.Context, repoPath, symbol string, workspaceRoots []string) (string, error) {
 	s.init()
 
 	if s.hasRg {
@@ -60,7 +67,7 @@ func (s *searcher) SearchSymbolTests(ctx context.Context, repoPath, symbol strin
 // gitGrepSymbol searches for a symbol using git grep.
 // Uses -P (Perl regex with \b) when available, falls back to plain -F (fixed string).
 // When workspaceRoots are provided, pathspecs are scoped to those directories.
-func (s *searcher) gitGrepSymbol(ctx context.Context, repoPath, symbol string, pathspecs []string, workspaceRoots []string) (string, error) {
+func (s *Searcher) gitGrepSymbol(ctx context.Context, repoPath, symbol string, pathspecs []string, workspaceRoots []string) (string, error) {
 	// Merge workspace roots into pathspecs for directory scoping
 	effectiveSpecs := buildGitPathspecs(pathspecs, workspaceRoots)
 
@@ -123,14 +130,14 @@ var testGlobs = []string{
 
 // rgSearch runs ripgrep with the given pattern, optionally filtering to glob patterns.
 // When workspaceRoots are provided, search is scoped to those directories.
-func (s *searcher) rgSearch(ctx context.Context, repoPath, pattern string, globs []string, workspaceRoots []string) (string, error) {
+func (s *Searcher) rgSearch(ctx context.Context, repoPath, pattern string, globs []string, workspaceRoots []string) (string, error) {
 	args := []string{
-		"--no-heading",   // file:line:content format
-		"--line-number",  // include line numbers
-		"--color=never",  // no ANSI codes
-		"--max-count=50", // cap matches per file
+		"--no-heading",      // file:line:content format
+		"--line-number",     // include line numbers
+		"--color=never",     // no ANSI codes
+		"--max-count=50",    // cap matches per file
 		"--max-columns=200", // truncate long lines
-		"-e", pattern,    // search pattern
+		"-e", pattern,       // search pattern
 	}
 
 	for _, g := range globs {
@@ -174,8 +181,8 @@ func (s *searcher) rgSearch(ctx context.Context, repoPath, pattern string, globs
 	return result, nil
 }
 
-// searchHit represents a single structured search match.
-type searchHit struct {
+// SearchHit represents a single structured search match.
+type SearchHit struct {
 	File string
 	Line int
 	Text string
@@ -183,7 +190,7 @@ type searchHit struct {
 
 // SearchSymbolHits returns structured search hits for a symbol, suitable for
 // blast-radius analysis. Returns file-level match data instead of formatted text.
-func (s *searcher) SearchSymbolHits(ctx context.Context, repoPath, symbol string, workspaceRoots []string) ([]searchHit, error) {
+func (s *Searcher) SearchSymbolHits(ctx context.Context, repoPath, symbol string, workspaceRoots []string) ([]SearchHit, error) {
 	raw, err := s.SearchSymbol(ctx, repoPath, symbol, workspaceRoots)
 	if err != nil || raw == "" {
 		return nil, err
@@ -192,8 +199,8 @@ func (s *searcher) SearchSymbolHits(ctx context.Context, repoPath, symbol string
 }
 
 // parseSearchHits parses file:line:text formatted output into structured hits.
-func parseSearchHits(raw string) []searchHit {
-	var hits []searchHit
+func parseSearchHits(raw string) []SearchHit {
+	var hits []SearchHit
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -212,7 +219,7 @@ func parseSearchHits(raw string) []searchHit {
 		if len(parts) >= 3 {
 			text = parts[2]
 		}
-		hits = append(hits, searchHit{
+		hits = append(hits, SearchHit{
 			File: parts[0],
 			Line: lineNum,
 			Text: strings.TrimSpace(text),
@@ -222,7 +229,7 @@ func parseSearchHits(raw string) []searchHit {
 }
 
 // UseRipgrep returns true if ripgrep is available.
-func (s *searcher) UseRipgrep() bool {
+func (s *Searcher) UseRipgrep() bool {
 	s.init()
 	return s.hasRg
 }

@@ -64,6 +64,12 @@ type patchDiffProvider struct{}
 func (patchDiffProvider) LayerName() string { return LayerPatchDiff }
 func (patchDiffProvider) Priority() int     { return 1 }
 func (patchDiffProvider) Build(_ context.Context, in BuildInput) (string, error) {
+	return AnalyzePatch(in)
+}
+
+// AnalyzePatch renders the authoritative patch layer using the deterministic
+// provider's exact byte limits.
+func renderPatch(in BuildInput) (string, error) {
 	diff := strings.TrimSpace(in.PatchEventContent)
 	if diff == "" {
 		return "", nil
@@ -80,6 +86,11 @@ type fileContextProvider struct{}
 func (fileContextProvider) LayerName() string { return LayerFileContext }
 func (fileContextProvider) Priority() int     { return 2 }
 func (fileContextProvider) Build(_ context.Context, in BuildInput) (string, error) {
+	return AnalyzeModifiedFiles(in)
+}
+
+// AnalyzeModifiedFiles renders current contents for files referenced by a patch.
+func analyzeModifiedFiles(in BuildInput) (string, error) {
 	if in.RepoPath == "" {
 		return "", nil
 	}
@@ -125,6 +136,13 @@ type symbolsCallsitesProvider struct {
 func (p symbolsCallsitesProvider) LayerName() string { return LayerSymbolsCallsites }
 func (p symbolsCallsitesProvider) Priority() int     { return 3 }
 func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (string, error) {
+	return AnalyzeSymbols(ctx, in, p.lspClient, p.search)
+}
+
+// AnalyzeSymbols extracts changed symbols and renders LSP- or search-backed
+// definitions and callsites.
+func analyzeSymbolsContent(ctx context.Context, in BuildInput, lspClient *lspbridge.Client, search *Searcher) (string, error) {
+	p := symbolsCallsitesProvider{lspClient: lspClient, search: search}
 	if in.RepoPath == "" {
 		return "", nil
 	}
@@ -155,19 +173,19 @@ func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (str
 	// If it is configured but unavailable/empty, surface that degraded status before
 	// falling back so callers can distinguish grep context from LSP-backed context.
 	if p.lspClient != nil {
-		lspResult := p.queryLSP(ctx, in, syms)
-		if lspResult.content != "" {
-			out.WriteString(lspResult.content)
+		lspResult := AnalyzeLSP(ctx, p.lspClient, in, syms)
+		if lspResult.Content != "" {
+			out.WriteString(lspResult.Content)
 			content := strings.TrimSpace(out.String())
 			if len(extractionWarnings) > 0 {
 				return content, &LayerWarning{Err: errors.Join(extractionWarnings...)}
 			}
 			return content, nil
 		}
-		if lspResult.status != "" {
+		if lspResult.Status != "" {
 			out.WriteString("\n## LSP Status\n")
 			out.WriteString("- ")
-			out.WriteString(lspResult.status)
+			out.WriteString(lspResult.Status)
 			out.WriteString("\n")
 		}
 	}
@@ -248,18 +266,21 @@ func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput, extractor
 	return names, warnings
 }
 
-type lspQueryResult struct {
-	content string
-	status  string
+// LSPAnalysis is reusable rendered LSP analysis plus degradation status.
+type LSPAnalysis struct {
+	Response *lspbridge.AnalyzeResponse
+	Content  string
+	Status   string
+	Usable   bool
 }
 
 // queryLSP calls the LSP bridge for type-aware symbol analysis.
 // It returns formatted context when LSP produced useful results, or a degraded
 // status string when the configured bridge failed/returned no useful data.
-func (p symbolsCallsitesProvider) queryLSP(ctx context.Context, in BuildInput, syms []string) lspQueryResult {
+func analyzeLSP(ctx context.Context, client *lspbridge.Client, in BuildInput, syms []string) LSPAnalysis {
 	files, err := parsePatch(in.PatchEventContent)
 	if err != nil {
-		return lspQueryResult{status: "degraded: could not parse patch for LSP request; using grep fallback"}
+		return LSPAnalysis{Status: "degraded: could not parse patch for LSP request; using grep fallback"}
 	}
 	var changedFiles []string
 	for _, f := range files {
@@ -269,21 +290,24 @@ func (p symbolsCallsitesProvider) queryLSP(ctx context.Context, in BuildInput, s
 		}
 	}
 
-	resp, err := p.lspClient.Analyze(ctx, lspbridge.AnalyzeRequest{
+	if client == nil {
+		return LSPAnalysis{Status: "degraded: LSP bridge is not configured; using grep fallback"}
+	}
+	resp, err := client.Analyze(ctx, lspbridge.AnalyzeRequest{
 		RepoPath:     in.RepoPath,
 		ChangedFiles: changedFiles,
 		Symbols:      syms,
 	})
 	if err != nil {
-		return lspQueryResult{status: "degraded: LSP bridge unavailable (" + err.Error() + "); using grep fallback"}
+		return LSPAnalysis{Status: "degraded: LSP bridge unavailable (" + err.Error() + "); using grep fallback"}
 	}
 	if resp.Error != "" || resp.Status == "degraded" || resp.Status == "error" || len(resp.LanguageErrors) > 0 {
-		return lspQueryResult{status: formatLSPStatus(resp)}
+		return LSPAnalysis{Response: resp, Status: formatLSPStatus(resp)}
 	}
 
 	// Only use LSP results if they returned something useful.
 	if len(resp.Definitions) == 0 && len(resp.References) == 0 && len(resp.Diagnostics) == 0 {
-		return lspQueryResult{status: "degraded: LSP bridge returned no definitions, references, or diagnostics; using grep fallback"}
+		return LSPAnalysis{Response: resp, Status: "degraded: LSP bridge returned no definitions, references, or diagnostics; using grep fallback"}
 	}
 
 	var out strings.Builder
@@ -330,7 +354,7 @@ func (p symbolsCallsitesProvider) queryLSP(ctx context.Context, in BuildInput, s
 		}
 	}
 
-	return lspQueryResult{content: out.String()}
+	return LSPAnalysis{Response: resp, Content: out.String(), Usable: true}
 }
 
 func formatLSPStatus(resp *lspbridge.AnalyzeResponse) string {
@@ -391,6 +415,13 @@ type testsProvider struct {
 func (p testsProvider) LayerName() string { return LayerTests }
 func (p testsProvider) Priority() int     { return 4 }
 func (p testsProvider) Build(ctx context.Context, in BuildInput) (string, error) {
+	return AnalyzeTests(ctx, in, p.search)
+}
+
+// AnalyzeTests renders test references and stable coverage-gap markers for
+// symbols changed by the patch.
+func analyzeTestsContent(ctx context.Context, in BuildInput, search *Searcher) (string, error) {
+	p := testsProvider{search: search}
 	if in.RepoPath == "" {
 		return "", nil
 	}
@@ -437,6 +468,11 @@ type importsExportsProvider struct{}
 func (importsExportsProvider) LayerName() string { return LayerImportsExports }
 func (importsExportsProvider) Priority() int     { return 5 }
 func (importsExportsProvider) Build(_ context.Context, in BuildInput) (string, error) {
+	return AnalyzeImportsExports(in)
+}
+
+// AnalyzeImportsExports renders import/export lines changed by the patch.
+func analyzeImportsExports(in BuildInput) (string, error) {
 	lines := extractImportExportLines(in.PatchEventContent)
 	if len(lines) == 0 {
 		return "", nil
@@ -449,6 +485,11 @@ type commitHistoryProvider struct{}
 func (commitHistoryProvider) LayerName() string { return LayerCommitHistory }
 func (commitHistoryProvider) Priority() int     { return 6 }
 func (commitHistoryProvider) Build(ctx context.Context, in BuildInput) (string, error) {
+	return AnalyzeHistory(ctx, in)
+}
+
+// AnalyzeHistory renders recent commits affecting patch paths.
+func analyzeHistoryContent(ctx context.Context, in BuildInput) (string, error) {
 	if in.RepoPath == "" {
 		return "", nil
 	}
@@ -482,6 +523,12 @@ type projectDocsProvider struct{}
 func (projectDocsProvider) LayerName() string { return LayerProjectDocs }
 func (projectDocsProvider) Priority() int     { return 7 }
 func (projectDocsProvider) Build(_ context.Context, in BuildInput) (string, error) {
+	return AnalyzeDocs(in)
+}
+
+// AnalyzeDocs renders repository and workspace guidance using deterministic
+// candidate ordering and byte limits.
+func analyzeDocsContent(in BuildInput) (string, error) {
 	if in.RepoPath == "" {
 		return "", nil
 	}

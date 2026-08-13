@@ -228,39 +228,31 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		effectiveBudget = in.TokenBudgetOverride
 	}
 
+	patchAnalysis, patchErr := AnalyzePatchStructure(PatchAnalysisRequest{
+		Diff: in.PatchEventContent, ExcludePaths: in.ExcludePaths,
+	})
+
 	// Auto-detect workspace boundaries for monorepo context isolation.
 	if in.RepoPath != "" && len(in.WorkspaceRoots) == 0 {
 		workspaces := DetectWorkspaces(in.RepoPath)
 		if len(workspaces) > 0 {
-			files, _ := parsePatch(in.PatchEventContent)
-			var changedPaths []string
-			for _, f := range files {
-				if p := pickPath(f); p != "" {
-					changedPaths = append(changedPaths, p)
+			changedPaths := make([]string, 0, len(patchAnalysis.Files))
+			for _, file := range patchAnalysis.Files {
+				if file.Path != "" {
+					changedPaths = append(changedPaths, file.Path)
 				}
 			}
 			in.WorkspaceRoots = RelevantWorkspaces(workspaces, changedPaths)
 		}
 	}
 
-	// Pre-scan: identify excluded files (built-in + repo-config) and filter
-	// the patch to remove excluded file diffs from the context.
-	var excludedFiles []string
-	if in.PatchEventContent != "" {
-		patchFiles, _ := parsePatch(in.PatchEventContent)
-		for _, f := range patchFiles {
-			path := pickPath(f)
-			if path == "" {
-				continue
-			}
-			if isExcludedPath(path) || matchesExcludePath(path, in.ExcludePaths) {
-				excludedFiles = append(excludedFiles, path)
-			}
-		}
-		// Rebuild a filtered patch so all providers see the same filtered diff.
-		if len(excludedFiles) > 0 {
-			in = filterPatchInput(in, excludedFiles)
-		}
+	// Pre-scan is intentionally tolerant of malformed patches, matching the
+	// prior builder behavior. Providers may still surface their own warnings.
+	var excludedFiles, changedFiles []string
+	if patchErr == nil {
+		excludedFiles = patchAnalysis.ExcludedFiles
+		changedFiles = patchAnalysis.ChangedFiles
+		in.PatchEventContent = patchAnalysis.FilteredDiff
 	}
 
 	type layer struct {
@@ -268,19 +260,6 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		priority int
 		content  string
 		tokens   int
-	}
-
-	// Extract changed files from the (possibly filtered) patch input.
-	// This is done before provider execution and token budgeting, so it
-	// captures the true set of reviewable files.
-	var changedFiles []string
-	if in.PatchEventContent != "" {
-		postFilterFiles, _ := parsePatch(in.PatchEventContent)
-		for _, f := range postFilterFiles {
-			if p := pickPath(f); p != "" {
-				changedFiles = append(changedFiles, p)
-			}
-		}
 	}
 
 	// Track doc layers that were disabled by repo config.
