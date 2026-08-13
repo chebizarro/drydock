@@ -87,6 +87,9 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	if strings.TrimSpace(in.RepoID) == "" {
 		return "", errors.New("repo id is required")
 	}
+	if strings.EqualFold(strings.TrimSpace(in.Model), "none") {
+		return "", errors.New("model none is reserved for operational failures; use PublishFailureNotice")
+	}
 	if in.TargetEnvelope != (targetidentity.Envelope{}) {
 		if err := in.TargetEnvelope.Validate(); err != nil {
 			return "", fmt.Errorf("invalid target identity envelope: %w", err)
@@ -188,6 +191,11 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 			return "", fmt.Errorf("persist summary delivery: %w", err)
 		}
 		summaryPublishedNow = true
+		model := strings.ToLower(strings.TrimSpace(in.Model))
+		if model == "" {
+			model = "unknown"
+		}
+		metrics.ReviewPublications.With(model).Inc()
 	}
 	if err := s.store.InsertReviewEvent(ctx, summaryEvent, in.PatchEventID, in.RepoID); err != nil {
 		return "", err

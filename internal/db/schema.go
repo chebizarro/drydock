@@ -99,6 +99,18 @@ CREATE TABLE IF NOT EXISTS review_publication_outbox (
 CREATE INDEX IF NOT EXISTS idx_review_publication_outbox_delivery
   ON review_publication_outbox(delivered_at);
 
+CREATE TABLE IF NOT EXISTS review_failure_notice_outbox (
+  patch_event_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  event_id TEXT NOT NULL UNIQUE,
+  raw_event_json TEXT NOT NULL,
+  delivered_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (patch_event_id, repo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_failure_notice_outbox_delivery
+  ON review_failure_notice_outbox(delivered_at);
+
 CREATE TABLE IF NOT EXISTS thread_cache (
   root_id TEXT PRIMARY KEY,
   event_ids TEXT NOT NULL DEFAULT '',

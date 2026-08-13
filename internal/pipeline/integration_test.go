@@ -400,7 +400,7 @@ func TestIntegrationMalformedReviewerJSONIsRepairedAndPublished(t *testing.T) {
 	}
 }
 
-func TestIntegrationApplyFailurePublishesHint(t *testing.T) {
+func TestIntegrationApplyFailurePublishesOperationalNotice(t *testing.T) {
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
@@ -499,12 +499,24 @@ func TestIntegrationApplyFailurePublishesHint(t *testing.T) {
 		t.Fatal("expected process to fail for unapplyable patch")
 	}
 
-	// But it should have published an apply-failure review comment
+	// It publishes a distinct operational notice, never an ordinary review.
 	if len(relayPub.events) == 0 {
-		t.Fatal("expected apply-failure review to be published")
+		t.Fatal("expected apply-failure operational notice to be published")
 	}
-	if !strings.Contains(relayPub.events[0].Content, "does not apply cleanly") {
+	if !strings.Contains(relayPub.events[0].Content, "review not performed") ||
+		!strings.Contains(relayPub.events[0].Content, "does not apply cleanly") {
 		t.Fatalf("expected apply-failure hint in content, got: %s", relayPub.events[0].Content)
+	}
+	if strings.Contains(relayPub.events[0].Content, "Automated review summary") ||
+		strings.Contains(relayPub.events[0].Content, "model: none") {
+		t.Fatalf("apply failure was formatted as a review: %s", relayPub.events[0].Content)
+	}
+	noticeType := relayPub.events[0].Tags.Find("drydock-type")
+	if noticeType == nil || len(noticeType) < 2 || noticeType[1] != publisher.FailureNoticeType {
+		t.Fatalf("missing operational notice tag: %v", noticeType)
+	}
+	if reviewID, err := store.GetReviewEventID(ctx, patchEvt.ID.Hex(), rID); err != nil || reviewID != "" {
+		t.Fatalf("failure notice reserved an ordinary review id: id=%q err=%v", reviewID, err)
 	}
 
 	// LLM should NOT have been called (patch didn't apply)

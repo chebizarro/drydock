@@ -225,8 +225,12 @@ func TestPreparePRTipRefusesImplicitBaseInForkClone(t *testing.T) {
 		Tags: nostr.Tags{{"clone", filepath.Join(t.TempDir(), "unsafe-local.git")}, {"c", tip}},
 	}
 	rec := db.PatchEventRecord{EventID: target.ID.Hex(), RepoID: repoID, RootID: target.ID.Hex(), Kind: 1618}
-	if _, err := NewService(store, mgr, testLogger()).preparePRTip(ctx, rec, target); err == nil || !strings.Contains(err.Error(), "canonical clone for implicit-base diff") {
+	result, err := NewService(store, mgr, testLogger()).preparePRTip(ctx, rec, target)
+	if err == nil || !strings.Contains(err.Error(), "canonical clone for implicit-base diff") {
 		t.Fatalf("expected implicit fork-base rejection, got %v", err)
+	}
+	if result.FailureStage != PrepareFailureFetch || !strings.Contains(result.FailureHint, "canonical clone for implicit-base diff") {
+		t.Fatalf("fetch failure classification = %+v", result)
 	}
 }
 
@@ -492,6 +496,9 @@ func TestPreparePatchRevisionFailureNamesMemberAndRequestedTarget(t *testing.T) 
 	result, err := svc.preparePatchRevision(ctx, rec, target)
 	if err == nil {
 		t.Fatal("expected ancestor apply failure")
+	}
+	if result.FailureStage != PrepareFailureApply {
+		t.Fatalf("failure stage = %q, want %q", result.FailureStage, PrepareFailureApply)
 	}
 	for _, want := range []string{root.ID.Hex(), target.ID.Hex()} {
 		if !strings.Contains(result.FailureHint, want) {

@@ -25,6 +25,7 @@ type PrepareResult struct {
 	RootID         string
 	AppliedIDs     []string
 	FailureHint    string
+	FailureStage   string
 	workspace      *reviewWorktree
 	// BaseRepoConfig is the raw .drydock.yaml content from the canonical
 	// base branch (before patch application). Nil if the file is absent.
@@ -40,6 +41,13 @@ type PrepareResult struct {
 	DiffFiles               int
 	DiffBytes               int64
 }
+
+const (
+	PrepareFailureApply         = "apply"
+	PrepareFailureFetch         = "fetch"
+	PrepareFailureCheckout      = "checkout"
+	PrepareFailureInvalidTarget = "invalid_target"
+)
 
 func NewService(store *db.Store, manager *Manager, logger *slog.Logger) *Service {
 	return &Service{store: store, manager: manager, logger: logger}
@@ -93,7 +101,7 @@ func (s *Service) preparePatchRevision(ctx context.Context, rec db.PatchEventRec
 	}
 	lease, err := s.manager.acquireRepoLease(ctx, rec.RepoID, cloneURLs, true)
 	if err != nil {
-		return PrepareResult{}, err
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureFetch, FailureHint: err.Error()}, err
 	}
 	leaseOwned := true
 	defer func() {
@@ -133,7 +141,7 @@ func (s *Service) preparePatchRevision(ctx context.Context, rec db.PatchEventRec
 	workspace, err := s.manager.createReviewWorktree(ctx, lease, rec.EventID, baseCommit)
 	if err != nil {
 		if workspace == nil {
-			return PrepareResult{}, err
+			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureCheckout, FailureHint: err.Error()}, err
 		}
 		leaseOwned = false
 		if cleanupErr := s.manager.cleanupReviewWorktree(ctx, workspace); cleanupErr != nil {
@@ -141,7 +149,7 @@ func (s *Service) preparePatchRevision(ctx context.Context, rec db.PatchEventRec
 		}
 		return PrepareResult{
 			RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
-			RootID: rec.RootID, workspace: workspace,
+			RootID: rec.RootID, FailureStage: PrepareFailureCheckout, FailureHint: err.Error(), workspace: workspace,
 		}, err
 	}
 	leaseOwned = false
@@ -152,7 +160,7 @@ func (s *Service) preparePatchRevision(ctx context.Context, rec db.PatchEventRec
 		failureHint := fmt.Sprintf("%v; requested target %s", err, rec.EventID)
 		return PrepareResult{
 			RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
-			RootID: rec.RootID, FailureHint: failureHint, workspace: workspace,
+			RootID: rec.RootID, FailureStage: PrepareFailureApply, FailureHint: failureHint, workspace: workspace,
 		}, fmt.Errorf("apply patch ancestry for requested target %s: %w", rec.EventID, err)
 	}
 	applied := make([]string, 0, len(ancestry))
@@ -191,7 +199,7 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 	}
 	sourceLease, err := s.manager.acquireRepoLease(ctx, rec.RepoID, cloneURLs, false)
 	if err != nil {
-		return PrepareResult{}, err
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureFetch, FailureHint: err.Error()}, err
 	}
 	defer sourceLease.release()
 
@@ -206,8 +214,8 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 	}
 	canonicalLease, err := s.manager.acquireRepoLease(ctx, rec.RepoID, canonicalURLs, true)
 	if err != nil {
-		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
-			fmt.Errorf("ensure canonical repo for review: %w", err)
+		wrapped := fmt.Errorf("ensure canonical repo for review: %w", err)
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureFetch, FailureHint: wrapped.Error()}, wrapped
 	}
 	canonicalOwned := true
 	canonicalRemoteIdentity, err := s.manager.remoteIdentity(ctx, canonicalLease.repoPath)
@@ -228,19 +236,19 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 
 	tip, err := prTipCommit(target)
 	if err != nil {
-		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureHint: err.Error()}, err
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureInvalidTarget, FailureHint: err.Error()}, err
 	}
 	assertedBase, err := prMergeBaseCommit(target)
 	if err != nil {
 		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID}, err
 	}
 	if err := s.manager.EnsureCommitAvailable(ctx, sourceLease.repoPath, target.ID.Hex(), tip, cloneURLs); err != nil {
-		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureHint: err.Error()}, err
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureFetch, FailureHint: err.Error()}, err
 	}
 	if assertedBase != "" {
 		if err := s.manager.EnsureCommitAvailable(ctx, sourceLease.repoPath, target.ID.Hex(), assertedBase, cloneURLs); err != nil {
-			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
-				fmt.Errorf("fetch event-asserted merge-base %s: %w", assertedBase, err)
+			wrapped := fmt.Errorf("fetch event-asserted merge-base %s: %w", assertedBase, err)
+			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureFetch, FailureHint: wrapped.Error()}, wrapped
 		}
 	}
 
@@ -250,8 +258,8 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 	canonicalTipErr := s.manager.EnsureCommitAvailable(ctx, canonicalLease.repoPath, rec.EventID, tip, cloneURLs)
 	if canonicalTipErr != nil {
 		if assertedBase == "" {
-			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
-				fmt.Errorf("fetch PR tip %s into canonical clone for implicit-base diff: %w", tip, canonicalTipErr)
+			wrapped := fmt.Errorf("fetch PR tip %s into canonical clone for implicit-base diff: %w", tip, canonicalTipErr)
+			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureFetch, FailureHint: wrapped.Error()}, wrapped
 		}
 		diffRepoPath = sourceLease.repoPath
 		s.logger.Warn("could not fetch PR tip into canonical clone; using event-asserted base in PR clone",
@@ -275,14 +283,14 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 	// remain unchanged.
 	if canonicalTipErr != nil {
 		if err := s.manager.importCommit(ctx, canonicalLease.repoPath, sourceLease.repoPath, diffResult.TipCommit); err != nil {
-			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
-				fmt.Errorf("import verified PR tip into canonical clone: %w", err)
+			wrapped := fmt.Errorf("import verified PR tip into canonical clone: %w", err)
+			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureFetch, FailureHint: wrapped.Error()}, wrapped
 		}
 	}
 	workspace, err := s.manager.createReviewWorktree(ctx, canonicalLease, rec.EventID, diffResult.TipCommit)
 	if err != nil {
 		if workspace == nil {
-			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID}, err
+			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureStage: PrepareFailureCheckout, FailureHint: err.Error()}, err
 		}
 		canonicalOwned = false
 		if cleanupErr := s.manager.cleanupReviewWorktree(ctx, workspace); cleanupErr != nil {
@@ -290,7 +298,7 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 		}
 		return PrepareResult{
 			RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: diffResult.TipCommit,
-			RootID: rec.RootID, workspace: workspace,
+			RootID: rec.RootID, FailureStage: PrepareFailureCheckout, FailureHint: err.Error(), workspace: workspace,
 		}, err
 	}
 	canonicalOwned = false

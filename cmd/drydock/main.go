@@ -675,7 +675,10 @@ func main() {
 					pipeline.NewQdrantRetriever(qdrantClient, embedClient, store, logger)))
 		}
 		pipelineRunner = pipeline.New(
-			pipeline.Config{Workers: cfg.PipelineWorkers},
+			pipeline.Config{
+				Workers:                 cfg.PipelineWorkers,
+				ApplyFailurePublication: cfg.ApplyFailurePublication,
+			},
 			store,
 			repoSvc,
 			ctxBuilder,

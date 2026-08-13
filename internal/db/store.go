@@ -650,6 +650,29 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 13,
+		name:    "review_failure_notice_outbox",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			for _, ddl := range []string{
+				`CREATE TABLE IF NOT EXISTS review_failure_notice_outbox (
+					patch_event_id TEXT NOT NULL,
+					repo_id TEXT NOT NULL,
+					event_id TEXT NOT NULL UNIQUE,
+					raw_event_json TEXT NOT NULL,
+					delivered_at INTEGER NOT NULL DEFAULT 0,
+					created_at INTEGER NOT NULL,
+					PRIMARY KEY (patch_event_id, repo_id))`,
+				`CREATE INDEX IF NOT EXISTS idx_review_failure_notice_outbox_delivery
+					ON review_failure_notice_outbox(delivered_at)`,
+			} {
+				if _, err := tx.ExecContext(ctx, ddl); err != nil {
+					return fmt.Errorf("apply failure notice outbox ddl: %w", err)
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -1328,6 +1351,70 @@ func (s *Store) MarkReviewPublicationDelivered(ctx context.Context, patchEventID
 	}
 	if affected == 0 {
 		return errors.New("review publication reservation not found")
+	}
+	return nil
+}
+
+// GetReviewFailureNotice returns the exact signed operational notice reserved
+// for a failed review preparation. It is separate from the review publication
+// outbox so a later successful retry can still publish an ordinary review.
+func (s *Store) GetReviewFailureNotice(ctx context.Context, patchEventID, repoID string) (event nostr.Event, delivered, found bool, err error) {
+	var raw string
+	var deliveredAt int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT raw_event_json, delivered_at
+		FROM review_failure_notice_outbox
+		WHERE patch_event_id=? AND repo_id=?`,
+		patchEventID, repoID,
+	).Scan(&raw, &deliveredAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nostr.Event{}, false, false, nil
+		}
+		return nostr.Event{}, false, false, fmt.Errorf("get review failure notice: %w", err)
+	}
+	if err := json.Unmarshal([]byte(raw), &event); err != nil {
+		return nostr.Event{}, false, false, fmt.Errorf("decode reserved review failure notice: %w", err)
+	}
+	return event, deliveredAt > 0, true, nil
+}
+
+func (s *Store) ReserveReviewFailureNotice(ctx context.Context, patchEventID, repoID string, event nostr.Event) (nostr.Event, bool, error) {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO review_failure_notice_outbox
+			(patch_event_id, repo_id, event_id, raw_event_json, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(patch_event_id, repo_id) DO NOTHING`,
+		patchEventID, repoID, event.ID.Hex(), event.String(), time.Now().Unix(),
+	)
+	if err != nil {
+		return nostr.Event{}, false, fmt.Errorf("reserve review failure notice: %w", err)
+	}
+	reserved, delivered, found, err := s.GetReviewFailureNotice(ctx, patchEventID, repoID)
+	if err != nil {
+		return nostr.Event{}, false, err
+	}
+	if !found {
+		return nostr.Event{}, false, errors.New("reserved review failure notice not found")
+	}
+	return reserved, delivered, nil
+}
+
+func (s *Store) MarkReviewFailureNoticeDelivered(ctx context.Context, patchEventID, repoID string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE review_failure_notice_outbox SET delivered_at=?
+		WHERE patch_event_id=? AND repo_id=?`,
+		time.Now().Unix(), patchEventID, repoID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark review failure notice delivered: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("review failure notice rows affected: %w", err)
+	}
+	if affected == 0 {
+		return errors.New("review failure notice reservation not found")
 	}
 	return nil
 }

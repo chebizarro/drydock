@@ -184,6 +184,12 @@ The LSP bridge is a separate HTTP service that manages language servers for type
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_PIPELINE_WORKERS` | integer | `2` | Number of concurrent review pipeline workers. Increase only if your LLM endpoints support concurrent requests. |
+| `DRYDOCK_APPLY_FAILURE_PUBLICATION` | `notice` or `suppress` | `notice` | Publish a clearly tagged operational notice when fetch/apply preparation fails, or suppress it entirely. Failure notices are never recorded as reviews. |
+
+Apply/fetch and meta-review quality signals are exposed on `/metrics`. Alert on
+`drydock_review_apply_failure_ratio`, `drydock_review_model_none_publication_ratio`,
+and `drydock_meta_review_failure_ratio`; the corresponding counters remain
+available for windowed PromQL `rate()` expressions.
 
 ## Kind 0 Profile & Media
 

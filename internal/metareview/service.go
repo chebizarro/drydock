@@ -136,6 +136,13 @@ func (s *Service) Run(ctx context.Context, in Input) (result Result, runErr erro
 	reused := false
 	metrics.MetaReviewAttempts.Inc()
 	defer func() {
+		outcome := "success"
+		if runErr != nil {
+			outcome = "failed"
+		}
+		metrics.MetaReviewOutcomes.With(outcome).Inc()
+	}()
+	defer func() {
 		status := "success"
 		auditFailureStage := ""
 		failureReason := ""

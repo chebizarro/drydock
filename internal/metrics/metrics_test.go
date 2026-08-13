@@ -143,6 +143,11 @@ func TestHandlerOutputPrometheusFormat(t *testing.T) {
 	MetaReviewAttempts.Inc()
 	MetaReviewSuccesses.Inc()
 	MetaReviewFailures.With("parse_output").Inc()
+	MetaReviewOutcomes.With("failed").Inc()
+	ReviewPrepareAttempts.Add(4)
+	ReviewApplyFailures.Inc()
+	ReviewPrepareFailures.With("fetch").Inc()
+	ReviewPublications.With("none").Inc()
 
 	rec := httptest.NewRecorder()
 	Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -169,6 +174,11 @@ func TestHandlerOutputPrometheusFormat(t *testing.T) {
 	requireContains(t, body, "# TYPE drydock_meta_review_attempts_total counter")
 	requireContains(t, body, "# TYPE drydock_meta_review_successes_total counter")
 	requireContains(t, body, `drydock_meta_review_failures_total{stage="parse_output"} 1`)
+	requireContains(t, body, `drydock_meta_review_outcomes_total{outcome="failed"} 1`)
+	requireContains(t, body, "# TYPE drydock_review_apply_failure_ratio gauge")
+	requireContains(t, body, `drydock_review_prepare_failures_total{stage="fetch"} 1`)
+	requireContains(t, body, "# TYPE drydock_review_model_none_publication_ratio gauge")
+	requireContains(t, body, "# TYPE drydock_meta_review_failure_ratio gauge")
 }
 
 func requireContains(t *testing.T, haystack, needle string) {

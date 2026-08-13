@@ -168,14 +168,19 @@ var (
 
 	// Pipeline
 	ReviewsStarted        = &Counter{}
+	ReviewPrepareAttempts = &Counter{}
+	ReviewApplyFailures   = &Counter{}
+	ReviewPrepareFailures = NewCounterVec() // label: apply, fetch, checkout, invalid_target
 	ContextLayersByStatus = NewCounterVec() // label: used, degraded, truncated, dropped
 	ReviewsFinished       = NewCounterVec() // label: "published", "failed"
+	ReviewPublications    = NewCounterVec() // label: model identity
 	ReviewDuration        = &Summary{}      // seconds, end-to-end
 
 	// Meta-review
 	MetaReviewAttempts  = &Counter{}
 	MetaReviewSuccesses = &Counter{}
 	MetaReviewFailures  = NewCounterVec() // label: failure stage
+	MetaReviewOutcomes  = NewCounterVec() // label: success, failed
 
 	// Workers
 	WorkersActive = &Gauge{}
@@ -189,9 +194,13 @@ var (
 	GitOpDuration = NewSummaryVec() // label: "clone", "fetch", "apply"
 
 	// Publisher
-	PublishAttempts  = &Counter{}
-	PublishSuccesses = &Counter{}
-	PublishFailures  = &Counter{}
+	PublishAttempts          = &Counter{}
+	PublishSuccesses         = &Counter{}
+	PublishFailures          = &Counter{}
+	FailureNoticeAttempts    = &Counter{}
+	FailureNoticeSuccesses   = &Counter{}
+	FailureNoticeFailures    = &Counter{}
+	FailureNoticesSuppressed = &Counter{}
 
 	// NIP-34 Status
 	StatusPublishAttempts  = &Counter{}
@@ -328,8 +337,23 @@ func writeMetrics(w io.Writer) {
 	// Pipeline
 	writeCounter(w, "drydock_reviews_started_total",
 		"Reviews started by pipeline workers.", ReviewsStarted)
+	writeCounter(w, "drydock_review_prepare_attempts_total",
+		"Repository and patch preparation attempts.", ReviewPrepareAttempts)
+	writeCounter(w, "drydock_review_apply_failures_total",
+		"Review preparations that failed before model review and formerly produced model-none summaries.", ReviewApplyFailures)
+	writeCounterVec(w, "drydock_review_prepare_failures_total",
+		"Review preparation failures by stage.", "stage", ReviewPrepareFailures)
 	writeCounterVec(w, "drydock_reviews_finished_total",
 		"Reviews finished by outcome.", "outcome", ReviewsFinished)
+	writeCounterVec(w, "drydock_review_publications_total",
+		"Ordinary review summary publications by model identity.", "model", ReviewPublications)
+	writeRatio(w, "drydock_review_apply_failure_ratio",
+		"Ratio of review preparation attempts that failed while fetching or applying the target.",
+		ReviewApplyFailures.Value(), ReviewPrepareAttempts.Value())
+	publications := ReviewPublications.Snapshot()
+	writeRatio(w, "drydock_review_model_none_publication_ratio",
+		"Ratio of ordinary review summary publications labeled with model none.",
+		publications["none"], sumCounters(publications))
 	writeCounterVec(w, "drydock_context_layers_total",
 		"Context layers by build status.", "status", ContextLayersByStatus)
 	writeSummary(w, "drydock_review_duration_seconds",
@@ -342,6 +366,12 @@ func writeMetrics(w io.Writer) {
 		"Meta-review attempts that completed and were audited.", MetaReviewSuccesses)
 	writeCounterVec(w, "drydock_meta_review_failures_total",
 		"Meta-review failures by processing stage.", "stage", MetaReviewFailures)
+	writeCounterVec(w, "drydock_meta_review_outcomes_total",
+		"Completed meta-review attempts by final outcome.", "outcome", MetaReviewOutcomes)
+	metaOutcomes := MetaReviewOutcomes.Snapshot()
+	writeRatio(w, "drydock_meta_review_failure_ratio",
+		"Ratio of completed meta-review attempts that failed.",
+		metaOutcomes["failed"], sumCounters(metaOutcomes))
 
 	// Workers
 	writeGauge(w, "drydock_pipeline_workers_active",
@@ -366,6 +396,14 @@ func writeMetrics(w io.Writer) {
 		"Successful review publishes.", PublishSuccesses)
 	writeCounter(w, "drydock_publish_failures_total",
 		"Failed review publishes.", PublishFailures)
+	writeCounter(w, "drydock_failure_notice_publish_attempts_total",
+		"Operational apply-failure notice publish attempts.", FailureNoticeAttempts)
+	writeCounter(w, "drydock_failure_notice_publish_successes_total",
+		"Successfully published operational apply-failure notices.", FailureNoticeSuccesses)
+	writeCounter(w, "drydock_failure_notice_publish_failures_total",
+		"Failed operational apply-failure notice publishes.", FailureNoticeFailures)
+	writeCounter(w, "drydock_failure_notices_suppressed_total",
+		"Apply-failure notices suppressed by configuration.", FailureNoticesSuppressed)
 
 	// NIP-34 Status
 	writeCounter(w, "drydock_status_publish_attempts_total",
@@ -518,6 +556,23 @@ func writeCounter(w io.Writer, name, help string, c *Counter) {
 func writeGauge(w io.Writer, name, help string, g *Gauge) {
 	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n\n",
 		name, help, name, name, g.Value())
+}
+
+func writeRatio(w io.Writer, name, help string, numerator, denominator int64) {
+	ratio := 0.0
+	if denominator > 0 {
+		ratio = float64(numerator) / float64(denominator)
+	}
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %.6f\n\n",
+		name, help, name, name, ratio)
+}
+
+func sumCounters(values map[string]int64) int64 {
+	var total int64
+	for _, value := range values {
+		total += value
+	}
+	return total
 }
 
 func writeCounterVec(w io.Writer, name, help, label string, cv *CounterVec) {

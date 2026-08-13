@@ -223,7 +223,7 @@ func TestPatchDiffForReviewUsesSelectedRevisionContent(t *testing.T) {
 	}
 }
 
-func TestPublishApplyFailureNamesFailingMemberAndRequestedTarget(t *testing.T) {
+func TestPublishApplyFailureNoticeNamesFailingMemberAndRequestedTarget(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	targetID, repoID := seedPatchForPipeline(t, ctx, store)
@@ -237,7 +237,7 @@ func TestPublishApplyFailureNamesFailingMemberAndRequestedTarget(t *testing.T) {
 	}, store, testSigner{sk: nostr.Generate()}, relayPub, testLogger())
 	runner := &Runner{store: store, pubSvc: pubSvc, logger: testLogger()}
 
-	runner.publishApplyFailure(ctx, db.ReviewTask{PatchEventID: targetID, RepoID: repoID}, hint)
+	runner.publishApplyFailure(ctx, db.ReviewTask{PatchEventID: targetID, RepoID: repoID}, repo.PrepareFailureApply, hint)
 
 	if len(relayPub.events) != 1 {
 		t.Fatalf("published events = %d, want 1", len(relayPub.events))
@@ -247,6 +247,40 @@ func TestPublishApplyFailureNamesFailingMemberAndRequestedTarget(t *testing.T) {
 		if !strings.Contains(content, want) {
 			t.Fatalf("apply-failure publication %q does not name %s", content, want)
 		}
+	}
+	if strings.Contains(content, "Automated review summary") || strings.Contains(content, "model: none") {
+		t.Fatalf("apply failure was formatted as a review: %s", content)
+	}
+	noticeType := relayPub.events[0].Tags.Find("drydock-type")
+	if noticeType == nil || len(noticeType) < 2 || noticeType[1] != publisher.FailureNoticeType {
+		t.Fatalf("missing operational notice tag: %v", noticeType)
+	}
+	if reviewID, err := store.GetReviewEventID(ctx, targetID, repoID); err != nil || reviewID != "" {
+		t.Fatalf("failure notice reserved an ordinary review id: id=%q err=%v", reviewID, err)
+	}
+}
+
+func TestPublishApplyFailureCanBeSuppressed(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	targetID, repoID := seedPatchForPipeline(t, ctx, store)
+	relayPub := &collectingRelayPublisher{}
+	pubSvc := publisher.New(publisher.Config{
+		DefaultRelays: []string{"wss://relay.test"},
+	}, store, testSigner{sk: nostr.Generate()}, relayPub, testLogger())
+	runner := &Runner{
+		store: store, pubSvc: pubSvc, logger: testLogger(),
+		applyFailurePublication: ApplyFailurePublicationSuppress,
+	}
+	before := metrics.FailureNoticesSuppressed.Value()
+
+	runner.publishApplyFailure(ctx, db.ReviewTask{PatchEventID: targetID, RepoID: repoID}, repo.PrepareFailureApply, "conflict")
+
+	if len(relayPub.events) != 0 {
+		t.Fatalf("published events = %d, want 0", len(relayPub.events))
+	}
+	if got := metrics.FailureNoticesSuppressed.Value(); got != before+1 {
+		t.Fatalf("suppressed metric = %d, want %d", got, before+1)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"drydock/internal/db"
+	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
 )
 
@@ -37,6 +38,7 @@ func TestMetaReviewTriggersOnLowConfidenceAndStoresLog(t *testing.T) {
 		Endpoint:         reviewengine.ModelEndpoint{BaseURL: "http://meta", Model: "gpt-5-codex"},
 		RandomSampleRate: 0,
 	}, store, client, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	successBefore := metrics.MetaReviewOutcomes.With("success").Value()
 
 	result, err := svc.Run(ctx, Input{
 		PatchEventID:  "patch-1",
@@ -64,6 +66,9 @@ func TestMetaReviewTriggersOnLowConfidenceAndStoresLog(t *testing.T) {
 	attempt, ok, err := store.LatestMetaReviewAttempt(ctx, "patch-1", "repo-1")
 	if err != nil || !ok || attempt.Status != "success" || attempt.FailureStage != "" {
 		t.Fatalf("unexpected success attempt audit: attempt=%+v ok=%v err=%v", attempt, ok, err)
+	}
+	if got := metrics.MetaReviewOutcomes.With("success").Value(); got != successBefore+1 {
+		t.Fatalf("success outcome metric = %d, want %d", got, successBefore+1)
 	}
 }
 
@@ -211,6 +216,7 @@ func TestMetaReviewPersistsFailedAttemptReason(t *testing.T) {
 	svc := New(Config{
 		Endpoint: reviewengine.ModelEndpoint{BaseURL: "http://meta", Model: "frontier"},
 	}, store, client, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	failureBefore := metrics.MetaReviewOutcomes.With("failed").Value()
 
 	result, err := svc.Run(ctx, Input{
 		PatchEventID: "failed-patch",
@@ -233,6 +239,9 @@ func TestMetaReviewPersistsFailedAttemptReason(t *testing.T) {
 	}
 	if !strings.Contains(attempt.FailureReason, "context limit exceeded") || attempt.Model != "frontier" {
 		t.Fatalf("attempt did not retain failure evidence: %+v", attempt)
+	}
+	if got := metrics.MetaReviewOutcomes.With("failed").Value(); got != failureBefore+1 {
+		t.Fatalf("failure outcome metric = %d, want %d", got, failureBefore+1)
 	}
 }
 

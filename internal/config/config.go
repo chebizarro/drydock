@@ -123,6 +123,7 @@ type Config struct {
 	HealthAddr                 string
 	DashboardBearerToken       string
 	PipelineWorkers            int
+	ApplyFailurePublication    string
 	SecurityEnabled            bool
 	SecurityAuditWorkers       int
 	SecurityNostrEnabled       string
@@ -241,6 +242,7 @@ func FromEnv() Config {
 		HealthAddr:                 envOrDefault("DRYDOCK_HEALTH_ADDR", "127.0.0.1:8081"),
 		DashboardBearerToken:       envOrDefault("DRYDOCK_DASHBOARD_BEARER_TOKEN", ""),
 		PipelineWorkers:            parseIntOrDefault(envOrDefault("DRYDOCK_PIPELINE_WORKERS", "2"), 2),
+		ApplyFailurePublication:    strings.ToLower(strings.TrimSpace(envOrDefault("DRYDOCK_APPLY_FAILURE_PUBLICATION", "notice"))),
 		SecurityEnabled:            parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_ENABLED", "false"), false),
 		SecurityAuditWorkers:       parseIntOrDefault(envOrDefault("DRYDOCK_SECURITY_AUDIT_WORKERS", "2"), 2),
 		SecurityNostrEnabled:       parseNostrEnabled(envOrDefault("DRYDOCK_SECURITY_NOSTR_ENABLED", "auto")),
@@ -297,6 +299,7 @@ func configuredEnv() map[string]bool {
 		"DRYDOCK_META_MODEL",
 		"DRYDOCK_META_API_KEY",
 		"DRYDOCK_META_MAX_INPUT_BYTES",
+		"DRYDOCK_APPLY_FAILURE_PUBLICATION",
 		"DRYDOCK_QDRANT_URL",
 		"DRYDOCK_QDRANT_API_KEY",
 		"DRYDOCK_EMBED_BASE_URL",
@@ -593,6 +596,9 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 	if c.PipelineWorkers > 32 {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("DRYDOCK_PIPELINE_WORKERS=%d is very high; consider reducing for stability", c.PipelineWorkers))
+	}
+	if c.ApplyFailurePublication != "" && c.ApplyFailurePublication != "notice" && c.ApplyFailurePublication != "suppress" {
+		result.Errors = append(result.Errors, "DRYDOCK_APPLY_FAILURE_PUBLICATION must be notice or suppress")
 	}
 
 	// --- Health address ---

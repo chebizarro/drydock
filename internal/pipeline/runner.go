@@ -81,24 +81,25 @@ type SecurityReviewStage interface {
 }
 
 type Runner struct {
-	store            *db.Store
-	repoSvc          *repo.Service
-	ctxBuilder       *contextbuilder.Builder
-	engine           *reviewengine.Engine
-	pubSvc           *publisher.Service
-	metaSvc          *metareview.Service
-	promptRefiner    PromptRefiner
-	fewShotRetriever FewShotRetriever
-	docIngester      DocIngester
-	codeIndexer      CodeIndexer
-	secScanner       *securityscan.Scanner
-	securityReviewer SecurityReviewStage
-	paymentAuth      PaymentAuthorizer
-	monitoring       MonitoringRegistry
-	queue            <-chan db.ReviewTask
-	workers          int
-	logger           *slog.Logger
-	activityHook     func()
+	store                   *db.Store
+	repoSvc                 *repo.Service
+	ctxBuilder              *contextbuilder.Builder
+	engine                  *reviewengine.Engine
+	pubSvc                  *publisher.Service
+	metaSvc                 *metareview.Service
+	promptRefiner           PromptRefiner
+	fewShotRetriever        FewShotRetriever
+	docIngester             DocIngester
+	codeIndexer             CodeIndexer
+	secScanner              *securityscan.Scanner
+	securityReviewer        SecurityReviewStage
+	paymentAuth             PaymentAuthorizer
+	monitoring              MonitoringRegistry
+	queue                   <-chan db.ReviewTask
+	workers                 int
+	logger                  *slog.Logger
+	activityHook            func()
+	applyFailurePublication string
 
 	// Narrow function seams keep failure handling testable without replacing the
 	// concrete services used by the rest of the pipeline.
@@ -108,8 +109,14 @@ type Runner struct {
 }
 
 type Config struct {
-	Workers int
+	Workers                 int
+	ApplyFailurePublication string
 }
+
+const (
+	ApplyFailurePublicationNotice   = "notice"
+	ApplyFailurePublicationSuppress = "suppress"
+)
 
 // WithPromptRefiner sets an optional prompt refinement service on the runner.
 // When set, the runner uses the active versioned reviewer prompt for each review.
@@ -198,16 +205,21 @@ func New(
 	if workers <= 0 {
 		workers = 2
 	}
+	applyFailurePublication := strings.ToLower(strings.TrimSpace(cfg.ApplyFailurePublication))
+	if applyFailurePublication == "" {
+		applyFailurePublication = ApplyFailurePublicationNotice
+	}
 	r := &Runner{
-		store:      store,
-		repoSvc:    repoSvc,
-		ctxBuilder: ctxBuilder,
-		engine:     engine,
-		pubSvc:     pubSvc,
-		metaSvc:    metaSvc,
-		queue:      queue,
-		workers:    workers,
-		logger:     logger,
+		store:                   store,
+		repoSvc:                 repoSvc,
+		ctxBuilder:              ctxBuilder,
+		engine:                  engine,
+		pubSvc:                  pubSvc,
+		metaSvc:                 metaSvc,
+		queue:                   queue,
+		workers:                 workers,
+		logger:                  logger,
+		applyFailurePublication: applyFailurePublication,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -302,6 +314,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 1. Prepare repo + apply patch series
 	var prep repo.PrepareResult
 	var prepErr error
+	metrics.ReviewPrepareAttempts.Inc()
 	timer.Time(tracing.StageRepoPrepare, func() error {
 		prep, prepErr = r.repoSvc.PreparePatchSeries(ctx, task.PatchEventID)
 		return prepErr
@@ -310,12 +323,20 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		// Preparation may have returned an owned worktree after a failed patch
 		// apply. Retry its idempotent cleanup before leaving the task.
 		defer r.repoSvc.CleanupPreparedReview(ctx, prep)
-		// Publish a review comment about the apply failure so the patch author gets feedback
-		if prep.FailureHint != "" && r.pubSvc != nil {
-			if gateErr := r.requireReactiveMonitoring(ctx, task, "pre_publication"); gateErr != nil {
-				return gateErr
+		// Preparation failures are operational outcomes, never model reviews.
+		if prep.FailureStage != "" {
+			metrics.ReviewApplyFailures.Inc()
+			metrics.ReviewPrepareFailures.With(prep.FailureStage).Inc()
+			if r.pubSvc != nil {
+				if gateErr := r.requireReactiveMonitoring(ctx, task, "pre_publication"); gateErr != nil {
+					return gateErr
+				}
+				hint := prep.FailureHint
+				if strings.TrimSpace(hint) == "" {
+					hint = prepErr.Error()
+				}
+				r.publishApplyFailure(ctx, task, prep.FailureStage, hint)
 			}
-			r.publishApplyFailure(ctx, task, prep.FailureHint)
 		}
 		return fmt.Errorf("prepare patch series: %w", prepErr)
 	}
@@ -513,7 +534,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			PatchEventID:         task.PatchEventID,
 			RepoID:               task.RepoID,
 			Summary:              "This patch only modifies files excluded by repository review policy, so no automated review was run.",
-			Model:                "none",
+			Model:                "policy",
 			ContextHash:          ctxHash,
 			TargetEnvelope:       targetEnvelope,
 			ContextLayersUsed:    bundle.LayersUsed,
@@ -814,32 +835,29 @@ func (r *Runner) requireReactiveMonitoring(ctx context.Context, task db.ReviewTa
 	return fmt.Errorf("%w at %s", errReactiveReviewSkipped, stage)
 }
 
-func (r *Runner) publishApplyFailure(ctx context.Context, task db.ReviewTask, hint string) {
-	summary := fmt.Sprintf(
-		"This patch does not apply cleanly to the current HEAD.\n\nReason: %s\n\n"+
-			"The patch may need to be rebased or updated to resolve conflicts.",
-		hint,
-	)
-	_, err := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
-		PatchEventID:         task.PatchEventID,
-		RepoID:               task.RepoID,
-		Summary:              summary,
-		Findings:             nil,
-		Model:                "none",
-		ContextHash:          "",
-		Confidence:           0,
-		ContextLayersUsed:    nil,
-		ContextLayersDropped: nil,
-		Superseded:           false,
+func (r *Runner) publishApplyFailure(ctx context.Context, task db.ReviewTask, stage, hint string) {
+	if r.applyFailurePublication == ApplyFailurePublicationSuppress {
+		metrics.FailureNoticesSuppressed.Inc()
+		r.logger.Info("suppressed apply-failure operational notice",
+			"patch_event_id", task.PatchEventID,
+			"repo_id", task.RepoID,
+		)
+		return
+	}
+	_, err := r.pubSvc.PublishFailureNotice(ctx, publisher.PublishFailureNoticeInput{
+		PatchEventID: task.PatchEventID,
+		RepoID:       task.RepoID,
+		FailureStage: stage,
+		Reason:       hint,
 	})
 	if err != nil {
-		r.logger.Warn("failed to publish apply-failure review",
+		r.logger.Warn("failed to publish apply-failure operational notice",
 			"patch_event_id", task.PatchEventID,
 			"repo_id", task.RepoID,
 			"error", err,
 		)
 	} else {
-		r.logger.Info("published apply-failure review",
+		r.logger.Info("published apply-failure operational notice",
 			"patch_event_id", task.PatchEventID,
 			"repo_id", task.RepoID,
 		)

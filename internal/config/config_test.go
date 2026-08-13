@@ -33,6 +33,20 @@ func TestFromEnvPRDiffLimits(t *testing.T) {
 	}
 }
 
+func TestFromEnvApplyFailurePublication(t *testing.T) {
+	t.Setenv("DRYDOCK_APPLY_FAILURE_PUBLICATION", "suppress")
+	if got := FromEnv().ApplyFailurePublication; got != "suppress" {
+		t.Fatalf("ApplyFailurePublication = %q, want suppress", got)
+	}
+
+	t.Setenv("DRYDOCK_APPLY_FAILURE_PUBLICATION", "invalid")
+	cfg := FromEnv()
+	result := cfg.Validate(context.Background())
+	if !hasErrorContaining(result, "DRYDOCK_APPLY_FAILURE_PUBLICATION") {
+		t.Fatalf("missing invalid publication mode error: %#v", result.Errors)
+	}
+}
+
 func TestFromEnvManagementDefaults(t *testing.T) {
 	t.Setenv("DRYDOCK_HEALTH_ADDR", "")
 	t.Setenv("DRYDOCK_DASHBOARD_BEARER_TOKEN", "")
