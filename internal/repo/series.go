@@ -2,10 +2,56 @@ package repo
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
+	"strings"
 
 	"fiatjaf.com/nostr"
 )
+
+// PatchRevisionAncestry selects only the root-to-target patch lineage for a
+// revision-scoped review. NIP-10 root markers may point outside the patch set;
+// reply links define patch ancestry. Sibling branches and descendants of the
+// requested target are deliberately excluded.
+func PatchRevisionAncestry(events []nostr.Event, targetID string) ([]nostr.Event, error) {
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
+		return nil, fmt.Errorf("target patch event ID is required")
+	}
+
+	byID := make(map[string]nostr.Event, len(events))
+	for _, evt := range events {
+		byID[evt.ID.Hex()] = evt
+	}
+	current, ok := byID[targetID]
+	if !ok {
+		return nil, fmt.Errorf("requested target patch %s is not in its stored thread", targetID)
+	}
+
+	reversed := make([]nostr.Event, 0, len(events))
+	seen := make(map[string]struct{}, len(events))
+	for {
+		currentID := current.ID.Hex()
+		if _, duplicate := seen[currentID]; duplicate {
+			return nil, fmt.Errorf("cycle in patch ancestry at %s for requested target %s", currentID, targetID)
+		}
+		seen[currentID] = struct{}{}
+		reversed = append(reversed, current)
+
+		previousID, hasPrevious := previousPatchID(current)
+		if !hasPrevious {
+			break
+		}
+		previous, exists := byID[previousID]
+		if !exists {
+			return nil, fmt.Errorf("patch %s references missing ancestor %s for requested target %s", currentID, previousID, targetID)
+		}
+		current = previous
+	}
+
+	slices.Reverse(reversed)
+	return reversed, nil
+}
 
 func OrderPatchSeries(events []nostr.Event) []nostr.Event {
 	if len(events) <= 1 {
@@ -68,10 +114,15 @@ func previousPatchID(event nostr.Event) (string, bool) {
 		if len(tag) < 2 || tag[0] != "e" {
 			continue
 		}
-		fallback = tag[1]
-		if len(tag) >= 4 && tag[3] == "reply" {
-			return tag[1], true
+		if len(tag) >= 4 {
+			switch tag[3] {
+			case "reply":
+				return tag[1], true
+			case "root":
+				continue
+			}
 		}
+		fallback = tag[1]
 	}
 	if fallback != "" {
 		return fallback, true
@@ -87,4 +138,3 @@ func sortEventsStable(events []nostr.Event) {
 		return cmp.Compare(a.ID.Hex(), b.ID.Hex())
 	})
 }
-

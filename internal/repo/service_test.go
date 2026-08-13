@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -283,7 +284,7 @@ func TestPreparePatchSeriesReadsConfigFromCanonicalCache(t *testing.T) {
 	}
 	rec := db.PatchEventRecord{EventID: target.ID.Hex(), RepoID: repoID, RootID: target.ID.Hex(), Kind: 1617}
 
-	result, err := svc.preparePatchSeries(ctx, rec, target)
+	result, err := svc.preparePatchRevision(ctx, rec, target)
 	if err != nil {
 		t.Fatalf("prepare patch series: %v", err)
 	}
@@ -416,6 +417,157 @@ func TestConcurrentSameRepoReviewsUseIsolatedWorktrees(t *testing.T) {
 	if strings.Contains(listed, firstPath) || strings.Contains(listed, secondPath) {
 		t.Fatalf("concurrent review worktrees were not pruned:\n%s", listed)
 	}
+}
+
+func TestPreparePatchRevisionAppliesOnlyRequestedAncestry(t *testing.T) {
+	ctx, store, svc, repoID := newPatchRevisionTestService(t)
+	root := patchTestEvent(
+		"1111111111111111111111111111111111111111111111111111111111111111",
+		1, "", addFilePatch("root.txt", "root"),
+	)
+	parent := patchTestEvent(
+		"2222222222222222222222222222222222222222222222222222222222222222",
+		4, root.ID.Hex(), addFilePatch("parent.txt", "parent"),
+	)
+	target := patchTestEvent(
+		"3333333333333333333333333333333333333333333333333333333333333333",
+		3, parent.ID.Hex(), addFilePatch("target.txt", "target"),
+	)
+	target.Tags = append(nostr.Tags{{"e", root.ID.Hex(), "", "root"}}, target.Tags...)
+	sibling := patchTestEvent(
+		"4444444444444444444444444444444444444444444444444444444444444444",
+		2, root.ID.Hex(), addFilePatch("sibling.txt", "sibling"),
+	)
+	descendant := patchTestEvent(
+		"5555555555555555555555555555555555555555555555555555555555555555",
+		5, target.ID.Hex(), addFilePatch("descendant.txt", "descendant"),
+	)
+	for _, evt := range []nostr.Event{descendant, sibling, target, root, parent} {
+		insertPatchThreadEvent(t, ctx, store, repoID, root.ID.Hex(), evt)
+	}
+
+	rec := db.PatchEventRecord{
+		EventID: target.ID.Hex(), RepoID: repoID, RootID: root.ID.Hex(), Kind: 1617,
+	}
+	result, err := svc.preparePatchRevision(ctx, rec, target)
+	if err != nil {
+		t.Fatalf("prepare selected patch revision: %v", err)
+	}
+	defer svc.CleanupPreparedReview(ctx, result)
+
+	wantApplied := []string{root.ID.Hex(), parent.ID.Hex(), target.ID.Hex()}
+	if strings.Join(result.AppliedIDs, ",") != strings.Join(wantApplied, ",") {
+		t.Fatalf("applied IDs = %v, want %v", result.AppliedIDs, wantApplied)
+	}
+	for _, name := range []string{"root.txt", "parent.txt", "target.txt"} {
+		if _, err := os.Stat(filepath.Join(result.RepoPath, name)); err != nil {
+			t.Fatalf("expected ancestry file %s: %v", name, err)
+		}
+	}
+	for _, name := range []string{"sibling.txt", "descendant.txt"} {
+		if _, err := os.Stat(filepath.Join(result.RepoPath, name)); !os.IsNotExist(err) {
+			t.Fatalf("non-ancestry file %s was applied: %v", name, err)
+		}
+	}
+}
+
+func TestPreparePatchRevisionFailureNamesMemberAndRequestedTarget(t *testing.T) {
+	ctx, store, svc, repoID := newPatchRevisionTestService(t)
+	root := patchTestEvent(
+		"6666666666666666666666666666666666666666666666666666666666666666",
+		1, "", "this is not a patch\n",
+	)
+	target := patchTestEvent(
+		"7777777777777777777777777777777777777777777777777777777777777777",
+		2, root.ID.Hex(), addFilePatch("target.txt", "target"),
+	)
+	target.Tags = append(nostr.Tags{{"e", root.ID.Hex(), "", "root"}}, target.Tags...)
+	for _, evt := range []nostr.Event{target, root} {
+		insertPatchThreadEvent(t, ctx, store, repoID, root.ID.Hex(), evt)
+	}
+
+	rec := db.PatchEventRecord{
+		EventID: target.ID.Hex(), RepoID: repoID, RootID: root.ID.Hex(), Kind: 1617,
+	}
+	result, err := svc.preparePatchRevision(ctx, rec, target)
+	if err == nil {
+		t.Fatal("expected ancestor apply failure")
+	}
+	for _, want := range []string{root.ID.Hex(), target.ID.Hex()} {
+		if !strings.Contains(result.FailureHint, want) {
+			t.Fatalf("failure hint %q does not name %s", result.FailureHint, want)
+		}
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("returned error %q does not name %s", err, want)
+		}
+	}
+}
+
+func newPatchRevisionTestService(t *testing.T) (context.Context, *db.Store, *Service, string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := db.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	repoID := "owner:patch-revision"
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO repositories
+		(repo_id, pubkey, identifier, announcement_event_id, name, description, clone_urls, relays, raw_event_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		repoID, "owner", "patch-revision", "announcement", "patch-revision", "",
+		"https://canonical.example/patch-revision.git", "", "{}", int64(1), int64(1)); err != nil {
+		t.Fatalf("seed repository: %v", err)
+	}
+
+	mgr := NewManager(t.TempDir(), testLogger())
+	canonicalPath := mgr.canonicalRepoPath(repoID)
+	initWorkRepo(t, canonicalPath)
+	origin := filepath.Join(t.TempDir(), "canonical-origin")
+	initWorkRepo(t, origin)
+	run(t, canonicalPath, "git", "remote", "add", "origin", origin)
+	return ctx, store, NewService(store, mgr, testLogger()), repoID
+}
+
+func patchTestEvent(id string, createdAt int64, previousID, content string) nostr.Event {
+	evt := nostr.Event{
+		ID:        nostr.MustIDFromHex(id),
+		Kind:      1617,
+		CreatedAt: nostr.Timestamp(createdAt),
+		Content:   content,
+	}
+	if previousID != "" {
+		evt.Tags = nostr.Tags{{"e", previousID, "", "reply"}}
+	}
+	return evt
+}
+
+func insertPatchThreadEvent(t *testing.T, ctx context.Context, store *db.Store, repoID, rootID string, evt nostr.Event) {
+	t.Helper()
+	raw, err := json.Marshal(evt)
+	if err != nil {
+		t.Fatalf("marshal patch event: %v", err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO patch_events
+		(event_id, repo_id, kind, author_pubkey, root_id, created_at, content, raw_event_json, seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		evt.ID.Hex(), repoID, int(evt.Kind), evt.PubKey.Hex(), rootID,
+		int64(evt.CreatedAt), evt.Content, string(raw), int64(1)); err != nil {
+		t.Fatalf("insert patch event %s: %v", evt.ID.Hex(), err)
+	}
+}
+
+func addFilePatch(name, content string) string {
+	return "diff --git a/" + name + " b/" + name + "\n" +
+		"new file mode 100644\n" +
+		"--- /dev/null\n" +
+		"+++ b/" + name + "\n" +
+		"@@ -0,0 +1 @@\n" +
+		"+" + content + "\n"
 }
 
 func TestCloneURLsFromEvent(t *testing.T) {

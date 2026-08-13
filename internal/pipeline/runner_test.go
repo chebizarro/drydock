@@ -210,6 +210,46 @@ func TestProcessEndToEndPersistsAndPublishesReview(t *testing.T) {
 	}
 }
 
+func TestPatchDiffForReviewUsesSelectedRevisionContent(t *testing.T) {
+	selected := "diff --git a/selected.go b/selected.go\n"
+	cumulative := "diff --git a/root.go b/root.go\n" + selected
+
+	got, err := patchDiffForReview("target-id", 1617, selected, cumulative)
+	if err != nil {
+		t.Fatalf("select revision diff: %v", err)
+	}
+	if got != selected {
+		t.Fatalf("revision prompt diff = %q, want selected event diff %q", got, selected)
+	}
+}
+
+func TestPublishApplyFailureNamesFailingMemberAndRequestedTarget(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	targetID, repoID := seedPatchForPipeline(t, ctx, store)
+	failingID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	hint := "patch " + failingID + " does not apply cleanly: conflict; requested target " + targetID
+
+	relayPub := &collectingRelayPublisher{}
+	pubSvc := publisher.New(publisher.Config{
+		DefaultRelays: []string{"wss://relay.test"},
+		DefaultTTL:    90 * 24 * time.Hour,
+	}, store, testSigner{sk: nostr.Generate()}, relayPub, testLogger())
+	runner := &Runner{store: store, pubSvc: pubSvc, logger: testLogger()}
+
+	runner.publishApplyFailure(ctx, db.ReviewTask{PatchEventID: targetID, RepoID: repoID}, hint)
+
+	if len(relayPub.events) != 1 {
+		t.Fatalf("published events = %d, want 1", len(relayPub.events))
+	}
+	content := relayPub.events[0].Content
+	for _, want := range []string{failingID, targetID} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("apply-failure publication %q does not name %s", content, want)
+		}
+	}
+}
+
 func TestCheckReviewStatusForceBypassesDraftAndClosed(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)

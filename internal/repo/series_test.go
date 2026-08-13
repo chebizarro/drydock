@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"strings"
 	"testing"
 
 	"fiatjaf.com/nostr"
@@ -31,6 +32,65 @@ func TestOrderPatchSeriesPrefersReplyChain(t *testing.T) {
 	}
 }
 
+func TestPatchRevisionAncestryOrdersOnlyRequestedLineage(t *testing.T) {
+	root := nostr.Event{
+		ID:        nostr.MustIDFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		CreatedAt: nostr.Timestamp(100),
+	}
+	parent := nostr.Event{
+		ID:        nostr.MustIDFromHex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		CreatedAt: nostr.Timestamp(103),
+		Tags:      nostr.Tags{{"e", root.ID.Hex(), "", "reply"}},
+	}
+	target := nostr.Event{
+		ID:        nostr.MustIDFromHex("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+		CreatedAt: nostr.Timestamp(102),
+		Tags: nostr.Tags{
+			{"e", root.ID.Hex(), "", "root"},
+			{"e", parent.ID.Hex(), "", "reply"},
+		},
+	}
+	sibling := nostr.Event{
+		ID:        nostr.MustIDFromHex("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+		CreatedAt: nostr.Timestamp(101),
+		Tags:      nostr.Tags{{"e", root.ID.Hex(), "", "reply"}},
+	}
+	descendant := nostr.Event{
+		ID:        nostr.MustIDFromHex("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+		CreatedAt: nostr.Timestamp(104),
+		Tags:      nostr.Tags{{"e", target.ID.Hex(), "", "reply"}},
+	}
+
+	ancestry, err := PatchRevisionAncestry(
+		[]nostr.Event{descendant, target, sibling, root, parent},
+		target.ID.Hex(),
+	)
+	if err != nil {
+		t.Fatalf("select target ancestry: %v", err)
+	}
+	want := []nostr.ID{root.ID, parent.ID, target.ID}
+	if len(ancestry) != len(want) {
+		t.Fatalf("ancestry length = %d, want %d: %v", len(ancestry), len(want), ancestry)
+	}
+	for i := range want {
+		if ancestry[i].ID != want[i] {
+			t.Fatalf("ancestry[%d] = %s, want %s", i, ancestry[i].ID.Hex(), want[i].Hex())
+		}
+	}
+}
+
+func TestPatchRevisionAncestryRejectsMissingAncestor(t *testing.T) {
+	missing := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	target := nostr.Event{
+		ID:   nostr.MustIDFromHex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		Tags: nostr.Tags{{"e", missing, "", "reply"}},
+	}
+	_, err := PatchRevisionAncestry([]nostr.Event{target}, target.ID.Hex())
+	if err == nil || !strings.Contains(err.Error(), missing) || !strings.Contains(err.Error(), target.ID.Hex()) {
+		t.Fatalf("expected missing ancestor and requested target attribution, got %v", err)
+	}
+}
+
 func TestOrderPatchSeriesFallsBackToCreatedAt(t *testing.T) {
 	a := nostr.Event{
 		ID:        nostr.MustIDFromHex("1111111111111111111111111111111111111111111111111111111111111111"),
@@ -50,4 +110,3 @@ func TestOrderPatchSeriesFallsBackToCreatedAt(t *testing.T) {
 		t.Fatalf("unexpected created_at fallback order: %s, %s, %s", ordered[0].ID.Hex(), ordered[1].ID.Hex(), ordered[2].ID.Hex())
 	}
 }
-

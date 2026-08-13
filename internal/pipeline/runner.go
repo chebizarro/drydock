@@ -424,11 +424,11 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// the diff in the event content; PR-style events (kind 1618/1619) carry a
 	// cover letter there, so we use the git diff computed by repo prepare
 	// (PR tip vs merge-base with the default branch) instead.
-	patchDiffContent := patchEvent.Content
-	if strings.TrimSpace(prep.Diff) != "" {
-		patchDiffContent = prep.Diff
-	} else if patchRec.Kind != 1617 {
-		return fmt.Errorf("PR event %s (kind %d) produced no diff against its base", task.PatchEventID, patchRec.Kind)
+	patchDiffContent, err := patchDiffForReview(
+		task.PatchEventID, patchRec.Kind, patchEvent.Content, prep.Diff,
+	)
+	if err != nil {
+		return err
 	}
 
 	// 3b. Validate that the patch diff is non-empty to avoid wasting an LLM call.
@@ -723,6 +723,22 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	return nil
+}
+
+func patchDiffForReview(patchEventID string, kind int, eventContent, preparedDiff string) (string, error) {
+	switch kind {
+	case 1617:
+		// Revision-scoped patch reviews always prompt with the requested
+		// event's diff. Applied ancestors only establish its worktree state.
+		return eventContent, nil
+	case 1618, 1619:
+		if strings.TrimSpace(preparedDiff) == "" {
+			return "", fmt.Errorf("PR event %s (kind %d) produced no diff against its base", patchEventID, kind)
+		}
+		return preparedDiff, nil
+	default:
+		return "", fmt.Errorf("patch event %s has unsupported review kind %d", patchEventID, kind)
+	}
 }
 
 func (r *Runner) indexSourceCode(ctx context.Context, repoPath, repoID string, log *slog.Logger) error {

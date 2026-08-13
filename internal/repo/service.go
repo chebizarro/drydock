@@ -74,7 +74,7 @@ func (s *Service) PreparePatchSeries(ctx context.Context, patchEventID string) (
 
 	switch rec.Kind {
 	case 1617:
-		return s.preparePatchSeries(ctx, rec, target)
+		return s.preparePatchRevision(ctx, rec, target)
 	case 1618, 1619:
 		return s.preparePRTip(ctx, rec, target)
 	default:
@@ -82,7 +82,10 @@ func (s *Service) PreparePatchSeries(ctx context.Context, patchEventID string) (
 	}
 }
 
-func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecord, target nostr.Event) (PrepareResult, error) {
+// preparePatchRevision prepares one revision-scoped kind-1617 review. It
+// applies only the ancestry needed to reach the requested target; the runner
+// prompts and publishes against that selected target event.
+func (s *Service) preparePatchRevision(ctx context.Context, rec db.PatchEventRecord, target nostr.Event) (PrepareResult, error) {
 	cloneURLs, err := s.store.GetRepositoryCloneURLs(ctx, rec.RepoID)
 	if err != nil {
 		return PrepareResult{}, err
@@ -114,9 +117,12 @@ func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecor
 	if err != nil {
 		return PrepareResult{}, err
 	}
-	ordered := OrderPatchSeries(threadEvents)
-	if len(ordered) == 0 {
-		ordered = []nostr.Event{target}
+	if !containsPatchEvent(threadEvents, target.ID.Hex()) {
+		threadEvents = append(threadEvents, target)
+	}
+	ancestry, err := PatchRevisionAncestry(threadEvents, target.ID.Hex())
+	if err != nil {
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID}, err
 	}
 
 	workspace, err := s.manager.createReviewWorktree(ctx, lease, rec.EventID, baseCommit)
@@ -134,17 +140,18 @@ func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecor
 		}, err
 	}
 	leaseOwned = false
-	if err := s.manager.ApplyPatchSeries(ctx, workspace.path, ordered); err != nil {
+	if err := s.manager.ApplyPatchSeries(ctx, workspace.path, ancestry); err != nil {
 		if cleanupErr := s.manager.cleanupReviewWorktree(ctx, workspace); cleanupErr != nil {
 			s.logger.Warn("failed to clean up review worktree after patch apply failure", "error", cleanupErr)
 		}
+		failureHint := fmt.Sprintf("%v; requested target %s", err, rec.EventID)
 		return PrepareResult{
 			RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
-			RootID: rec.RootID, FailureHint: err.Error(), workspace: workspace,
-		}, err
+			RootID: rec.RootID, FailureHint: failureHint, workspace: workspace,
+		}, fmt.Errorf("apply patch ancestry for requested target %s: %w", rec.EventID, err)
 	}
-	applied := make([]string, 0, len(ordered))
-	for _, evt := range ordered {
+	applied := make([]string, 0, len(ancestry))
+	for _, evt := range ancestry {
 		applied = append(applied, evt.ID.Hex())
 	}
 
@@ -152,10 +159,19 @@ func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecor
 		RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
 		RootID: rec.RootID, AppliedIDs: applied, BaseRepoConfig: baseConfig, workspace: workspace,
 	}
-	s.logger.Info("prepared patch series in isolated worktree",
+	s.logger.Info("prepared patch revision in isolated worktree",
 		"patch_event_id", rec.EventID, "repo_id", rec.RepoID,
-		"worktree", workspace.path, "expected_commit", baseCommit, "series_len", len(applied))
+		"worktree", workspace.path, "expected_commit", baseCommit, "ancestry_len", len(applied))
 	return result, nil
+}
+
+func containsPatchEvent(events []nostr.Event, eventID string) bool {
+	for _, evt := range events {
+		if evt.ID.Hex() == eventID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, target nostr.Event) (PrepareResult, error) {
