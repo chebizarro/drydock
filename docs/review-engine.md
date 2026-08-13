@@ -1,6 +1,6 @@
 # Review Engine
 
-The review engine is a two-stage LLM pipeline: a lightweight **planner** selects the appropriate model and review focus, then a **reviewer** produces structured findings.
+The review engine owns planning, checklist construction, consensus, scope validation, severity compatibility, and walkthrough generation. Its reviewer stage is pluggable: the default agentic executor iterates over frozen-snapshot tools and can succeed only through `review.submit`; the legacy single-shot executor remains available during rollout. See [Agentic Review Operations](agentic-review.md) for tool policy, configuration, failure handling, and rollout.
 
 ## Pipeline Overview
 
@@ -30,6 +30,22 @@ Patch Context Bundle
                               • needs_more_context[]
 ```
 
+## Agentic Reviewer Loop
+
+```
+model response
+    │
+    ├─ read/search/git tool calls ──▶ frozen snapshot
+    │                                  │
+    │◀──────── bounded tool results ───┘
+    │
+    ├─ invalid review.submit ──▶ structured tool error, continue
+    │
+    └─ valid review.submit ──▶ validated ReviewerOutput
+```
+
+`review.submit` is the only successful stop condition. Every finding cites successful tool-call IDs from the current member's evidence ledger and includes explicit examined-file coverage. Turn, tool-call, cumulative-token, model-context, and tool-result limits are enforced independently.
+
 ## Planner Stage
 
 The planner receives the full context bundle and changed file list, then outputs a structured JSON plan:
@@ -50,7 +66,7 @@ The planner receives the full context bundle and changed file list, then outputs
 | `risk_areas` | string[] | Identified risk categories |
 | `needed_context` | string[] | Additional context the reviewer should look for |
 | `review_focus` | string | Primary focus instruction for the reviewer |
-| `model_route` | enum (required) | One of `coder32b`, `llm70b`, `coder14b` |
+| `model_route` | enum (required) | General routes `coder32b`, `llm70b`, `coder14b`; security routes `sec70b`, `secclassify`, `seclocalize` |
 
 ## Model Routing
 
@@ -60,7 +76,10 @@ The planner selects one of three model routes based on patch complexity:
 |-------|--------------|----------|
 | `coder14b` | Qwen 2.5 Coder 14B | Simple patches, style changes, documentation |
 | `coder32b` | Qwen 2.5 Coder 32B | Complex code logic, multi-file refactors, API changes |
-| `llm70b` | Llama 3.3 70B | Architecture review, security analysis, nuanced reasoning |
+| `llm70b` | Llama 3.3 70B | Architecture review and nuanced reasoning |
+| `sec70b` | Security-specialized 70B | Full security-audit reviewer |
+| `secclassify` | Security classifier | Candidate classification |
+| `seclocalize` | Security localizer | Finding localization |
 
 Each route maps to independently configurable endpoint and model name via environment variables. See [Configuration](configuration.md#llm-endpoints).
 
@@ -72,24 +91,28 @@ probe of each endpoint) and finally the configured model name.
 
 ## Reviewer Stage
 
-The reviewer receives the context bundle, the planner's analysis, an auto-generated checklist, and optional few-shot examples. It outputs structured findings:
+The reviewer receives the finalized context bundle, planner analysis, an auto-generated checklist, optional few-shot examples, and any compacted session history. In agentic mode it submits evidence-backed structured findings:
 
 ```json
 {
   "summary": "The patch adds concurrent map access without synchronization.",
   "findings": [
     {
-      "severity": "high",
+      "priority": "P1",
       "category": "concurrency",
       "file": "cache/store.go",
       "line": 15,
-      "evidence": "func (s *Store) Set(key, value string) { s.items[key] = value }",
+      "evidence_tool_call_ids": ["call-read-store"],
       "explanation": "Map write without mutex in a type documented as concurrent-safe.",
       "suggestion": "Add sync.RWMutex and lock around map operations.",
       "confidence": 0.92
     }
   ],
-  "needs_more_context": []
+  "coverage": {
+    "examined_files": ["cache/store.go"],
+    "outcome": "findings",
+    "summary": "Read the changed store and its callers."
+  }
 }
 ```
 
@@ -97,11 +120,12 @@ The reviewer receives the context bundle, the planner's analysis, an auto-genera
 
 | Field | Type | Constraints | Description |
 |-------|------|------------|-------------|
-| `severity` | enum | `critical`, `high`, `medium`, `low`, `info` | Impact level |
+| `priority` | enum | `P0`, `P1`, `P2` | Canonical agentic priority |
+| `severity` | enum | P0→`critical`, P1→`high`, P2→`medium` | Derived legacy compatibility field |
 | `category` | enum | `security`, `correctness`, `architecture`, `style`, `test-coverage` | Finding type |
 | `file` | string | required, non-empty | Affected file path |
 | `line` | integer | required, > 0 | Line number in the file |
-| `evidence` | string | | Code snippet demonstrating the issue |
+| `evidence_tool_call_ids` | string[] | one or more successful current-run calls | Evidence provenance; converted to legacy `evidence` text |
 | `explanation` | string | | Why this is a problem |
 | `suggestion` | string | | Recommended fix |
 | `confidence` | float | [0.0, 1.0] | Model's confidence. Below 0.6 requires `needs_more_context` |
@@ -109,7 +133,8 @@ The reviewer receives the context bundle, the planner's analysis, an auto-genera
 ### Validation Rules
 
 - `summary` is required and non-empty
-- Each finding must have valid `severity` and `category` enum values
+- Agentic findings require canonical P0/P1/P2 priority, a valid category, and current-run evidence tool-call IDs
+- Priority/severity normalization is total: P0/critical, P1/high, P2/medium; conflicting pairs are rejected
 - `file` must be non-empty and `line` must be positive
 - `confidence` must be in [0, 1]
 - If any finding has `confidence < 0.6`, the `needs_more_context` array must be non-empty
@@ -123,10 +148,8 @@ touched. Two deterministic guards run outside the LLM:
 - The pipeline **fails closed before any LLM call** when the changed-file
   set parsed from the diff is empty — a review anchored to nothing but
   context would be baseless.
-- After the reviewer (and after ensemble merging), findings and walkthrough
-  `file_summaries` whose paths are not in the deterministic changed-file set
-  are dropped and logged. Only the parsed diff is authoritative for what
-  changed.
+- After the reviewer (and after ensemble merging), patch-review findings and walkthrough `file_summaries` outside the deterministic changed-file set are dropped and logged.
+- Security-audit mode instead validates findings against the full frozen snapshot root, so verified issues may be reported in unchanged files.
 
 ## Checklist Injection
 
@@ -141,6 +164,12 @@ Before the reviewer call, `BuildChecklist` generates review checklist items base
 | `*migration*`, `*schema*` | Migration rollback safety and constraint violation checks |
 
 If any changed file matches `auth`, `crypto`, or `security`, the reviewer prompt is augmented with additional data-flow tracing instructions.
+
+## Ensemble and Session Behavior
+
+Ensemble members share one finalized package but receive fresh reviewer executors. Transcripts, evidence ledgers, counters, and replay caches are isolated per member. Failed members are dropped; the run fails only when every member fails. Consensus runs before one optional walkthrough.
+
+Stateful IDE follow-ups persist an opaque 128-bit `chat_id`, owner, snapshot hashes, ordered artifacts, turns, and normalized messages. Each continuation supplies `expected_version`, a unique request ID, and a message. The store applies optimistic version checks and request-ID idempotency before the reviewer runs. Code context is re-rendered from the frozen snapshot and is never silently dropped during history compaction.
 
 ## Retry Behavior
 

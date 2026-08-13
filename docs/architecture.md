@@ -1,6 +1,6 @@
 # Architecture
 
-Drydock is a Go-based NIP-34 automated code review agent. The core review pipeline runs as a single binary (`drydock-core`), with optional microservices for vector search (Qdrant), language server analysis (LSP bridge), and text embedding.
+Drydock is a Go-based NIP-34 automated code review agent. The core review pipeline runs as `drydock-core`; `drydock-mcp` exposes the same frozen-snapshot tools to authenticated external clients. Optional services provide vector search (Qdrant), language-server analysis (LSP bridge), and text embedding.
 
 ## Component Map
 
@@ -26,7 +26,7 @@ Drydock is a Go-based NIP-34 automated code review agent. The core review pipeli
 │       ▼                            ▼                  ▼        │
 │  ┌─────────┐  ┌──────────────────────────┐  ┌─────────────┐   │
 │  │  Repo   │  │    Context Builder       │  │   Review     │   │
-│  │ Manager │  │  (8 priority layers)     │  │   Engine     │   │
+│  │ Manager │  │  (9 core providers)      │  │   Engine     │   │
 │  └─────────┘  │  ┌──────┐ ┌───────────┐ │  └──────┬──────┘   │
 │               │  │tree- │ │  ripgrep/  │ │         │          │
 │               │  │sitter│ │  git grep  │ │         ▼          │
@@ -97,7 +97,8 @@ A queue send is only a wake-up hint. Claims, ContextVM receipts, invocation meta
 
 | Service | Binary | Required | Purpose |
 |---------|--------|----------|---------|
-| `drydock-core` | `cmd/drydock` | Yes | Full review pipeline: listen → ingest → build context → review → publish |
+| `drydock-core` | `cmd/drydock` | Yes | Full review pipeline: listen → ingest → freeze snapshot → discover context → review → publish |
+| `drydock-mcp` | `cmd/drydock-mcp` | No | Stdio or authenticated Streamable HTTP adapter over the canonical agent tool registry |
 | `qdrant` | Docker image `qdrant/qdrant:v1.12.6` | No | Vector similarity search for NIP specs, project docs, few-shot examples |
 | Embedding server | Ollama or dedicated endpoint | No | Text → vector embeddings (required if Qdrant is enabled) |
 | `lsp-bridge` | `cmd/lsp-bridge` | No | Multi-language LSP server manager for type-aware symbol analysis |
@@ -130,9 +131,14 @@ Private intent payloads should be wrapped with NIP-59 gift-wrap (`1059`) while k
 | `monitoring` | Persists and atomically projects the winning operator-authored NIP-51 list |
 | `revieworder` | Applies reactive/on-demand policy, atomically claims work, stores receipts, and owns the bounded queue |
 | `pipeline` | Worker pool that orchestrates review lifecycle and rechecks reactive membership |
-| `contextbuilder` | Builds deterministic context bundles with a 64K token budget across 8 priority layers; workspace boundary detection for monorepos |
+| `agenticreview` | Shared snapshot → discovery → exact finalization → iterative review → session service used by pipeline, IDE, and audit |
+| `agenttools` | Canonical tool schemas, role/capability policy, snapshot-bound handlers, selection state, and replay isolation |
+| `workspacesnapshot` | Immutable pinned-git or mutable-copy snapshots, manifests, leases, expiry, and garbage collection |
+| `reviewsession` | Versioned review conversations, idempotent turns, persisted artifacts/messages, and deterministic compaction |
+| `mcpserver` | MCP transport adapter with per-connection server-resolved role and snapshot scope |
+| `contextbuilder` | Deterministic fallback builder with 9 core providers plus optional retrieval/security providers and a 64K budget |
 | `symbols` | Tree-sitter AST parsing for 9 languages (Go, Python, JS, TS, Rust, C, C++, Java, Ruby) — extracts declarations from changed files |
-| `reviewengine` | Two-stage LLM pipeline: planner selects a model route, reviewer produces findings |
+| `reviewengine` | Engine-owned planner, checklist, consensus, severity mapping, finding filtering, and walkthrough around a pluggable reviewer executor |
 | `publisher` | Constructs and publishes kind 1111 (NIP-22 comment) Nostr events with relay fanout |
 | `metareview` | Self-improvement loop: evaluates review quality and routes feedback for prompt tuning |
 | `promptrefine` | Automated prompt versioning: batches prompt gaps, refines via LLM, activates with eval-gated rollback |
@@ -167,32 +173,63 @@ Trace of a single patch event from relay to published review:
 4. **Pipeline** — `pipeline.Runner.work` picks up the durable task:
    - `repo.Service.PreparePatchSeries` — clones or fetches the repository; for kind 1617 applies the patch series to a throwaway branch, for kind 1618/1619 checks out the PR tip and computes the diff against its merge-base with the default branch (in the canonical clone, so a fork cannot pick the diff base)
    - **Status gate** — re-checks the root's current NIP-34 status against the repo's `review.statuses` config (open by default, drafts opt-in, merged/closed never); status skips are permanent
-   - `contextbuilder.Builder.Build` — detects workspace boundaries, assembles context layers within token budget; the pipeline fails closed if the deterministic changed-file set is empty
-   - `reviewengine.Engine.Run` — planner call → model route selection → reviewer call with checklist injection; findings and walkthrough file summaries are filtered to the changed-file set
+   - `agenticreview.Service.Prepare` — freezes a pinned snapshot, runs capability-filtered discovery, and accepts context only after `selection.finalize` passes the exact-token gate; the explicit rollout fallback uses `contextbuilder.Builder.Build` with its deterministic budget policy
+   - `agenticreview.Service.ReviewPrepared` — the engine plans once, then an iterative reviewer uses read-only snapshot tools and must finish with evidence-backed `review.submit`; consensus, filtering, and one post-consensus walkthrough remain engine-owned
+   - **Pipeline-owned post-review stages** — deterministic security scans, security verification, deduplication, repository-policy filtering, final target filtering, and optional auto-fix remain outside the shared service
    - `publisher.Service.PublishReview` — builds kind 1111 events (labeled with the model the endpoint actually served), signs them, fans out to relays
    - `metareview.Service.RunAsync` — asynchronous quality evaluation (non-blocking)
 
 5. **Publish** — The publisher resolves target relays (patch-seen relays + repo announcement relays + defaults), constructs summary and detail comment events, signs each, and publishes.
 
-## Context Builder Data Flow
+## Agentic Review Data Flow
+
+```
+authoritative patch + repository state
+                │
+                ▼
+       immutable workspace snapshot
+       (pinned git or copy + hashes)
+                │
+                ▼
+     discovery loop (read + selection tools)
+                │
+                ▼
+ selection.finalize ──exact tokens over limit──▶ prune and retry
+                │ success
+                ▼
+        frozen ContextBundle
+                │
+                ▼
+ planner ──▶ iterative reviewer ──▶ review.submit
+                │                         │
+                └──── engine-owned consensus, scope validation,
+                      severity mapping, walkthrough, publication
+```
+
+All three orchestration families call `internal/agenticreview.Service`. Pipeline and audit snapshots pin a Git commit; IDE snapshots copy and hash the mutable workspace before any tool call. Audit scanning, localization, verification, and progress reporting remain audit-owned around the shared service. Sessions persist the finalized artifact manifest and re-render code context from that same snapshot on every continuation.
+
+MCP HTTP currently exposes only the `external_readonly` role. Authentication resolves a server-created session and snapshot before a tool list is returned; clients cannot choose or replace roles, capabilities, sessions, or roots. Listing and dispatch both enforce capability policy, and path resolution rejects absolute paths, traversal, symlinks, and live-workspace fallback.
+
+## Deterministic Context Provider Flow
+
+The deterministic builder remains the rollout and discovery-exhaustion fallback. It has **9 core providers**; optional retrieval and security providers are appended by configuration.
 
 ```
 Patch diff
     │
-    ├─→ Layer 1: patch (raw diff, 40 KB cap)
-    ├─→ Layer 2: modified-files (full file contents, workspace-scoped)
-    ├─→ Layer 3: symbols (tree-sitter AST → changed declarations → rg/git grep callsites)
-    ├─→ Layer 4: tests (rg/git grep in test files, workspace-scoped)
-    ├─→ Layer 5: imports-exports (import/export line extraction)
-    ├─→ Layer 6: commit-history (git log for changed files)
-    ├─→ Layer 7: project-docs (workspace-local + repo-level docs)
-    └─→ Layer 8: qdrant-docs (vector search: NIP specs + project docs)
-                                    │
-                                    ├─ embed(patch diff) → query nip_specs (if Nostr-related)
-                                    └─ embed(patch diff) → query project_docs
+    ├─→ priority 1: patch (raw diff, 40 KB cap)
+    ├─→ priority 2: modified-files
+    ├─→ priority 2: change-impact
+    ├─→ priority 2: taint
+    ├─→ priority 3: symbols
+    ├─→ priority 4: tests
+    ├─→ priority 5: imports-exports
+    ├─→ priority 6: commit-history
+    ├─→ priority 7: project-docs
+    └─→ priority 8: optional qdrant/chartroom retrieval
 ```
 
-When the 64K token budget is reached, the current layer and all lower-priority layers are dropped (hard stop policy).
+The deterministic builder truncates priority-1/2 content when a useful prefix fits, otherwise drops an oversized layer and continues considering later layers. Agentic discovery instead mutates a selection and must pass the exact serialized-package gate before review.
 
 ## Signer Chain
 
@@ -289,6 +326,11 @@ All state is stored in SQLite with WAL mode, foreign keys, and `busy_timeout=500
 | `few_shot_reviews` | Positive/negative few-shot examples for prompt improvement |
 | `listener_state` | High-water-mark timestamp for restart resilience |
 | `eval_runs` | Evaluation harness run results and metrics |
+| `review_snapshots` | Snapshot metadata, manifest/diff hashes, expiry, and reference count |
+| `review_sessions` | Opaque chat IDs, owners, modes, snapshot binding, state, lease, and optimistic version |
+| `review_session_artifacts` | Ordered immutable selection artifacts and content hashes |
+| `review_session_turns` | Request-ID idempotency, expected versions, results, and failures |
+| `review_session_messages` | Normalized ordered assistant/tool transcript messages |
 
 Full DDL is in [`internal/db/schema.go`](../internal/db/schema.go).
 

@@ -1,6 +1,6 @@
 # Context Builder
 
-The context builder assembles a deterministic context bundle for LLM review. It enforces a strict token budget with priority-based layer selection — higher-priority layers are always included first, and lower-priority layers are dropped when the budget is exhausted.
+Drydock has two context paths that produce the same `ContextBundle`: agentic discovery selects frozen-snapshot artifacts and passes an exact serialized-token gate; the deterministic builder remains the rollout and loop-exhaustion fallback. Neither path may bypass finalization. Operational limits and failure procedures are in [Agentic Review Operations](agentic-review.md).
 
 ## Why Deterministic Context Matters
 
@@ -12,34 +12,60 @@ LLM output is sensitive to input context. By enforcing a fixed priority order an
 
 ## Layer Priority Table
 
-Layers are assembled in strict priority order. Once the token budget is reached, the current layer and all remaining layers are dropped.
+Layers are assembled in stable priority/name order. When a layer exceeds the remaining budget, priority-1/2 content may be truncated to a useful prefix; otherwise that layer is dropped and later layers are still considered.
 
 | Priority | Layer | Provider | Source | Caps |
 |----------|-------|----------|--------|------|
-| 1 | `patch` | `patchDiffProvider` | Event content (unified diff) | 40 KB hard cap |
-| 2 | `modified-files` | `fileContextProvider` | Full file contents from repo checkout (workspace-scoped) | 20 KB total, 4 KB per file |
-| 3 | `symbols` | `symbolsCallsitesProvider` | Tree-sitter AST → changed declarations → ripgrep/git grep callsites | 12 symbols max |
-| 4 | `tests` | `testsProvider` | ripgrep/git grep in test files for changed symbols (workspace-scoped) | — |
+| 1 | `patch` | `patchDiffProvider` | Authoritative filtered unified diff | 40 KB hard cap |
+| 2 | `modified-files` | `fileContextProvider` | Changed-file contents | 20 KB total, 4 KB per file |
+| 2 | `change-impact` | `changeImpactProvider` | Changed symbols and downstream callsites | bounded search results |
+| 2 | `taint` | `taintProvider` | Taint-oriented source/sink analysis, with optional LSP | bounded analysis output |
+| 3 | `symbols` | `symbolsCallsitesProvider` | Tree-sitter declarations plus LSP or rg/git-grep callsites | 12 symbols max |
+| 4 | `tests` | `testsProvider` | Test files referencing changed symbols | — |
 | 5 | `imports-exports` | `importsExportsProvider` | Import/export lines extracted from the diff | 100 lines max |
 | 6 | `commit-history` | `commitHistoryProvider` | `git log --oneline -n 10` for changed files | 10 commits |
-| 7 | `project-docs` | `projectDocsProvider` | Workspace-local + repo-level CONTRIBUTING.md, README.md, style guides | 15 KB total, 4 KB per file |
-| 8 | `qdrant-docs` | `QdrantProvider` | Vector search: NIP specs (for Nostr patches) + project documentation | Requires Qdrant + embedding server |
+| 7 | `project-docs` | `projectDocsProvider` | Workspace-local and repository docs | 15 KB total, 4 KB per file |
+
+These are the **9 core providers** returned by `DefaultProviders`. Configured Qdrant or Chartroom retrieval is appended at priority 8; audit configuration may append security-surface providers.
 
 ## Token Budget
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | Token budget | 64,000 | Maximum tokens in the assembled bundle |
-| Token counter | `TiktokenCounter` | Uses tiktoken-go (cl100k_base encoding); falls back to `ApproxTokenCounter` (rune_count / 4) if loading fails |
+| Token counter | `TiktokenCounter` | Uses tiktoken-go (`cl100k_base`). Deterministic-only mode may use `ApproxTokenCounter`; agentic startup rejects approximate fallback as a hard error |
 
 ### Drop Policy
 
 When a layer would exceed the remaining budget:
 
-1. That layer is dropped
-2. **All** lower-priority layers are also dropped (hard stop)
-3. Dropped layer names are recorded in `LayersDropped`
-4. The `context-layers-dropped` field appears in every published review footer
+1. Priority-1/2 content is truncated when a useful prefix fits
+2. Otherwise that layer is dropped and later layers are still considered
+3. Dropped or truncated status, messages, and token counts are recorded in `LayerStatuses`
+4. Dropped layer names are recorded in `LayersDropped` and publication metadata
+
+## Agentic Discovery and Exact Finalization
+
+```
+authoritative patch + changed files
+              │
+              ▼
+     mandatory selection seed
+              │
+      model uses read/search/git tools
+      and selection.add/remove/status
+              │
+              ▼
+       selection.finalize
+        │             │
+   over budget      success
+        │             ▼
+   prune + retry   immutable ContextBundle
+```
+
+Discovery runs with a snapshot-bound `context_discovery` role. The patch and changed-file artifacts are mandatory; optional full files, line ranges, and codemaps can be added or removed. `selection.finalize` re-verifies snapshot hashes, renders the exact package, counts the serialized content with the authoritative tokenizer, applies configurable headroom (10% by default), and freezes the selection only on success.
+
+If discovery exhausts its turn, tool-call, token, or model-context limit without successful finalization, `contextbuilder.Builder.Build` runs against a materialization of the same snapshot. Its output must pass the same exact gate. If fallback building or gating fails, review fails rather than reviewing partial or approximate context.
 
 ## Symbol Extraction (Tree-sitter)
 
