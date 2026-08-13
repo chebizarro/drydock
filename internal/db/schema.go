@@ -616,4 +616,97 @@ CREATE TABLE IF NOT EXISTS rate_limits (
   timestamp INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rate_limits_key_timestamp ON rate_limits(key, timestamp);
+` + reviewSessionSchemaSQL
+
+const reviewSessionSchemaSQL = `
+CREATE TABLE IF NOT EXISTS review_snapshots (
+  snapshot_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('pinned_git', 'mutable_copy')),
+  storage_path TEXT NOT NULL,
+  manifest_sha256 TEXT NOT NULL,
+  diff_sha256 TEXT NOT NULL,
+  ref_count INTEGER NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_snapshots_expiry
+  ON review_snapshots(ref_count, expires_at);
+
+CREATE TABLE IF NOT EXISTS review_sessions (
+  chat_id TEXT PRIMARY KEY CHECK (length(chat_id) = 32),
+  owner_kind TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('patch', 'inline_patch', 'security_audit')),
+  state TEXT NOT NULL CHECK (state IN ('initializing', 'active', 'broken', 'expired')),
+  snapshot_id TEXT NOT NULL,
+  target_envelope_json TEXT NOT NULL,
+  bundle_sha256 TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+  active_request_id TEXT NOT NULL DEFAULT '',
+  lease_id TEXT NOT NULL DEFAULT '',
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (snapshot_id) REFERENCES review_snapshots(snapshot_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_review_sessions_owner
+  ON review_sessions(owner_kind, owner_id);
+CREATE INDEX IF NOT EXISTS idx_review_sessions_expiry
+  ON review_sessions(state, expires_at);
+
+CREATE TABLE IF NOT EXISTS review_session_artifacts (
+  chat_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  kind TEXT NOT NULL CHECK (kind IN ('patch', 'file', 'line_range', 'codemap')),
+  path TEXT NOT NULL DEFAULT '',
+  start_line INTEGER NOT NULL DEFAULT 0 CHECK (start_line >= 0),
+  end_line INTEGER NOT NULL DEFAULT 0 CHECK (end_line >= start_line),
+  content_sha256 TEXT NOT NULL,
+  mandatory INTEGER NOT NULL DEFAULT 0 CHECK (mandatory IN (0, 1)),
+  PRIMARY KEY (chat_id, ordinal),
+  FOREIGN KEY (chat_id) REFERENCES review_sessions(chat_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_review_session_artifacts_chat
+  ON review_session_artifacts(chat_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS review_session_turns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL,
+  turn_no INTEGER NOT NULL CHECK (turn_no >= 0),
+  request_id TEXT NOT NULL,
+  request_sha256 TEXT NOT NULL,
+  request_text TEXT NOT NULL DEFAULT '',
+  expected_version INTEGER NOT NULL CHECK (expected_version >= 0),
+  status TEXT NOT NULL CHECK (status IN ('reserved', 'complete', 'failed')),
+  result_json TEXT NOT NULL DEFAULT '',
+  error_text TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (chat_id, turn_no),
+  UNIQUE (chat_id, request_id),
+  FOREIGN KEY (chat_id) REFERENCES review_sessions(chat_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_review_session_turns_chat
+  ON review_session_turns(chat_id, turn_no);
+
+CREATE TABLE IF NOT EXISTS review_session_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL,
+  turn_no INTEGER NOT NULL,
+  seq INTEGER NOT NULL CHECK (seq >= 0),
+  role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+  name TEXT NOT NULL DEFAULT '',
+  tool_call_id TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  tool_calls_json TEXT NOT NULL DEFAULT '[]',
+  prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
+  completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (completion_tokens >= 0),
+  created_at INTEGER NOT NULL,
+  UNIQUE (chat_id, turn_no, seq),
+  FOREIGN KEY (chat_id, turn_no)
+    REFERENCES review_session_turns(chat_id, turn_no) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_review_session_messages_history
+  ON review_session_messages(chat_id, turn_no, seq);
 `

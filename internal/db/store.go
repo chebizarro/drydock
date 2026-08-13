@@ -673,6 +673,16 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 14,
+		name:    "agentic_review_sessions",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, reviewSessionSchemaSQL); err != nil {
+				return fmt.Errorf("apply agentic review session ddl: %w", err)
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

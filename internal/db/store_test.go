@@ -143,8 +143,8 @@ func TestSchemaMigrationNumbersAreContiguous(t *testing.T) {
 			t.Fatalf("schema migration %d has empty name", migration.version)
 		}
 	}
-	if got := schemaMigrations[len(schemaMigrations)-1].version; got != 13 {
-		t.Fatalf("latest characterized schema migration = %d, want 13 (next reserved version is 14)", got)
+	if got := schemaMigrations[len(schemaMigrations)-1].version; got != 14 {
+		t.Fatalf("latest characterized schema migration = %d, want 14 (next reserved version is 15)", got)
 	}
 }
 
