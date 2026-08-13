@@ -163,19 +163,67 @@ func (r *Registry) Register(def Definition, handler Handler) error {
 	return nil
 }
 
+func (role Role) Valid() bool {
+	switch role {
+	case RoleContextDiscovery, RoleCodeReviewer, RoleSecurityAuditor,
+		RoleSecurityAuditorDiscovery, RoleExternalReadonly:
+		return true
+	default:
+		return false
+	}
+}
+
 func (r *Registry) List(role Role) []Definition {
+	return r.list(role, nil)
+}
+
+// ListForScope returns only tools that both the bound role may invoke and the
+// frozen scope can execute with its server-provided dependencies.
+func (r *Registry) ListForScope(scope *Scope) []Definition {
+	if scope == nil || scope.Snapshot == nil || scope.ID == "" || !scope.Role.Valid() {
+		return nil
+	}
+	return r.list(scope.Role, scope)
+}
+
+func (r *Registry) list(role Role, scope *Scope) []Definition {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var definitions []Definition
 	for _, tool := range r.tools {
-		if roleAllows(role, tool.definition.Capability) {
-			def := tool.definition
-			def.InputSchema = append(json.RawMessage(nil), def.InputSchema...)
-			definitions = append(definitions, def)
+		if !roleAllows(role, tool.definition.Capability) || (scope != nil && !r.available(tool.definition.Name, scope)) {
+			continue
 		}
+		def := tool.definition
+		def.InputSchema = append(json.RawMessage(nil), def.InputSchema...)
+		definitions = append(definitions, def)
 	}
 	sortDefinitions(definitions)
 	return definitions
+}
+
+func (r *Registry) available(name string, scope *Scope) bool {
+	switch name {
+	case ToolCodeReferences:
+		return r.references != nil && r.references.Available()
+	case ToolContextLayer:
+		return r.layers != nil
+	case ToolSecurityTrace:
+		return r.securityTrace != nil
+	}
+	if scope == nil {
+		return true
+	}
+	switch name {
+	case ToolSelectionAdd, ToolSelectionRemove, ToolSelectionStatus, ToolSelectionFinalize:
+		return scope.Selection != nil
+	case ToolReviewSubmit:
+		return scope.Review != nil
+	case ToolGitRead:
+		return scope.Snapshot.SnapshotKind() == workspacesnapshot.KindPinnedGit
+	default:
+		return true
+	}
 }
 
 func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result, error) {

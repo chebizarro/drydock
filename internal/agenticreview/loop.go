@@ -95,7 +95,7 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 	request.Scope.MaxResultBytes = limits.MaxToolResultBytes
 	request.Scope.Selection = request.Selection
 
-	definitions := request.Registry.List(request.Scope.Role)
+	definitions := request.Registry.ListForScope(request.Scope)
 	request.Completion.Tools = make([]reviewengine.ToolSchema, 0, len(definitions))
 	for _, definition := range definitions {
 		request.Completion.Tools = append(request.Completion.Tools, reviewengine.ToolSchema{

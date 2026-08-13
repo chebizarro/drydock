@@ -26,6 +26,11 @@ func NewReferencesFacade(client *lspbridge.Client) *ReferencesFacade {
 	return &ReferencesFacade{client: client}
 }
 
+// Available reports whether the LSP dependency required by code.references is configured.
+func (f *ReferencesFacade) Available() bool {
+	return f != nil && f.client != nil
+}
+
 func (f *ReferencesFacade) Analyze(ctx context.Context, req ReferencesRequest) (*lspbridge.AnalyzeResponse, error) {
 	if f == nil || f.client == nil {
 		return nil, fmt.Errorf("contextbuilder: LSP references are not configured")
