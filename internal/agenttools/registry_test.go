@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -77,6 +78,48 @@ func TestRolePolicyFiltersListingAndDispatch(t *testing.T) {
 	}
 }
 
+func TestCapabilityEscalationFailsAtListingAndDispatch(t *testing.T) {
+	snapshot := mutableSnapshot(t, map[string]string{"main.go": "package p"})
+	selection, err := NewSelection(SelectionConfig{
+		Snapshot: snapshot, ChangedFiles: []string{"main.go"},
+		Counter: byteCounter{}, TokenBudget: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := NewRegistry()
+	tests := []struct {
+		name string
+		role Role
+		tool string
+	}{
+		{"external submit", RoleExternalReadonly, ToolReviewSubmit},
+		{"external finalize", RoleExternalReadonly, ToolSelectionFinalize},
+		{"reviewer selection mutation", RoleCodeReviewer, ToolSelectionAdd},
+		{"auditor selection mutation", RoleSecurityAuditor, ToolSelectionAdd},
+		{"unknown role read", Role("forged_admin"), ToolCodeRead},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if slices.Contains(definitionNames(registry.List(test.role)), test.tool) {
+				t.Fatalf("%s advertised to role %s", test.tool, test.role)
+			}
+			scope := NewScope("escalation:"+test.name, snapshot, test.role)
+			scope.Selection = selection
+			_, err := registry.Dispatch(context.Background(), Invocation{
+				ToolCallID: "attack-" + test.name, Name: test.tool,
+				Arguments: json.RawMessage(`{}`), Scope: scope,
+			})
+			if !errors.Is(err, ErrCapabilityDenied) {
+				t.Fatalf("dispatch %s as %s error = %v", test.tool, test.role, err)
+			}
+		})
+	}
+	if selection.Status().Finalized {
+		t.Fatal("denied capability mutated selection")
+	}
+}
+
 func TestHandlersReadOnlyFromSnapshotAndRejectTraversal(t *testing.T) {
 	workspace := t.TempDir()
 	writeAgentFile(t, workspace, "main.go", "package p\nfunc Before() {}\n")
@@ -118,12 +161,53 @@ func TestHandlersReadOnlyFromSnapshotAndRejectTraversal(t *testing.T) {
 		t.Fatalf("tests.search content = %q", tests.Content)
 	}
 
-	_, err = registry.Dispatch(context.Background(), Invocation{
-		ToolCallID: "escape-1", Name: ToolCodeRead,
-		Arguments: json.RawMessage(`{"path":"../main.go"}`), Scope: scope,
+	for index, path := range []string{
+		"../main.go", "/etc/passwd", `C:\Windows\system.ini`,
+		`src\..\main.go`, "src/../../etc/passwd", "main.go\x00outside",
+	} {
+		arguments, marshalErr := json.Marshal(map[string]any{"path": path})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		result, dispatchErr := registry.Dispatch(context.Background(), Invocation{
+			ToolCallID: fmt.Sprintf("escape-%d", index), Name: ToolCodeRead,
+			Arguments: arguments, Scope: scope,
+		})
+		if !errors.Is(dispatchErr, workspacesnapshot.ErrInvalidPath) {
+			t.Errorf("path %q error = %v, want ErrInvalidPath", path, dispatchErr)
+		}
+		if result.Content != "" {
+			t.Errorf("path %q leaked content %q", path, result.Content)
+		}
+	}
+}
+
+func TestToolReadRejectsPostFreezeSymlinkSubstitution(t *testing.T) {
+	snapshot := mutableSnapshot(t, map[string]string{"main.go": "safe snapshot content"})
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := snapshot.Resolve("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(resolved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, resolved); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewRegistry().Dispatch(context.Background(), Invocation{
+		ToolCallID: "symlink-attack", Name: ToolCodeRead,
+		Arguments: json.RawMessage(`{"path":"main.go"}`),
+		Scope:     NewScope("symlink-attack", snapshot, RoleExternalReadonly),
 	})
-	if !errors.Is(err, workspacesnapshot.ErrInvalidPath) {
-		t.Fatalf("traversal error = %v", err)
+	if err == nil {
+		t.Fatal("post-freeze symlink read succeeded")
+	}
+	if strings.Contains(result.Content, "outside secret") {
+		t.Fatalf("outside content leaked: %q", result.Content)
 	}
 }
 

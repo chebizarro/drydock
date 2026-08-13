@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"drydock/internal/db"
 	"drydock/internal/reviewengine"
 	"drydock/internal/reviewsession"
+	"drydock/internal/testutil"
 	"drydock/internal/workspacesnapshot"
 
 	"fiatjaf.com/nostr"
@@ -40,15 +42,17 @@ type ideTokenCounter struct{}
 func (ideTokenCounter) Count(text string) int { return len(text) }
 
 type ideAgenticClient struct {
-	results []reviewengine.CompletionResult
-	next    int
+	results  []reviewengine.CompletionResult
+	requests []reviewengine.CompletionRequest
+	next     int
 }
 
 func (c *ideAgenticClient) ChatCompletion(context.Context, reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
 	return reviewengine.ChatResult{Content: `{"change_type":"feature","risk_areas":["correctness"],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`}, nil
 }
 
-func (c *ideAgenticClient) Complete(context.Context, reviewengine.CompletionRequest) (reviewengine.CompletionResult, error) {
+func (c *ideAgenticClient) Complete(_ context.Context, request reviewengine.CompletionRequest) (reviewengine.CompletionResult, error) {
+	c.requests = append(c.requests, request)
 	result := c.results[c.next]
 	c.next++
 	return result, nil
@@ -84,7 +88,7 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
 	workspace := t.TempDir()
-	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main\nfunc x() int { return 0 }\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte(testutil.AgenticFixtureBaseFiles()["main.go"]), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	llm := &ideAgenticClient{results: []reviewengine.CompletionResult{
@@ -181,12 +185,13 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 		t.Fatalf("handle session: %v", err)
 	}
 
-	reviewParams := json.RawMessage(`{
-		"session_id":"sess-1",
-		"request_id":"req-1",
-		"diff":"diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+func x() int { return 0 }\n",
-		"changed_files":["client-supplied-wrong.go"]
-	}`)
+	reviewParams, err := json.Marshal(ReviewRequest{
+		SessionID: "sess-1", RequestID: "req-1", Diff: testutil.AgenticFixturePatch(),
+		ChangedFiles: []string{"client-supplied-wrong.go"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	clientPub := nostr.GetPublicKey(clientSK)
 	reviewEvent := nostr.Event{PubKey: clientPub, Tags: nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "req-1"}}}
 	reviewResult, rpcErr := handler.HandleReviewRequest(ctx, contextvm.Request{
@@ -222,6 +227,9 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 		t.Fatal("expected suggested_fix in review response")
 	}
 
+	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("LIVE WORKSPACE MUTATION\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	followVersion := *reviewResp.ExpectedVersion
 	followParams, err := json.Marshal(ReviewRequest{
 		SessionID: "sess-1", RequestID: "req-2", ChatID: reviewResp.ChatID,
@@ -243,6 +251,47 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 	}
 	if len(followResp.Diagnostics) != 1 || followResp.Diagnostics[0].FixID == diag.FixID {
 		t.Fatalf("turn-scoped fix ID missing: initial=%q follow=%+v", diag.FixID, followResp.Diagnostics)
+	}
+	var frozenRead agenttools.Result
+	for _, message := range llm.requests[len(llm.requests)-1].Messages {
+		if message.Role == reviewengine.MessageRoleTool && message.ToolCallID == "evidence-2" {
+			if err := json.Unmarshal([]byte(message.Content), &frozenRead); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if strings.Contains(frozenRead.Content, "LIVE WORKSPACE MUTATION") ||
+		frozenRead.Content != testutil.AgenticFixtureBaseFiles()["main.go"] {
+		t.Fatalf("continuation frozen code.read = %q", frozenRead.Content)
+	}
+
+	completionsBeforeReplay := llm.next
+	replayed, replayErr := handler.HandleReviewRequest(ctx, contextvm.Request{
+		Event: followEvent, Msg: contextvm.Message{JSONRPC: "2.0", ID: "req-2", Method: MethodReviewRequest, Params: followParams},
+	})
+	if replayErr != nil {
+		t.Fatalf("duplicate continuation failed: %v", replayErr.Message)
+	}
+	replayResp := replayed.(ReviewResponse)
+	if llm.next != completionsBeforeReplay || replayResp.ExpectedVersion == nil ||
+		*replayResp.ExpectedVersion != 1 || replayResp.Diagnostics[0].FixID != followResp.Diagnostics[0].FixID {
+		t.Fatalf("duplicate continuation was not replayed: response=%+v calls=%d", replayResp, llm.next)
+	}
+
+	staleVersion := int64(0)
+	staleParams, err := json.Marshal(ReviewRequest{
+		SessionID: "sess-1", RequestID: "req-stale", ChatID: reviewResp.ChatID,
+		ExpectedVersion: &staleVersion, Message: "stale follow-up",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleEvent := nostr.Event{PubKey: clientPub, Tags: nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "req-stale"}}}
+	_, staleErr := handler.HandleReviewRequest(ctx, contextvm.Request{
+		Event: staleEvent, Msg: contextvm.Message{JSONRPC: "2.0", ID: "req-stale", Method: MethodReviewRequest, Params: staleParams},
+	})
+	if staleErr == nil || staleErr.Code != contextvm.ErrorConflict || llm.next != completionsBeforeReplay {
+		t.Fatalf("stale continuation result: error=%+v calls=%d", staleErr, llm.next)
 	}
 
 	fixParams := json.RawMessage(`{

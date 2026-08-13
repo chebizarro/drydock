@@ -2,14 +2,19 @@ package auditengine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"drydock/internal/agenticreview"
+	"drydock/internal/agenttools"
 	"drydock/internal/codemap"
 	"drydock/internal/db"
 	"drydock/internal/nostrscan"
@@ -298,6 +303,132 @@ func (f *fakeAgenticAuditReview) ReviewPrepared(_ context.Context, _ *agenticrev
 }
 func (f *fakeAgenticAuditReview) ReleasePrepared(*agenticreview.PreparedReview) {
 	f.released = true
+}
+
+type auditTokenCounter struct{}
+
+func (auditTokenCounter) Count(text string) int { return len(text) }
+
+func auditToolCompletion(t *testing.T, id, name string, arguments any) reviewengine.CompletionResult {
+	t.Helper()
+	encoded, err := json.Marshal(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reviewengine.CompletionResult{
+		Message: reviewengine.CompletionMessage{
+			Role: reviewengine.MessageRoleAssistant,
+			ToolCalls: []reviewengine.ToolCall{{
+				ID: id, Type: "function",
+				Function: reviewengine.ToolCallFunction{Name: name, Arguments: string(encoded)},
+			}},
+		},
+		Usage: reviewengine.CompletionUsage{TotalTokens: 1},
+	}
+}
+
+func TestAgenticAuditRealServiceUsesCanonicalFrozenSnapshot(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	repoPath := t.TempDir()
+	for path, content := range testutil.AgenticFixtureBaseFiles() {
+		if err := os.WriteFile(filepath.Join(repoPath, path), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGitForAuditTest(t, repoPath, "init", "-q")
+	runGitForAuditTest(t, repoPath, "add", ".")
+	runGitForAuditTest(t, repoPath, "-c", "user.name=drydock-test", "-c", "user.email=drydock@example.test", "commit", "-qm", "fixture")
+	commitBytes, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := strings.TrimSpace(string(commitBytes))
+
+	database, err := db.Open(ctx, filepath.Join(t.TempDir(), "audit-agentic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := reviewsession.NewSQLiteStore(database.DB(), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := workspacesnapshot.NewManager(workspacesnapshot.Config{
+		StorageRoot: t.TempDir(), LeaseTTL: time.Hour, SessionLifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submission := map[string]any{
+		"summary": "audit finding",
+		"findings": []any{map[string]any{
+			"priority": "P1", "category": "security", "file": "main.go", "line": 1,
+			"explanation": "verified audit evidence", "suggestion": "fix it", "confidence": 0.9,
+			"evidence_tool_call_ids": []string{"audit-read"},
+		}},
+		"coverage": map[string]any{
+			"examined_files": []string{"main.go"}, "outcome": "findings", "summary": "read canonical fixture",
+		},
+	}
+	client := &testutil.ScriptedAgenticClient{
+		ChatResults: []reviewengine.ChatResult{{Content: `{"change_type":"security","risk_areas":["security"],"needed_context":[],"review_focus":"security","model_route":"sec70b"}`}},
+		Steps: []testutil.CompletionStep{
+			{Model: "discovery", Result: auditToolCompletion(t, "audit-finalize", agenttools.ToolSelectionFinalize, map[string]any{})},
+			{Model: "sec70b", Result: auditToolCompletion(t, "audit-read", agenttools.ToolCodeRead, map[string]any{"path": "main.go"})},
+			{Model: "sec70b", Result: auditToolCompletion(t, "audit-submit", agenttools.ToolReviewSubmit, submission)},
+		},
+	}
+	reviewEngine := reviewengine.New(reviewengine.Config{
+		Planner: reviewengine.ModelEndpoint{BaseURL: "planner", Model: "planner"},
+		Sec70B:  reviewengine.ModelEndpoint{BaseURL: "security", Model: "sec70b"},
+	}, client, logger)
+	registry := agenttools.NewRegistry()
+	discovery, err := agenticreview.NewDiscovery(agenticreview.DiscoveryConfig{
+		Client: client, Registry: registry, Counter: auditTokenCounter{},
+		Model: "discovery", TokenBudget: 100_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := agenticreview.NewService(agenticreview.ServiceConfig{
+		Snapshots: manager, Sessions: sessions, Discovery: discovery, Engine: reviewEngine,
+		Client: client, Registry: registry, Counter: auditTokenCounter{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := New(Config{}, Dependencies{AgenticReview: service}, logger)
+	findings, err := engine.reviewAgentically(
+		ctx, Request{RepoID: "repo", CloneURLs: []string{"https://example.test/repo.git"}}, repoPath, commit,
+		[]string{"main.go", "context.go"}, []candidateUnit{{File: "main.go", Score: 100}},
+		nil, surface.Result{}, Budget{TokenBudget: 32_000, ModelReview: true}, "", "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].Priority != reviewengine.PriorityP1 ||
+		findings[0].Severity != "high" {
+		t.Fatalf("audit findings = %#v", findings)
+	}
+	requests := client.RequestsForModel("sec70b")
+	if len(requests) != 2 {
+		t.Fatalf("security reviewer Complete requests = %d", len(requests))
+	}
+	var readResult agenttools.Result
+	for _, message := range requests[1].Messages {
+		if message.Role == reviewengine.MessageRoleTool && message.ToolCallID == "audit-read" {
+			if err := json.Unmarshal([]byte(message.Content), &readResult); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if readResult.Content != testutil.AgenticFixtureBaseFiles()["main.go"] {
+		t.Fatalf("audit code.read frozen bytes = %q", readResult.Content)
+	}
 }
 
 func TestAgenticAuditUsesPinnedSecuritySnapshotAndSharedReview(t *testing.T) {

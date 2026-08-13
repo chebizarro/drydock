@@ -190,6 +190,43 @@ func TestRunEnsembleWithExecutorsUsesIsolatedMembersAndOneWalkthrough(t *testing
 	}
 }
 
+func TestRunEnsembleWithExecutorsMapsP0P1P2ThroughConsensus(t *testing.T) {
+	client := &plannerWalkthroughClient{}
+	engine := newExecutorTestEngine(client)
+	findings := []Finding{
+		{Priority: PriorityP2, Category: "correctness", File: "main.go", Line: 20, Confidence: 0.8},
+		{Priority: PriorityP0, Category: "security", File: "main.go", Line: 1, Confidence: 0.8},
+		{Priority: PriorityP1, Category: "architecture", File: "main.go", Line: 10, Confidence: 0.8},
+	}
+	out, err := engine.RunEnsembleWithExecutors(context.Background(), RunInput{
+		ContextBundle: "shared finalized package", ChangedFiles: []string{"main.go"}, SkipWalkthrough: true,
+	}, EnsembleConfig{
+		Enabled: true, Models: []ModelRoute{RouteCoder32B, RouteLLM70B},
+		RequireConsensus: true, ConsensusBoost: 0.10,
+	}, func(ModelRoute) ReviewerExecutor {
+		return &recordingReviewerExecutor{result: ReviewerExecutionResult{
+			Review:         ReviewerOutput{Summary: "priorities", Findings: append([]Finding(nil), findings...)},
+			ValidatedScope: FindingScopePatch,
+		}}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPriorities := []Priority{PriorityP0, PriorityP1, PriorityP2}
+	wantSeverities := []string{"critical", "high", "medium"}
+	if len(out.Review.Findings) != len(wantPriorities) {
+		t.Fatalf("consensus findings = %#v", out.Review.Findings)
+	}
+	for i, finding := range out.Review.Findings {
+		if finding.Priority != wantPriorities[i] || finding.Severity != wantSeverities[i] {
+			t.Errorf("finding %d canonical mapping = %#v", i, finding)
+		}
+		if finding.Confidence != 0.9 {
+			t.Errorf("finding %d consensus confidence = %v", i, finding.Confidence)
+		}
+	}
+}
+
 func TestRunEnsembleWithExecutorsTreatsParentCancellationAsRunFailure(t *testing.T) {
 	client := &plannerWalkthroughClient{}
 	engine := newExecutorTestEngine(client)

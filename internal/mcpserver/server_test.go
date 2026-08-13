@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,6 +81,83 @@ func TestBoundServerFiltersAndDispatchesRegistryTools(t *testing.T) {
 	if envelope.Content != "package example\n" {
 		t.Fatalf("unexpected content %q", envelope.Content)
 	}
+
+	for _, forbidden := range []string{agenttools.ToolSelectionAdd, agenttools.ToolSelectionFinalize, agenttools.ToolReviewSubmit} {
+		result, callErr := session.CallTool(ctx, &mcp.CallToolParams{
+			Name: forbidden, Arguments: map[string]any{},
+		})
+		if callErr == nil && (result == nil || !result.IsError) {
+			t.Fatalf("external_readonly invoked hidden tool %s successfully", forbidden)
+		}
+	}
+	for _, path := range []string{"../outside.txt", "/etc/passwd"} {
+		result, callErr := session.CallTool(ctx, &mcp.CallToolParams{
+			Name: agenttools.ToolCodeRead, Arguments: map[string]any{"path": path},
+		})
+		if callErr == nil && (result == nil || !result.IsError) {
+			t.Fatalf("MCP traversal %q succeeded", path)
+		}
+		if result != nil {
+			encoded, _ := json.Marshal(result.Content)
+			if strings.Contains(string(encoded), "outside secret") {
+				t.Fatalf("MCP traversal %q leaked outside content", path)
+			}
+		}
+	}
+}
+
+type mcpByteCounter struct{}
+
+func (mcpByteCounter) Count(text string) int { return len(text) }
+
+func TestBoundServerToolsListIsRoleFiltered(t *testing.T) {
+	registry := agenttools.NewRegistry()
+	external := testScope(t, agenttools.RoleExternalReadonly)
+	discovery := testScope(t, agenttools.RoleContextDiscovery)
+	selection, err := agenttools.NewSelection(agenttools.SelectionConfig{
+		Snapshot: discovery.Snapshot, ChangedFiles: []string{"main.go"},
+		Counter: mcpByteCounter{}, TokenBudget: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	discovery.Selection = selection
+
+	externalNames := listBoundTools(t, registry, external)
+	discoveryNames := listBoundTools(t, registry, discovery)
+	if externalNames[agenttools.ToolSelectionFinalize] || externalNames[agenttools.ToolReviewSubmit] {
+		t.Fatalf("external tools/list = %v", externalNames)
+	}
+	if !discoveryNames[agenttools.ToolSelectionFinalize] || discoveryNames[agenttools.ToolReviewSubmit] {
+		t.Fatalf("discovery tools/list = %v", discoveryNames)
+	}
+}
+
+func listBoundTools(t *testing.T, registry *agenttools.Registry, scope *agenttools.Scope) map[string]bool {
+	t.Helper()
+	bound, err := NewBoundServer(registry, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = bound.SDKServer().Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "list-test", Version: "1"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	listed, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make(map[string]bool, len(listed.Tools))
+	for _, tool := range listed.Tools {
+		names[tool.Name] = true
+	}
+	return names
 }
 
 func TestBoundServerFailsClosedWithoutScope(t *testing.T) {

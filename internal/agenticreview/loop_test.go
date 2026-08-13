@@ -214,6 +214,72 @@ func TestDiscoveryFailsWhenFallbackAlsoExceedsGate(t *testing.T) {
 	}
 }
 
+func TestLoopPrunesAfterOverBudgetFinalizeAndThenSucceeds(t *testing.T) {
+	patch := testPatch()
+	snapshot := discoverySnapshot(t, patch, map[string]string{
+		"changed.go": "new\n",
+		"large.txt":  strings.Repeat("optional context ", 100),
+	})
+	selection, err := agenttools.NewSelection(agenttools.SelectionConfig{
+		Snapshot: snapshot, ChangedFiles: []string{"changed.go"},
+		Counter: testCounter{}, TokenBudget: 500, Headroom: 0.10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(id, name, arguments string) reviewengine.ToolCall {
+		return reviewengine.ToolCall{
+			ID: id, Type: "function",
+			Function: reviewengine.ToolCallFunction{Name: name, Arguments: arguments},
+		}
+	}
+	client := &scriptedClient{results: []reviewengine.CompletionResult{
+		{Message: reviewengine.CompletionMessage{
+			Role: reviewengine.MessageRoleAssistant,
+			ToolCalls: []reviewengine.ToolCall{
+				call("add-large", agenttools.ToolSelectionAdd, `{"artifacts":[{"kind":"file","path":"large.txt"}]}`),
+				call("finalize-over", agenttools.ToolSelectionFinalize, `{}`),
+			},
+		}, Usage: reviewengine.CompletionUsage{TotalTokens: 1}},
+		{Message: reviewengine.CompletionMessage{
+			Role: reviewengine.MessageRoleAssistant,
+			ToolCalls: []reviewengine.ToolCall{
+				call("remove-large", agenttools.ToolSelectionRemove, `{"artifacts":[{"kind":"file","path":"large.txt"}]}`),
+				call("finalize-fit", agenttools.ToolSelectionFinalize, `{}`),
+			},
+		}, Usage: reviewengine.CompletionUsage{TotalTokens: 1}},
+	}}
+	scope := agenttools.NewScope("prune-after-budget", snapshot, agenttools.RoleContextDiscovery)
+	result, err := (&LoopRunner{Client: client}).Run(context.Background(), LoopRequest{
+		Completion: reviewengine.CompletionRequest{
+			Messages: []reviewengine.CompletionMessage{{Role: reviewengine.MessageRoleUser, Content: "select context"}},
+		},
+		Registry: agenttools.NewRegistry(), Scope: scope, Selection: selection, Counter: testCounter{},
+		Limits: LoopLimits{MaxTurns: 3, MaxToolCalls: 6, MaxCumulativeTokens: 100_000, MaxModelContext: 100_000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace.StopReason != StopFinalized || result.Trace.ToolCalls != 4 {
+		t.Fatalf("trace = %#v", result.Trace)
+	}
+	if strings.Contains(result.Bundle.Content, "optional context") ||
+		result.Bundle.TokenCount > int(float64(result.Bundle.TokenBudget)*0.9) {
+		t.Fatalf("pruned bundle still exceeds budget: tokens=%d budget=%d\n%s",
+			result.Bundle.TokenCount, result.Bundle.TokenBudget, result.Bundle.Content)
+	}
+	var sawBudgetError bool
+	for _, message := range client.requests[1].Messages {
+		if message.Role == reviewengine.MessageRoleTool && message.ToolCallID == "finalize-over" &&
+			strings.Contains(message.Content, agenttools.ErrBudgetExceeded.Error()) {
+			sawBudgetError = true
+		}
+	}
+	if !sawBudgetError {
+		t.Fatalf("second turn did not receive recoverable finalization error: %#v", client.requests[1].Messages)
+	}
+}
+
 func TestDiscoveryRejectsPatchSnapshotMismatch(t *testing.T) {
 	snapshot := discoverySnapshot(t, "different", map[string]string{"changed.go": "new"})
 	discovery, err := NewDiscovery(DiscoveryConfig{

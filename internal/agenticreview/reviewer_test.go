@@ -11,6 +11,7 @@ import (
 	"drydock/internal/agenttools"
 	"drydock/internal/reviewengine"
 	"drydock/internal/targetidentity"
+	"drydock/internal/testutil"
 	"drydock/internal/workspacesnapshot"
 )
 
@@ -310,6 +311,47 @@ func TestReviewerLimitsAndCancellationReturnNoPartialFindings(t *testing.T) {
 	}
 	if len(cancelledClient.requests) != 0 {
 		t.Fatalf("client called after cancellation: %d", len(cancelledClient.requests))
+	}
+}
+
+func TestReviewerCancellationMidLoopReturnsNoPartialReview(t *testing.T) {
+	started := make(chan struct{}, 1)
+	client := &testutil.ScriptedAgenticClient{Steps: []testutil.CompletionStep{
+		{
+			Model: "review-model",
+			Result: reviewerCompletion(reviewerToolCall(t, "read-before-cancel", agenttools.ToolCodeRead,
+				map[string]any{"path": "changed.go"})),
+		},
+		{Model: "review-model", WaitForCancel: true, Started: started},
+	}}
+	reviewer := newTestReviewer(t, client, FindingScopePatch, LoopLimits{
+		MaxTurns: 4, MaxToolCalls: 8, MaxCumulativeTokens: 100_000, MaxModelContext: 100_000,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	type outcome struct {
+		result reviewengine.ReviewerExecutionResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := reviewer.ExecuteReviewer(ctx, testReviewerExecutionRequest())
+		done <- outcome{result: result, err: err}
+	}()
+	<-started
+	cancel()
+	got := <-done
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("mid-loop cancellation error = %v", got.err)
+	}
+	if got.result.Review.Summary != "" || len(got.result.Review.Findings) != 0 {
+		t.Fatalf("partial review leaked after cancellation: %#v", got.result)
+	}
+	// A cancellation returned by Complete is currently classified as a
+	// transport stop; this test pins the fail-closed behavior while the final
+	// review epic decides whether to normalize it to StopCancelled.
+	if got.result.Trace.StopReason != string(StopTransportError) ||
+		!slices.Contains(got.result.Trace.ToolCallIDs, "read-before-cancel") {
+		t.Fatalf("cancellation trace = %#v", got.result.Trace)
 	}
 }
 

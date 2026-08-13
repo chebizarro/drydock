@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
@@ -13,13 +14,17 @@ import (
 	"testing"
 	"time"
 
+	"drydock/internal/agenticreview"
+	"drydock/internal/agenttools"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/metareview"
 	"drydock/internal/publisher"
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
+	"drydock/internal/reviewsession"
 	"drydock/internal/testutil"
+	"drydock/internal/workspacesnapshot"
 
 	"fiatjaf.com/nostr"
 )
@@ -102,6 +107,11 @@ func makePatchDiff() string {
 // Returns the patch event ID and repo ID.
 func seedIntegrationDB(t *testing.T, ctx context.Context, store *db.Store) (patchEventID, repoID string) {
 	t.Helper()
+	return seedIntegrationDBWithDiff(t, ctx, store, makePatchDiff())
+}
+
+func seedIntegrationDBWithDiff(t *testing.T, ctx context.Context, store *db.Store, diff string) (patchEventID, repoID string) {
+	t.Helper()
 
 	repoSK := nostr.Generate()
 	patchSK := nostr.Generate()
@@ -129,7 +139,7 @@ func seedIntegrationDB(t *testing.T, ctx context.Context, store *db.Store) (patc
 			{"a", "30617:" + nostr.GetPublicKey(repoSK).Hex() + ":integ-repo"},
 			{"e", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "", "root"},
 		},
-		Content: makePatchDiff(),
+		Content: diff,
 	}
 	patchEvt.Sign(patchSK)
 	if err := store.InsertPatchEvent(ctx, patchEvt); err != nil {
@@ -147,6 +157,130 @@ func seedIntegrationDB(t *testing.T, ctx context.Context, store *db.Store) (patc
 }
 
 // --- Integration tests ---
+
+type pipelineTokenCounter struct{}
+
+func (pipelineTokenCounter) Count(text string) int { return len(text) }
+
+func pipelineToolCompletion(t *testing.T, id, name string, arguments any) reviewengine.CompletionResult {
+	t.Helper()
+	encoded, err := json.Marshal(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reviewengine.CompletionResult{
+		Message: reviewengine.CompletionMessage{
+			Role: reviewengine.MessageRoleAssistant,
+			ToolCalls: []reviewengine.ToolCall{{
+				ID: id, Type: "function",
+				Function: reviewengine.ToolCallFunction{Name: name, Arguments: string(encoded)},
+			}},
+		},
+		Usage: reviewengine.CompletionUsage{TotalTokens: 1},
+	}
+}
+
+func TestIntegrationAgenticPipelineUsesCanonicalFrozenSnapshot(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	store, err := db.Open(ctx, filepath.Join(t.TempDir(), "agentic-pipeline.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	patchID, repoID := seedIntegrationDBWithDiff(t, ctx, store, testutil.AgenticFixturePatch())
+	cacheDir := filepath.Join(t.TempDir(), "repos")
+	initRepoInCanonicalCache(t, cacheDir, repoID)
+	repoSvc := repo.NewService(store, repo.NewManager(cacheDir, logger), logger)
+
+	submission := map[string]any{
+		"summary": "agentic pipeline finding",
+		"findings": []any{map[string]any{
+			"priority": "P1", "category": "correctness", "file": "main.go", "line": 2,
+			"explanation": "verified through frozen code.read", "suggestion": "fix it", "confidence": 0.9,
+			"evidence_tool_call_ids": []string{"pipeline-read"},
+		}},
+		"coverage": map[string]any{
+			"examined_files": []string{"main.go"}, "outcome": "findings", "summary": "read canonical fixture",
+		},
+	}
+	client := &testutil.ScriptedAgenticClient{
+		ChatResults: []reviewengine.ChatResult{
+			{Content: `{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"correctness","model_route":"coder32b"}`},
+			{Content: `{"walkthrough":"agentic walkthrough","file_summaries":[{"file":"main.go","summary":"changed"}]}`},
+		},
+		Steps: []testutil.CompletionStep{
+			{Model: "discovery", Result: pipelineToolCompletion(t, "pipeline-finalize", agenttools.ToolSelectionFinalize, map[string]any{})},
+			{Model: "coder32b", Result: pipelineToolCompletion(t, "pipeline-read", agenttools.ToolCodeRead, map[string]any{"path": "main.go"})},
+			{Model: "coder32b", Result: pipelineToolCompletion(t, "pipeline-submit", agenttools.ToolReviewSubmit, submission)},
+		},
+	}
+	engine := reviewengine.New(reviewengine.Config{
+		Planner:  reviewengine.ModelEndpoint{BaseURL: "planner", Model: "planner"},
+		Coder32B: reviewengine.ModelEndpoint{BaseURL: "coder", Model: "coder32b"},
+		LLM70B:   reviewengine.ModelEndpoint{BaseURL: "large", Model: "llm70b"},
+	}, client, logger)
+	sessionStore, err := reviewsession.NewSQLiteStore(store.DB(), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := workspacesnapshot.NewManager(workspacesnapshot.Config{
+		StorageRoot: t.TempDir(), LeaseTTL: time.Hour, SessionLifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := agenttools.NewRegistry()
+	discovery, err := agenticreview.NewDiscovery(agenticreview.DiscoveryConfig{
+		Client: client, Registry: registry, Counter: pipelineTokenCounter{},
+		Model: "discovery", TokenBudget: 100_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := agenticreview.NewService(agenticreview.ServiceConfig{
+		Snapshots: manager, Sessions: sessionStore, Discovery: discovery, Engine: engine,
+		Client: client, Registry: registry, Counter: pipelineTokenCounter{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayPub := &collectingRelayPublisher{}
+	pubSvc := publisher.New(publisher.Config{
+		DefaultRelays: []string{"wss://relay.test"}, DetailSeverityFloor: "high",
+		DefaultTTL: 90 * 24 * time.Hour, SupersededTTL: 7 * 24 * time.Hour,
+	}, store, testSigner{sk: nostr.Generate()}, relayPub, logger)
+	runner := New(Config{Workers: 1}, store, repoSvc, contextbuilder.NewDefault(), engine,
+		pubSvc, nil, make(chan db.ReviewTask, 1), logger,
+		WithAgenticReviewService(service), WithMonitoringRegistry(allowAllRegistry{}))
+	if err := runner.process(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}); err != nil {
+		t.Fatal(err)
+	}
+	if len(relayPub.events) == 0 || !strings.Contains(relayPub.events[0].Content, "agentic pipeline finding") {
+		t.Fatalf("agentic review was not published: %#v", relayPub.events)
+	}
+	requests := client.RequestsForModel("coder32b")
+	if len(requests) != 2 {
+		t.Fatalf("reviewer Complete requests = %d", len(requests))
+	}
+	var readResult agenttools.Result
+	for _, message := range requests[1].Messages {
+		if message.Role == reviewengine.MessageRoleTool && message.ToolCallID == "pipeline-read" {
+			if err := json.Unmarshal([]byte(message.Content), &readResult); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if readResult.Content != testutil.AgenticFixtureBaseFiles()["main.go"] {
+		t.Fatalf("pipeline code.read frozen bytes = %q", readResult.Content)
+	}
+	if client.RemainingSteps() != 0 {
+		t.Fatalf("unconsumed completion steps = %d", client.RemainingSteps())
+	}
+}
 
 func TestIntegrationFullPipelineProcess(t *testing.T) {
 	ctx := context.Background()
