@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -23,6 +24,9 @@ const (
 	ToolCodeStructure     = "code.structure"
 	ToolCodeSearch        = "code.search"
 	ToolCodeRead          = "code.read"
+	ToolCodeReferences    = "code.references"
+	ToolContextLayer      = "context.layer"
+	ToolSecurityTrace     = "security.trace"
 	ToolTestsSearch       = "tests.search"
 	ToolGitRead           = "git.read"
 	ToolSelectionAdd      = "selection.add"
@@ -41,6 +45,9 @@ func registerCoreTools(registry *Registry) {
 		{definition(ToolCodeStructure, "Extract tree-sitter declarations from a frozen source file.", CapabilityRead, `{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`), handleStructure},
 		{definition(ToolCodeSearch, "Search frozen source content.", CapabilityRead, `{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"regex":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false}`), handleCodeSearch},
 		{definition(ToolCodeRead, "Read a line range from a frozen file.", CapabilityRead, `{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}`), handleCodeRead},
+		{definition(ToolCodeReferences, "Resolve symbol definitions and references through the configured LSP facade against the frozen snapshot.", CapabilityRead, `{"type":"object","properties":{"files":{"type":"array","items":{"type":"string"},"minItems":1,"uniqueItems":true},"symbols":{"type":"array","items":{"type":"string"},"minItems":1,"uniqueItems":true}},"required":["files","symbols"],"additionalProperties":false}`), registry.handleCodeReferences},
+		{definition(ToolContextLayer, "Run one existing context provider selected from its closed layer name.", CapabilityRead, `{"type":"object","properties":{"name":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"required":["name"],"additionalProperties":false}`), registry.handleContextLayer},
+		{definition(ToolSecurityTrace, "Trace taint paths or security surfaces across frozen audit roots.", CapabilitySnapshotWide, `{"type":"object","properties":{"kind":{"type":"string","enum":["taint","security-surface"]},"paths":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"additionalProperties":false}`), registry.handleSecurityTrace},
 		{definition(ToolTestsSearch, "Search test files in the frozen snapshot.", CapabilityRead, `{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"regex":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false}`), handleTestsSearch},
 		{definition(ToolGitRead, "Run one closed read-only git action (diff, show, log, blame) at the pinned commit.", CapabilityRead, `{"type":"object","properties":{"action":{"type":"string","enum":["diff","show","log","blame"]},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["action"],"additionalProperties":false}`), handleGitRead},
 		{definition(ToolSelectionAdd, "Add file, line-range, or codemap artifacts to the run-local selection.", CapabilitySelectionMutate, `{"type":"object","properties":{"artifacts":{"type":"array","items":{"type":"object"}}},"required":["artifacts"],"additionalProperties":false}`), handleSelection},
@@ -244,6 +251,149 @@ func handleGitRead(ctx context.Context, invocation Invocation) (Result, error) {
 		return Result{}, err
 	}
 	return Result{Content: string(content)}, nil
+}
+
+func (r *Registry) handleCodeReferences(ctx context.Context, invocation Invocation) (Result, error) {
+	if r.references == nil {
+		return Result{}, ErrHandlerUnavailable
+	}
+	var args struct {
+		Files   []string `json:"files"`
+		Symbols []string `json:"symbols"`
+	}
+	if err := decodeArguments(invocation.Arguments, &args); err != nil {
+		return Result{}, err
+	}
+	files, err := validatedSnapshotPaths(ctx, invocation.Scope.Snapshot, args.Files)
+	if err != nil {
+		return Result{}, err
+	}
+	var response any
+	err = withMaterializedSnapshot(ctx, invocation.Scope.Snapshot, func(root string) error {
+		var analyzeErr error
+		response, analyzeErr = r.references.Analyze(ctx, contextbuilder.ReferencesRequest{
+			RepoPath: root, Files: files, Symbols: args.Symbols,
+		})
+		return analyzeErr
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return jsonResult(response)
+}
+
+func (r *Registry) handleContextLayer(ctx context.Context, invocation Invocation) (Result, error) {
+	if r.layers == nil {
+		return Result{}, ErrHandlerUnavailable
+	}
+	var args struct {
+		Name  string   `json:"name"`
+		Paths []string `json:"paths"`
+	}
+	if err := decodeArguments(invocation.Arguments, &args); err != nil {
+		return Result{}, err
+	}
+	if (args.Name == contextbuilder.LayerTaint || args.Name == contextbuilder.LayerSecuritySurface) &&
+		invocation.Scope.Role != RoleSecurityAuditor && invocation.Scope.Role != RoleSecurityAuditorDiscovery {
+		return Result{}, ErrCapabilityDenied
+	}
+	files, err := validatedSnapshotPaths(ctx, invocation.Scope.Snapshot, args.Paths)
+	if err != nil {
+		return Result{}, err
+	}
+	patch := string(invocation.Scope.Snapshot.PatchContent())
+	if len(files) > 0 {
+		patch = syntheticSnapshotPatch(files)
+	}
+	var result contextbuilder.LayerResult
+	err = withMaterializedSnapshot(ctx, invocation.Scope.Snapshot, func(root string) error {
+		var analyzeErr error
+		result, analyzeErr = r.layers.Analyze(ctx, args.Name, contextbuilder.BuildInput{
+			RepoPath: root, PatchEventContent: patch,
+		})
+		return analyzeErr
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return jsonResult(result)
+}
+
+func (r *Registry) handleSecurityTrace(ctx context.Context, invocation Invocation) (Result, error) {
+	if r.securityTrace == nil {
+		return Result{}, ErrHandlerUnavailable
+	}
+	var args struct {
+		Kind  string   `json:"kind"`
+		Paths []string `json:"paths"`
+	}
+	if err := decodeArguments(invocation.Arguments, &args); err != nil {
+		return Result{}, err
+	}
+	files, err := validatedSnapshotPaths(ctx, invocation.Scope.Snapshot, args.Paths)
+	if err != nil {
+		return Result{}, err
+	}
+	var result contextbuilder.SecurityTraceResult
+	err = withMaterializedSnapshot(ctx, invocation.Scope.Snapshot, func(root string) error {
+		var analyzeErr error
+		result, analyzeErr = r.securityTrace.Analyze(ctx, contextbuilder.SecurityTraceRequest{
+			Kind: args.Kind, RepoPath: root, Patch: syntheticSnapshotPatch(files),
+		})
+		return analyzeErr
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	return jsonResult(result)
+}
+
+func validatedSnapshotPaths(ctx context.Context, snapshot *workspacesnapshot.Snapshot, requested []string) ([]string, error) {
+	if len(requested) == 0 {
+		entries, err := snapshot.List(".")
+		if err != nil {
+			return nil, err
+		}
+		requested = make([]string, 0, len(entries))
+		for _, entry := range entries {
+			requested = append(requested, entry.Path)
+		}
+	}
+	seen := make(map[string]struct{}, len(requested))
+	paths := make([]string, 0, len(requested))
+	for _, path := range requested {
+		if _, err := snapshot.ReadFile(ctx, path); err != nil {
+			return nil, err
+		}
+		path = cleanDisplayPath(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func withMaterializedSnapshot(ctx context.Context, snapshot *workspacesnapshot.Snapshot, run func(string) error) error {
+	root, err := os.MkdirTemp("", "drydock-agent-tool-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+	if err := snapshot.Materialize(ctx, root); err != nil {
+		return err
+	}
+	return run(root)
+}
+
+func syntheticSnapshotPatch(paths []string) string {
+	var patch strings.Builder
+	for _, path := range paths {
+		fmt.Fprintf(&patch, "diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1,0 +1,1 @@\n+audit target\n", path, path, path, path)
+	}
+	return patch.String()
 }
 
 func handleSelection(ctx context.Context, invocation Invocation) (Result, error) {

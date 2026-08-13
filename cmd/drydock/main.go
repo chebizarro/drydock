@@ -487,7 +487,11 @@ func main() {
 		logger.Error("failed to initialize review sessions", "error", err)
 		os.Exit(1)
 	}
-	agentRegistry := agenttools.NewRegistry()
+	agentRegistry := agenttools.NewRegistry(
+		agenttools.WithReferencesFacade(contextbuilder.NewReferencesFacade(lspClient)),
+		agenttools.WithLayerFacade(contextbuilder.NewLayerFacade(contextbuilder.NewBuilderOptions(builderOpts...))),
+		agenttools.WithSecurityTraceFacade(contextbuilder.NewSecurityTraceFacade(lspClient, secScanner)),
+	)
 	discovery, err := agenticreview.NewDiscovery(agenticreview.DiscoveryConfig{
 		Client: llmClient, Registry: agentRegistry, Counter: agentCounter, Builder: ctxBuilder,
 		BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey),
@@ -557,11 +561,10 @@ func main() {
 				NostrProbeActive:  cfg.SecurityNostrProbeActive,
 			},
 			auditengine.Dependencies{
-				Repos:          repoManager,
-				Store:          store,
-				Scanner:        secScanner,
-				ContextBuilder: ctxBuilder,
-				Reviewer:       engine,
+				Repos:         repoManager,
+				Store:         store,
+				Scanner:       secScanner,
+				AgenticReview: agenticReviewSvc,
 				VerifierFactory: func(votes int) auditengine.Verifier {
 					return securityverify.New(llmClient, securityverify.Config{
 						VerifyVotes: votes, VerifyEndpoint: verifyEndpoint, ClassifyEndpoint: classifyEndpoint,

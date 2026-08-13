@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"drydock/internal/contextbuilder"
+	"drydock/internal/lspbridge"
+	"drydock/internal/securityscan"
 	"drydock/internal/workspacesnapshot"
 )
 
@@ -48,6 +53,14 @@ func TestRolePolicyFiltersListingAndDispatch(t *testing.T) {
 	reviewer := definitionNames(registry.List(RoleCodeReviewer))
 	if !slices.Contains(reviewer, ToolReviewSubmit) || slices.Contains(reviewer, ToolSelectionAdd) {
 		t.Fatalf("reviewer definitions = %v", reviewer)
+	}
+	security := definitionNames(registry.List(RoleSecurityAuditor))
+	if !slices.Contains(security, ToolSecurityTrace) || slices.Contains(reviewer, ToolSecurityTrace) {
+		t.Fatalf("security definitions = %v reviewer = %v", security, reviewer)
+	}
+	securityDiscovery := definitionNames(registry.List(RoleSecurityAuditorDiscovery))
+	if !slices.Contains(securityDiscovery, ToolSecurityTrace) || !slices.Contains(securityDiscovery, ToolSelectionFinalize) || slices.Contains(securityDiscovery, ToolReviewSubmit) {
+		t.Fatalf("security discovery definitions = %v", securityDiscovery)
 	}
 	external := definitionNames(registry.List(RoleExternalReadonly))
 	if slices.Contains(external, ToolReviewSubmit) || slices.Contains(external, ToolSelectionStatus) {
@@ -111,6 +124,70 @@ func TestHandlersReadOnlyFromSnapshotAndRejectTraversal(t *testing.T) {
 	})
 	if !errors.Is(err, workspacesnapshot.ErrInvalidPath) {
 		t.Fatalf("traversal error = %v", err)
+	}
+}
+
+func TestAuditToolsUseFrozenFacadesAndSecurityCapability(t *testing.T) {
+	snapshot := mutableSnapshot(t, map[string]string{
+		"main.go": "package p\nfunc run(req string) { exec.Command(req) }\n",
+	})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/analyze" {
+			http.NotFound(w, request)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","lsp_available":true,"references":[{"symbol":"run","file":"main.go","line":2,"column":1}]}`))
+	}))
+	defer server.Close()
+
+	registry := NewRegistry(
+		WithReferencesFacade(contextbuilder.NewReferencesFacade(lspbridge.NewClient(server.URL))),
+		WithLayerFacade(contextbuilder.NewLayerFacade(contextbuilder.NewBuilderOptions())),
+		WithSecurityTraceFacade(contextbuilder.NewSecurityTraceFacade(nil, securityscan.New())),
+	)
+	securityScope := NewScope("security-run", snapshot, RoleSecurityAuditor)
+
+	references, err := registry.Dispatch(context.Background(), Invocation{
+		ToolCallID: "references-1", Name: ToolCodeReferences,
+		Arguments: json.RawMessage(`{"files":["main.go"],"symbols":["run"]}`), Scope: securityScope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(references.Content, `"symbol":"run"`) {
+		t.Fatalf("references = %s", references.Content)
+	}
+
+	layer, err := registry.Dispatch(context.Background(), Invocation{
+		ToolCallID: "layer-1", Name: ToolContextLayer,
+		Arguments: json.RawMessage(`{"name":"patch","paths":["main.go"]}`), Scope: securityScope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(layer.Content, "diff --git a/main.go b/main.go") {
+		t.Fatalf("context layer = %s", layer.Content)
+	}
+
+	trace, err := registry.Dispatch(context.Background(), Invocation{
+		ToolCallID: "trace-1", Name: ToolSecurityTrace,
+		Arguments: json.RawMessage(`{"kind":"taint","paths":["main.go"]}`), Scope: securityScope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(trace.Content, "command-execution") {
+		t.Fatalf("security trace = %s", trace.Content)
+	}
+
+	_, err = registry.Dispatch(context.Background(), Invocation{
+		ToolCallID: "trace-denied", Name: ToolSecurityTrace,
+		Arguments: json.RawMessage(`{"kind":"taint","paths":["main.go"]}`),
+		Scope:     NewScope("review-run", snapshot, RoleCodeReviewer),
+	})
+	if !errors.Is(err, ErrCapabilityDenied) {
+		t.Fatalf("non-security trace error = %v", err)
 	}
 }
 

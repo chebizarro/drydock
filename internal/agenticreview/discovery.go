@@ -44,6 +44,7 @@ type DiscoveryInput struct {
 	Patch        string
 	ChangedFiles []string
 	BuildInput   contextbuilder.BuildInput
+	Role         agenttools.Role
 }
 
 type DiscoveryTrace struct {
@@ -102,7 +103,11 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	scope := agenttools.NewScope("discovery:"+input.Snapshot.ID, input.Snapshot, agenttools.RoleContextDiscovery)
+	role := input.Role
+	if role == "" {
+		role = agenttools.RoleContextDiscovery
+	}
+	scope := agenttools.NewScope("discovery:"+input.Snapshot.ID, input.Snapshot, role)
 	scope.Selection = selection
 	user := fmt.Sprintf(discoveryUserPrompt, strings.Join(changedFiles, "\n"),
 		d.config.TokenBudget, d.config.Headroom*100, analysis.FilteredDiff)

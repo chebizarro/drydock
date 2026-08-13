@@ -9,16 +9,19 @@ import (
 	"strings"
 	"testing"
 
+	"drydock/internal/agenticreview"
 	"drydock/internal/codemap"
 	"drydock/internal/db"
 	"drydock/internal/nostrscan"
 	"drydock/internal/publisher"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
+	"drydock/internal/reviewsession"
 	"drydock/internal/securityscan"
 	"drydock/internal/securityscan/surface"
 	"drydock/internal/securityverify"
 	"drydock/internal/testutil"
+	"drydock/internal/workspacesnapshot"
 )
 
 func TestAuditCandidateLocalizationContract(t *testing.T) {
@@ -278,10 +281,69 @@ func (coverageErrorScanner) LocateSurface(context.Context, string, []string) sur
 	return surface.Result{FilesScanned: 3, FilesSkipped: 2, FilesErrored: 2}
 }
 
-type noOpAuditReviewer struct{}
+type fakeAgenticAuditReview struct {
+	prepareInput agenticreview.PrepareInput
+	options      agenticreview.ReviewOptions
+	output       reviewengine.RunOutput
+	released     bool
+}
 
-func (noOpAuditReviewer) Run(context.Context, reviewengine.RunInput) (reviewengine.RunOutput, error) {
-	return reviewengine.RunOutput{}, nil
+func (f *fakeAgenticAuditReview) Prepare(_ context.Context, input agenticreview.PrepareInput) (*agenticreview.PreparedReview, error) {
+	f.prepareInput = input
+	return &agenticreview.PreparedReview{}, nil
+}
+func (f *fakeAgenticAuditReview) ReviewPrepared(_ context.Context, _ *agenticreview.PreparedReview, options agenticreview.ReviewOptions) (reviewengine.RunOutput, error) {
+	f.options = options
+	return f.output, nil
+}
+func (f *fakeAgenticAuditReview) ReleasePrepared(*agenticreview.PreparedReview) {
+	f.released = true
+}
+
+func TestAgenticAuditUsesPinnedSecuritySnapshotAndSharedReview(t *testing.T) {
+	agentic := &fakeAgenticAuditReview{output: reviewengine.RunOutput{
+		Review: reviewengine.ReviewerOutput{Findings: []reviewengine.Finding{{
+			File: "context.go", Line: 2, Severity: "high", Category: "CWE-78",
+			Evidence: "reachable command sink",
+		}}},
+	}}
+	engine := New(Config{}, Dependencies{AgenticReview: agentic}, nil)
+	deterministic := []reviewengine.Finding{{
+		File: "main.go", Line: 1, Severity: "high", Category: "security",
+		Evidence: "[CWE-78] deterministic hypothesis",
+	}}
+	findings, err := engine.reviewAgentically(
+		context.Background(),
+		Request{RepoID: "repo", CloneURLs: []string{"https://example.test/repo.git"}},
+		t.TempDir(), strings.Repeat("a", 40),
+		[]string{"main.go", "context.go"},
+		[]candidateUnit{{File: "main.go", Score: 100}},
+		deterministic,
+		surface.Result{Locations: []surface.Location{{File: "main.go", Line: 1, Tag: "sink"}}},
+		Budget{TokenBudget: 32_000, ModelReview: true},
+		"", "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agentic.prepareInput.Mode != reviewsession.ModeSecurityAudit ||
+		agentic.prepareInput.Snapshot.Kind != workspacesnapshot.KindPinnedGit ||
+		agentic.prepareInput.Snapshot.RepoPath == "" ||
+		agentic.prepareInput.Snapshot.Ref != strings.Repeat("a", 40) {
+		t.Fatalf("prepare input = %#v", agentic.prepareInput)
+	}
+	if len(agentic.prepareInput.Snapshot.Allowlist) != 2 ||
+		agentic.options.ReviewerRoute != reviewengine.RouteSec70B ||
+		!agentic.options.SkipWalkthrough ||
+		!strings.Contains(agentic.options.AdditionalInstructions, "deterministic hypothesis") {
+		t.Fatalf("review options = %#v prepare = %#v", agentic.options, agentic.prepareInput)
+	}
+	if !agentic.released {
+		t.Fatal("prepared audit snapshot lease was not released")
+	}
+	if len(findings) != 1 || findings[0].File != "context.go" || findings[0].Category != "security" {
+		t.Fatalf("agent findings = %#v", findings)
+	}
 }
 
 type passAuditVerifier struct{}
@@ -310,7 +372,7 @@ func TestRunFailsAndPersistsCoverageOnScanErrors(t *testing.T) {
 	pub := &recordingAuditPublisher{}
 	engine := New(Config{Workers: 1, NostrEnabled: "false"}, Dependencies{
 		Repos: fixedAuditRepo{path: repoPath}, Store: store, CodeMap: fixedAuditCodeMap{},
-		Scanner: coverageErrorScanner{}, Reviewer: noOpAuditReviewer{},
+		Scanner:         coverageErrorScanner{},
 		VerifierFactory: func(int) Verifier { return passAuditVerifier{} },
 		Publisher:       pub,
 	}, nil)

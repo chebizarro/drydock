@@ -247,9 +247,13 @@ func (s *Service) Prepare(ctx context.Context, input PrepareInput) (*PreparedRev
 			s.snapshots.Release(prepareLease.ID)
 		}
 	}()
+	discoveryRole := agenttools.RoleContextDiscovery
+	if input.Mode == reviewsession.ModeSecurityAudit {
+		discoveryRole = agenttools.RoleSecurityAuditorDiscovery
+	}
 	discovered, err := s.discovery.Run(ctx, DiscoveryInput{
 		Snapshot: snapshot, Patch: filteredPatch, ChangedFiles: analysis.ChangedFiles,
-		BuildInput: input.BuildInput,
+		BuildInput: input.BuildInput, Role: discoveryRole,
 	})
 	if err != nil {
 		return nil, err

@@ -179,6 +179,90 @@ func TestServicePrepareStartContinueAndReplay(t *testing.T) {
 	}
 }
 
+func TestSecurityAuditServiceValidatesFindingsAgainstSnapshotRoot(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	if err := osWrite(filepath.Join(workspace, "changed.go"), "package p\nfunc changed() {}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := osWrite(filepath.Join(workspace, "context.go"), "package p\nfunc vulnerable(input string) { execute(input) }\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := db.Open(ctx, filepath.Join(t.TempDir(), "security-service.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := reviewsession.NewSQLiteStore(database.DB(), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := workspacesnapshot.NewManager(workspacesnapshot.Config{
+		StorageRoot: t.TempDir(), LeaseTTL: time.Hour, SessionLifetime: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &serviceClient{results: []reviewengine.CompletionResult{
+		serviceCompletion(serviceToolCall(t, "finalize", agenttools.ToolSelectionFinalize, map[string]any{})),
+		serviceCompletion(serviceToolCall(t, "context-evidence", agenttools.ToolCodeRead, map[string]any{
+			"path": "context.go", "start_line": 1, "end_line": 2,
+		})),
+		serviceCompletion(serviceToolCall(t, "audit-submit", agenttools.ToolReviewSubmit,
+			findingSubmission("context.go", 2, "context-evidence"))),
+	}}
+	registry := agenttools.NewRegistry()
+	discovery, err := NewDiscovery(DiscoveryConfig{
+		Client: client, Registry: registry, Counter: testCounter{}, TokenBudget: 100_000,
+		Limits: LoopLimits{MaxTurns: 4, MaxToolCalls: 8, MaxCumulativeTokens: 1_000_000, MaxModelContext: 1_000_000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := reviewengine.New(reviewengine.Config{
+		Planner: reviewengine.ModelEndpoint{BaseURL: "planner", Model: "planner"},
+		Sec70B:  reviewengine.ModelEndpoint{BaseURL: "reviewer", Model: "reviewer"},
+	}, client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	service, err := NewService(ServiceConfig{
+		Snapshots: manager, Sessions: sessionStore, Discovery: discovery,
+		Engine: engine, Client: client, Registry: registry, Counter: testCounter{},
+		ReviewerLimits: LoopLimits{MaxTurns: 4, MaxToolCalls: 8, MaxCumulativeTokens: 1_000_000, MaxModelContext: 1_000_000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := service.Prepare(ctx, PrepareInput{
+		Mode: reviewsession.ModeSecurityAudit,
+		Snapshot: SnapshotSpec{
+			Kind: workspacesnapshot.KindMutableCopy, WorkspacePath: workspace,
+			Allowlist: []string{"."}, TTL: time.Hour,
+		},
+		Patch: reviewerPatch(),
+		Target: TargetInput{
+			RepoID: "repo", RootID: "root", PatchEventID: "audit",
+			CanonicalRemoteIdentity: "remote",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.ReleasePrepared(prepared)
+
+	output, err := service.ReviewPrepared(ctx, prepared, ReviewOptions{
+		ReviewerRoute: reviewengine.RouteSec70B, SkipWalkthrough: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Review.Findings) != 1 || output.Review.Findings[0].File != "context.go" {
+		t.Fatalf("snapshot-root findings = %#v", output.Review.Findings)
+	}
+}
+
 func osWrite(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o600)
 }

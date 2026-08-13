@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 
+	"drydock/internal/contextbuilder"
 	"drydock/internal/workspacesnapshot"
 )
 
@@ -24,10 +25,11 @@ const (
 type Role string
 
 const (
-	RoleContextDiscovery Role = "context_discovery"
-	RoleCodeReviewer     Role = "code_reviewer"
-	RoleSecurityAuditor  Role = "security_auditor"
-	RoleExternalReadonly Role = "external_readonly"
+	RoleContextDiscovery         Role = "context_discovery"
+	RoleCodeReviewer             Role = "code_reviewer"
+	RoleSecurityAuditor          Role = "security_auditor"
+	RoleSecurityAuditorDiscovery Role = "security_auditor_discovery"
+	RoleExternalReadonly         Role = "external_readonly"
 )
 
 type Definition struct {
@@ -107,12 +109,33 @@ type Registry struct {
 	tools   map[string]registeredTool
 	replay  map[string]replayEntry
 	flights map[string]*replayFlight
+
+	references    *contextbuilder.ReferencesFacade
+	layers        *contextbuilder.LayerFacade
+	securityTrace *contextbuilder.SecurityTraceFacade
 }
 
-func NewRegistry() *Registry {
+type RegistryOption func(*Registry)
+
+func WithReferencesFacade(facade *contextbuilder.ReferencesFacade) RegistryOption {
+	return func(registry *Registry) { registry.references = facade }
+}
+
+func WithLayerFacade(facade *contextbuilder.LayerFacade) RegistryOption {
+	return func(registry *Registry) { registry.layers = facade }
+}
+
+func WithSecurityTraceFacade(facade *contextbuilder.SecurityTraceFacade) RegistryOption {
+	return func(registry *Registry) { registry.securityTrace = facade }
+}
+
+func NewRegistry(options ...RegistryOption) *Registry {
 	registry := &Registry{
 		tools: make(map[string]registeredTool), replay: make(map[string]replayEntry),
 		flights: make(map[string]*replayFlight),
+	}
+	for _, option := range options {
+		option(registry)
 	}
 	registerCoreTools(registry)
 	return registry
@@ -260,6 +283,10 @@ func roleAllows(role Role, capability Capability) bool {
 	case RoleSecurityAuditor:
 		return capability == CapabilityRead || capability == CapabilityReviewSubmit ||
 			capability == CapabilitySnapshotWide
+	case RoleSecurityAuditorDiscovery:
+		return capability == CapabilityRead || capability == CapabilitySnapshotWide ||
+			capability == CapabilitySelectionRead || capability == CapabilitySelectionMutate ||
+			capability == CapabilitySelectionFinalize
 	case RoleExternalReadonly:
 		return capability == CapabilityRead
 	default:

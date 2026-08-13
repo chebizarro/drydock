@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 
+	"drydock/internal/agenticreview"
 	"drydock/internal/codemap"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
@@ -28,9 +29,12 @@ import (
 	"drydock/internal/publisher"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
+	"drydock/internal/reviewsession"
 	"drydock/internal/securityscan"
 	"drydock/internal/securityscan/surface"
 	"drydock/internal/securityverify"
+	"drydock/internal/targetidentity"
+	"drydock/internal/workspacesnapshot"
 
 	"fiatjaf.com/nostr"
 )
@@ -77,8 +81,10 @@ type Scanner interface {
 	ScanFiles(context.Context, string, []string, string) securityscan.ScanResult
 	LocateSurface(context.Context, string, []string) surface.Result
 }
-type Reviewer interface {
-	Run(context.Context, reviewengine.RunInput) (reviewengine.RunOutput, error)
+type AgenticReviewer interface {
+	Prepare(context.Context, agenticreview.PrepareInput) (*agenticreview.PreparedReview, error)
+	ReviewPrepared(context.Context, *agenticreview.PreparedReview, agenticreview.ReviewOptions) (reviewengine.RunOutput, error)
+	ReleasePrepared(*agenticreview.PreparedReview)
 }
 type Verifier interface {
 	Run(context.Context, []reviewengine.Finding) ([]reviewengine.Finding, error)
@@ -121,8 +127,7 @@ type Dependencies struct {
 	Store           AuditStore
 	CodeMap         CodeMapBuilder
 	Scanner         Scanner
-	ContextBuilder  *contextbuilder.Builder
-	Reviewer        Reviewer
+	AgenticReview   AgenticReviewer
 	VerifierFactory VerifierFactory
 	Publisher       AuditPublisher
 	Progress        ProgressReporter
@@ -151,13 +156,6 @@ func New(cfg Config, deps Dependencies, logger *slog.Logger) *Engine {
 	}
 	if deps.Scanner == nil {
 		deps.Scanner = securityscan.New()
-	}
-	if deps.ContextBuilder == nil {
-		providers := []contextbuilder.Provider{contextbuilder.NewSecuritySurfaceProvider(deps.Scanner)}
-		if scanner, ok := deps.Scanner.(*securityscan.Scanner); ok {
-			providers = append(providers, securityscan.NewProvider(scanner))
-		}
-		deps.ContextBuilder = contextbuilder.NewWithOptions(contextbuilder.NewBuilderOptions(contextbuilder.WithExtraProviders(providers...)))
 	}
 	if deps.Tools == nil {
 		deps.Tools = osToolRunner{}
@@ -228,7 +226,8 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	if err != nil {
 		return result, err
 	}
-	if e.deps.Repos == nil || e.deps.Store == nil || e.deps.Reviewer == nil || e.deps.VerifierFactory == nil || e.deps.Publisher == nil {
+	if e.deps.Repos == nil || e.deps.Store == nil || e.deps.VerifierFactory == nil || e.deps.Publisher == nil ||
+		(budget.ModelReview && e.deps.AgenticReview == nil) {
 		return result, errors.New("auditengine: incomplete dependencies")
 	}
 	ref := strings.TrimSpace(req.Ref)
@@ -352,8 +351,22 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	}
 
 	e.progress(ctx, auditID, "localize")
-	units := e.localize(ctx, repoPath, codeMap, files, allDeterministic, surfaceResult, req.SinceCommit)
-	units = e.applyModelLocalization(ctx, req.Localizer, codeMap, files, allDeterministic, units)
+	accepted := append([]reviewengine.Finding(nil), allDeterministic...)
+	units := e.localize(ctx, repoPath, codeMap, files, accepted, surfaceResult, req.SinceCommit)
+
+	e.progress(ctx, auditID, "review")
+	if budget.ModelReview {
+		modelFindings, reviewErr := e.reviewAgentically(ctx, req, repoPath, result.Commit, files, units, accepted, surfaceResult, budget, nostrContext, nostrPreamble)
+		if reviewErr != nil {
+			return result, reviewErr
+		}
+		accepted = append(accepted, modelFindings...)
+		// Re-localize after candidate acceptance so findings outside the initial
+		// heuristic units and CWE hypotheses from the shared loop reach the
+		// existing localizer and verifier.
+		units = e.localize(ctx, repoPath, codeMap, files, accepted, surfaceResult, req.SinceCommit)
+	}
+	units = e.applyModelLocalization(ctx, req.Localizer, codeMap, files, accepted, units)
 	if len(units) > budget.MaxUnits {
 		for _, unit := range units[budget.MaxUnits:] {
 			result.DroppedUnits = append(result.DroppedUnits, unit.File)
@@ -367,14 +380,9 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		return result, err
 	}
 	for i := range units {
-		units[i].Findings = findingsForFile(allDeterministic, units[i].File)
-		if budget.ModelReview {
-			units[i].Packet = e.assemblePacket(ctx, repoPath, req.RepoID, codeMap, units[i].File, units[i].Findings, surfaceResult, budget.TokenBudget, nostrContext)
-		}
+		units[i].Findings = findingsForFile(accepted, units[i].File)
 	}
-
-	e.progress(ctx, auditID, "review")
-	verified, err := e.reviewUnits(ctx, units, budget, nostrPreamble)
+	verified, err := e.reviewUnits(ctx, units, budget)
 	if err != nil {
 		return result, err
 	}
@@ -673,52 +681,65 @@ func topRank(m *codemap.Map, file string) float64 {
 	return 0
 }
 
-func (e *Engine) assemblePacket(ctx context.Context, repoPath, repoID string, codeMap *codemap.Map, file string, findings []reviewengine.Finding, surfaces surface.Result, tokenBudget int, nostrContext string) string {
-	bundle, err := e.deps.ContextBuilder.Build(ctx, contextbuilder.BuildInput{PatchEventContent: syntheticPatch(repoPath, file), RepoPath: repoPath, RepoID: repoID, TokenBudgetOverride: tokenBudget, DisableDocs: true})
+func (e *Engine) reviewAgentically(ctx context.Context, req Request, repoPath, commit string, files []string, units []candidateUnit, deterministic []reviewengine.Finding, surfaces surface.Result, budget Budget, nostrContext, nostrPreamble string) ([]reviewengine.Finding, error) {
+	rootID := targetidentity.SHA256(fmt.Sprintf("security-audit:%s:%s", req.RepoID, commit))
+	prepared, err := e.deps.AgenticReview.Prepare(ctx, agenticreview.PrepareInput{
+		Mode: reviewsession.ModeSecurityAudit,
+		Snapshot: agenticreview.SnapshotSpec{
+			Kind: workspacesnapshot.KindPinnedGit, RepoPath: repoPath, Ref: commit,
+			Allowlist: append([]string(nil), files...),
+		},
+		BuildInput: contextbuilder.BuildInput{
+			RepoID: req.RepoID, TokenBudgetOverride: budget.TokenBudget, DisableDocs: true,
+		},
+		Target: agenticreview.TargetInput{
+			RepoID: req.RepoID, RootID: rootID, PatchEventID: rootID,
+			CanonicalRemoteIdentity: targetidentity.RemoteIdentity(req.CloneURLs),
+			BaseCommit:              commit, TipCommit: commit, PreparedDiffSHA256: targetidentity.SHA256(""),
+		},
+	})
 	if err != nil {
-		e.logger.Warn("audit context packet degraded", "file", file, "error", err)
+		return nil, fmt.Errorf("prepare agentic security audit: %w", err)
 	}
-	var b strings.Builder
-	b.WriteString(bundle.Content)
-	if nostrContext != "" {
-		b.WriteString("\n\n## nostr-protocol\n")
-		b.WriteString(nostrContext)
+	defer e.deps.AgenticReview.ReleasePrepared(prepared)
+
+	systemPrompt := securityAuditPrompt()
+	if nostrPreamble != "" {
+		systemPrompt += "\n\n" + nostrPreamble
 	}
-	b.WriteString("\n\n## blast-radius\n")
-	for _, symbol := range codeMap.Files[file].Symbols {
-		fmt.Fprintf(&b, "%s:%d %s", file, symbol.StartLine, symbol.Name)
-		if callers := codeMap.Callers(symbol.ID); len(callers) > 0 {
-			fmt.Fprintf(&b, " callers=%s", strings.Join(callers, ","))
-		}
-		if callees := codeMap.Callees(symbol.ID); len(callees) > 0 {
-			fmt.Fprintf(&b, " callees=%s", strings.Join(callees, ","))
-		}
-		b.WriteByte('\n')
+	output, err := e.deps.AgenticReview.ReviewPrepared(ctx, prepared, agenticreview.ReviewOptions{
+		ReviewerRoute: reviewengine.RouteSec70B, ReviewerSystemPromptOverride: systemPrompt,
+		AdditionalInstructions: auditReviewInstructions(units, deterministic, surfaces, nostrContext),
+		SkipWalkthrough:        true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("agentic security audit review: %w", err)
 	}
-	b.WriteString("\n## sast-and-cwe-hypotheses\n")
-	for _, finding := range findings {
-		fmt.Fprintf(&b, "%s:%d %s %s\n", finding.File, finding.Line, findingCWE(finding), finding.Evidence)
+	findings := append([]reviewengine.Finding(nil), output.Review.Findings...)
+	for i := range findings {
+		findings[i].Category = "security"
 	}
-	b.WriteString("\n## security-surface\n")
-	for _, location := range surfaces.Locations {
-		if location.File == file {
-			fmt.Fprintf(&b, "[%s] %s:%d %s\n", location.Tag, location.File, location.Line, location.Evidence)
-		}
-	}
-	return strings.TrimSpace(b.String())
-}
-func syntheticPatch(repoPath, file string) string {
-	line := "audit target"
-	if data, err := os.ReadFile(filepath.Join(repoPath, filepath.FromSlash(file))); err == nil {
-		first, _, _ := strings.Cut(string(data), "\n")
-		if strings.TrimSpace(first) != "" {
-			line = first
-		}
-	}
-	return fmt.Sprintf("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1,0 +1,1 @@\n+%s\n", file, file, file, file, line)
+	return findings, nil
 }
 
-func (e *Engine) reviewUnits(ctx context.Context, units []candidateUnit, budget Budget, nostrPreamble string) ([]reviewengine.Finding, error) {
+func auditReviewInstructions(units []candidateUnit, findings []reviewengine.Finding, surfaces surface.Result, nostrContext string) string {
+	payload := struct {
+		CandidateFiles []string               `json:"candidate_files"`
+		Findings       []reviewengine.Finding `json:"deterministic_findings"`
+		Surfaces       []surface.Location     `json:"security_surfaces"`
+		NostrContext   string                 `json:"nostr_context,omitempty"`
+	}{Findings: findings, Surfaces: surfaces.Locations, NostrContext: nostrContext}
+	for _, unit := range units {
+		payload.CandidateFiles = append(payload.CandidateFiles, unit.File)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "Review the frozen snapshot for reachable security findings."
+	}
+	return "Treat deterministic findings as hypotheses, inspect beyond the candidate files when tracing reachability, and submit only accepted findings.\n" + string(encoded)
+}
+
+func (e *Engine) reviewUnits(ctx context.Context, units []candidateUnit, budget Budget) ([]reviewengine.Finding, error) {
 	if len(units) == 0 {
 		return nil, nil
 	}
@@ -739,21 +760,7 @@ func (e *Engine) reviewUnits(ctx context.Context, units []candidateUnit, budget 
 					continue
 				}
 				candidates := append([]reviewengine.Finding(nil), unit.Findings...)
-				if budget.ModelReview {
-					systemPrompt := securityAuditPrompt()
-					if nostrPreamble != "" {
-						systemPrompt += "\n\n" + nostrPreamble
-					}
-					output, err := e.deps.Reviewer.Run(ctx, reviewengine.RunInput{ContextBundle: unit.Packet, ChangedFiles: []string{unit.File}, ReviewerRoute: reviewengine.RouteSec70B, ReviewerSystemPromptOverride: systemPrompt, SkipWalkthrough: true})
-					if err != nil {
-						results <- unitResult{err: fmt.Errorf("review %s: %w", unit.File, err)}
-						continue
-					}
-					for _, finding := range output.Review.Findings {
-						finding.Category = "security"
-						candidates = append(candidates, finding)
-					}
-				} else {
+				if !budget.ModelReview {
 					candidates = filterSeverity(candidates, budget.MinSeverity)
 				}
 				verified, err := verifier.Run(ctx, reviewengine.DeduplicateFindings(candidates))
