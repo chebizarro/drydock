@@ -12,6 +12,46 @@ import (
 	"time"
 )
 
+func TestManagerRestoresPersistedMutableSnapshot(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	writeFile(t, workspace, "main.go", "package main\n")
+	storage := t.TempDir()
+	config := Config{StorageRoot: storage, LeaseTTL: time.Hour, SessionLifetime: time.Hour}
+	first, err := NewManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := first.CreateMutable(ctx, MutableCopyOptions{
+		WorkspacePath: workspace, Patch: []byte("diff"), Allowlist: []string{"."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := second.Restore(ctx, created.StoragePath(), created.ID, created.ManifestDigest(), created.PatchDigest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := restored.ReadFile(ctx, "main.go")
+	if err != nil || string(content) != "package main\n" {
+		t.Fatalf("restored content = %q, %v", content, err)
+	}
+	if err := os.WriteFile(filepath.Join(created.StoragePath(), "patch"), []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	third, err := NewManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := third.Restore(ctx, created.StoragePath(), created.ID, created.ManifestDigest(), created.PatchDigest()); !errors.Is(err, ErrHashMismatch) {
+		t.Fatalf("tampered restore error = %v", err)
+	}
+}
+
 func TestPinnedSnapshotReadsCommitAndEnforcesScope(t *testing.T) {
 	repo := initRepo(t)
 	writeFile(t, repo, "src/main.go", "package main\nconst Version = 1\n")

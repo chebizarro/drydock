@@ -27,6 +27,7 @@ const (
 
 var (
 	ErrSelectionFinalized                = errors.New("agent tools: selection is finalized")
+	ErrSelectionNotFinalized             = errors.New("agent tools: selection is not finalized")
 	ErrMandatoryArtifact                 = errors.New("agent tools: mandatory artifact cannot be removed")
 	ErrBudgetExceeded                    = errors.New("agent tools: exact context package exceeds token budget")
 	ErrAuthoritativeTokenCounterRequired = errors.New("agent tools: authoritative token counter is required")
@@ -332,6 +333,70 @@ func (s *Selection) Finalize(ctx context.Context) (contextbuilder.ContextBundle,
 	s.bundle = cloneBundle(bundle)
 	s.finalized = true
 	return cloneBundle(bundle), nil
+}
+
+func (s *Selection) Artifacts() ([]SelectionArtifact, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.finalized {
+		return nil, ErrSelectionNotFinalized
+	}
+	return append([]SelectionArtifact(nil), s.artifactsLocked()...), nil
+}
+
+// RestoreSelection replays a persisted canonical artifact manifest through the
+// ordinary renderer and exact-token finalization gate. It never accepts a
+// pre-rendered context blob.
+func RestoreSelection(ctx context.Context, cfg SelectionConfig, artifacts []SelectionArtifact) (*Selection, error) {
+	selection, err := NewSelection(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if len(artifacts) == 0 || artifacts[0].Kind != ArtifactPatch || artifacts[0].Hash != cfg.Snapshot.PatchDigest() {
+		return nil, fmt.Errorf("agent tools: persisted selection is missing the authoritative patch")
+	}
+	seeded := selection.artifactsLocked()
+	seedByPath := make(map[string]SelectionArtifact)
+	for _, artifact := range seeded {
+		if artifact.Kind == ArtifactFile && artifact.Mandatory {
+			seedByPath[artifact.Path] = artifact
+		}
+	}
+	for _, artifact := range artifacts[1:] {
+		if artifact.Kind == ArtifactFile && artifact.Mandatory {
+			seed, ok := seedByPath[artifact.Path]
+			if !ok || seed.Hash != artifact.Hash {
+				return nil, fmt.Errorf("%w: mandatory artifact %s", workspacesnapshot.ErrHashMismatch, artifact.Path)
+			}
+			continue
+		}
+		if artifact.Mandatory {
+			return nil, fmt.Errorf("agent tools: unsupported mandatory artifact %s", artifact.Path)
+		}
+		if err := selection.Add(ctx, artifact); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := selection.Finalize(ctx); err != nil {
+		return nil, err
+	}
+	restored, _ := selection.Artifacts()
+	if !sameSelectionArtifacts(restored, artifacts) {
+		return nil, fmt.Errorf("agent tools: restored selection differs from persisted manifest")
+	}
+	return selection, nil
+}
+
+func sameSelectionArtifacts(a, b []SelectionArtifact) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Selection) Bundle() (contextbuilder.ContextBundle, bool) {

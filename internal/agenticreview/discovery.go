@@ -53,8 +53,10 @@ type DiscoveryTrace struct {
 }
 
 type DiscoveryResult struct {
-	Bundle contextbuilder.ContextBundle
-	Trace  DiscoveryTrace
+	Bundle         contextbuilder.ContextBundle
+	Trace          DiscoveryTrace
+	Artifacts      []agenttools.SelectionArtifact
+	SessionCapable bool
 }
 
 type Discovery struct {
@@ -117,7 +119,12 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 		Counter: d.config.Counter, Limits: d.config.Limits,
 	})
 	if loopErr == nil {
-		return DiscoveryResult{Bundle: loopResult.Bundle, Trace: DiscoveryTrace{Loop: loopResult.Trace}}, nil
+		artifacts, err := selection.Artifacts()
+		if err != nil {
+			return DiscoveryResult{Trace: DiscoveryTrace{Loop: loopResult.Trace}}, err
+		}
+		return DiscoveryResult{Bundle: loopResult.Bundle, Trace: DiscoveryTrace{Loop: loopResult.Trace},
+			Artifacts: artifacts, SessionCapable: true}, nil
 	}
 	if !isExhaustion(loopErr) {
 		return DiscoveryResult{Trace: DiscoveryTrace{Loop: loopResult.Trace}}, loopErr

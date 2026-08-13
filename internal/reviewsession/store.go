@@ -39,7 +39,8 @@ func (s *SQLStore) Create(ctx context.Context, p CreateParams) (Reservation, err
 			return Reservation{}, err
 		}
 	}
-	if len(p.ChatID) != 32 || p.Owner.Validate() != nil || !validMode(p.Mode) {
+	decodedChatID, decodeErr := hex.DecodeString(p.ChatID)
+	if decodeErr != nil || len(decodedChatID) != 16 || strings.ToLower(p.ChatID) != p.ChatID || p.Owner.Validate() != nil || !validMode(p.Mode) {
 		return Reservation{}, fmt.Errorf("review session: invalid create parameters")
 	}
 	if p.Snapshot.ID == "" || p.Snapshot.Kind == "" || p.Snapshot.StoragePath == "" ||
@@ -462,6 +463,50 @@ func (s *SQLStore) MarkBroken(ctx context.Context, chatID string, cause error) e
 		WHERE chat_id=? AND state!='expired'`, now.Unix(), chatID)
 	if err != nil {
 		return fmt.Errorf("review session: mark broken (%s): %w", message, err)
+	}
+	return nil
+}
+
+func (s *SQLStore) ListActive(ctx context.Context) ([]Session, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT chat_id FROM review_sessions WHERE state='active' ORDER BY chat_id`)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	sessions := make([]Session, 0, len(ids))
+	for _, id := range ids {
+		session, err := loadSession(ctx, s.db, id)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions, nil
+}
+
+func (s *SQLStore) BindLease(ctx context.Context, chatID, leaseID string) error {
+	if strings.TrimSpace(leaseID) == "" {
+		return fmt.Errorf("review session: lease ID is required")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE review_sessions SET lease_id=?, updated_at=?
+		WHERE chat_id=? AND state='active'`, leaseID, s.now().UTC().Unix(), chatID)
+	if err != nil {
+		return err
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		return ErrNotFound
 	}
 	return nil
 }

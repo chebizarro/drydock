@@ -126,7 +126,8 @@ type Message struct {
 func (m Message) CompletionMessage() reviewengine.CompletionMessage {
 	return reviewengine.CompletionMessage{
 		Role: m.Role, Name: m.Name, ToolCallID: m.ToolCallID, Content: m.Content,
-		ToolCalls: cloneToolCalls(m.ToolCalls),
+		ToolCalls:    cloneToolCalls(m.ToolCalls),
+		PromptTokens: m.PromptTokens, CompletionTokens: m.CompletionTokens,
 	}
 }
 
@@ -134,7 +135,8 @@ func MessageFromCompletion(turnNo int, message reviewengine.CompletionMessage) M
 	return Message{
 		TurnNo: turnNo, Role: message.Role, Name: message.Name,
 		ToolCallID: message.ToolCallID, Content: message.Content,
-		ToolCalls: cloneToolCalls(message.ToolCalls),
+		ToolCalls:    cloneToolCalls(message.ToolCalls),
+		PromptTokens: message.PromptTokens, CompletionTokens: message.CompletionTokens,
 	}
 }
 
@@ -184,6 +186,8 @@ type Store interface {
 	LoadForContinuation(context.Context, string) (Loaded, error)
 	Expire(context.Context, string) (string, error)
 	MarkBroken(context.Context, string, error) error
+	ListActive(context.Context) ([]Session, error)
+	BindLease(context.Context, string, string) error
 }
 
 func NewChatID() (string, error) {

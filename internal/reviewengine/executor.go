@@ -7,6 +7,23 @@ import (
 	"drydock/internal/targetidentity"
 )
 
+type FindingScope string
+
+const (
+	FindingScopePatch    FindingScope = "patch"
+	FindingScopeSnapshot FindingScope = "snapshot"
+)
+
+type ReviewerTranscriptSink interface {
+	AppendReviewerMessages(context.Context, []CompletionMessage) error
+}
+
+type ReviewerConversation struct {
+	History []CompletionMessage
+	Message string
+	Sink    ReviewerTranscriptSink
+}
+
 // ReviewerExecutionRequest is the fully assembled reviewer invocation. The
 // engine owns planning, checklist construction, prompt assembly, and route
 // resolution before handing this immutable request to an executor.
@@ -21,6 +38,8 @@ type ReviewerExecutionRequest struct {
 	PatchDiff      string
 	ChangedFiles   []string
 	TargetEnvelope targetidentity.Envelope
+	FindingScope   FindingScope
+	Conversation   ReviewerConversation
 }
 
 // ReviewerTrace captures executor-neutral loop metadata. Single-shot
@@ -40,9 +59,11 @@ type ReviewerTrace struct {
 
 // ReviewerExecutionResult is the executor output consumed by the engine.
 type ReviewerExecutionResult struct {
-	Review      ReviewerOutput
-	ServedModel string
-	Trace       ReviewerTrace
+	Review         ReviewerOutput
+	ServedModel    string
+	Trace          ReviewerTrace
+	ValidatedScope FindingScope
+	Transcript     []CompletionMessage
 }
 
 // ReviewerExecutor executes the reviewer stage only. Planner, checklist,
@@ -76,14 +97,23 @@ func (x *singleShotReviewerExecutor) ExecuteReviewer(ctx context.Context, reques
 	if err != nil {
 		return ReviewerExecutionResult{}, err
 	}
-	return ReviewerExecutionResult{Review: review, ServedModel: servedModel}, nil
+	return ReviewerExecutionResult{Review: review, ServedModel: servedModel, ValidatedScope: FindingScopePatch}, nil
 }
 
 func (e *Engine) singleShotExecutor() ReviewerExecutor {
 	return &singleShotReviewerExecutor{engine: e}
 }
 
-func normalizeReviewerExecution(result ReviewerExecutionResult) (ReviewerExecutionResult, error) {
+func normalizeReviewerExecution(result ReviewerExecutionResult, expectedScope FindingScope) (ReviewerExecutionResult, error) {
+	if expectedScope == "" {
+		expectedScope = FindingScopePatch
+	}
+	if result.ValidatedScope == "" && expectedScope == FindingScopePatch {
+		result.ValidatedScope = FindingScopePatch
+	}
+	if result.ValidatedScope != expectedScope {
+		return ReviewerExecutionResult{}, fmt.Errorf("reviewer executor validated scope %q, want %q", result.ValidatedScope, expectedScope)
+	}
 	findings, err := NormalizeFindings(result.Review.Findings)
 	if err != nil {
 		return ReviewerExecutionResult{}, fmt.Errorf("reviewer executor output: %w", err)
@@ -95,5 +125,18 @@ func normalizeReviewerExecution(result ReviewerExecutionResult) (ReviewerExecuti
 	result.Trace.ToolCallIDs = append([]string(nil), result.Trace.ToolCallIDs...)
 	result.Trace.EvidenceToolCallIDs = append([]string(nil), result.Trace.EvidenceToolCallIDs...)
 	result.Trace.ExaminedFiles = append([]string(nil), result.Trace.ExaminedFiles...)
+	result.Transcript = cloneCompletionMessages(result.Transcript)
 	return result, nil
+}
+
+func cloneCompletionMessages(messages []CompletionMessage) []CompletionMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	out := make([]CompletionMessage, len(messages))
+	for i, message := range messages {
+		out[i] = message
+		out[i].ToolCalls = append([]ToolCall(nil), message.ToolCalls...)
+	}
+	return out
 }

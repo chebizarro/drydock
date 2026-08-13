@@ -52,6 +52,9 @@ type CompletionMessage struct {
 	Name       string      `json:"name,omitempty"`
 	ToolCallID string      `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
+	// Usage attribution is persistence metadata and is never sent to providers.
+	PromptTokens     int `json:"-"`
+	CompletionTokens int `json:"-"`
 }
 
 // ToolCallFunction contains OpenAI-compatible function-call arguments.

@@ -37,11 +37,12 @@ func DefaultEnsembleConfig() EnsembleConfig {
 
 // modelResult holds the output from a single model in the ensemble.
 type modelResult struct {
-	Route  ModelRoute
-	Review ReviewerOutput
-	Served string // model identifier the endpoint reported serving
-	Trace  ReviewerTrace
-	Err    error
+	Route      ModelRoute
+	Review     ReviewerOutput
+	Served     string // model identifier the endpoint reported serving
+	Trace      ReviewerTrace
+	Transcript []CompletionMessage
+	Err        error
 }
 
 // RunEnsemble preserves legacy single-shot review through a fresh executor per
@@ -58,6 +59,13 @@ func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfi
 func (e *Engine) RunEnsembleWithExecutors(ctx context.Context, in RunInput, cfg EnsembleConfig, factory ReviewerExecutorFactory) (RunOutput, error) {
 	if factory == nil {
 		return RunOutput{}, fmt.Errorf("review engine: reviewer executor factory is required")
+	}
+	scope := in.FindingScope
+	if scope == "" {
+		scope = FindingScopePatch
+	}
+	if scope != FindingScopePatch && scope != FindingScopeSnapshot {
+		return RunOutput{}, fmt.Errorf("review engine: unsupported finding scope %q", scope)
 	}
 	prepared, err := e.prepareReviewer(ctx, in)
 	if err != nil {
@@ -90,18 +98,19 @@ func (e *Engine) RunEnsembleWithExecutors(ctx context.Context, in RunInput, cfg 
 				Label:         fmt.Sprintf("reviewer %s", r),
 				ContextBundle: in.ContextBundle, PatchDiff: in.PatchDiff,
 				ChangedFiles:   append([]string(nil), in.ChangedFiles...),
-				TargetEnvelope: in.TargetEnvelope,
+				TargetEnvelope: in.TargetEnvelope, FindingScope: scope,
+				Conversation: ReviewerConversation{History: cloneCompletionMessages(in.Conversation.History), Message: in.Conversation.Message, Sink: in.Conversation.Sink},
 			})
 			if executeErr == nil {
-				executed, executeErr = normalizeReviewerExecution(executed)
+				executed, executeErr = normalizeReviewerExecution(executed, scope)
 			}
 			if executeErr != nil {
-				results <- modelResult{Route: r, Trace: executed.Trace, Err: executeErr}
+				results <- modelResult{Route: r, Trace: executed.Trace, Transcript: cloneCompletionMessages(executed.Transcript), Err: executeErr}
 				return
 			}
 			results <- modelResult{
 				Route: r, Review: executed.Review, Served: executed.ServedModel,
-				Trace: executed.Trace,
+				Trace: executed.Trace, Transcript: cloneCompletionMessages(executed.Transcript),
 			}
 		}(route, executor)
 	}
@@ -156,15 +165,23 @@ func (e *Engine) RunEnsembleWithExecutors(ctx context.Context, in RunInput, cfg 
 	}
 
 	merged := mergeFindings(reviews, cfg, e.logger)
-	merged, err = filterFindingsToChangedFiles(
-		merged,
-		in.ChangedFiles,
-		in.TargetEnvelope,
-		in.PatchDiff,
-		in.ContextBundle,
-		e.logger,
-		"ensemble",
-	)
+	if scope == FindingScopePatch {
+		merged, err = filterFindingsToChangedFiles(merged, in.ChangedFiles, in.TargetEnvelope,
+			in.PatchDiff, in.ContextBundle, e.logger, "ensemble")
+	} else {
+		err = in.TargetEnvelope.VerifyMaterials(in.PatchDiff, in.ContextBundle)
+		if err == nil && in.SnapshotFindingValidator == nil {
+			err = fmt.Errorf("review engine: snapshot finding validator is required")
+		}
+		if err == nil {
+			for _, finding := range merged {
+				if validateErr := in.SnapshotFindingValidator(ctx, finding); validateErr != nil {
+					err = fmt.Errorf("review engine: validate snapshot finding: %w", validateErr)
+					break
+				}
+			}
+		}
+	}
 	if err != nil {
 		return RunOutput{}, err
 	}
@@ -211,7 +228,8 @@ func (e *Engine) RunEnsembleWithExecutors(ctx context.Context, in RunInput, cfg 
 	}
 	return RunOutput{
 		Planner: prepared.planner, Review: review, Route: prepared.planner.ModelRoute,
-		ServedModel: primary.Served, Checklist: prepared.checklist,
+		ReviewerTranscript: cloneCompletionMessages(primary.Transcript),
+		ServedModel:        primary.Served, Checklist: prepared.checklist,
 		Walkthrough: walkthrough, WalkthroughStatus: walkthroughStatus,
 		ReviewerTrace: primary.Trace, EnsembleStatus: status,
 	}, nil

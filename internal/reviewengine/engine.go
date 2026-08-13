@@ -49,6 +49,11 @@ type RunInput struct {
 	TestCoverageGaps []string
 	// SkipWalkthrough disables the walkthrough generation step.
 	SkipWalkthrough bool
+	// FindingScope defaults to patch-only validation. Snapshot scope is accepted
+	// only from an executor that explicitly proves it validated that scope.
+	FindingScope             FindingScope
+	Conversation             ReviewerConversation
+	SnapshotFindingValidator func(context.Context, Finding) error
 }
 
 type RunOutput struct {
@@ -58,12 +63,13 @@ type RunOutput struct {
 	// ServedModel is the model identifier the reviewer endpoint reported
 	// serving for this specific review. Empty when the provider omitted it;
 	// callers should fall back to ModelForRoute(Route).
-	ServedModel       string
-	Checklist         []string
-	Walkthrough       WalkthroughOutput
-	WalkthroughStatus StepStatus
-	ReviewerTrace     ReviewerTrace
-	EnsembleStatus    EnsembleStatus
+	ServedModel        string
+	Checklist          []string
+	Walkthrough        WalkthroughOutput
+	WalkthroughStatus  StepStatus
+	ReviewerTrace      ReviewerTrace
+	EnsembleStatus     EnsembleStatus
+	ReviewerTranscript []CompletionMessage
 }
 
 type Engine struct {
@@ -129,6 +135,13 @@ func (e *Engine) RunWithExecutor(ctx context.Context, in RunInput, executor Revi
 	if executor == nil {
 		return RunOutput{}, fmt.Errorf("review engine: reviewer executor is required")
 	}
+	scope := in.FindingScope
+	if scope == "" {
+		scope = FindingScopePatch
+	}
+	if scope != FindingScopePatch && scope != FindingScopeSnapshot {
+		return RunOutput{}, fmt.Errorf("review engine: unsupported finding scope %q", scope)
+	}
 	prepared, err := e.prepareReviewer(ctx, in)
 	if err != nil {
 		return RunOutput{}, err
@@ -147,24 +160,35 @@ func (e *Engine) RunWithExecutor(ctx context.Context, in RunInput, executor Revi
 		System: prepared.system, User: prepared.user, Label: "reviewer",
 		ContextBundle: in.ContextBundle, PatchDiff: in.PatchDiff,
 		ChangedFiles:   append([]string(nil), in.ChangedFiles...),
-		TargetEnvelope: in.TargetEnvelope,
+		TargetEnvelope: in.TargetEnvelope, FindingScope: scope,
+		Conversation: ReviewerConversation{History: cloneCompletionMessages(in.Conversation.History), Message: in.Conversation.Message, Sink: in.Conversation.Sink},
 	})
 	if err != nil {
-		return RunOutput{ReviewerTrace: executed.Trace}, err
+		return RunOutput{ReviewerTrace: executed.Trace, ReviewerTranscript: cloneCompletionMessages(executed.Transcript)}, err
 	}
-	executed, err = normalizeReviewerExecution(executed)
+	rawTranscript := cloneCompletionMessages(executed.Transcript)
+	executed, err = normalizeReviewerExecution(executed, scope)
 	if err != nil {
-		return RunOutput{}, err
+		return RunOutput{ReviewerTranscript: rawTranscript}, err
 	}
-	executed.Review.Findings, err = filterFindingsToChangedFiles(
-		executed.Review.Findings,
-		in.ChangedFiles,
-		in.TargetEnvelope,
-		in.PatchDiff,
-		in.ContextBundle,
-		e.logger,
-		"reviewer",
-	)
+	if scope == FindingScopePatch {
+		executed.Review.Findings, err = filterFindingsToChangedFiles(
+			executed.Review.Findings, in.ChangedFiles, in.TargetEnvelope,
+			in.PatchDiff, in.ContextBundle, e.logger, "reviewer")
+	} else {
+		err = in.TargetEnvelope.VerifyMaterials(in.PatchDiff, in.ContextBundle)
+		if err == nil && in.SnapshotFindingValidator == nil {
+			err = fmt.Errorf("review engine: snapshot finding validator is required")
+		}
+		if err == nil {
+			for _, finding := range executed.Review.Findings {
+				if validateErr := in.SnapshotFindingValidator(ctx, finding); validateErr != nil {
+					err = fmt.Errorf("review engine: validate snapshot finding: %w", validateErr)
+					break
+				}
+			}
+		}
+	}
 	if err != nil {
 		return RunOutput{}, err
 	}
@@ -180,14 +204,15 @@ func (e *Engine) RunWithExecutor(ctx context.Context, in RunInput, executor Revi
 		)
 	}
 	return RunOutput{
-		Planner:           prepared.planner,
-		Review:            executed.Review,
-		Route:             reviewerRoute,
-		ServedModel:       executed.ServedModel,
-		Checklist:         prepared.checklist,
-		Walkthrough:       walkthrough,
-		WalkthroughStatus: walkthroughStatus,
-		ReviewerTrace:     executed.Trace,
+		Planner:            prepared.planner,
+		Review:             executed.Review,
+		Route:              reviewerRoute,
+		ServedModel:        executed.ServedModel,
+		Checklist:          prepared.checklist,
+		Walkthrough:        walkthrough,
+		WalkthroughStatus:  walkthroughStatus,
+		ReviewerTrace:      executed.Trace,
+		ReviewerTranscript: cloneCompletionMessages(executed.Transcript),
 	}, nil
 }
 

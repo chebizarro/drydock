@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,10 +60,26 @@ type Manager struct {
 }
 
 type ManifestEntry struct {
-	Path string
-	Hash string
-	Size int64
-	Mode fs.FileMode
+	Path string      `json:"path"`
+	Hash string      `json:"hash"`
+	Size int64       `json:"size"`
+	Mode fs.FileMode `json:"mode"`
+}
+
+type Descriptor struct {
+	Version      int             `json:"version"`
+	SnapshotID   string          `json:"snapshot_id"`
+	Kind         Kind            `json:"kind"`
+	RepoRoot     string          `json:"repo_root,omitempty"`
+	RefName      string          `json:"ref_name,omitempty"`
+	Commit       string          `json:"commit,omitempty"`
+	PatchRef     string          `json:"patch_ref,omitempty"`
+	PatchHash    string          `json:"patch_hash"`
+	ManifestHash string          `json:"manifest_hash"`
+	Allowlist    []string        `json:"allowlist"`
+	Entries      []ManifestEntry `json:"entries"`
+	CreatedAt    time.Time       `json:"created_at"`
+	ExpiresAt    time.Time       `json:"expires_at"`
 }
 
 type Snapshot struct {
@@ -76,12 +93,13 @@ type Snapshot struct {
 	CreatedAt    time.Time
 	ExpiresAt    time.Time
 
-	manager   *Manager
-	repoRoot  string
-	filesRoot string
-	refName   string
-	patch     []byte
-	entries   map[string]ManifestEntry
+	manager     *Manager
+	repoRoot    string
+	filesRoot   string
+	refName     string
+	storagePath string
+	patch       []byte
+	entries     map[string]ManifestEntry
 
 	immutableKind         Kind
 	immutableCommit       string
@@ -181,6 +199,10 @@ func (m *Manager) CreatePinned(ctx context.Context, opts PinnedGitOptions) (_ *S
 	if err != nil {
 		return nil, err
 	}
+	snapshotRoot := filepath.Join(m.storageRoot, id)
+	if err := os.MkdirAll(snapshotRoot, 0o700); err != nil {
+		return nil, fmt.Errorf("workspace snapshot: create descriptor root: %w", err)
+	}
 	refName := "refs/drydock/snapshots/" + id
 	if _, err := runGit(ctx, repoRoot, "update-ref", refName, commit); err != nil {
 		return nil, fmt.Errorf("workspace snapshot: create lease ref: %w", err)
@@ -189,6 +211,7 @@ func (m *Manager) CreatePinned(ctx context.Context, opts PinnedGitOptions) (_ *S
 	defer func() {
 		if !committed {
 			_, _ = runGit(context.Background(), repoRoot, "update-ref", "-d", refName)
+			_ = os.RemoveAll(snapshotRoot)
 		}
 	}()
 
@@ -200,7 +223,7 @@ func (m *Manager) CreatePinned(ctx context.Context, opts PinnedGitOptions) (_ *S
 	s := &Snapshot{
 		ID: id, Kind: KindPinnedGit, Commit: commit, PatchRef: strings.TrimSpace(opts.PatchRef),
 		PatchHash: hashBytes(opts.Patch), Allowlist: allowlist, CreatedAt: now,
-		ExpiresAt: now.Add(ttl), manager: m, repoRoot: repoRoot, refName: refName,
+		ExpiresAt: now.Add(ttl), manager: m, repoRoot: repoRoot, refName: refName, storagePath: snapshotRoot,
 		patch: append([]byte(nil), opts.Patch...), entries: entries,
 		immutableKind: KindPinnedGit, immutableCommit: commit,
 		immutablePatchRef:  strings.TrimSpace(opts.PatchRef),
@@ -209,6 +232,9 @@ func (m *Manager) CreatePinned(ctx context.Context, opts PinnedGitOptions) (_ *S
 	}
 	s.ManifestHash = manifestHash(s.Kind, commit, s.PatchRef, s.PatchHash, allowlist, entries)
 	s.immutableManifestHash = s.ManifestHash
+	if err := persistDescriptor(snapshotRoot, s); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	m.snapshots[id] = s
 	m.mu.Unlock()
@@ -272,7 +298,7 @@ func (m *Manager) CreateMutable(ctx context.Context, opts MutableCopyOptions) (_
 	s := &Snapshot{
 		ID: id, Kind: KindMutableCopy, PatchRef: strings.TrimSpace(opts.PatchRef),
 		PatchHash: hashBytes(opts.Patch), Allowlist: allowlist, CreatedAt: now,
-		ExpiresAt: now.Add(ttl), manager: m, filesRoot: filesRoot,
+		ExpiresAt: now.Add(ttl), manager: m, filesRoot: filesRoot, storagePath: snapshotRoot,
 		patch: append([]byte(nil), opts.Patch...), entries: entries,
 		immutableKind: KindMutableCopy, immutablePatchRef: strings.TrimSpace(opts.PatchRef),
 		immutablePatchHash: hashBytes(opts.Patch),
@@ -281,6 +307,9 @@ func (m *Manager) CreateMutable(ctx context.Context, opts MutableCopyOptions) (_
 	s.ManifestHash = manifestHash(s.Kind, "", s.PatchRef, s.PatchHash, allowlist, entries)
 	s.immutableManifestHash = s.ManifestHash
 	if err := writeManifest(snapshotRoot, s); err != nil {
+		return nil, err
+	}
+	if err := persistDescriptor(snapshotRoot, s); err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
@@ -301,6 +330,96 @@ func (m *Manager) Get(id string) (*Snapshot, error) {
 		return nil, ErrExpired
 	}
 	return s, nil
+}
+
+func (m *Manager) Restore(ctx context.Context, storagePath, expectedID, expectedManifestHash, expectedPatchHash string) (*Snapshot, error) {
+	root, err := filepath.Abs(storagePath)
+	if err != nil || !insideRoot(m.storageRoot, root) || root == m.storageRoot {
+		return nil, ErrOutsideScope
+	}
+	m.mu.RLock()
+	existing := m.snapshots[expectedID]
+	m.mu.RUnlock()
+	if existing != nil {
+		if existing.storagePath != root || existing.ManifestDigest() != expectedManifestHash || existing.PatchDigest() != expectedPatchHash {
+			return nil, ErrHashMismatch
+		}
+		return existing, nil
+	}
+	descriptorData, err := os.ReadFile(filepath.Join(root, "descriptor.json"))
+	if err != nil {
+		return nil, fmt.Errorf("workspace snapshot: read descriptor: %w", err)
+	}
+	var descriptor Descriptor
+	decoder := json.NewDecoder(bytes.NewReader(descriptorData))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&descriptor); err != nil {
+		return nil, fmt.Errorf("workspace snapshot: decode descriptor: %w", err)
+	}
+	if descriptor.Version != 1 || descriptor.SnapshotID != expectedID ||
+		descriptor.ManifestHash != expectedManifestHash || descriptor.PatchHash != expectedPatchHash {
+		return nil, ErrHashMismatch
+	}
+	allowlist, err := normalizeAllowlist(descriptor.Allowlist)
+	if err != nil {
+		return nil, err
+	}
+	entries := make(map[string]ManifestEntry, len(descriptor.Entries))
+	for _, entry := range descriptor.Entries {
+		path, err := normalizePath(entry.Path, false)
+		if err != nil || path != entry.Path || entry.Hash == "" {
+			return nil, ErrHashMismatch
+		}
+		if _, duplicate := entries[path]; duplicate {
+			return nil, ErrHashMismatch
+		}
+		entries[path] = entry
+	}
+	patch, err := os.ReadFile(filepath.Join(root, "patch"))
+	if err != nil || hashBytes(patch) != descriptor.PatchHash {
+		return nil, ErrHashMismatch
+	}
+	if manifestHash(descriptor.Kind, descriptor.Commit, descriptor.PatchRef, descriptor.PatchHash, allowlist, entries) != descriptor.ManifestHash {
+		return nil, ErrHashMismatch
+	}
+	snapshot := &Snapshot{
+		ID: descriptor.SnapshotID, Kind: descriptor.Kind, Commit: descriptor.Commit,
+		PatchRef: descriptor.PatchRef, PatchHash: descriptor.PatchHash, ManifestHash: descriptor.ManifestHash,
+		Allowlist: allowlist, CreatedAt: descriptor.CreatedAt.UTC(), ExpiresAt: descriptor.ExpiresAt.UTC(),
+		manager: m, repoRoot: descriptor.RepoRoot, refName: descriptor.RefName,
+		storagePath: root, patch: patch, entries: entries,
+		immutableKind: descriptor.Kind, immutableCommit: descriptor.Commit,
+		immutablePatchRef: descriptor.PatchRef, immutablePatchHash: descriptor.PatchHash,
+		immutableManifestHash: descriptor.ManifestHash, immutableAllowlist: append([]string(nil), allowlist...),
+	}
+	switch descriptor.Kind {
+	case KindPinnedGit:
+		if descriptor.RepoRoot == "" || descriptor.RefName == "" {
+			return nil, ErrHashMismatch
+		}
+		resolved, err := runGit(ctx, descriptor.RepoRoot, "rev-parse", "--verify", descriptor.RefName+"^{commit}")
+		if err != nil || strings.TrimSpace(resolved) != descriptor.Commit {
+			return nil, ErrHashMismatch
+		}
+	case KindMutableCopy:
+		snapshot.filesRoot = filepath.Join(root, "files")
+	default:
+		return nil, ErrHashMismatch
+	}
+	if err := snapshot.Verify(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	if prior := m.snapshots[expectedID]; prior != nil {
+		m.mu.Unlock()
+		if prior.ManifestDigest() != expectedManifestHash || prior.PatchDigest() != expectedPatchHash {
+			return nil, ErrHashMismatch
+		}
+		return prior, nil
+	}
+	m.snapshots[expectedID] = snapshot
+	m.mu.Unlock()
+	return snapshot, nil
 }
 
 func (m *Manager) Acquire(snapshotID, sessionID string, ttl time.Duration) (Lease, error) {
@@ -383,6 +502,9 @@ func (m *Manager) GC(ctx context.Context) ([]string, error) {
 		case KindPinnedGit:
 			if _, err := runGit(ctx, s.repoRoot, "update-ref", "-d", s.refName); err != nil {
 				return removed, fmt.Errorf("workspace snapshot: delete lease ref: %w", err)
+			}
+			if err := os.RemoveAll(s.storagePath); err != nil {
+				return removed, fmt.Errorf("workspace snapshot: remove descriptor: %w", err)
 			}
 		case KindMutableCopy:
 			if err := os.RemoveAll(filepath.Dir(s.filesRoot)); err != nil {
@@ -496,6 +618,8 @@ func (s *Snapshot) List(prefix string) ([]ManifestEntry, error) {
 }
 
 func (s *Snapshot) PatchContent() []byte { return append([]byte(nil), s.patch...) }
+
+func (s *Snapshot) StoragePath() string { return s.storagePath }
 
 func (s *Snapshot) PatchDigest() string    { return s.immutablePatchHash }
 func (s *Snapshot) ManifestDigest() string { return s.immutableManifestHash }
@@ -899,6 +1023,64 @@ func manifestHash(kind Kind, commit, patchRef, patchHash string, allowlist []str
 		fmt.Fprintf(h, "%s\x00%s\x00%d\x00%o\x00", path, entry.Hash, entry.Size, entry.Mode)
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func persistDescriptor(root string, s *Snapshot) error {
+	paths := make([]string, 0, len(s.entries))
+	for path := range s.entries {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	entries := make([]ManifestEntry, 0, len(paths))
+	for _, path := range paths {
+		entries = append(entries, s.entries[path])
+	}
+	descriptor := Descriptor{
+		Version: 1, SnapshotID: s.ID, Kind: s.immutableKind, RepoRoot: s.repoRoot,
+		RefName: s.refName, Commit: s.immutableCommit, PatchRef: s.immutablePatchRef,
+		PatchHash: s.immutablePatchHash, ManifestHash: s.immutableManifestHash,
+		Allowlist: append([]string(nil), s.immutableAllowlist...), Entries: entries,
+		CreatedAt: s.CreatedAt.UTC(), ExpiresAt: s.ExpiresAt.UTC(),
+	}
+	encoded, err := json.Marshal(descriptor)
+	if err != nil {
+		return fmt.Errorf("workspace snapshot: encode descriptor: %w", err)
+	}
+	if err := atomicWrite(filepath.Join(root, "patch"), s.patch); err != nil {
+		return err
+	}
+	if err := atomicWrite(filepath.Join(root, "descriptor.json"), encoded); err != nil {
+		return err
+	}
+	return nil
+}
+
+func atomicWrite(path string, data []byte) error {
+	temp, err := os.CreateTemp(filepath.Dir(path), ".snapshot-*")
+	if err != nil {
+		return err
+	}
+	name := temp.Name()
+	defer os.Remove(name)
+	if err := temp.Chmod(0o600); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return nil
 }
 
 func writeManifest(root string, s *Snapshot) error {

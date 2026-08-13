@@ -634,7 +634,7 @@ CREATE INDEX IF NOT EXISTS idx_review_snapshots_expiry
   ON review_snapshots(ref_count, expires_at);
 
 CREATE TABLE IF NOT EXISTS review_sessions (
-  chat_id TEXT PRIMARY KEY CHECK (length(chat_id) = 32),
+  chat_id TEXT PRIMARY KEY CHECK (length(chat_id) = 32 AND chat_id NOT GLOB '*[^0-9a-f]*'),
   owner_kind TEXT NOT NULL,
   owner_id TEXT NOT NULL,
   mode TEXT NOT NULL CHECK (mode IN ('patch', 'inline_patch', 'security_audit')),

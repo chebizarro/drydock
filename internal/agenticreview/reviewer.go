@@ -42,11 +42,11 @@ const (
 	StopTargetMismatch  StopReason = "target_mismatch"
 )
 
-type FindingScope string
+type FindingScope = reviewengine.FindingScope
 
 const (
-	FindingScopePatch    FindingScope = "patch"
-	FindingScopeSnapshot FindingScope = "snapshot"
+	FindingScopePatch    = reviewengine.FindingScopePatch
+	FindingScopeSnapshot = reviewengine.FindingScopeSnapshot
 )
 
 const ReviewerSystemPrompt = `You are Drydock's iterative code reviewer.
@@ -515,6 +515,18 @@ func (s *reviewSubmitter) Accepted() (acceptedSubmission, bool) {
 	return accepted, true
 }
 
+func cloneReviewerMessages(messages []reviewengine.CompletionMessage) []reviewengine.CompletionMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	out := make([]reviewengine.CompletionMessage, len(messages))
+	for i, message := range messages {
+		out[i] = message
+		out[i].ToolCalls = append([]reviewengine.ToolCall(nil), message.ToolCalls...)
+	}
+	return out
+}
+
 func cleanNonEmptyStrings(values []string) []string {
 	var cleaned []string
 	for _, value := range values {
@@ -591,6 +603,13 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 			Trace: reviewengine.ReviewerTrace{StopReason: string(StopCancelled)},
 		}, err
 	}
+	requestScope := request.FindingScope
+	if requestScope == "" {
+		requestScope = r.config.Scope
+	}
+	if requestScope != r.config.Scope {
+		return reviewengine.ReviewerExecutionResult{}, fmt.Errorf("agentic review: reviewer scope %q does not match request %q", r.config.Scope, requestScope)
+	}
 	if err := r.validateExecutionBinding(request); err != nil {
 		return reviewengine.ReviewerExecutionResult{
 			Trace: reviewengine.ReviewerTrace{StopReason: string(StopTargetMismatch)},
@@ -620,24 +639,40 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 			Parameters: append(json.RawMessage(nil), definition.InputSchema...),
 		})
 	}
+	baseMessages := []reviewengine.CompletionMessage{
+		{Role: reviewengine.MessageRoleSystem, Content: ReviewerSystemPrompt + "\n\nEngine-owned review policy:\n" + request.System},
+		{Role: reviewengine.MessageRoleUser, Content: request.User},
+	}
+	baseMessages = append(baseMessages, cloneReviewerMessages(request.Conversation.History)...)
+	if strings.TrimSpace(request.Conversation.Message) != "" {
+		baseMessages = append(baseMessages, reviewengine.CompletionMessage{Role: reviewengine.MessageRoleUser, Content: request.Conversation.Message})
+	}
 	completionRequest := reviewengine.CompletionRequest{
 		BaseURL: request.Endpoint.BaseURL, APIKey: request.Endpoint.APIKey,
 		Model: request.Endpoint.Model, Temperature: request.Temperature,
-		Messages: []reviewengine.CompletionMessage{
-			{Role: reviewengine.MessageRoleSystem, Content: ReviewerSystemPrompt + "\n\nEngine-owned review policy:\n" + request.System},
-			{Role: reviewengine.MessageRoleUser, Content: request.User},
-		},
-		Tools: tools,
+		Messages: baseMessages, Tools: tools,
 	}
 
 	limits := r.config.Limits
 	trace := LoopTrace{}
 	emptyNudged := false
 	servedModel := ""
+	var transcript []reviewengine.CompletionMessage
+	appendTranscript := func(messages ...reviewengine.CompletionMessage) error {
+		cloned := cloneReviewerMessages(messages)
+		if request.Conversation.Sink != nil {
+			if err := request.Conversation.Sink.AppendReviewerMessages(ctx, cloned); err != nil {
+				return fmt.Errorf("agentic review: persist reviewer transcript: %w", err)
+			}
+		}
+		transcript = append(transcript, cloned...)
+		return nil
+	}
 	fail := func(reason StopReason, err error) (reviewengine.ReviewerExecutionResult, error) {
 		trace.StopReason = reason
 		return reviewengine.ReviewerExecutionResult{
-			Trace: reviewerTrace(trace, acceptedSubmission{}),
+			Trace: reviewerTrace(trace, acceptedSubmission{}), ValidatedScope: requestScope,
+			Transcript: cloneReviewerMessages(transcript),
 		}, err
 	}
 
@@ -664,6 +699,8 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 		if model := strings.TrimSpace(completion.Model); model != "" {
 			servedModel = model
 		}
+		completion.Message.PromptTokens = completion.Usage.PromptTokens
+		completion.Message.CompletionTokens = completion.Usage.CompletionTokens
 		used := completion.Usage.TotalTokens
 		if used <= 0 {
 			used = preflight + r.config.Counter.Count(completion.Message.Content)
@@ -678,6 +715,9 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 		}
 
 		completionRequest.Messages = append(completionRequest.Messages, completion.Message)
+		if err := appendTranscript(completion.Message); err != nil {
+			return fail(StopTransportError, err)
+		}
 		if len(completion.Message.ToolCalls) == 0 {
 			if emptyNudged {
 				return fail(StopEmptyAssistant, ErrReviewerEmptyResponse)
@@ -709,10 +749,14 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 			if err != nil {
 				return fail(StopTransportError, err)
 			}
-			completionRequest.Messages = append(completionRequest.Messages, reviewengine.CompletionMessage{
+			toolMessage := reviewengine.CompletionMessage{
 				Role: reviewengine.MessageRoleTool, ToolCallID: call.ID,
 				Name: call.Function.Name, Content: string(encoded),
-			})
+			}
+			completionRequest.Messages = append(completionRequest.Messages, toolMessage)
+			if err := appendTranscript(toolMessage); err != nil {
+				return fail(StopTransportError, err)
+			}
 			if call.Function.Name == agenttools.ToolReviewSubmit && dispatchErr == nil && !toolResult.IsError {
 				accepted, ok := submitter.Accepted()
 				if !ok {
@@ -721,7 +765,8 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 				trace.StopReason = StopReviewSubmitted
 				return reviewengine.ReviewerExecutionResult{
 					Review: accepted.review, ServedModel: servedModel,
-					Trace: reviewerTrace(trace, accepted),
+					Trace: reviewerTrace(trace, accepted), ValidatedScope: requestScope,
+					Transcript: cloneReviewerMessages(transcript),
 				}, nil
 			}
 		}
