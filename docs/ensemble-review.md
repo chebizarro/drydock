@@ -37,10 +37,11 @@ Drydock supports running code reviews across multiple LLM models simultaneously,
               └───────────────────────┘
 ```
 
-1. **Parallel Execution**: The patch is sent to 2-3 configured models concurrently
-2. **Independent Reviews**: Each model produces findings independently
-3. **Finding Merge**: Duplicate findings (same file, line, category) are merged
-4. **Consensus Boost**: Findings confirmed by multiple models receive confidence boosts
+1. **One shared preparation**: The planner, checklist, and finalized context package are built once
+2. **Isolated parallel execution**: A `ReviewerExecutorFactory` creates a fresh executor for each configured route, so transcripts, evidence ledgers, counters, and replay caches cannot leak between members
+3. **Finding merge**: Duplicate findings (same file, nearby line, category) are merged
+4. **Consensus boost**: Findings confirmed by multiple models receive confidence boosts while retaining the highest canonical P0/P1/P2 priority
+5. **One walkthrough**: Consensus and scope validation run before a single optional walkthrough; members do not generate their own walkthroughs
 
 ## Configuration
 
@@ -49,33 +50,24 @@ Enable ensemble mode in your repository's `.drydock.yml`:
 ```yaml
 ensemble:
   enabled: true
-  models:
-    - route: "anthropic/claude-3.5-sonnet"
-    - route: "openai/gpt-4o"
-    - route: "local/llama-3.1-70b"
-  consensus_boost: 0.15      # Confidence boost per additional model
+  models: [coder32b, llm70b]
+  consensus_boost: 0.10      # Confidence boost per additional model
   require_consensus: false    # If true, only publish findings with 2+ model agreement
 ```
 
-Or via environment variables:
-
-```bash
-DRYDOCK_ENSEMBLE_ENABLED=true
-DRYDOCK_ENSEMBLE_MODELS="anthropic/claude-3.5-sonnet,openai/gpt-4o,local/llama-3.1-70b"
-DRYDOCK_ENSEMBLE_CONSENSUS_BOOST=0.15
-DRYDOCK_ENSEMBLE_REQUIRE_CONSENSUS=false
-```
+Ensemble configuration is repository-scoped; there are no `DRYDOCK_ENSEMBLE_*` environment variables.
 
 ## Model Routes
 
-Model routes follow the format `provider/model-name`:
+`models` accepts Drydock's configured review-engine route aliases:
 
-| Provider | Route Example | Notes |
-|----------|---------------|-------|
-| `anthropic` | `anthropic/claude-3.5-sonnet` | Requires `ANTHROPIC_API_KEY` |
-| `openai` | `openai/gpt-4o` | Requires `OPENAI_API_KEY` |
-| `local` | `local/llama-3.1-70b` | Uses `DRYDOCK_LLM70B_BASE_URL` |
-| `ollama` | `ollama/codellama:34b` | Uses local Ollama instance |
+| Route | Endpoint configuration |
+|-------|------------------------|
+| `coder14b` | `DRYDOCK_CODER14B_BASE_URL`, `DRYDOCK_CODER14B_MODEL` |
+| `coder32b` | `DRYDOCK_CODER32B_BASE_URL`, `DRYDOCK_CODER32B_MODEL` |
+| `llm70b` | `DRYDOCK_LLM70B_BASE_URL`, `DRYDOCK_LLM70B_MODEL` |
+
+When ensemble mode is enabled with no models, it defaults to `coder32b` and `llm70b`. `consensus_boost` defaults to `0.10` and must be in `[0, 0.5]`.
 
 ## Consensus Scoring
 
@@ -98,9 +90,10 @@ Findings are considered duplicates if they match on:
 - **Category**: Same category (e.g., "security", "performance")
 
 When duplicates are found:
-1. The finding with highest original confidence is used as the base
-2. Consensus boost is applied based on agreeing model count
-3. Message content from the primary finding is preserved
+1. The finding with highest original confidence supplies the explanatory fields
+2. The cluster retains the highest canonical priority reported by any member (P0 over P1 over P2), and legacy severity is re-derived from that priority
+3. Consensus boost is applied based on agreeing model count
+4. Final findings are deterministically sorted by canonical priority, confidence, path, and line
 
 ## Metrics
 
@@ -122,10 +115,12 @@ Ensemble mode exposes additional Prometheus metrics:
 
 ## Fallback Behavior
 
-If a model fails during ensemble review:
-- Remaining models continue independently
-- If all models fail, the review falls back to single-model mode
-- Failures are logged with model route for debugging
+If an ensemble member fails during review:
+- The failed member is dropped; remaining members continue independently
+- The result records required, succeeded, and failed reviewers, per-member traces, and `degraded: true`
+- The run fails if every member fails; it does **not** start a separate single-model fallback
+- Parent cancellation or deadline fails the entire run and returns no partial review, even if a member already succeeded
+- Failures are logged with their model route and retained trace
 
 ## Example Output
 
@@ -135,11 +130,11 @@ If a model fails during ensemble review:
     {
       "file": "src/auth.go",
       "line": 42,
+      "priority": "P0",
+      "severity": "critical",
       "category": "security",
-      "message": "SQL injection vulnerability in user input",
-      "confidence": 0.95,
-      "models_agreed": 3,
-      "consensus_boosted": true
+      "explanation": "SQL injection vulnerability in user input",
+      "confidence": 0.95
     }
   ]
 }

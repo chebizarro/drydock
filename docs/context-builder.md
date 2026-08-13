@@ -65,7 +65,7 @@ authoritative patch + changed files
 
 Discovery runs with a snapshot-bound `context_discovery` role. The patch and changed-file artifacts are mandatory; optional full files, line ranges, and codemaps can be added or removed. `selection.finalize` re-verifies snapshot hashes, renders the exact package, counts the serialized content with the authoritative tokenizer, applies configurable headroom (10% by default), and freezes the selection only on success.
 
-If discovery exhausts its turn, tool-call, token, or model-context limit without successful finalization, `contextbuilder.Builder.Build` runs against a materialization of the same snapshot. Its output must pass the same exact gate. If fallback building or gating fails, review fails rather than reviewing partial or approximate context.
+If discovery exhausts its turn, tool-call, token, or model-context limit without successful finalization, `contextbuilder.Builder.Build` runs against a materialization of the same snapshot. The explicit rollout fallback follows the same rule: after deterministic assembly, its serialized output must pass the authoritative exact-token gate with configured headroom. If fallback building or gating fails, review fails rather than reviewing partial or approximate context.
 
 ## Symbol Extraction (Tree-sitter)
 
@@ -131,6 +131,10 @@ When Qdrant and an embedding server are configured, the `QdrantProvider` adds a 
 4. Concatenate results as the `qdrant-docs` layer
 
 **Nostr detection keywords**: `nip`, `nostr`, `relay`, `event`, `kind`, `pubkey`, `npub`, `nsec`, `naddr`, `nevent`, `nprofile`, `tag`.
+
+## Repository Path Safety
+
+Deterministic providers do not join model- or patch-derived paths directly to the repository root. File-backed analysis normalizes repository-relative paths and rejects empty paths, absolute or volume-qualified paths, NULs, parent traversal, and any symlink component. Reads for modified-file content, tree-sitter symbol extraction, and project documentation therefore fail closed rather than escaping the frozen snapshot or falling back to a live workspace.
 
 ## Excluded Paths
 

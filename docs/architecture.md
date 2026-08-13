@@ -173,7 +173,7 @@ Trace of a single patch event from relay to published review:
 4. **Pipeline** — `pipeline.Runner.work` picks up the durable task:
    - `repo.Service.PreparePatchSeries` — clones or fetches the repository; for kind 1617 applies the patch series to a throwaway branch, for kind 1618/1619 checks out the PR tip and computes the diff against its merge-base with the default branch (in the canonical clone, so a fork cannot pick the diff base)
    - **Status gate** — re-checks the root's current NIP-34 status against the repo's `review.statuses` config (open by default, drafts opt-in, merged/closed never); status skips are permanent
-   - `agenticreview.Service.Prepare` — freezes a pinned snapshot, runs capability-filtered discovery, and accepts context only after `selection.finalize` passes the exact-token gate; the explicit rollout fallback uses `contextbuilder.Builder.Build` with its deterministic budget policy
+   - `agenticreview.Service.Prepare` — freezes a pinned snapshot, runs capability-filtered discovery, and accepts context only after `selection.finalize` passes the exact-token gate; the explicit rollout fallback uses `contextbuilder.Builder.Build` and then passes its serialized package through the same authoritative exact-token gate
    - `agenticreview.Service.ReviewPrepared` — the engine plans once, then an iterative reviewer uses read-only snapshot tools and must finish with evidence-backed `review.submit`; consensus, filtering, and one post-consensus walkthrough remain engine-owned
    - **Pipeline-owned post-review stages** — deterministic security scans, security verification, deduplication, repository-policy filtering, final target filtering, and optional auto-fix remain outside the shared service
    - `publisher.Service.PublishReview` — builds kind 1111 events (labeled with the model the endpoint actually served), signs them, fans out to relays
@@ -206,7 +206,7 @@ authoritative patch + repository state
                       severity mapping, walkthrough, publication
 ```
 
-All three orchestration families call `internal/agenticreview.Service`. Pipeline and audit snapshots pin a Git commit; IDE snapshots copy and hash the mutable workspace before any tool call. Audit scanning, localization, verification, and progress reporting remain audit-owned around the shared service. Sessions persist the finalized artifact manifest and re-render code context from that same snapshot on every continuation.
+All three orchestration families call `internal/agenticreview.Service`. Pipeline and audit snapshots pin a Git commit; IDE snapshots copy and hash the mutable workspace before any tool call. An IDE pubkey may freeze only an exact, canonical workspace root assigned to it by `DRYDOCK_IDE_WORKSPACE_BINDINGS`; unbound, relative, nonexistent, non-directory, and workspace-rebinding requests cannot start an inline filesystem review. Audit scanning, localization, verification, and progress reporting remain audit-owned around the shared service. Sessions persist the finalized artifact manifest and re-render code context from that same snapshot on every continuation; broken or expired sessions are rejected before snapshot restore or model execution.
 
 MCP HTTP currently exposes only the `external_readonly` role. Authentication resolves a server-created session and snapshot before a tool list is returned; clients cannot choose or replace roles, capabilities, sessions, or roots. Listing and dispatch both enforce capability policy, and path resolution rejects absolute paths, traversal, symlinks, and live-workspace fallback.
 
@@ -229,7 +229,7 @@ Patch diff
     └─→ priority 8: optional qdrant/chartroom retrieval
 ```
 
-The deterministic builder truncates priority-1/2 content when a useful prefix fits, otherwise drops an oversized layer and continues considering later layers. Agentic discovery instead mutates a selection and must pass the exact serialized-package gate before review.
+The deterministic builder truncates priority-1/2 content when a useful prefix fits, otherwise drops an oversized layer and continues considering later layers. Its repository file reads normalize relative paths and reject absolute paths, traversal, NULs, and every symlink component. Whether invoked by the rollout flag or discovery exhaustion, its serialized output must pass the same authoritative exact-token gate before review. Agentic discovery instead mutates a selection and passes that gate through `selection.finalize`.
 
 ## Signer Chain
 

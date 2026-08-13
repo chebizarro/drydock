@@ -47,7 +47,7 @@ All handlers live in `internal/agenttools`. Internal loops call the registry dir
 | `selection.finalize` | Re-verify hashes, render, exact-count, and freeze the package |
 | `review.submit` | Submit schema-valid coverage and evidence-backed P0/P1/P2 findings |
 
-Every invocation has a server-generated tool-call ID, a bound scope, a result-size limit, and replay protection. Absolute paths, parent traversal, NULs, symlinks, paths outside the allowlist, and fallback to the live workspace fail closed.
+Every invocation has a server-generated tool-call ID, a bound scope, a result-size limit, and replay protection. Absolute paths, parent traversal, NULs, symlinks, paths outside the allowlist, and fallback to the live workspace fail closed. The deterministic fallback uses the same repository-relative path normalization and rejects symlink components before reading modified files, symbols, or project docs.
 
 ## Capability Matrix
 
@@ -86,8 +86,9 @@ A continuation requires `chat_id`, owner, request ID, `expected_version`, and a 
 | Tokenizer cannot load authoritative encoding | Agentic startup/configuration fails; approximate counting is not accepted | Restore tokenizer assets/build support before enabling agentic mode |
 | `selection.finalize` over budget | Return a tool error; selection remains mutable so the model can prune and retry | Inspect utilization and finalization-failure metrics |
 | Reviewer loop exhausts without `review.submit` | Drop that ensemble member; fail only if every member fails | Inspect per-member trace and model/tool limits |
-| Cancellation | Return no partial review; session turn is recorded failed where applicable | Retry with a fresh request ID after the caller is healthy |
+| Cancellation or deadline | Record stop reason `cancelled` (`StopCancelled`) and return no partial review; a reserved session turn is recorded failed where applicable | Retry with a fresh request ID after the caller is healthy |
 | Version or idempotency conflict | Reject before model execution | Reload the latest version; never recycle a request ID for different text |
+| Broken or expired session | Reject the continuation before snapshot restore or model execution | Start a new review; do not retry the broken/expired `chat_id` |
 | Snapshot/patch/manifest hash mismatch | Fail closed and mark a persisted session broken | Preserve evidence, expire the session, and follow snapshot cleanup |
 | History exceeds budget | Fail the continuation; code context is never silently removed | Shorten conversation or raise the history budget deliberately |
 | MCP authentication or scope resolution failure | Reject before tools are listed or dispatched | Verify bearer token and server-created session binding |
@@ -122,7 +123,7 @@ All integer limits must be positive. Headroom must be at least 0 and less than 1
 
 | Environment variable | Default | Purpose |
 |----------------------|---------|---------|
-| `DRYDOCK_REVIEW_SNAPSHOT_STORAGE_PATH` | derived application data path | Snapshot descriptors and mutable copies |
+| `DRYDOCK_REVIEW_SNAPSHOT_STORAGE_PATH` | `<DRYDOCK_REPO_CACHE_DIR>/review-snapshots` (`repos/review-snapshots` by default) | Snapshot descriptors and mutable copies |
 | `DRYDOCK_REVIEW_SNAPSHOT_TTL` | `24h` | Unleased snapshot lifetime |
 | `DRYDOCK_REVIEW_SNAPSHOT_LEASE_TTL` | `24h` | Default lease lifetime |
 | `DRYDOCK_REVIEW_SESSION_LIFETIME` | `24h` | Review-session lifetime |
@@ -161,9 +162,18 @@ For HTTP, configure the environment variables above on `drydock-core`. The beare
 
 ## Metrics and Logs
 
-Monitor agentic loop turns, tool calls, budget utilization, finalization failures, loop-exhaustion fallbacks, stop reasons, session conflicts, and snapshot corruption. Ensemble status reports required, successful, failed, and degraded members with per-member traces.
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `drydock_agentic_loop_turns_total` | — | Discovery and reviewer model turns |
+| `drydock_agentic_tool_calls_total` | `tool`, `outcome` | Canonical agent-tool calls and outcomes |
+| `drydock_agentic_budget_utilization_ratio` | `budget` | Utilization for turns, tool calls, cumulative tokens, and context package |
+| `drydock_agentic_finalization_failures_total` | `reason` | Exact-package finalization failures |
+| `drydock_agentic_loop_exhaustion_fallbacks_total` | — | Discovery exhaustion runs that invoked deterministic fallback |
+| `drydock_agentic_session_conflicts_total` | `type` | Version, idempotency, and active-turn conflicts |
+| `drydock_agentic_snapshot_corruption_total` | — | Frozen-snapshot integrity failures |
+| `drydock_agentic_stop_reasons_total` | `reason` | Loop stop reasons, including `cancelled` |
 
-Alert on sustained finalization failures, any snapshot corruption, all-member ensemble failure, conflict spikes, repeated tokenizer startup failure, and p95 IDE duration approaching `DRYDOCK_IDE_AGENTIC_TIMEOUT`.
+Ensemble status additionally reports required, successful, failed, and degraded members with per-member traces. Alert on sustained finalization failures, any snapshot corruption, all-member ensemble failure, conflict spikes, repeated tokenizer startup failure, and p95 IDE duration approaching `DRYDOCK_IDE_AGENTIC_TIMEOUT`.
 
 ## Snapshot Cleanup
 

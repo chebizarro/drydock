@@ -32,10 +32,9 @@ Downstream audit:
 - Meta-review normalizes the local review before gating, JSON packaging, and
   few-shot persistence. Its payload therefore contains canonical priority and
   compatible legacy severity.
-- Security-audit publication remains a five-level legacy envelope. Audit
-  findings pass through review-engine deduplication first; the later audit
-  migration must derive its published legacy severity from canonical priority
-  when agentic findings enter that path.
+- Security-audit publication remains a five-level legacy envelope. Agentic
+  audit findings pass through review-engine deduplication, and publication
+  derives compatible legacy severity from canonical priority.
 
 ## Snapshot storage strategy
 
@@ -52,8 +51,9 @@ Copy-and-hash is reserved for mutable IDE state.
 
 ## Characterized boundaries
 
-- Database migrations are an ordered in-code slice, currently contiguous from
-  version 1 through version 13. The next migration version is 14.
+- At foundation characterization time, database migrations were contiguous
+  through version 13. The implemented session/snapshot schema is migration 14,
+  and the in-code sequence is now contiguous through version 14.
 - Audit localization produces ranked internal `candidateUnit` values.
   Per-unit workers return internal `unitResult` values, and `Run` aggregates
   them into exported `auditengine.Result`. Model localization may reprioritize

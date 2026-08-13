@@ -1,6 +1,6 @@
 # Configuration Reference
 
-All configuration is via environment variables with the `DRYDOCK_` prefix. Copy `.env.example` as a starting point:
+All configuration is via environment variables with the `DRYDOCK_` prefix. Agentic loop, snapshot/session, IDE workspace-binding, and MCP HTTP variables and defaults are listed in [Agentic Review Operations](agentic-review.md#operator-configuration). Copy `.env.example` as a starting point:
 
 ```bash
 cp .env.example .env
@@ -40,12 +40,14 @@ The list contract is kind `30001`, authored by `DRYDOCK_MONITORED_REPOS_AUTHOR`,
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| `DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS` | integer | `20` | Maximum encrypted codebase-chat requests per sender and window. |
+| `DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW` | duration | `1h` | Codebase-chat rate-limit window. |
 | `DRYDOCK_REVIEW_ORDER_RATE_LIMIT_REQUESTS` | integer | `20` | Maximum new generic `review/order` requests per requester and window. Idempotent receipt retries do not consume quota. |
 | `DRYDOCK_REVIEW_ORDER_RATE_LIMIT_WINDOW` | duration | `1h` | Generic order rate-limit window. |
 | `DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_REQUESTS` | integer | `100` | Maximum marketplace feedback notifications per sender and window. |
 | `DRYDOCK_MARKETPLACE_FEEDBACK_RATE_LIMIT_WINDOW` | duration | `24h` | Marketplace feedback rate-limit window. |
 
-Both request counts must be at least 1 and both windows must be positive. Limits are backed by the configured rate-limit store; backend failures deny processing rather than silently allowing traffic.
+All request counts must be at least 1 and all windows must be positive. Limits are backed by the configured rate-limit store; backend failures deny processing rather than silently allowing traffic.
 
 ## Payment Service
 
@@ -156,10 +158,11 @@ Qdrant provides vector similarity search for NIP spec retrieval, project documen
 | `DRYDOCK_QDRANT_URL` | URL | *(empty)* | Qdrant REST API endpoint (e.g., `http://qdrant:6333`). Empty disables all RAG features. |
 | `DRYDOCK_QDRANT_API_KEY` | string | *(empty)* | API key for Qdrant authentication. Not needed for local/Docker deployments. |
 
-Drydock auto-creates three collections on startup:
+Drydock auto-creates four collections on startup:
 - `nip_specs` — Nostr Improvement Proposal documentation chunks
 - `project_docs` — Per-project documentation embeddings
 - `few_shot_reviews` — Positive/negative review examples for prompt enrichment
+- `code_chunks` — Tree-sitter code chunks used by semantic code retrieval and codebase chat
 
 ## Embedding Model (Optional)
 
@@ -170,6 +173,7 @@ Required when Qdrant is enabled. Any OpenAI-compatible `/embeddings` endpoint wo
 | `DRYDOCK_EMBED_BASE_URL` | URL | *(empty)* | Embedding server base URL (e.g., `http://host.docker.internal:11434/v1` for Ollama). |
 | `DRYDOCK_EMBED_MODEL` | string | `nomic-embed-text` | Model name for embedding requests. |
 | `DRYDOCK_EMBED_API_KEY` | string | *(empty)* | API key for the embedding endpoint. |
+| `DRYDOCK_EMBED_DIMENSION` | integer | `768` | Embedding vector dimension; must match the configured model and existing Qdrant collections. |
 
 ## LSP Bridge (Optional)
 
@@ -219,7 +223,7 @@ are omitted with a warning.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DRYDOCK_HEALTH_ADDR` | `host:port` | `:8081` | Listen address for the health check HTTP server. |
+| `DRYDOCK_HEALTH_ADDR` | `host:port` | `127.0.0.1:8081` | Listen address for the health, metrics, dashboard, and management HTTP server. |
 
 Endpoints:
 - `GET /healthz` — Always returns `200 OK`. Use as a liveness probe.

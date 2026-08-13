@@ -1,6 +1,6 @@
 # Design: Nostr-Specific Security Review
 
-**Status:** Proposed
+**Status:** Implemented (design record)
 **Date:** 2026-08-06
 **Scope:** Extend the security review feature (`docs/security-review.md`) with a Nostr-aware lens: protocol-specific static rules, a threat-model knowledge pack for the reviewer, and an optional dynamic relay/client probe — applied only to Nostr projects.
 **Primary source:** Kimura, Ito, Minematsu, Shiraki, Isobe — *"Not in The Prophecies: Practical Attacks on Nostr"* (IACR ePrint 2025/1459). Referred to below as **[NP25]**.
@@ -20,7 +20,7 @@ Drydock's own domain is Nostr. The repositories it reviews are overwhelmingly No
 
 A generic reviewer will not name these, will not rate them correctly, and will most likely miss them entirely, because the dangerous code looks unremarkable — an event handler that *doesn't* call `verify`, a cache lookup that *does* use `ev.ID`. **Absence-of-check** is the dominant failure mode here, and regex SAST is built to find presence-of-pattern.
 
-This design therefore adds three things: rules that reason about the Nostr protocol (including absence checks), a knowledge pack that gives the reviewer [NP25]'s adversary models, and an optional dynamic probe for live targets. All are gated on a **Nostr-project detector** so non-Nostr repos see no change.
+The implementation adds three things: rules that reason about the Nostr protocol (including absence checks), a knowledge pack that gives the reviewer [NP25]'s adversary models, and an optional dynamic probe for live targets. All are gated on a **Nostr-project detector** so non-Nostr repos see no change.
 
 **Design principles** (inherited from §1 of the security-review design, plus one):
 

@@ -1,6 +1,6 @@
 # Design: Security Code Review
 
-**Status:** Proposed
+**Status:** Implemented (design record; current runtime uses the shared agentic review service)
 **Date:** 2026-08-06
 **Scope:** Add a first-class security review capability to Drydock, exposed as two pathways — a deep whole-repository audit and a security lens on the existing per-patch/PR review — built on local open-weight models.
 
@@ -8,7 +8,7 @@
 
 ## 1. Motivation and goals
 
-Drydock today produces general code review (correctness, architecture, style, test-coverage, and a thin `security` category) driven by a two-stage planner→reviewer pipeline. Security is present but shallow: a regex SAST scanner (`internal/securityscan`) injects deterministic pattern matches as a context layer, and the reviewer is nudged with a data-flow instruction when a changed file name matches `auth`/`crypto`/`security`. There is no dedicated audit flow, no taint/data-flow evidence, no false-positive suppression pass, and no way to run a security sweep across an entire repository rather than a single diff.
+At proposal time, Drydock produced general code review (correctness, architecture, style, test-coverage, and a thin `security` category) driven by a two-stage planner→reviewer pipeline. Security was present but shallow: a regex SAST scanner (`internal/securityscan`) injects deterministic pattern matches as a context layer, and the reviewer is nudged with a data-flow instruction when a changed file name matches `auth`/`crypto`/`security`. There is no dedicated audit flow, no taint/data-flow evidence, no false-positive suppression pass, and no way to run a security sweep across an entire repository rather than a single diff.
 
 This design adds security review as a distinct concern with two entry points:
 
@@ -26,7 +26,7 @@ This design adds security review as a distinct concern with two entry points:
 
 ---
 
-## 2. What exists today (and the gap)
+## 2. Baseline at proposal time (and the gap)
 
 | Capability | Today | Gap for security review |
 |---|---|---|
@@ -38,7 +38,7 @@ This design adds security review as a distinct concern with two entry points:
 | Config | `.drydock.yaml` (`review`, `ensemble`, `status`, `autofix`, …) | No `security` section |
 | Protocol | kinds 1111 / 1617-1619 / 1630-1633 / 25910 / 1059 | Audit requests and progress now use ContextVM; NIP-90 kind 7000 is retired |
 
-The good news: the two pathways are mostly *composition* of existing seams — a new `Provider` or two, a new `ModelRoute`, a new pipeline stage, one ContextVM method, and a `.drydock.yaml` section — plus one genuinely new subsystem (the repo-wide audit orchestrator) that still reuses `contextbuilder`, `reviewengine`, and `publisher`.
+The implementation subsequently delivered both pathways and migrated their model-facing review work to `internal/agenticreview.Service`; deterministic scan, localization, verification, baseline, SARIF, and progress stages remain audit-owned around that shared snapshot/discovery/reviewer core. The composition described below is the original design rationale — a new `Provider` or two, a new `ModelRoute`, a new pipeline stage, one ContextVM method, and a `.drydock.yaml` section — plus one genuinely new subsystem (the repo-wide audit orchestrator) that still reuses `contextbuilder`, `reviewengine`, and `publisher`.
 
 ---
 

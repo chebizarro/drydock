@@ -1,7 +1,10 @@
 # Drydock Strategic Review & Roadmap
 
-> **Date**: 2026-04-23
+> **Originally assessed**: 2026-04-23
+> **Updated through**: 2026-08-13
 > **Scope**: Full codebase audit, competitive analysis, and implementation roadmap to make Drydock a world-class Nostr-first AI code review service.
+>
+> The phase estimates below are retained as the original planning record. The current-status tables and completion markers reflect the implementation now in the repository.
 
 ---
 
@@ -17,11 +20,13 @@ Drydock is a fully automated NIP-34 code review agent. It listens for patch and 
 | **Event ingestion** | Signature verification, dedup, staleness/closed-root filtering | ✅ Production |
 | **Repository management** | Git clone/fetch with LRU cache, per-repo locking, URL validation | ✅ Production |
 | **Patch series ordering** | Reply-chain topology sort with timestamp fallback | ✅ Production |
-| **Context builder** | 8-layer priority system, 64K token budget, deterministic assembly | ✅ Production |
+| **Context builder** | Agentic frozen-snapshot discovery with exact-token finalization; hardened 9-provider deterministic fallback | ✅ Production |
 | **Tree-sitter AST** | Symbol extraction for 9 languages (Go, Python, JS, TS, Rust, C, C++, Java, Ruby) | ✅ Production |
 | **Workspace detection** | Monorepo boundary detection (npm, pnpm, Cargo, Go workspaces, Lerna) | ✅ Production |
-| **LLM review pipeline** | Two-stage planner → reviewer with model routing (14B/32B/70B) | ✅ Production |
-| **Structured findings** | JSON schema with severity, category, file, line, evidence, confidence | ✅ Production |
+| **LLM review pipeline** | Planner → budgeted iterative reviewer with snapshot-bound tools, mandatory `review.submit`, and model routing | ✅ Production |
+| **Structured findings** | Canonical P0/P1/P2 findings with legacy severity mapping, current-run evidence IDs, coverage, and confidence | ✅ Production |
+| **Review sessions** | Versioned IDE `chat_id` continuations over immutable snapshots with idempotency and optimistic concurrency | ✅ Production |
+| **External tooling** | Stdio and authenticated Streamable HTTP MCP, locked to `external_readonly` snapshot scopes | ✅ Production |
 | **Review publishing** | Kind 1111 (NIP-22) comments with NIP-40 expiration, relay fanout | ✅ Production |
 | **Signer chain** | Shared `cascadia-go/signet` NIP-46 client → local nsec development fallback | ✅ Production |
 | **Meta-review** | Self-improvement loop: quality evaluation, false positive detection | ✅ Production |
@@ -31,8 +36,8 @@ Drydock is a fully automated NIP-34 code review agent. It listens for patch and 
 | **LSP bridge** | Type-aware symbol analysis via language server sidecar | ✅ Production |
 | **Evaluation harness** | Held-out dataset with recall, FPR, calibration, precision metrics | ✅ Production |
 | **Drift guard** | Convention drift detection and flagging from meta-review samples | ✅ Production |
-| **Observability** | Prometheus-compatible /metrics with 17 counters/gauges/summaries | ✅ Production |
-| **Crash recovery** | Pre-publish breadcrumbs, failed-review requeue, stuck-review reset | ✅ Production |
+| **Observability** | Prometheus-compatible `/metrics`, including agentic budgets, stop reasons, session conflicts, snapshot corruption, and ensemble degradation | ✅ Production |
+| **Crash recovery** | Pre-publish breadcrumbs, failed-review requeue, stuck-review reset, persisted review sessions, and leased snapshot recovery | ✅ Production |
 | **Health checks** | /healthz, /readyz, graceful shutdown with drain timeout | ✅ Production |
 
 ### Self-Improvement Loop (Unique)
@@ -75,14 +80,14 @@ Review published
 | Incremental review | Reviews only changed hunks | Reviews full diff | ⚠️ Minor |
 | **Inline code suggestions** | Diff-ready code blocks, one-click apply | Findings describe fixes but don't provide replacement code | ❌ Critical |
 | **Conversational threads** | Reply to comments, get follow-up analysis | ✅ Multi-turn (up to 3 replies), history-aware | ✅ Implemented |
-| **Review profiles** | Per-repo `.coderabbit.yaml` | Single global config | ❌ Critical |
-| Path filtering | Configurable per repo | Hardcoded exclusion list | ⚠️ Moderate |
+| **Review profiles** | Per-repo `.coderabbit.yaml` | Per-repo `.drydock.yaml` | ✅ Implemented |
+| Path filtering | Configurable per repo | Per-repo include/exclude policy plus hardened snapshot allowlists | ✅ Implemented |
 | **Auto-fix generation** | One-click apply of suggestions | ✅ IDE extension applies fixes via workspace edits | ✅ Implemented |
-| **PR summary / walkthrough** | Auto-generated walkthrough | Summary is finding-focused | ⚠️ Moderate |
+| **PR summary / walkthrough** | Auto-generated walkthrough | Engine-owned post-consensus walkthrough with per-file summaries | ✅ Implemented |
 | Sequence diagrams | Visual flow diagrams | Not available | Low priority |
 | Knowledge graph | Learns project patterns | Few-shot partial coverage | ⚠️ Partial |
-| **Dashboard** | Web UI for history, metrics, trends | /metrics only, no UI | ❌ Moderate |
-| Security scanning | SAST + LLM | LLM-only + checklist injection | ⚠️ Moderate |
+| **Dashboard** | Web UI for history, metrics, trends | Embedded operator dashboard and management APIs | ✅ Implemented |
+| Security scanning | SAST + LLM | Deterministic SAST/taint/security context plus agentic audit/review and verification | ✅ Implemented |
 | Data sovereignty | ❌ Code sent to cloud | ✅ All local | **Drydock wins** |
 | Self-improvement | ❌ Static | ✅ Auto prompt refinement | **Drydock wins** |
 | Cryptographic provenance | ❌ Platform-signed | ✅ Nostr-signed, verifiable | **Drydock wins** |
@@ -91,8 +96,8 @@ Review published
 
 | Feature | Greptile | Drydock | Gap |
 |---------|---------|---------|-----|
-| **Full codebase indexing** | Entire repo semantic search | Project docs only | ❌ High |
-| **Codebase chat** | Interactive Q&A | Not available | ❌ Differentiating |
+| **Full codebase indexing** | Entire repo semantic search | Tree-sitter code chunks in Qdrant with review-time indexing | ✅ Implemented |
+| **Codebase chat** | Interactive Q&A | Encrypted NIP-17/NIP-59 Q&A over the code index | ✅ Implemented |
 | Cross-repo learning | Patterns transfer between repos | Global few-shots | ⚠️ Moderate |
 | API endpoint | Programmatic access | Not available | ⚠️ Moderate |
 | Change impact analysis | "What else might break?" | Symbols + callsites partial | ⚠️ Partial |
@@ -158,11 +163,11 @@ LSP `findReferences` for modified symbols. Codebase index queries. "This functio
 
 ### Phase 4: Platform Play (Week 10+)
 
-#### 4.1 Codebase Chat
-Nostr-native Q&A. Users query via kind 1111, Drydock responds from code index. **Effort: 5d**
+#### 4.1 Codebase Chat ✅ IMPLEMENTED
+Nostr-native Q&A uses NIP-17 kind-14 rumors inside NIP-59 gift wraps and answers from the Qdrant code index. **Status: Complete**
 
-#### 4.2 Multi-Model Ensemble
-Run 2-3 models in parallel. Consensus-based confidence. Single-model findings flagged. **Effort: 3d**
+#### 4.2 Multi-Model Ensemble ✅ IMPLEMENTED
+Repository-configured reviewer routes run concurrently through fresh executor factories. Failed members are dropped with degraded status; all-member failure aborts; consensus preserves the highest canonical priority. **Status: Complete**
 
 #### 4.3 Review Marketplace
 Operators publish quality scores. Submitters choose reviewers. Payment + quality market. **Effort: 5d**
@@ -192,6 +197,6 @@ For marketplace: replace in-process queue with NATS/Redis Streams. Separate list
 | Phase 1 | Inline suggestions, per-repo config, walkthrough, conversations | ~10.5d | Interactive review partner |
 | Phase 2 | Codebase indexing, security scanner, cross-repo learning, dashboard | ~17d | Deep analysis + operator visibility |
 | Phase 3 | Cashu payments, auto-fix patches, status integration, impact analysis | ~13d | Nostr-native moats |
-| Phase 4 | Codebase chat, ensemble review, marketplace, IDE integration | ~18d | Platform |
+| Phase 4 | Codebase chat, ensemble review, marketplace, IDE integration | ~18d original estimate | ✅ Implemented platform capabilities |
 
 **Total Phases 1–3: ~40 engineering days.**

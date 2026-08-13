@@ -62,6 +62,10 @@ The meta-review LLM produces a structured JSON response:
 | `prompt_gaps` | string[] | — | Specific prompt deficiencies identified |
 | `suggested_few_shot` | bool | — | Whether this review should become a few-shot example |
 
+## Agent Trace Metadata
+
+The primary pipeline now appends execution metadata to the meta-review prompt alongside the patch, finalized context, and normalized local review. The payload contains the discovery trace, the primary reviewer trace, and per-route ensemble reviewer traces when ensemble mode ran. This lets the evaluator distinguish a model-quality miss from discovery exhaustion, tool failures, cancellation, or a degraded ensemble. Trace metadata is advisory diagnostic context; it does not replace the frozen evidence package or alter meta-review gating and deduplication.
+
 ## Feedback Routing
 
 Each missed finding includes a `why_missed` reason that maps to an action:

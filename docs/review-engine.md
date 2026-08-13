@@ -167,9 +167,9 @@ If any changed file matches `auth`, `crypto`, or `security`, the reviewer prompt
 
 ## Ensemble and Session Behavior
 
-Ensemble members share one finalized package but receive fresh reviewer executors. Transcripts, evidence ledgers, counters, and replay caches are isolated per member. Failed members are dropped; the run fails only when every member fails. Consensus runs before one optional walkthrough.
+Ensemble members share one finalized package but receive fresh reviewer executors from a `ReviewerExecutorFactory`. Transcripts, evidence ledgers, counters, and replay caches are isolated per member. Ordinary member failures are dropped and reported as degraded status; the run fails only when every member fails. Parent cancellation or deadline fails the whole run with no partial review, even if one member already succeeded. During deduplication, explanatory fields come from the highest-confidence representative, but the merged cluster retains the highest canonical priority (P0 over P1 over P2) and derives compatible legacy severity from it. Consensus runs before one optional walkthrough.
 
-Stateful IDE follow-ups persist an opaque 128-bit `chat_id`, owner, snapshot hashes, ordered artifacts, turns, and normalized messages. Each continuation supplies `expected_version`, a unique request ID, and a message. The store applies optimistic version checks and request-ID idempotency before the reviewer runs. Code context is re-rendered from the frozen snapshot and is never silently dropped during history compaction.
+Stateful IDE follow-ups persist an opaque 128-bit `chat_id`, owner, snapshot hashes, ordered artifacts, turns, and normalized messages. Each continuation supplies `expected_version`, a unique request ID, and a message. The store applies optimistic version checks and request-ID idempotency before the reviewer runs. Broken and expired sessions are rejected before snapshot restore or model execution. Code context is re-rendered from the frozen snapshot and is never silently dropped during history compaction.
 
 ## Retry Behavior
 
@@ -183,7 +183,7 @@ LLM calls are wrapped in a `RetryingClient` with exponential backoff:
 
 **Transient errors** (retried): HTTP 429, HTTP 5xx, network timeouts, connection refused, DNS failures.
 
-**Non-transient errors** (fail immediately): HTTP 4xx (except 429), context cancellation, malformed responses.
+**Non-transient errors** (fail immediately): HTTP 4xx (except 429), context cancellation/deadline, malformed responses. Agentic loops classify cancellation and deadlines as `StopCancelled` and return no partial review.
 
 Backoff formula: `baseDelay × 2^attempt`, capped at `maxDelay`.
 

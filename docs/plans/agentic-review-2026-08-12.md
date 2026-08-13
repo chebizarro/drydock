@@ -99,6 +99,6 @@ Five additive SQLite tables: `review_snapshots` (storage path, manifest/diff has
 
 ## References
 
-- `docs/architecture.md`, `docs/review-engine.md`, `docs/context-builder.md`, `docs/meta-review.md` (drydock)
+- [`docs/architecture.md`](../architecture.md), [`docs/review-engine.md`](../review-engine.md), [`docs/context-builder.md`](../context-builder.md), [`docs/meta-review.md`](../meta-review.md) (drydock)
 - MCP Go SDK: https://github.com/modelcontextprotocol/go-sdk · mcp-go: https://github.com/mark3labs/mcp-go
 - MCP sampling spec: https://modelcontextprotocol.io/specification/draft/client/sampling

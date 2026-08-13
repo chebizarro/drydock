@@ -79,20 +79,12 @@ Drydock: (continues with same repo context) State is managed using Redux...
 
 ### Environment Variables
 
-```bash
-# Enable codebase chat
-DRYDOCK_CODECHAT_ENABLED=true
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS` | `20` | Maximum requests per sender in the configured window |
+| `DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW` | `1h` | Per-sender rate-limit window |
 
-# Rate limiting (per user)
-DRYDOCK_CODECHAT_RATE_LIMIT_PER_HOUR=20
-DRYDOCK_CODECHAT_RATE_LIMIT_PER_DAY=100
-
-# Maximum conversation history to maintain
-DRYDOCK_CODECHAT_MAX_HISTORY_TURNS=10
-
-# Allowed repositories (glob patterns, empty = all)
-DRYDOCK_CODECHAT_ALLOWED_REPOS="github.com/myorg/*,gitlab.com/myteam/*"
-```
+Codebase chat is registered automatically when Drydock has a signer with encrypt/decrypt support plus configured Qdrant and embedding clients. There is no separate enable flag. Conversation length is currently a code constant of 10 turns, the prompt loads the latest 5 stored turns, and repository availability comes from the indexed `code_chunks` collection rather than a codechat-specific allowlist.
 
 ### Keyer Configuration
 
@@ -142,8 +134,8 @@ CREATE TABLE codechat_turns (
 
 1. **Encryption**: DMs use the complete NIP-17/NIP-59 rumor, seal, and gift-wrap construction; only the outer kind-1059 wrapper is published
 2. **Private Key Handling**: Use bunker signing; never expose nsec in production
-3. **Repository Access**: Only indexes public repositories by default
-4. **Rate Limiting**: Prevents abuse; configurable per-user limits
+3. **Repository Access**: Chat retrieves only repositories already present in the operator's `code_chunks` index; normal repository admission and indexing policy controls what becomes available
+4. **Rate Limiting**: The SQLite-backed limiter denies on backend failure and enforces the configured per-sender request window
 5. **Conversation Isolation**: Each user's history is separate
 
 ## Example Conversation
@@ -174,7 +166,7 @@ Would you like me to explain any specific stage in more detail?
 
 ### "Repository not found"
 - Ensure the repository URL is correct and publicly accessible
-- Check `DRYDOCK_CODECHAT_ALLOWED_REPOS` if configured
+- Confirm the repository has been reviewed/indexed and is present in the `code_chunks` collection
 
 ### "Rate limited"
 - Users are limited to configured requests per hour/day

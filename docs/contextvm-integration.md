@@ -94,11 +94,18 @@ The pair `(requester pubkey, JSON-RPC id)` is the immutable order key. Exact ret
 | Field | Required | Description |
 |-------|----------|-------------|
 | `session_id` | yes | Active session owned by the signer |
-| `request_id` | optional | Defaults to the JSON-RPC ID |
-| `diff` | inline mode | Unified diff |
-| `changed_files` | optional | Paths for inline diagnostics |
+| `request_id` | optional | Defaults to the JSON-RPC ID; persisted as the turn idempotency key |
+| `diff` | initial inline mode | Unified diff; a new inline review must be non-empty |
+| `changed_files` | optional | Compatibility hint; the server derives the authoritative changed-file set from the filtered diff |
+| `chat_id` | continuation | Opaque ID returned by the initial inline response |
+| `expected_version` | continuation | Non-negative version returned by the preceding response |
+| `message` | continuation | Non-empty follow-up instruction |
 | `patch_event_id` | stored-patch mode | Stored NIP-34 patch/PR |
 | `force` | optional | Authorized root-status bypass in stored-patch mode |
+
+Initial inline review responses include `chat_id` and `expected_version`. A continuation reuses the same `review/request` method with those fields plus a new `request_id` and `message`; it does not resend the diff. Exact duplicate turns replay their stored response, while a reused request ID with different content or a stale/future version returns conflict before model execution. Broken and expired chats are rejected before snapshot restore or model execution.
+
+Inline filesystem review also requires the session's absolute `workspace_path` to be an exact canonical root assigned to the signer's lowercase hex pubkey by `DRYDOCK_IDE_WORKSPACE_BINDINGS`. An unauthorized workspace is cleared from the session and cannot be rebound later under the same session ID.
 
 ## Marketplace Feedback Notification
 

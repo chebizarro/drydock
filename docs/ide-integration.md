@@ -54,20 +54,24 @@ When the IDE extension activates, it publishes replaceable NIP-78 application da
 {
   "kind": 30078,
   "content": {
-    "workspace": "/path/to/project",
-    "repo_url": "github.com/user/project",
-    "capabilities": ["review", "fix", "explain"]
+    "session_id": "session-uuid",
+    "workspace_path": "/path/to/project",
+    "repo_id": "<owner-pubkey>:project",
+    "editor": "vscode",
+    "version": "0.1.0",
+    "languages": ["go"]
   },
   "tags": [
     ["d", "drydock:ide-session:session-uuid"],
-    ["client", "vscode-drydock/1.0.0"],
-    ["t", "drydock"],
-    ["t", "ide-session"]
+    ["p", "<drydock-pubkey>"],
+    ["type", "ide-session"],
+    ["schema", "drydock.ide-session.v1"],
+    ["client", "vscode-drydock/0.1.0"]
   ]
 }
 ```
 
-If the session data contains private repository information, publish it inside a NIP-59 gift-wrap addressed to Drydock.
+If the session data contains private repository information, publish it inside a NIP-59 gift-wrap addressed to Drydock. For inline filesystem review, `workspace_path` must be absolute and must resolve to an exact canonical root assigned to the session author's lowercase hex pubkey in `DRYDOCK_IDE_WORKSPACE_BINDINGS`. Unauthorized paths are cleared, and an established session cannot later rebind to another workspace.
 
 ### 2. Review Request
 
@@ -82,16 +86,16 @@ When the user saves a file or triggers manual review, the IDE sends a ContextVM 
     "method": "review/request",
     "params": {
       "session_id": "session-uuid",
-      "file": "src/auth.go",
-      "content": "package auth\n\nfunc Login(user, pass string) {...}",
-      "selection": {"start": 10, "end": 25},
-      "trigger": "save"
+      "request_id": "review-01HZX...",
+      "diff": "--- a/src/auth.go\n+++ b/src/auth.go\n@@ -15 +15 @@\n-old\n+new",
+      "changed_files": ["src/auth.go"],
+      "full_review": true
     }
   },
   "tags": [
     ["p", "<drydock-pubkey>"],
-    ["a", "30078:<ide-pubkey>:drydock:ide-session:session-uuid"],
-    ["t", "drydock"],
+    ["session", "session-uuid"],
+    ["request", "review-01HZX..."],
     ["method", "review/request"]
   ]
 }
@@ -111,24 +115,46 @@ Drydock responds on kind `25910` with the same JSON-RPC `id`. Responses are rout
       "diagnostics": [
         {
           "file": "src/auth.go",
-          "range": {"start": {"line": 15, "character": 4}, "end": {"line": 15, "character": 20}},
+          "range": {"start_line": 14, "start_column": 4, "end_line": 14, "end_column": 20},
           "severity": 1,
           "message": "Password compared in constant time to prevent timing attacks",
           "source": "drydock",
           "has_fix": true,
           "fix_id": "fix-timing-attack-001"
         }
-      ]
+      ],
+      "summary": "Found one issue.",
+      "review_time_ms": 4210,
+      "chat_id": "9f4c...32-hex-characters...",
+      "expected_version": 0
     }
   },
   "tags": [
     ["e", "<request-event-id>"],
-    ["p", "<user-pubkey>"]
+    ["p", "<user-pubkey>"],
+    ["session", "session-uuid"],
+    ["request", "review-01HZX..."]
   ]
 }
 ```
 
-### 4. Fix Request & Response
+### 4. Continue a Review
+
+The response's `chat_id` identifies the persisted review session and `expected_version` is the version the next turn must echo. A follow-up uses the same `review/request` method with a new request/JSON-RPC ID:
+
+```json
+{
+  "session_id": "session-uuid",
+  "request_id": "review-follow-up-01",
+  "chat_id": "9f4c...32-hex-characters...",
+  "expected_version": 0,
+  "message": "Check the error path in the changed function."
+}
+```
+
+Do not resend the diff. Exact duplicate turns replay the stored response. Reusing a request ID with different content, or sending a stale/future version, returns conflict without running the model. Broken or expired sessions must be replaced with a new initial review. Initial reviews and continuations share the `DRYDOCK_IDE_AGENTIC_TIMEOUT` deadline (`10m` by default).
+
+### 5. Fix Request & Response
 
 User clicks "Quick Fix" in the IDE:
 
@@ -141,17 +167,21 @@ User clicks "Quick Fix" in the IDE:
     "method": "review/apply-fix",
     "params": {
       "session_id": "session-uuid",
+      "request_id": "fix-01HZY...",
       "fix_id": "fix-timing-attack-001",
       "file": "src/auth.go"
     }
   },
   "tags": [
     ["p", "<drydock-pubkey>"],
-    ["t", "drydock"],
+    ["session", "session-uuid"],
+    ["request", "fix-01HZY..."],
     ["method", "review/apply-fix"]
   ]
 }
 ```
+
+Fix IDs are deterministic for the persisted `(chat_id, version, finding)` turn, so a later continuation produces distinct IDs even for a finding at the same location. Suggested fixes expire after 15 minutes.
 
 Drydock replies:
 
@@ -169,8 +199,9 @@ Drydock replies:
   "tags": [
     ["p", "<user-pubkey>"],
     ["e", "<fix-request-event-id>"],
-    ["t", "drydock"],
-    ["method", "review/apply-fix"]
+    ["session", "session-uuid"],
+    ["request", "fix-01HZY..."],
+    ["fix", "fix-timing-attack-001"]
   ]
 }
 ```
@@ -192,67 +223,45 @@ Drydock replies:
 # From VS Code marketplace
 code --install-extension drydock.vscode-drydock
 
-# Or build from source
+# Or run from source
 cd extensions/vscode-drydock
-npm install && npm run package
-code --install-extension drydock-*.vsix
+npm install
+npm run compile
+# Press F5 in VS Code to launch the Extension Development Host
 ```
 
 ### Extension Settings
 
 ```json
 {
-  "drydock.enabled": true,
-  "drydock.serverPubkey": "npub1drydock...",
-  "drydock.relays": ["wss://relay.damus.io", "wss://nos.lol"],
-  "drydock.reviewOnSave": true,
-  "drydock.reviewDelay": 500,
-  "drydock.showInlineHints": true
+  "drydock.drydockPubkey": "npub1drydock...",
+  "drydock.relays": ["wss://trusted-relay.example"],
+  "drydock.autoReview": false
 }
 ```
 
 ### Features
 
-- **Real-time Diagnostics**: Squiggly underlines appear as you type
-- **Hover Information**: Hover over issues to see full explanations
-- **Quick Fixes**: Click the lightbulb or use `Cmd+.` to apply fixes
+- **Review Diagnostics**: Squiggly underlines appear after a manual review, or after save when `drydock.autoReview` is enabled
+- **Hover Information**: VS Code shows diagnostic explanations on hover
+- **Review Continuations**: Run **Drydock: Continue Review** to send a follow-up against the frozen snapshot using `chat_id`/`expected_version`
+- **One-Click Fixes**: Apply the turn-scoped suggested fix returned for a diagnostic
 - **Problems Panel**: All diagnostics appear in VS Code's Problems panel
-- **Status Bar**: Shows connection status and active session
-
-## Neovim Integration
-
-For Neovim users, integrate via the LSP client:
-
-```lua
--- In your Neovim config
-require('lspconfig').drydock.setup({
-  cmd = {'drydock-lsp-bridge'},
-  filetypes = {'go', 'python', 'typescript', 'rust'},
-  settings = {
-    drydock = {
-      serverPubkey = 'npub1drydock...',
-      relays = {'wss://relay.damus.io'}
-    }
-  }
-})
-```
 
 ## Server Configuration
 
 ### Environment Variables
 
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DRYDOCK_IDE_AGENTIC_TIMEOUT` | `10m` | End-to-end deadline for an initial inline agentic review or continuation |
+| `DRYDOCK_IDE_WORKSPACE_BINDINGS` | *(empty)* | Comma-separated `lowercase-64-hex-pubkey=/absolute/workspace` bindings; repeat a pubkey to approve multiple exact roots. Empty disables inline filesystem review. |
+
+Example:
+
 ```bash
-# Enable IDE gateway
-DRYDOCK_IDE_ENABLED=true
-
-# Session timeout (inactive sessions are cleaned up)
-DRYDOCK_IDE_SESSION_TIMEOUT=30m
-
-# Maximum concurrent sessions per user
-DRYDOCK_IDE_MAX_SESSIONS_PER_USER=3
-
-# Review debounce (avoid overwhelming with rapid saves)
-DRYDOCK_IDE_REVIEW_DEBOUNCE=2s
+DRYDOCK_IDE_AGENTIC_TIMEOUT=10m
+DRYDOCK_IDE_WORKSPACE_BINDINGS='0123...64-hex...cdef=/srv/workspaces/project'
 ```
 
 ## Metrics
@@ -281,22 +290,24 @@ go test -tags=integration ./internal/idegateway/...
 ## Security
 
 1. **Encryption**: Private IDE ↔ Server payloads use NIP-59 gift-wrap; the inner event carries the kind `25910` ContextVM request or response.
-2. **Session Isolation**: Each user's sessions are separate and authenticated by Nostr signatures.
-3. **Code Privacy**: Source code is transmitted encrypted, processed locally.
-4. **No Cloud**: All LLM inference runs on your infrastructure.
+2. **Session Isolation**: Each session is owned by the signing pubkey; continuations also bind `chat_id`, optimistic version, and idempotent request ID to that owner.
+3. **Workspace Authorization**: Inline review can freeze only an operator-approved exact canonical root for that pubkey; symlink aliases and session workspace rebinding are rejected.
+4. **Snapshot Isolation**: Continuations read the immutable copied snapshot, not later live-workspace mutations. Broken/expired sessions short-circuit before model execution.
+5. **Code Privacy**: Source code should be transmitted encrypted and is processed locally.
+6. **Operator-Controlled Inference**: Drydock sends code only to the OpenAI-compatible endpoints the operator configured; use local endpoints when code must remain on operator infrastructure.
 
 ## Troubleshooting
 
 ### No diagnostics appearing
-1. Check extension is enabled: `drydock.enabled: true`
-2. Verify relay connectivity in output panel
-3. Ensure Drydock server has IDE gateway enabled
-4. Check file type is supported
+1. Verify `drydock.drydockPubkey` and at least one trusted `drydock.relays` entry
+2. Verify relay connectivity in the output panel
+3. Confirm the extension's pubkey and workspace are present in `DRYDOCK_IDE_WORKSPACE_BINDINGS`
+4. Check the Drydock logs for an unauthorized workspace or session error
 
 ### Slow diagnostics
-1. Increase `drydock.reviewDelay` setting
-2. Check server-side LLM latency
-3. Consider disabling `reviewOnSave` for large files
+1. Check server-side discovery/reviewer latency and agentic budget metrics
+2. Consider disabling `drydock.autoReview` and triggering reviews manually
+3. Compare end-to-end duration with `DRYDOCK_IDE_AGENTIC_TIMEOUT`
 
 ### Connection issues
 1. Verify relays are reachable
