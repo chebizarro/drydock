@@ -47,13 +47,52 @@ func registerCoreTools(registry *Registry) {
 		{definition(ToolSelectionRemove, "Remove non-mandatory artifacts from the run-local selection.", CapabilitySelectionMutate, `{"type":"object","properties":{"artifacts":{"type":"array","items":{"type":"object"}}},"required":["artifacts"],"additionalProperties":false}`), handleSelection},
 		{definition(ToolSelectionStatus, "Report the run-local selection and budget status.", CapabilitySelectionRead, `{"type":"object","additionalProperties":false}`), handleSelection},
 		{definition(ToolSelectionFinalize, "Render, hash-verify, and exact-token-check the immutable context package.", CapabilitySelectionFinalize, `{"type":"object","additionalProperties":false}`), handleSelection},
-		{definition(ToolReviewSubmit, "Submit the final structured review.", CapabilityReviewSubmit, `{"type":"object","properties":{"findings":{"type":"array"},"coverage":{"type":"string"}},"required":["findings","coverage"],"additionalProperties":true}`), handleReviewSubmit},
+		{reviewSubmitDefinition(), handleReviewSubmit},
 	}
 	for _, item := range definitions {
 		if err := registry.Register(item.def, item.handler); err != nil {
 			panic(err)
 		}
 	}
+}
+
+func reviewSubmitDefinition() Definition {
+	return definition(ToolReviewSubmit, "Submit the final evidence-backed structured review.", CapabilityReviewSubmit, `{
+		"type":"object",
+		"properties":{
+			"summary":{"type":"string","minLength":1},
+			"findings":{"type":"array","items":{
+				"type":"object",
+				"properties":{
+					"priority":{"type":"string","enum":["P0","P1","P2"]},
+					"category":{"type":"string","enum":["security","correctness","architecture","style","test-coverage"]},
+					"file":{"type":"string","minLength":1},
+					"line":{"type":"integer","minimum":1},
+					"explanation":{"type":"string","minLength":1},
+					"suggestion":{"type":"string"},
+					"suggested_diff":{"type":"string"},
+					"suggested_code":{"type":"string"},
+					"confidence":{"type":"number","minimum":0,"maximum":1},
+					"evidence_tool_call_ids":{"type":"array","items":{"type":"string","minLength":1},"minItems":1,"uniqueItems":true}
+				},
+				"required":["priority","category","file","line","explanation","confidence","evidence_tool_call_ids"],
+				"additionalProperties":false
+			}},
+			"needs_more_context":{"type":"array","items":{"type":"string"}},
+			"coverage":{
+				"type":"object",
+				"properties":{
+					"examined_files":{"type":"array","items":{"type":"string","minLength":1},"minItems":1,"uniqueItems":true},
+					"outcome":{"type":"string","enum":["findings","no_findings"]},
+					"summary":{"type":"string","minLength":1}
+				},
+				"required":["examined_files","outcome","summary"],
+				"additionalProperties":false
+			}
+		},
+		"required":["summary","findings","coverage"],
+		"additionalProperties":false
+	}`)
 }
 
 func definition(name, description string, capability Capability, schema string) Definition {

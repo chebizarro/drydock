@@ -16,6 +16,27 @@ import (
 	"drydock/internal/workspacesnapshot"
 )
 
+func TestReviewSubmitSchemaRequiresEvidenceAndCoverage(t *testing.T) {
+	var schema string
+	for _, definition := range NewRegistry().List(RoleCodeReviewer) {
+		if definition.Name == ToolReviewSubmit {
+			schema = string(definition.InputSchema)
+			break
+		}
+	}
+	if schema == "" {
+		t.Fatal("review.submit definition missing")
+	}
+	for _, required := range []string{
+		`"summary"`, `"priority"`, `"evidence_tool_call_ids"`,
+		`"examined_files"`, `"no_findings"`,
+	} {
+		if !strings.Contains(schema, required) {
+			t.Fatalf("review.submit schema missing %s: %s", required, schema)
+		}
+	}
+}
+
 func TestRolePolicyFiltersListingAndDispatch(t *testing.T) {
 	snapshot := mutableSnapshot(t, map[string]string{"main.go": "package p"})
 	registry := NewRegistry()

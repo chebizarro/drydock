@@ -225,7 +225,9 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 	}
 	// Ground truth for the served model: the response reports what actually
 	// handled the request, regardless of configured deployment names.
-	c.Identity.Observe(req.BaseURL, req.APIKey, req.Model, decoded.Model)
+	if c.Identity != nil {
+		c.Identity.Observe(req.BaseURL, req.APIKey, req.Model, decoded.Model)
+	}
 	return ChatResult{Content: decoded.Choices[0].Message.Content, Model: strings.TrimSpace(decoded.Model)}, nil
 }
 
@@ -305,7 +307,9 @@ func (c *OpenAICompatClient) Complete(ctx context.Context, req CompletionRequest
 	if len(decoded.Choices) == 0 {
 		return CompletionResult{}, fmt.Errorf("llm response has no choices (model=%s)", req.Model)
 	}
-	c.Identity.Observe(req.BaseURL, req.APIKey, req.Model, decoded.Model)
+	if c.Identity != nil {
+		c.Identity.Observe(req.BaseURL, req.APIKey, req.Model, decoded.Model)
+	}
 	choice := decoded.Choices[0]
 	return CompletionResult{
 		Message: choice.Message, FinishReason: choice.FinishReason, Usage: decoded.Usage,

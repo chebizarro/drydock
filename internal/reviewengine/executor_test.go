@@ -35,6 +35,12 @@ func (c *plannerWalkthroughClient) ChatCompletion(_ context.Context, request Cha
 	}
 }
 
+type reviewerExecutorFunc func(context.Context, ReviewerExecutionRequest) (ReviewerExecutionResult, error)
+
+func (f reviewerExecutorFunc) ExecuteReviewer(ctx context.Context, request ReviewerExecutionRequest) (ReviewerExecutionResult, error) {
+	return f(ctx, request)
+}
+
 type recordingReviewerExecutor struct {
 	mu       sync.Mutex
 	requests []ReviewerExecutionRequest
@@ -89,6 +95,11 @@ func TestRunWithExecutorKeepsEngineOwnedStages(t *testing.T) {
 	if request.Route != RouteCoder32B || request.Endpoint.Model != "coder32b" || request.Temperature != 0.25 {
 		t.Fatalf("execution request routing = %#v", request)
 	}
+	if request.ContextBundle != "finalized package" ||
+		request.PatchDiff != "diff --git a/main.go b/main.go" ||
+		len(request.ChangedFiles) != 1 || request.ChangedFiles[0] != "main.go" {
+		t.Fatalf("authoritative execution materials = %#v", request)
+	}
 	if !strings.Contains(request.System, "Preserve compatibility") ||
 		!strings.Contains(request.System, "Handle") ||
 		!strings.Contains(request.User, "finalized package") {
@@ -105,6 +116,30 @@ func TestRunWithExecutorKeepsEngineOwnedStages(t *testing.T) {
 	}
 	if client.unexpectedReviews != 0 || out.ServedModel != "served-agent" || out.ReviewerTrace.Turns != 2 {
 		t.Fatalf("unexpected output/client state: out=%#v client=%#v", out, client)
+	}
+}
+
+func TestRunWithExecutorReturnsFailureTraceWithoutPartialReview(t *testing.T) {
+	client := &plannerWalkthroughClient{}
+	executor := &recordingReviewerExecutor{
+		result: ReviewerExecutionResult{Trace: ReviewerTrace{
+			Turns: 20, ToolCalls: 9, StopReason: "turn_limit",
+		}},
+		err: errors.New("review.submit missing"),
+	}
+	out, err := newExecutorTestEngine(client).RunWithExecutor(context.Background(), RunInput{
+		ContextBundle: "bundle", PatchDiff: "patch", ChangedFiles: []string{"main.go"},
+		SkipWalkthrough: true,
+	}, executor)
+	if err == nil {
+		t.Fatal("expected executor failure")
+	}
+	if out.Review.Summary != "" || len(out.Review.Findings) != 0 ||
+		out.ReviewerTrace.StopReason != "turn_limit" || out.ReviewerTrace.Turns != 20 {
+		t.Fatalf("failure output leaked review or lost trace: %#v", out)
+	}
+	if client.walkthroughCalls != 0 {
+		t.Fatalf("walkthrough ran after reviewer failure: %d", client.walkthroughCalls)
 	}
 }
 
@@ -155,13 +190,60 @@ func TestRunEnsembleWithExecutorsUsesIsolatedMembersAndOneWalkthrough(t *testing
 	}
 }
 
+func TestRunEnsembleWithExecutorsTreatsParentCancellationAsRunFailure(t *testing.T) {
+	client := &plannerWalkthroughClient{}
+	engine := newExecutorTestEngine(client)
+	successDone := make(chan struct{})
+	cancelReady := make(chan struct{})
+	success := reviewerExecutorFunc(func(context.Context, ReviewerExecutionRequest) (ReviewerExecutionResult, error) {
+		close(successDone)
+		return ReviewerExecutionResult{Review: ReviewerOutput{Summary: "must not publish"}}, nil
+	})
+	cancelled := reviewerExecutorFunc(func(ctx context.Context, _ ReviewerExecutionRequest) (ReviewerExecutionResult, error) {
+		<-successDone
+		close(cancelReady)
+		<-ctx.Done()
+		return ReviewerExecutionResult{Trace: ReviewerTrace{StopReason: "cancelled"}}, ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	type runResult struct {
+		output RunOutput
+		err    error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		output, err := engine.RunEnsembleWithExecutors(ctx, RunInput{
+			ContextBundle: "shared", ChangedFiles: []string{"main.go"}, SkipWalkthrough: true,
+		}, EnsembleConfig{Models: []ModelRoute{RouteCoder32B, RouteLLM70B}}, func(route ModelRoute) ReviewerExecutor {
+			if route == RouteCoder32B {
+				return success
+			}
+			return cancelled
+		})
+		done <- runResult{output: output, err: err}
+	}()
+	<-cancelReady
+	cancel()
+	result := <-done
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("parent cancellation error = %v", result.err)
+	}
+	if result.output.Review.Summary != "" || len(result.output.EnsembleStatus.SucceededReviewers) != 1 ||
+		len(result.output.EnsembleStatus.FailedReviewers) != 1 {
+		t.Fatalf("cancellation output = %#v", result.output)
+	}
+}
+
 func TestRunEnsembleWithExecutorsDropsFailuresAndFailsOnlyWhenAllFail(t *testing.T) {
 	client := &plannerWalkthroughClient{}
 	engine := newExecutorTestEngine(client)
 	success := &recordingReviewerExecutor{result: ReviewerExecutionResult{
 		Review: ReviewerOutput{Summary: "survivor", Findings: nil},
 	}}
-	failure := &recordingReviewerExecutor{err: errors.New("loop exhausted without review.submit")}
+	failure := &recordingReviewerExecutor{
+		result: ReviewerExecutionResult{Trace: ReviewerTrace{Turns: 20, ToolCalls: 8, StopReason: "turn_limit"}},
+		err:    errors.New("loop exhausted without review.submit"),
+	}
 	out, err := engine.RunEnsembleWithExecutors(context.Background(), RunInput{
 		ContextBundle: "shared", ChangedFiles: []string{"main.go"}, SkipWalkthrough: true,
 	}, EnsembleConfig{Models: []ModelRoute{RouteCoder32B, RouteLLM70B}}, func(route ModelRoute) ReviewerExecutor {
@@ -176,6 +258,10 @@ func TestRunEnsembleWithExecutorsDropsFailuresAndFailsOnlyWhenAllFail(t *testing
 	if !out.EnsembleStatus.Degraded || len(out.EnsembleStatus.FailedReviewers) != 1 ||
 		out.Review.Summary != "survivor" {
 		t.Fatalf("degraded output = %#v", out)
+	}
+	if len(out.EnsembleStatus.ReviewerTraces) != 1 ||
+		out.EnsembleStatus.ReviewerTraces[0].Trace.StopReason != "turn_limit" {
+		t.Fatalf("failed member trace missing: %#v", out.EnsembleStatus.ReviewerTraces)
 	}
 
 	_, err = engine.RunEnsembleWithExecutors(context.Background(), RunInput{

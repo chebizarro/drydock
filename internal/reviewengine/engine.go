@@ -145,9 +145,12 @@ func (e *Engine) RunWithExecutor(ctx context.Context, in RunInput, executor Revi
 	executed, err := executor.ExecuteReviewer(ctx, ReviewerExecutionRequest{
 		Route: reviewerRoute, Endpoint: endpoint, Temperature: e.cfg.ReviewerTemp,
 		System: prepared.system, User: prepared.user, Label: "reviewer",
+		ContextBundle: in.ContextBundle, PatchDiff: in.PatchDiff,
+		ChangedFiles:   append([]string(nil), in.ChangedFiles...),
+		TargetEnvelope: in.TargetEnvelope,
 	})
 	if err != nil {
-		return RunOutput{}, err
+		return RunOutput{ReviewerTrace: executed.Trace}, err
 	}
 	executed, err = normalizeReviewerExecution(executed)
 	if err != nil {

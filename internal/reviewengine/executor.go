@@ -3,18 +3,24 @@ package reviewengine
 import (
 	"context"
 	"fmt"
+
+	"drydock/internal/targetidentity"
 )
 
 // ReviewerExecutionRequest is the fully assembled reviewer invocation. The
 // engine owns planning, checklist construction, prompt assembly, and route
 // resolution before handing this immutable request to an executor.
 type ReviewerExecutionRequest struct {
-	Route       ModelRoute
-	Endpoint    ModelEndpoint
-	Temperature float64
-	System      string
-	User        string
-	Label       string
+	Route          ModelRoute
+	Endpoint       ModelEndpoint
+	Temperature    float64
+	System         string
+	User           string
+	Label          string
+	ContextBundle  string
+	PatchDiff      string
+	ChangedFiles   []string
+	TargetEnvelope targetidentity.Envelope
 }
 
 // ReviewerTrace captures executor-neutral loop metadata. Single-shot
@@ -26,6 +32,9 @@ type ReviewerTrace struct {
 	CumulativeTokens    int      `json:"cumulative_tokens,omitempty"`
 	ToolCallIDs         []string `json:"tool_call_ids,omitempty"`
 	EvidenceToolCallIDs []string `json:"evidence_tool_call_ids,omitempty"`
+	ExaminedFiles       []string `json:"examined_files,omitempty"`
+	CoverageOutcome     string   `json:"coverage_outcome,omitempty"`
+	CoverageSummary     string   `json:"coverage_summary,omitempty"`
 	StopReason          string   `json:"stop_reason,omitempty"`
 }
 
@@ -85,5 +94,6 @@ func normalizeReviewerExecution(result ReviewerExecutionResult) (ReviewerExecuti
 	}
 	result.Trace.ToolCallIDs = append([]string(nil), result.Trace.ToolCallIDs...)
 	result.Trace.EvidenceToolCallIDs = append([]string(nil), result.Trace.EvidenceToolCallIDs...)
+	result.Trace.ExaminedFiles = append([]string(nil), result.Trace.ExaminedFiles...)
 	return result, nil
 }

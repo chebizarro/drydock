@@ -87,13 +87,16 @@ func (e *Engine) RunEnsembleWithExecutors(ctx context.Context, in RunInput, cfg 
 			executed, executeErr := member.ExecuteReviewer(ctx, ReviewerExecutionRequest{
 				Route: r, Endpoint: endpoint, Temperature: e.cfg.ReviewerTemp,
 				System: prepared.system, User: prepared.user,
-				Label: fmt.Sprintf("reviewer %s", r),
+				Label:         fmt.Sprintf("reviewer %s", r),
+				ContextBundle: in.ContextBundle, PatchDiff: in.PatchDiff,
+				ChangedFiles:   append([]string(nil), in.ChangedFiles...),
+				TargetEnvelope: in.TargetEnvelope,
 			})
 			if executeErr == nil {
 				executed, executeErr = normalizeReviewerExecution(executed)
 			}
 			if executeErr != nil {
-				results <- modelResult{Route: r, Err: executeErr}
+				results <- modelResult{Route: r, Trace: executed.Trace, Err: executeErr}
 				return
 			}
 			results <- modelResult{
@@ -113,6 +116,9 @@ func (e *Engine) RunEnsembleWithExecutors(ctx context.Context, in RunInput, cfg 
 	var succeeded []ModelRoute
 	var traces []EnsembleReviewerTrace
 	for result := range results {
+		if result.Trace.StopReason != "" || result.Trace.Turns > 0 || result.Trace.ToolCalls > 0 {
+			traces = append(traces, EnsembleReviewerTrace{Route: result.Route, Trace: result.Trace})
+		}
 		if result.Err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", result.Route, result.Err))
 			failures = append(failures, ModelFailure{Route: result.Route, Error: result.Err.Error()})
@@ -123,19 +129,27 @@ func (e *Engine) RunEnsembleWithExecutors(ctx context.Context, in RunInput, cfg 
 		}
 		reviews = append(reviews, result)
 		succeeded = append(succeeded, result.Route)
-		traces = append(traces, EnsembleReviewerTrace{Route: result.Route, Trace: result.Trace})
 		if e.logger != nil {
 			e.logger.Info("ensemble model completed", "route", result.Route, "findings", len(result.Review.Findings))
 		}
 	}
-	sort.Slice(reviews, func(i, j int) bool { return reviews[i].Route < reviews[j].Route })
-	sort.Slice(succeeded, func(i, j int) bool { return succeeded[i] < succeeded[j] })
-	sort.Slice(failures, func(i, j int) bool { return failures[i].Route < failures[j].Route })
-	sort.Slice(traces, func(i, j int) bool { return traces[i].Route < traces[j].Route })
+	order := make(map[ModelRoute]int, len(models))
+	for index, route := range models {
+		if _, exists := order[route]; !exists {
+			order[route] = index
+		}
+	}
+	sort.SliceStable(reviews, func(i, j int) bool { return order[reviews[i].Route] < order[reviews[j].Route] })
+	sort.SliceStable(succeeded, func(i, j int) bool { return order[succeeded[i]] < order[succeeded[j]] })
+	sort.SliceStable(failures, func(i, j int) bool { return order[failures[i].Route] < order[failures[j].Route] })
+	sort.SliceStable(traces, func(i, j int) bool { return order[traces[i].Route] < order[traces[j].Route] })
 
 	status := EnsembleStatus{
 		RequiredReviewers: len(models), SucceededReviewers: succeeded,
 		FailedReviewers: failures, ReviewerTraces: traces, Degraded: len(failures) > 0,
+	}
+	if err := ctx.Err(); err != nil {
+		return RunOutput{EnsembleStatus: status}, err
 	}
 	if len(reviews) == 0 {
 		return RunOutput{}, fmt.Errorf("all %d ensemble reviewer(s) failed: %s", len(models), joinErrors(errs))
