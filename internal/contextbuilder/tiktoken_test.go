@@ -4,6 +4,27 @@ import (
 	"testing"
 )
 
+func TestRequiredTiktokenCounterFailsClosed(t *testing.T) {
+	counter, err := NewRequiredTiktokenCounter("nonexistent-encoding-xyz")
+	if err == nil || counter != nil {
+		t.Fatalf("counter=%v err=%v, want hard initialization error", counter, err)
+	}
+	builder, err := NewWithOptionsForMode(BuilderOptions{}, BuilderModeAgentic, "nonexistent-encoding-xyz")
+	if err == nil || builder != nil {
+		t.Fatalf("agentic builder=%v err=%v, want hard initialization error", builder, err)
+	}
+}
+
+func TestDeterministicModeRetainsApproximateFallback(t *testing.T) {
+	builder, err := NewWithOptionsForMode(BuilderOptions{}, BuilderModeDeterministic, "nonexistent-encoding-xyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := builder.Counter.(ApproxTokenCounter); !ok {
+		t.Fatalf("counter type = %T, want ApproxTokenCounter", builder.Counter)
+	}
+}
+
 func TestTiktokenCounterFallsBackOnBadEncoding(t *testing.T) {
 	counter := NewTiktokenCounter("nonexistent-encoding-xyz")
 	// Should fall back to ApproxTokenCounter (not panic)

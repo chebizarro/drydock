@@ -24,6 +24,24 @@ type byteCounter struct{}
 
 func (byteCounter) Count(text string) int { return len(text) }
 
+func TestNewBuilderRequiresTokenCounter(t *testing.T) {
+	builder, err := NewBuilder(DefaultTokenBudget, nil, nil)
+	if !errors.Is(err, ErrTokenCounterRequired) || builder != nil {
+		t.Fatalf("builder=%v err=%v, want ErrTokenCounterRequired", builder, err)
+	}
+}
+
+func TestBuilderBuildRejectsCounterRemovedAfterConstruction(t *testing.T) {
+	builder, err := NewBuilder(DefaultTokenBudget, byteCounter{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder.Counter = nil
+	if _, err := builder.Build(context.Background(), BuildInput{}); !errors.Is(err, ErrTokenCounterRequired) {
+		t.Fatalf("Build error = %v, want ErrTokenCounterRequired", err)
+	}
+}
+
 func TestBuilderSkipsOversizedLayerAndContinuesPacking(t *testing.T) {
 	b := &Builder{
 		TokenBudget: 10,

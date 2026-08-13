@@ -2,6 +2,7 @@ package contextbuilder
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -19,17 +20,27 @@ var (
 	defaultTiktokenCounter TokenCounter
 )
 
+// NewRequiredTiktokenCounter loads an authoritative tokenizer and never
+// falls back to approximation.
+func NewRequiredTiktokenCounter(encoding string) (*TiktokenCounter, error) {
+	enc, err := loadEncodingWithTimeout(encoding, 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("load tiktoken encoding %q: %w", encoding, err)
+	}
+	return &TiktokenCounter{enc: enc}, nil
+}
+
 // NewTiktokenCounter creates a counter using the specified tiktoken encoding.
 // Common encodings: "cl100k_base" (GPT-4/Claude), "o200k_base" (GPT-4o).
 // Returns a fallback ApproxTokenCounter if the encoding cannot be loaded.
 func NewTiktokenCounter(encoding string) TokenCounter {
-	enc, err := loadEncodingWithTimeout(encoding, 5*time.Second)
+	counter, err := NewRequiredTiktokenCounter(encoding)
 	if err != nil {
 		slog.Warn("tiktoken encoding unavailable, using approximate counter",
 			"encoding", encoding, "error", err)
 		return ApproxTokenCounter{}
 	}
-	return &TiktokenCounter{enc: enc}
+	return counter
 }
 
 // DefaultTiktokenCounter returns a singleton cl100k_base counter.

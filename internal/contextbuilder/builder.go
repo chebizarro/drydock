@@ -79,6 +79,15 @@ type ContextBundle struct {
 	ChangedFiles []string
 }
 
+var ErrTokenCounterRequired = errors.New("contextbuilder: token counter is required")
+
+type BuilderMode string
+
+const (
+	BuilderModeDeterministic BuilderMode = "deterministic"
+	BuilderModeAgentic       BuilderMode = "agentic"
+)
+
 type TokenCounter interface {
 	Count(text string) int
 }
@@ -129,18 +138,51 @@ type Builder struct {
 	Providers   []Provider
 }
 
+// NewBuilder constructs a builder with an explicit, non-nil token counter.
+func NewBuilder(tokenBudget int, counter TokenCounter, providers []Provider) (*Builder, error) {
+	if counter == nil {
+		return nil, ErrTokenCounterRequired
+	}
+	if tokenBudget <= 0 {
+		tokenBudget = DefaultTokenBudget
+	}
+	return &Builder{TokenBudget: tokenBudget, Counter: counter, Providers: providers}, nil
+}
+
 // NewDefault creates a builder with no optional services.
 func NewDefault() *Builder {
 	return NewWithOptions(BuilderOptions{})
 }
 
-// NewWithOptions creates a builder with optional service clients.
+// NewWithOptions creates a deterministic builder with optional service clients.
 func NewWithOptions(opts BuilderOptions) *Builder {
-	return &Builder{
-		TokenBudget: DefaultTokenBudget,
-		Counter:     DefaultTiktokenCounter(),
-		Providers:   DefaultProviders(opts),
+	builder, err := NewWithOptionsForMode(opts, BuilderModeDeterministic, "")
+	if err != nil {
+		panic(err) // deterministic construction always has an approximate fallback
 	}
+	return builder
+}
+
+// NewWithOptionsForMode constructs a builder at the mode boundary. Agentic mode
+// fails closed if the authoritative tokenizer cannot be loaded.
+func NewWithOptionsForMode(opts BuilderOptions, mode BuilderMode, encoding string) (*Builder, error) {
+	if strings.TrimSpace(encoding) == "" {
+		encoding = "cl100k_base"
+	}
+	var counter TokenCounter
+	switch mode {
+	case BuilderModeDeterministic:
+		counter = NewTiktokenCounter(encoding)
+	case BuilderModeAgentic:
+		required, err := NewRequiredTiktokenCounter(encoding)
+		if err != nil {
+			return nil, err
+		}
+		counter = required
+	default:
+		return nil, fmt.Errorf("contextbuilder: unknown builder mode %q", mode)
+	}
+	return NewBuilder(DefaultTokenBudget, counter, DefaultProviders(opts))
 }
 
 // isDocLayer returns true if the layer name is a documentation provider.
@@ -173,8 +215,8 @@ func matchesExcludePath(filePath string, patterns []string) bool {
 }
 
 func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, error) {
-	if b.Counter == nil {
-		b.Counter = ApproxTokenCounter{}
+	if b == nil || b.Counter == nil {
+		return ContextBundle{}, ErrTokenCounterRequired
 	}
 
 	// Compute per-build effective budget (never mutate b.TokenBudget).
