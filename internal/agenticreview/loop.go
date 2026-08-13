@@ -109,7 +109,7 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 	defer observeLoopMetrics(&trace, limits)
 	for trace.Turns < limits.MaxTurns {
 		if err := ctx.Err(); err != nil {
-			trace.StopReason = StopTransportError
+			trace.StopReason = StopCancelled
 			return LoopResult{Trace: trace}, err
 		}
 		preflight, err := serializedRequestTokens(request.Completion, request.Counter)
@@ -129,7 +129,11 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 		completion, err := r.Client.Complete(ctx, request.Completion)
 		trace.Turns++
 		if err != nil {
-			trace.StopReason = StopTransportError
+			if isContextCancellation(ctx, err) {
+				trace.StopReason = StopCancelled
+			} else {
+				trace.StopReason = StopTransportError
+			}
 			return LoopResult{Trace: trace}, err
 		}
 		used := completion.Usage.TotalTokens
@@ -157,6 +161,10 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 				ToolCallID: call.ID, Name: call.Function.Name,
 				Arguments: json.RawMessage(call.Function.Arguments), Scope: request.Scope,
 			})
+			if dispatchErr != nil && isContextCancellation(ctx, dispatchErr) {
+				trace.StopReason = StopCancelled
+				return LoopResult{Trace: trace}, dispatchErr
+			}
 			if dispatchErr != nil {
 				toolResult = agenttools.Result{Content: dispatchErr.Error(), IsError: true}
 			}
@@ -182,6 +190,10 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 	}
 	trace.StopReason = StopTurnsExhausted
 	return LoopResult{Trace: trace}, ErrTurnLimit
+}
+
+func isContextCancellation(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil
 }
 
 func normalizeLoopLimits(limits LoopLimits) LoopLimits {

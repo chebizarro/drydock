@@ -65,6 +65,33 @@ func TestParseReviewerOutputRejectsConflictingPrioritySeverity(t *testing.T) {
 	}
 }
 
+func TestConsensusPreservesHighestPriorityAcrossConfidence(t *testing.T) {
+	reviews := []modelResult{
+		{Route: RouteCoder32B, Review: ReviewerOutput{Summary: "critical", Findings: []Finding{{
+			Priority: PriorityP0, Severity: "critical", File: "same.go", Category: "security", Line: 10, Confidence: 0.61,
+		}}}},
+		{Route: RouteLLM70B, Review: ReviewerOutput{Summary: "confident", Findings: []Finding{{
+			Priority: PriorityP2, Severity: "medium", File: "same.go", Category: "security", Line: 10, Confidence: 0.99,
+		}}}},
+	}
+	for _, ordered := range [][]modelResult{reviews, {reviews[1], reviews[0]}} {
+		got := mergeFindings(ordered, EnsembleConfig{}, slog.Default())
+		if len(got) != 1 || got[0].Priority != PriorityP0 || got[0].Severity != "critical" || got[0].Confidence != 1.0 {
+			t.Fatalf("consensus downgraded canonical priority: %+v", got)
+		}
+	}
+}
+
+func TestDeduplicateFindingsPreservesHighestPriority(t *testing.T) {
+	got := DeduplicateFindings([]Finding{
+		{Priority: PriorityP0, Severity: "critical", File: "same.go", Category: "security", Line: 10, Confidence: 0.61},
+		{Priority: PriorityP1, Severity: "high", File: "same.go", Category: "security", Line: 11, Confidence: 0.99},
+	})
+	if len(got) != 1 || got[0].Priority != PriorityP0 || got[0].Severity != "critical" || got[0].Confidence != 0.99 {
+		t.Fatalf("deduplication downgraded canonical priority: %+v", got)
+	}
+}
+
 func TestConsensusSortRecognizesCanonicalPriorities(t *testing.T) {
 	reviews := []modelResult{{
 		Route: RouteCoder32B,

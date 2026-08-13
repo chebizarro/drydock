@@ -695,6 +695,9 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 		completion, err := r.config.Client.Complete(ctx, completionRequest)
 		trace.Turns++
 		if err != nil {
+			if isContextCancellation(ctx, err) {
+				return fail(StopCancelled, err)
+			}
 			return fail(StopTransportError, err)
 		}
 		if model := strings.TrimSpace(completion.Model); model != "" {
@@ -740,6 +743,9 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 				ToolCallID: call.ID, Name: call.Function.Name,
 				Arguments: json.RawMessage(call.Function.Arguments), Scope: scope,
 			})
+			if dispatchErr != nil && isContextCancellation(ctx, dispatchErr) {
+				return fail(StopCancelled, dispatchErr)
+			}
 			if dispatchErr != nil {
 				toolResult = agenttools.Result{Content: dispatchErr.Error(), IsError: true}
 			}

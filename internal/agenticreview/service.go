@@ -478,6 +478,12 @@ func (s *Service) Continue(ctx context.Context, input ContinueInput) (SessionRes
 	if loaded.Session.Owner != input.Owner {
 		return SessionResult{}, reviewsession.ErrOwnerMismatch
 	}
+	if loaded.Session.State == reviewsession.StateBroken {
+		return SessionResult{}, reviewsession.ErrBroken
+	}
+	if loaded.Session.State == reviewsession.StateExpired || !time.Now().UTC().Before(loaded.Session.ExpiresAt) {
+		return SessionResult{}, reviewsession.ErrExpired
+	}
 	snapshot, err := s.snapshots.Get(loaded.Session.Snapshot.ID)
 	if errors.Is(err, workspacesnapshot.ErrNotFound) {
 		snapshot, err = s.snapshots.Restore(ctx, loaded.Session.Snapshot.StoragePath,

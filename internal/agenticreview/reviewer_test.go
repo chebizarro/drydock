@@ -346,10 +346,7 @@ func TestReviewerCancellationMidLoopReturnsNoPartialReview(t *testing.T) {
 	if got.result.Review.Summary != "" || len(got.result.Review.Findings) != 0 {
 		t.Fatalf("partial review leaked after cancellation: %#v", got.result)
 	}
-	// A cancellation returned by Complete is currently classified as a
-	// transport stop; this test pins the fail-closed behavior while the final
-	// review epic decides whether to normalize it to StopCancelled.
-	if got.result.Trace.StopReason != string(StopTransportError) ||
+	if got.result.Trace.StopReason != string(StopCancelled) ||
 		!slices.Contains(got.result.Trace.ToolCallIDs, "read-before-cancel") {
 		t.Fatalf("cancellation trace = %#v", got.result.Trace)
 	}

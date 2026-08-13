@@ -254,9 +254,9 @@ func findingKey(f Finding) string {
 
 // mergedFinding tracks a finding across multiple models.
 type mergedFinding struct {
-	Finding    Finding
-	Models     []ModelRoute
-	Confidence float64
+	Finding  Finding
+	Models   []ModelRoute
+	Priority Priority
 }
 
 // mergeFindings combines findings from multiple models, deduplicates by
@@ -273,17 +273,17 @@ func mergeFindings(reviews []modelResult, cfg EnsembleConfig, logger *slog.Logge
 		for _, f := range r.Review.Findings {
 			key := findingKey(f)
 			if existing, ok := byKey[key]; ok {
-				// Finding already reported by another model — boost confidence
+				// Finding already reported by another model — boost confidence.
 				existing.Models = append(existing.Models, r.Route)
-				// Keep the higher base confidence
+				existing.Priority = higherCanonicalPriority(existing.Priority, canonicalFindingPriority(f))
+				// Keep the higher-confidence representative for explanatory fields,
+				// but never let confidence downgrade the cluster's priority.
 				if f.Confidence > existing.Finding.Confidence {
 					existing.Finding = f
 				}
 			} else {
 				byKey[key] = &mergedFinding{
-					Finding:    f,
-					Models:     []ModelRoute{r.Route},
-					Confidence: f.Confidence,
+					Finding: f, Models: []ModelRoute{r.Route}, Priority: canonicalFindingPriority(f),
 				}
 			}
 		}
@@ -325,6 +325,10 @@ func mergeFindings(reviews []modelResult, cfg EnsembleConfig, logger *slog.Logge
 		}
 
 		finding := mf.Finding
+		if mf.Priority != "" && mf.Priority != canonicalFindingPriority(finding) {
+			finding.Priority = mf.Priority
+			finding.Severity, _ = SeverityFromPriority(mf.Priority)
+		}
 		finding.Confidence = boostedConfidence
 		result = append(result, finding)
 	}
@@ -382,8 +386,13 @@ func DeduplicateFindings(findings []Finding) []Finding {
 			if existing.Line-finding.Line > 2 || finding.Line-existing.Line > 2 {
 				continue
 			}
+			priority := higherCanonicalPriority(canonicalFindingPriority(existing), canonicalFindingPriority(finding))
 			if finding.Confidence > existing.Confidence {
 				result[i] = finding
+			}
+			if priority != "" {
+				result[i].Priority = priority
+				result[i].Severity, _ = SeverityFromPriority(priority)
 			}
 			merged = true
 			break
@@ -412,6 +421,21 @@ func DeduplicateFindings(findings []Finding) []Finding {
 		return normalized
 	}
 	return result
+}
+
+func canonicalFindingPriority(f Finding) Priority {
+	if priority, ok := NormalizePriority(string(f.Priority)); ok {
+		return priority
+	}
+	priority, _ := PriorityFromSeverity(f.Severity)
+	return priority
+}
+
+func higherCanonicalPriority(a, b Priority) Priority {
+	if FindingPriorityRank(Finding{Priority: b}) > FindingPriorityRank(Finding{Priority: a}) {
+		return b
+	}
+	return a
 }
 
 func collectNeedsMoreContext(reviews []modelResult) []string {

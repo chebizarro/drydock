@@ -235,13 +235,12 @@ func TestServicePrepareStartContinueAndReplay(t *testing.T) {
 	if err != nil || loadedBroken.Session.State != reviewsession.StateBroken {
 		t.Fatalf("session after corruption = %#v, error = %v", loadedBroken.Session, err)
 	}
-	// Continue verifies the corrupt snapshot before consulting persisted state,
-	// so a retry currently returns the integrity error again. The session must
-	// nevertheless remain broken and the model must not run.
+	// Broken is terminal: retries short-circuit before resolving or verifying
+	// the already-corrupt snapshot and never invoke the model.
 	if _, err := service.Continue(ctx, ContinueInput{
 		ChatID: start.ChatID, Owner: owner, RequestID: "broken-retry",
 		ExpectedVersion: 1, Message: "retry",
-	}); !errors.Is(err, workspacesnapshot.ErrHashMismatch) {
+	}); !errors.Is(err, reviewsession.ErrBroken) {
 		t.Fatalf("broken session retry error = %v", err)
 	}
 	if client.complete != rejectedAt {
