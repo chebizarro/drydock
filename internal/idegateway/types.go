@@ -67,27 +67,33 @@ type IDESession struct {
 // review of a stored NIP-34 patch target. Sent as ContextVM JSON-RPC params for
 // MethodReviewRequest.
 type ReviewRequest struct {
-	SessionID    string   `json:"session_id"`               // Reference to IDESession
-	RequestID    string   `json:"request_id"`               // Unique request identifier
-	Diff         string   `json:"diff"`                     // Unified diff of uncommitted changes
-	ChangedFiles []string `json:"changed_files"`            // List of changed file paths
-	FullReview   bool     `json:"full_review"`              // Request full review vs quick diagnostics
-	PatchEventID string   `json:"patch_event_id,omitempty"` // Stored NIP-34 patch/PR target
-	Force        bool     `json:"force,omitempty"`          // Request an authorized root-status bypass
+	SessionID       string   `json:"session_id"`                 // Reference to IDESession
+	RequestID       string   `json:"request_id"`                 // Unique request identifier
+	Diff            string   `json:"diff"`                       // Unified diff of uncommitted changes
+	ChangedFiles    []string `json:"changed_files"`              // List of changed file paths
+	FullReview      bool     `json:"full_review"`                // Request full review vs quick diagnostics
+	PatchEventID    string   `json:"patch_event_id,omitempty"`   // Stored NIP-34 patch/PR target
+	Force           bool     `json:"force,omitempty"`            // Request an authorized root-status bypass
+	ChatID          string   `json:"chat_id,omitempty"`          // Future review-session continuation identifier
+	ExpectedVersion *int64   `json:"expected_version,omitempty"` // Future optimistic session version
+	Message         string   `json:"message,omitempty"`          // Future conversational follow-up text
 }
 
 // ReviewResponse contains findings for the IDE to display.
 // Sent as the JSON-RPC result inside a ContextVM response (kind 25910)
 // with an "e" tag referencing the review request event.
 type ReviewResponse struct {
-	RequestID    string       `json:"request_id"`               // Reference to the ReviewRequest
-	SessionID    string       `json:"session_id"`               // Reference to IDESession
-	Diagnostics  []Diagnostic `json:"diagnostics"`              // Findings formatted as LSP diagnostics
-	Summary      string       `json:"summary"`                  // Brief summary of the review
-	ReviewTimeMs int64        `json:"review_time_ms"`           // Time taken to process
-	PatchEventID string       `json:"patch_event_id,omitempty"` // Asynchronously queued patch target
-	Queued       bool         `json:"queued,omitempty"`         // Whether pipeline work was enqueued
-	Forced       bool         `json:"forced,omitempty"`         // Whether the queued task bypasses root status
+	RequestID       string       `json:"request_id"`                 // Reference to the ReviewRequest
+	SessionID       string       `json:"session_id"`                 // Reference to IDESession
+	Diagnostics     []Diagnostic `json:"diagnostics"`                // Findings formatted as LSP diagnostics
+	Summary         string       `json:"summary"`                    // Brief summary of the review
+	ReviewTimeMs    int64        `json:"review_time_ms"`             // Time taken to process
+	PatchEventID    string       `json:"patch_event_id,omitempty"`   // Asynchronously queued patch target
+	Queued          bool         `json:"queued,omitempty"`           // Whether pipeline work was enqueued
+	Forced          bool         `json:"forced,omitempty"`           // Whether the queued task bypasses root status
+	ChatID          string       `json:"chat_id,omitempty"`          // Future review-session continuation identifier
+	ExpectedVersion *int64       `json:"expected_version,omitempty"` // Echoed future optimistic session version
+	Message         string       `json:"message,omitempty"`          // Future conversational response text
 }
 
 // JSONRPCResponse is the JSON-RPC 2.0 envelope used in ContextVM responses.

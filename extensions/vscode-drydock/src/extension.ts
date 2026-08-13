@@ -96,6 +96,9 @@ interface ReviewResponse {
     diagnostics: Diagnostic[];
     summary: string;
     review_time_ms: number;
+    chat_id?: string;
+    expected_version?: number;
+    message?: string;
 }
 
 interface IDESessionAnnouncement {
@@ -113,6 +116,9 @@ interface ReviewRequest {
     diff: string;
     changed_files: string[];
     full_review: boolean;
+    chat_id?: string;
+    expected_version?: number;
+    message?: string;
 }
 
 interface FixRequest {

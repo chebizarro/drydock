@@ -1,6 +1,8 @@
 package idegateway
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"drydock/internal/reviewengine"
@@ -77,7 +79,10 @@ func TestParseReviewRequest(t *testing.T) {
 		"changed_files": ["main.go"],
 		"full_review": true,
 		"patch_event_id": "patch-123",
-		"force": true
+		"force": true,
+		"chat_id": "chat-abc",
+		"expected_version": 7,
+		"message": "Please check the revised function"
 	}`
 
 	req, err := ParseReviewRequest(content)
@@ -97,8 +102,27 @@ func TestParseReviewRequest(t *testing.T) {
 	if req.PatchEventID != "patch-123" || !req.Force {
 		t.Errorf("patch force fields = %q, %v", req.PatchEventID, req.Force)
 	}
+	if req.ChatID != "chat-abc" || req.ExpectedVersion == nil || *req.ExpectedVersion != 7 || req.Message != "Please check the revised function" {
+		t.Errorf("continuation fields = chat %q, version %v, message %q", req.ChatID, req.ExpectedVersion, req.Message)
+	}
 	if len(req.ChangedFiles) != 1 || req.ChangedFiles[0] != "main.go" {
 		t.Errorf("ChangedFiles = %v, want [main.go]", req.ChangedFiles)
+	}
+}
+
+func TestIDEContinuationFieldsRemainOptional(t *testing.T) {
+	requestJSON, err := json.Marshal(ReviewRequest{SessionID: "sess", RequestID: "req"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseJSON, err := json.Marshal(ReviewResponse{SessionID: "sess", RequestID: "req"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{string(requestJSON), string(responseJSON)} {
+		if strings.Contains(raw, "chat_id") || strings.Contains(raw, "expected_version") || strings.Contains(raw, "message") {
+			t.Fatalf("zero-value compatibility fields must be omitted: %s", raw)
+		}
 	}
 }
 
