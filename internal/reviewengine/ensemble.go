@@ -305,15 +305,18 @@ func mergeFindings(reviews []modelResult, cfg EnsembleConfig, logger *slog.Logge
 		result = append(result, finding)
 	}
 
-	// Sort by severity (desc), then confidence (desc), then file/line
+	// Sort by canonical priority (desc), then confidence (desc), then file/line.
+	// FindingPriorityRank accepts both P0/P1/P2 and every legacy severity, so
+	// a canonical priority can never silently fall through a lookup map.
 	sort.Slice(result, func(i, j int) bool {
-		sevOrder := map[string]int{
-			"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1,
-		}
-		si := sevOrder[strings.ToLower(result[i].Severity)]
-		sj := sevOrder[strings.ToLower(result[j].Severity)]
+		si := FindingPriorityRank(result[i])
+		sj := FindingPriorityRank(result[j])
 		if si != sj {
 			return si > sj
+		}
+		legacyI, legacyJ := FindingLegacySeverityRank(result[i]), FindingLegacySeverityRank(result[j])
+		if legacyI != legacyJ {
+			return legacyI > legacyJ
 		}
 		if result[i].Confidence != result[j].Confidence {
 			return result[i].Confidence > result[j].Confidence
@@ -323,7 +326,9 @@ func mergeFindings(reviews []modelResult, cfg EnsembleConfig, logger *slog.Logge
 		}
 		return result[i].Line < result[j].Line
 	})
-
+	if normalized, err := NormalizeFindings(result); err == nil {
+		return normalized
+	}
 	return result
 }
 
@@ -364,10 +369,12 @@ func DeduplicateFindings(findings []Finding) []Finding {
 		}
 	}
 
-	severityRank := map[string]int{"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
 	sort.SliceStable(result, func(i, j int) bool {
-		if severityRank[strings.ToLower(result[i].Severity)] != severityRank[strings.ToLower(result[j].Severity)] {
-			return severityRank[strings.ToLower(result[i].Severity)] > severityRank[strings.ToLower(result[j].Severity)]
+		if FindingPriorityRank(result[i]) != FindingPriorityRank(result[j]) {
+			return FindingPriorityRank(result[i]) > FindingPriorityRank(result[j])
+		}
+		if FindingLegacySeverityRank(result[i]) != FindingLegacySeverityRank(result[j]) {
+			return FindingLegacySeverityRank(result[i]) > FindingLegacySeverityRank(result[j])
 		}
 		if result[i].Confidence != result[j].Confidence {
 			return result[i].Confidence > result[j].Confidence
@@ -377,6 +384,9 @@ func DeduplicateFindings(findings []Finding) []Finding {
 		}
 		return result[i].Line < result[j].Line
 	})
+	if normalized, err := NormalizeFindings(result); err == nil {
+		return normalized
+	}
 	return result
 }
 

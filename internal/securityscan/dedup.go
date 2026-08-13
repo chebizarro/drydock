@@ -73,6 +73,9 @@ func DeduplicateFindings(scanFindings []SecurityFinding, llmFindings []revieweng
 		})
 	}
 	result = append(result, llmFindings...)
+	if normalized, err := reviewengine.NormalizeFindings(result); err == nil {
+		return normalized
+	}
 	return result
 }
 

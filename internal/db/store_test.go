@@ -130,6 +130,24 @@ func TestMigrateAppliesVersionedMigrationsIdempotently(t *testing.T) {
 	}
 }
 
+func TestSchemaMigrationNumbersAreContiguous(t *testing.T) {
+	if len(schemaMigrations) == 0 {
+		t.Fatal("schema migrations must not be empty")
+	}
+	for i, migration := range schemaMigrations {
+		want := i + 1
+		if migration.version != want {
+			t.Fatalf("schema migration[%d] version = %d, want contiguous version %d", i, migration.version, want)
+		}
+		if strings.TrimSpace(migration.name) == "" {
+			t.Fatalf("schema migration %d has empty name", migration.version)
+		}
+	}
+	if got := schemaMigrations[len(schemaMigrations)-1].version; got != 13 {
+		t.Fatalf("latest characterized schema migration = %d, want 13 (next reserved version is 14)", got)
+	}
+}
+
 func TestMigrateAddsReviewLogColumnsFromOldSnapshot(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "old.db")

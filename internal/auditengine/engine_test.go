@@ -21,6 +21,43 @@ import (
 	"drydock/internal/testutil"
 )
 
+func TestAuditCandidateLocalizationContract(t *testing.T) {
+	engine := New(Config{}, Dependencies{}, nil)
+	units := engine.localize(
+		context.Background(),
+		"",
+		&codemap.Map{},
+		[]string{"a.go", "b.go"},
+		[]reviewengine.Finding{
+			{File: "a.go", Severity: "high"},
+			{File: "outside.go", Severity: "critical"},
+		},
+		surface.Result{Locations: []surface.Location{{File: "b.go"}}},
+		"",
+	)
+	if len(units) != 2 {
+		t.Fatalf("candidate units = %+v, want two allowed files", units)
+	}
+	if units[0].File != "a.go" || units[0].Score != 100 || units[1].File != "b.go" || units[1].Score != 50 {
+		t.Fatalf("candidate ordering = %+v, want deterministic findings before surfaces", units)
+	}
+	if len(units[0].Findings) != 0 || units[0].Packet != "" {
+		t.Fatalf("localization must only rank units; assembly happens later: %+v", units[0])
+	}
+
+	// unitResult is the worker boundary: findings and error travel together,
+	// while Result is the exported aggregate returned by Run.
+	worker := unitResult{findings: []reviewengine.Finding{{File: "a.go"}}, err: errors.New("review failed")}
+	if len(worker.findings) != 1 || worker.err == nil {
+		t.Fatalf("unit result contract changed: %+v", worker)
+	}
+	var aggregate Result
+	aggregate.Findings = worker.findings
+	if len(aggregate.Findings) != 1 {
+		t.Fatalf("aggregate result contract changed: %+v", aggregate)
+	}
+}
+
 func TestBudgetForDepth(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

@@ -90,6 +90,11 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	if strings.EqualFold(strings.TrimSpace(in.Model), "none") {
 		return "", errors.New("model none is reserved for operational failures; use PublishFailureNotice")
 	}
+	normalizedFindings, err := reviewengine.NormalizeFindings(in.Findings)
+	if err != nil {
+		return "", fmt.Errorf("normalize publication findings: %w", err)
+	}
+	in.Findings = normalizedFindings
 	if in.TargetEnvelope != (targetidentity.Envelope{}) {
 		if err := in.TargetEnvelope.Validate(); err != nil {
 			return "", fmt.Errorf("invalid target identity envelope: %w", err)

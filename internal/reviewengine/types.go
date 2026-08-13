@@ -69,17 +69,29 @@ type EnsembleStatus struct {
 	Degraded           bool           `json:"degraded"`
 }
 
+// Priority is the canonical review urgency used by agentic review flows.
+type Priority string
+
+const (
+	PriorityP0 Priority = "P0"
+	PriorityP1 Priority = "P1"
+	PriorityP2 Priority = "P2"
+)
+
 type Finding struct {
-	Severity      string  `json:"severity"`
-	Category      string  `json:"category"`
-	File          string  `json:"file"`
-	Line          int     `json:"line"`
-	Evidence      string  `json:"evidence"`
-	Explanation   string  `json:"explanation"`
-	Suggestion    string  `json:"suggestion"`
-	SuggestedDiff string  `json:"suggested_diff,omitempty"`
-	SuggestedCode string  `json:"suggested_code,omitempty"`
-	Confidence    float64 `json:"confidence"`
+	// Priority is canonical. Severity remains on the wire for compatibility
+	// with existing scanners, publishers, and stored review artifacts.
+	Priority      Priority `json:"priority,omitempty"`
+	Severity      string   `json:"severity"`
+	Category      string   `json:"category"`
+	File          string   `json:"file"`
+	Line          int      `json:"line"`
+	Evidence      string   `json:"evidence"`
+	Explanation   string   `json:"explanation"`
+	Suggestion    string   `json:"suggestion"`
+	SuggestedDiff string   `json:"suggested_diff,omitempty"`
+	SuggestedCode string   `json:"suggested_code,omitempty"`
+	Confidence    float64  `json:"confidence"`
 }
 
 func ParsePlannerOutput(raw string) (PlannerOutput, error) {
@@ -114,10 +126,16 @@ func ParseReviewerOutput(raw string) (ReviewerOutput, error) {
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return ReviewerOutput{}, fmt.Errorf("parse reviewer json: %w", err)
 	}
-	// Sanitize optional suggestion fields (non-fatal).
+	// Sanitize optional suggestion fields and establish the canonical priority
+	// while retaining the legacy severity field.
 	for i := range out.Findings {
-		out.Findings[i].SuggestedDiff = sanitizeSuggestedDiff(out.Findings[i].SuggestedDiff)
-		out.Findings[i].SuggestedCode = strings.TrimSpace(out.Findings[i].SuggestedCode)
+		normalized, err := NormalizeFindingPriority(out.Findings[i])
+		if err != nil {
+			return ReviewerOutput{}, fmt.Errorf("finding[%d] %w", i, err)
+		}
+		normalized.SuggestedDiff = sanitizeSuggestedDiff(normalized.SuggestedDiff)
+		normalized.SuggestedCode = strings.TrimSpace(normalized.SuggestedCode)
+		out.Findings[i] = normalized
 	}
 	if err := out.Validate(); err != nil {
 		return ReviewerOutput{}, err
@@ -135,6 +153,128 @@ func (p PlannerOutput) Validate() error {
 		return errors.New("planner change_type is required")
 	}
 	return nil
+}
+
+// NormalizePriority returns the canonical spelling of a priority.
+func NormalizePriority(priority string) (Priority, bool) {
+	switch strings.ToUpper(strings.TrimSpace(priority)) {
+	case string(PriorityP0):
+		return PriorityP0, true
+	case string(PriorityP1):
+		return PriorityP1, true
+	case string(PriorityP2):
+		return PriorityP2, true
+	default:
+		return "", false
+	}
+}
+
+// PriorityFromSeverity maps every legacy severity to the canonical three-level
+// priority contract. Low and informational findings remain valid legacy inputs,
+// but are grouped under P2.
+func PriorityFromSeverity(severity string) (Priority, bool) {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "critical":
+		return PriorityP0, true
+	case "high":
+		return PriorityP1, true
+	case "medium", "low", "info":
+		return PriorityP2, true
+	default:
+		if priority, ok := NormalizePriority(severity); ok {
+			return priority, true
+		}
+		return "", false
+	}
+}
+
+// SeverityFromPriority returns the canonical legacy severity for a priority.
+func SeverityFromPriority(priority Priority) (string, bool) {
+	normalized, ok := NormalizePriority(string(priority))
+	if !ok {
+		return "", false
+	}
+	switch normalized {
+	case PriorityP0:
+		return "critical", true
+	case PriorityP1:
+		return "high", true
+	case PriorityP2:
+		return "medium", true
+	default:
+		return "", false
+	}
+}
+
+// NormalizeFindingPriority fills the compatibility field that is absent and
+// rejects contradictory priority/severity pairs. Existing low/info severities
+// are preserved while receiving canonical P2.
+func NormalizeFindingPriority(f Finding) (Finding, error) {
+	priority, hasPriority := NormalizePriority(string(f.Priority))
+	severity := strings.ToLower(strings.TrimSpace(f.Severity))
+	if !hasPriority && severity == "" {
+		return Finding{}, errors.New("finding priority or severity is required")
+	}
+	if !hasPriority {
+		var ok bool
+		priority, ok = PriorityFromSeverity(severity)
+		if !ok {
+			return Finding{}, fmt.Errorf("invalid severity %q", f.Severity)
+		}
+	}
+	if severity == "" {
+		var ok bool
+		severity, ok = SeverityFromPriority(priority)
+		if !ok {
+			return Finding{}, fmt.Errorf("invalid priority %q", f.Priority)
+		}
+	} else {
+		severityPriority, ok := PriorityFromSeverity(severity)
+		if !ok {
+			return Finding{}, fmt.Errorf("invalid severity %q", f.Severity)
+		}
+		if severityPriority != priority {
+			return Finding{}, fmt.Errorf("priority %s conflicts with severity %s", priority, severity)
+		}
+	}
+	f.Priority = priority
+	f.Severity = severity
+	return f, nil
+}
+
+// NormalizeFindings returns a copy with canonical priorities populated.
+func NormalizeFindings(findings []Finding) ([]Finding, error) {
+	normalized := make([]Finding, len(findings))
+	for i, finding := range findings {
+		var err error
+		normalized[i], err = NormalizeFindingPriority(finding)
+		if err != nil {
+			return nil, fmt.Errorf("finding[%d] %w", i, err)
+		}
+	}
+	return normalized, nil
+}
+
+// FindingPriorityRank returns a total rank for canonical priorities and all
+// recognized legacy severities. Invalid or missing values rank zero.
+func FindingPriorityRank(f Finding) int {
+	priority, ok := NormalizePriority(string(f.Priority))
+	if !ok {
+		priority, ok = PriorityFromSeverity(f.Severity)
+	}
+	if !ok {
+		return 0
+	}
+	switch priority {
+	case PriorityP0:
+		return 3
+	case PriorityP1:
+		return 2
+	case PriorityP2:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // IsValidSeverity returns true if severity is a recognized level.
@@ -155,12 +295,32 @@ func IsValidCategory(category string) bool {
 	return false
 }
 
-// IsAtOrAboveSeverity returns true if severity is at or above the threshold.
-func IsAtOrAboveSeverity(severity, threshold string) bool {
+// FindingLegacySeverityRank returns the compatibility rank, deriving the
+// canonical legacy severity when only Priority is populated.
+func FindingLegacySeverityRank(f Finding) int {
+	if rank := LegacySeverityRank(f.Severity); rank > 0 {
+		return rank
+	}
+	if severity, ok := SeverityFromPriority(f.Priority); ok {
+		return LegacySeverityRank(severity)
+	}
+	return 0
+}
+
+// LegacySeverityRank returns the five-level compatibility rank, or zero for
+// an invalid severity.
+func LegacySeverityRank(severity string) int {
 	order := map[string]int{
 		"info": 1, "low": 2, "medium": 3, "high": 4, "critical": 5,
 	}
-	return order[strings.ToLower(severity)] >= order[strings.ToLower(threshold)]
+	return order[strings.ToLower(strings.TrimSpace(severity))]
+}
+
+// IsAtOrAboveSeverity returns true if severity is at or above the threshold.
+func IsAtOrAboveSeverity(severity, threshold string) bool {
+	severityRank := LegacySeverityRank(severity)
+	thresholdRank := LegacySeverityRank(threshold)
+	return severityRank > 0 && thresholdRank > 0 && severityRank >= thresholdRank
 }
 
 // sanitizeSuggestedDiff clears the suggested diff if it doesn't look like a
@@ -201,7 +361,12 @@ func (r ReviewerOutput) Validate() error {
 		return errors.New("reviewer summary is required")
 	}
 
-	for i, f := range r.Findings {
+	for i := range r.Findings {
+		f, err := NormalizeFindingPriority(r.Findings[i])
+		if err != nil {
+			return fmt.Errorf("finding[%d] %w", i, err)
+		}
+		r.Findings[i] = f
 		if !IsValidSeverity(f.Severity) {
 			return fmt.Errorf("finding[%d] invalid severity %q", i, f.Severity)
 		}

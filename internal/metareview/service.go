@@ -123,6 +123,18 @@ func (s *Service) RunAsync(ctx context.Context, in Input) {
 }
 
 func (s *Service) Run(ctx context.Context, in Input) (result Result, runErr error) {
+	normalizedFindings := append([]reviewengine.Finding(nil), in.LocalReview.Findings...)
+	for i, finding := range normalizedFindings {
+		if strings.TrimSpace(string(finding.Priority)) == "" && strings.TrimSpace(finding.Severity) == "" {
+			continue // preserve compatibility with older partial quality fixtures
+		}
+		normalized, normalizeErr := reviewengine.NormalizeFindingPriority(finding)
+		if normalizeErr != nil {
+			return result, fmt.Errorf("normalize meta-review finding[%d]: %w", i, normalizeErr)
+		}
+		normalizedFindings[i] = normalized
+	}
+	in.LocalReview.Findings = normalizedFindings
 	reasons := gateReasons(in.LocalReview, in.ChangedFiles, in.SecurityFindings, s.cfg.RandomSampleRate)
 	if len(reasons) == 0 {
 		return Result{Triggered: false}, nil
