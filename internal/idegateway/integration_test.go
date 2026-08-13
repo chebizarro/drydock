@@ -3,13 +3,22 @@ package idegateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"drydock/internal/agenticreview"
+	"drydock/internal/agenttools"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/contextvm"
+	"drydock/internal/db"
 	"drydock/internal/reviewengine"
+	"drydock/internal/reviewsession"
+	"drydock/internal/workspacesnapshot"
 
 	"fiatjaf.com/nostr"
 )
@@ -26,6 +35,41 @@ func (s integSigner) SignEvent(_ context.Context, evt *nostr.Event) error {
 	return evt.Sign(s.sk)
 }
 
+type ideTokenCounter struct{}
+
+func (ideTokenCounter) Count(text string) int { return len(text) }
+
+type ideAgenticClient struct {
+	results []reviewengine.CompletionResult
+	next    int
+}
+
+func (c *ideAgenticClient) ChatCompletion(context.Context, reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
+	return reviewengine.ChatResult{Content: `{"change_type":"feature","risk_areas":["correctness"],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`}, nil
+}
+
+func (c *ideAgenticClient) Complete(context.Context, reviewengine.CompletionRequest) (reviewengine.CompletionResult, error) {
+	result := c.results[c.next]
+	c.next++
+	return result, nil
+}
+
+func ideToolCall(t *testing.T, id, name string, arguments any) reviewengine.ToolCall {
+	t.Helper()
+	encoded, err := json.Marshal(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reviewengine.ToolCall{ID: id, Type: "function", Function: reviewengine.ToolCallFunction{Name: name, Arguments: string(encoded)}}
+}
+
+func ideCompletion(calls ...reviewengine.ToolCall) reviewengine.CompletionResult {
+	return reviewengine.CompletionResult{
+		Message: reviewengine.CompletionMessage{Role: reviewengine.MessageRoleAssistant, ToolCalls: calls},
+		Usage:   reviewengine.CompletionUsage{TotalTokens: 1},
+	}
+}
+
 type integRelayPublisher struct {
 	events []nostr.Event
 }
@@ -39,12 +83,35 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
-	llm := &reviewengine.FakeLLMForTest{
-		Responses: []string{
-			`{"change_type":"feature","risk_areas":["correctness"],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
-			`{"summary":"Found one issue.","findings":[{"severity":"high","category":"correctness","file":"main.go","line":2,"evidence":"unused branch","explanation":"Prefer explicit return handling.","suggestion":"apply patch","suggested_diff":"@@ -2,1 +2,1 @@\n-return 0\n+return 1","confidence":0.95}],"needs_more_context":[]}`,
-		},
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main\nfunc x() int { return 0 }\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	llm := &ideAgenticClient{results: []reviewengine.CompletionResult{
+		ideCompletion(ideToolCall(t, "finalize", agenttools.ToolSelectionFinalize, map[string]any{})),
+		ideCompletion(ideToolCall(t, "evidence-1", agenttools.ToolCodeRead, map[string]any{"path": "main.go", "start_line": 1, "end_line": 2})),
+		ideCompletion(ideToolCall(t, "submit-1", agenttools.ToolReviewSubmit, map[string]any{
+			"summary": "Found one issue.",
+			"findings": []any{map[string]any{
+				"priority": "P1", "category": "correctness", "file": "main.go", "line": 2,
+				"explanation": "Prefer explicit return handling.", "suggestion": "apply patch",
+				"suggested_diff": "@@ -2,1 +2,1 @@\n-return 0\n+return 1", "confidence": 0.95,
+				"evidence_tool_call_ids": []string{"evidence-1"},
+			}},
+			"coverage": map[string]any{"examined_files": []string{"main.go"}, "outcome": "findings", "summary": "reviewed changed file"},
+		})),
+		ideCompletion(ideToolCall(t, "evidence-2", agenttools.ToolCodeRead, map[string]any{"path": "main.go", "start_line": 1, "end_line": 2})),
+		ideCompletion(ideToolCall(t, "submit-2", agenttools.ToolReviewSubmit, map[string]any{
+			"summary": "The issue remains.",
+			"findings": []any{map[string]any{
+				"priority": "P1", "category": "correctness", "file": "main.go", "line": 2,
+				"explanation": "Prefer explicit return handling.", "suggestion": "apply patch",
+				"suggested_diff": "@@ -2,1 +2,1 @@\n-return 0\n+return 1", "confidence": 0.95,
+				"evidence_tool_call_ids": []string{"evidence-2"},
+			}},
+			"coverage": map[string]any{"examined_files": []string{"main.go"}, "outcome": "findings", "summary": "reviewed frozen file"},
+		})),
+	}}
 
 	engine := reviewengine.New(reviewengine.Config{
 		Planner:  reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "planner"},
@@ -53,22 +120,52 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 		Coder14B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "coder14b"},
 	}, llm, logger)
 
+	database, err := db.Open(ctx, filepath.Join(t.TempDir(), "ide.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := reviewsession.NewSQLiteStore(database.DB(), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := workspacesnapshot.NewManager(workspacesnapshot.Config{StorageRoot: t.TempDir(), LeaseTTL: time.Hour, SessionLifetime: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := agenttools.NewRegistry()
+	discovery, err := agenticreview.NewDiscovery(agenticreview.DiscoveryConfig{Client: llm, Registry: registry, Counter: ideTokenCounter{}, TokenBudget: 100_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agenticSvc, err := agenticreview.NewService(agenticreview.ServiceConfig{
+		Snapshots: manager, Sessions: sessionStore, Discovery: discovery, Engine: engine,
+		Client: llm, Registry: registry, Counter: ideTokenCounter{}, HistoryTokens: 100_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	pub := &integRelayPublisher{}
 	gatewaySigner := integSigner{sk: nostr.Generate()}
 	clientSK := nostr.Generate()
 	handler := New(
 		Config{DefaultRelays: []string{"wss://relay.test"}},
-		nil,
+		database,
 		contextbuilder.NewDefault(),
 		engine,
 		gatewaySigner,
 		pub,
 		logger,
+		WithAgenticReviewService(agenticSvc),
 	)
 
 	sessionEvent := nostr.Event{
 		Kind:    nostr.Kind(KindIDESession),
-		Content: `{"workspace_path":"/tmp/repo","editor":"vscode","version":"1.0.0"}`,
+		Content: fmt.Sprintf(`{"workspace_path":%q,"editor":"vscode","version":"1.0.0"}`, workspace),
 		Tags: nostr.Tags{
 			{"p", handler.ourPubKey},
 			{"d", BuildSessionDTag("sess-1")},
@@ -88,7 +185,7 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 		"session_id":"sess-1",
 		"request_id":"req-1",
 		"diff":"diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+func x() int { return 0 }\n",
-		"changed_files":["main.go"]
+		"changed_files":["client-supplied-wrong.go"]
 	}`)
 	clientPub := nostr.GetPublicKey(clientSK)
 	reviewEvent := nostr.Event{PubKey: clientPub, Tags: nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "req-1"}}}
@@ -110,6 +207,9 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 	if !ok {
 		t.Fatalf("review result = %T, want ReviewResponse", reviewResult)
 	}
+	if reviewResp.ChatID == "" || reviewResp.ExpectedVersion == nil || *reviewResp.ExpectedVersion != 0 {
+		t.Fatalf("session metadata missing: %+v", reviewResp)
+	}
 	if len(reviewResp.Diagnostics) != 1 {
 		t.Fatalf("diagnostics = %d, want 1", len(reviewResp.Diagnostics))
 	}
@@ -120,6 +220,29 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 	}
 	if diag.SuggestedFix == "" {
 		t.Fatal("expected suggested_fix in review response")
+	}
+
+	followVersion := *reviewResp.ExpectedVersion
+	followParams, err := json.Marshal(ReviewRequest{
+		SessionID: "sess-1", RequestID: "req-2", ChatID: reviewResp.ChatID,
+		ExpectedVersion: &followVersion, Message: "Check the frozen workspace again.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	followEvent := nostr.Event{PubKey: clientPub, Tags: nostr.Tags{{"p", handler.ourPubKey}, {"session", "sess-1"}, {"request", "req-2"}}}
+	followResult, followErr := handler.HandleReviewRequest(ctx, contextvm.Request{
+		Event: followEvent, Msg: contextvm.Message{JSONRPC: "2.0", ID: "req-2", Method: MethodReviewRequest, Params: followParams},
+	})
+	if followErr != nil {
+		t.Fatalf("follow-up failed: %v", followErr.Message)
+	}
+	followResp := followResult.(ReviewResponse)
+	if followResp.ChatID != reviewResp.ChatID || followResp.ExpectedVersion == nil || *followResp.ExpectedVersion != 1 {
+		t.Fatalf("follow-up session metadata = %+v", followResp)
+	}
+	if len(followResp.Diagnostics) != 1 || followResp.Diagnostics[0].FixID == diag.FixID {
+		t.Fatalf("turn-scoped fix ID missing: initial=%q follow=%+v", diag.FixID, followResp.Diagnostics)
 	}
 
 	fixParams := json.RawMessage(`{

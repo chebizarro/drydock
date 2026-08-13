@@ -27,7 +27,9 @@ import {
     buildSessionAnnouncementTags,
     hasResponseCorrelationTags,
     isTrustedGatewayEvent,
-    type ResponseCorrelation
+    reviewSessionState,
+    type ResponseCorrelation,
+    type ReviewSessionState
 } from './protocol';
 
 const { useWebSocketImplementation } = require('nostr-tools/pool') as {
@@ -57,6 +59,7 @@ let reviewResponseSubscription: { close: (reason?: string) => void | Promise<voi
 let activeRelayUrls: string[] = [];
 let activeSubscriptionKey: string | undefined;
 let latestReviewRequest: { requestId: string; eventId: string } | undefined;
+let activeReviewSession: ReviewSessionState | undefined;
 
 // Store pending fixes by ID
 const pendingFixes: Map<string, PendingFix> = new Map();
@@ -175,6 +178,7 @@ export function activate(context: vscode.ExtensionContext) {
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('drydock.reviewChanges', reviewChanges),
+        vscode.commands.registerCommand('drydock.continueReview', continueReview),
         vscode.commands.registerCommand('drydock.applyFix', applyFix),
         vscode.commands.registerCommand('drydock.clearDiagnostics', clearDiagnostics),
         vscode.workspace.onDidChangeConfiguration(event => {
@@ -273,6 +277,7 @@ async function reviewChanges() {
                 tags: buildContextVMRequestTags(config, requestId, METHOD_REVIEW_REQUEST)
             }, privateKey);
 
+            activeReviewSession = undefined;
             latestReviewRequest = { requestId, eventId: requestEvent.id };
             await publishEvent(requestEvent);
         });
@@ -290,6 +295,59 @@ async function reviewChanges() {
 }
 
 /**
+ * Continue the most recent agentic review against its frozen workspace snapshot.
+ */
+async function continueReview() {
+    if (!activeReviewSession) {
+        vscode.window.showInformationMessage('Drydock: Run a review first; this gateway may not support follow-ups');
+        return;
+    }
+    const message = await vscode.window.showInputBox({
+        prompt: 'What should Drydock review next?',
+        placeHolder: 'Check error handling in the changed code'
+    });
+    if (!message?.trim()) {
+        return;
+    }
+
+    try {
+        const config = getDrydockConfig();
+        const privateKey = parsePrivateKey(config.privateKey);
+        if (!tryParsePubkey(config.drydockPubkey)) {
+            throw new Error('Configure drydock.drydockPubkey before requesting a review');
+        }
+        await refreshRelaySubscription({ announceSession: true, notifyOnFailure: true });
+        if (!relayPool || activeRelayUrls.length === 0) {
+            throw new Error('No Nostr relays configured');
+        }
+
+        const requestId = uuidv4();
+        const request: ReviewRequest = {
+            session_id: sessionId,
+            request_id: requestId,
+            diff: '',
+            changed_files: [],
+            full_review: true,
+            chat_id: activeReviewSession.chatId,
+            expected_version: activeReviewSession.expectedVersion,
+            message: message.trim()
+        };
+        const rpcRequest = buildJSONRPCRequest(requestId, METHOD_REVIEW_REQUEST, request);
+        const requestEvent = signEvent({
+            kind: KIND_CONTEXTVM,
+            content: JSON.stringify(rpcRequest),
+            tags: buildContextVMRequestTags(config, requestId, METHOD_REVIEW_REQUEST)
+        }, privateKey);
+        latestReviewRequest = { requestId, eventId: requestEvent.id };
+        await publishEvent(requestEvent);
+        vscode.window.showInformationMessage('Drydock: Follow-up review request published');
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(`Drydock: Failed to continue review: ${errorMessage}`);
+    }
+}
+
+/**
  * Process review response and display diagnostics
  */
 function handleReviewResponse(response: ReviewResponse) {
@@ -298,6 +356,11 @@ function handleReviewResponse(response: ReviewResponse) {
 
     if (response.session_id !== sessionId) {
         return;
+    }
+
+    const nextSession = reviewSessionState(response);
+    if (nextSession) {
+        activeReviewSession = nextSession;
     }
 
     if (!response.diagnostics.length && response.summary) {
@@ -636,6 +699,7 @@ function clearDiagnostics() {
     diagnosticCollection.clear();
     pendingFixes.clear();
     pendingFixRequests.clear();
+    activeReviewSession = undefined;
     vscode.window.showInformationMessage('Drydock: Diagnostics cleared');
 }
 

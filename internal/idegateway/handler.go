@@ -11,12 +11,16 @@ import (
 	"sync"
 	"time"
 
+	"drydock/internal/agenticreview"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/contextvm"
 	"drydock/internal/db"
 	"drydock/internal/metrics"
 	"drydock/internal/reviewengine"
 	"drydock/internal/revieworder"
+	"drydock/internal/reviewsession"
+	"drydock/internal/targetidentity"
+	"drydock/internal/workspacesnapshot"
 
 	"fiatjaf.com/nostr"
 )
@@ -25,8 +29,8 @@ const (
 	// maxConcurrent limits parallel review requests.
 	maxConcurrent = 4
 
-	// reviewTimeout is the max time for processing a review request.
-	reviewTimeout = 60 * time.Second
+	// defaultAgenticTimeout allows iterative discovery/review turns to finish.
+	defaultAgenticTimeout = 10 * time.Minute
 
 	// fixTTL controls how long suggested fixes are retained server-side.
 	fixTTL = 15 * time.Minute
@@ -50,7 +54,8 @@ type PatchOrderer interface {
 
 // Config holds IDE gateway configuration.
 type Config struct {
-	DefaultRelays []string
+	DefaultRelays  []string
+	AgenticTimeout time.Duration
 }
 
 // Handler processes IDE integration events.
@@ -59,6 +64,7 @@ type Handler struct {
 	store      *db.Store
 	ctxBuilder *contextbuilder.Builder
 	engine     *reviewengine.Engine
+	agenticSvc *agenticreview.Service
 	signer     Signer
 	publish    RelayPublisher
 	logger     *slog.Logger
@@ -113,6 +119,10 @@ func New(
 		}
 	}
 
+	if cfg.AgenticTimeout <= 0 {
+		cfg.AgenticTimeout = defaultAgenticTimeout
+	}
+
 	h := &Handler{
 		cfg:        cfg,
 		store:      store,
@@ -130,6 +140,11 @@ func New(
 		opt(h)
 	}
 	return h
+}
+
+// WithAgenticReviewService configures shared inline review preparation and sessions.
+func WithAgenticReviewService(service *agenticreview.Service) func(*Handler) {
+	return func(h *Handler) { h.agenticSvc = service }
 }
 
 // WithPatchOrderer configures shared stored-patch admission.
@@ -320,7 +335,18 @@ func (h *Handler) HandleReviewRequest(ctx context.Context, rpcReq contextvm.Requ
 	}
 	resp, err := h.processReviewRequest(ctx, rpcReq.Event, rpcReq.Relay, req)
 	if err != nil {
-		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+		switch {
+		case errors.Is(err, reviewsession.ErrVersionConflict), errors.Is(err, reviewsession.ErrActiveTurn),
+			errors.Is(err, reviewsession.ErrRequestInProgress), errors.Is(err, reviewsession.ErrIdempotencyConflict):
+			return nil, &contextvm.Error{Code: contextvm.ErrorConflict, Message: err.Error()}
+		case errors.Is(err, reviewsession.ErrOwnerMismatch):
+			return nil, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: err.Error()}
+		case errors.Is(err, reviewsession.ErrNotFound), errors.Is(err, reviewsession.ErrExpired),
+			errors.Is(err, reviewsession.ErrBroken):
+			return nil, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: err.Error()}
+		default:
+			return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
+		}
 	}
 	return resp, nil
 }
@@ -418,9 +444,16 @@ func (h *Handler) processReviewRequest(ctx context.Context, event nostr.Event, _
 		return ReviewResponse{}, ctx.Err()
 	}
 
-	if req.Diff == "" {
+	isContinuation := strings.TrimSpace(req.ChatID) != ""
+	if !isContinuation && strings.TrimSpace(req.Diff) == "" {
 		h.logger.Debug("empty diff in review request", "event_id", event.ID.Hex())
-		return ReviewResponse{}, fmt.Errorf("empty diff in review request")
+		return ReviewResponse{}, fmt.Errorf("empty diff in initial review request")
+	}
+	if isContinuation && (req.ExpectedVersion == nil || *req.ExpectedVersion < 0 || strings.TrimSpace(req.Message) == "") {
+		return ReviewResponse{}, fmt.Errorf("chat_id follow-ups require non-negative expected_version and message")
+	}
+	if h.agenticSvc == nil {
+		return ReviewResponse{}, fmt.Errorf("agentic review service is not configured")
 	}
 
 	// Look up the session and verify the request author owns it.
@@ -432,49 +465,75 @@ func (h *Handler) processReviewRequest(ctx context.Context, event nostr.Event, _
 		return ReviewResponse{}, fmt.Errorf("unauthorized IDE session sender")
 	}
 	session.LastSeen = time.Now()
-	repoPath := session.Session.WorkspacePath
+	ideSession := session.Session
+	repoPath := ideSession.WorkspacePath
 	h.mu.Unlock()
 
-	// Process the review.
-	ctx, cancel := context.WithTimeout(ctx, reviewTimeout)
+	// Process the iterative review with the configured agentic deadline.
+	ctx, cancel := context.WithTimeout(ctx, h.cfg.AgenticTimeout)
 	defer cancel()
 
 	start := time.Now()
 	h.cleanupExpiredFixes(ctx, start)
 
-	// Build context from the diff.
-	bundle, err := h.ctxBuilder.Build(ctx, contextbuilder.BuildInput{
-		PatchEventContent: req.Diff,
-		RepoPath:          repoPath,
-	})
-	if err != nil {
-		h.logger.Warn("context build failed", "request_id", req.RequestID, "error", err)
-		return ReviewResponse{}, fmt.Errorf("failed to build context: %w", err)
-	}
-	for _, status := range bundle.LayerStatuses {
-		metrics.ContextLayersByStatus.With(status.Status).Inc()
-		if status.Status != "used" {
-			h.logger.Warn("context layer not fully available", "request_id", req.RequestID, "layer", status.Layer, "status", status.Status, "message", status.Message)
+	owner := reviewsession.Owner{Kind: "ide", ID: strings.ToLower(event.PubKey.Hex())}
+	var sessionResult agenticreview.SessionResult
+	var err error
+	if isContinuation {
+		sessionResult, err = h.agenticSvc.Continue(ctx, agenticreview.ContinueInput{
+			ChatID: req.ChatID, Owner: owner, RequestID: req.RequestID,
+			ExpectedVersion: int(*req.ExpectedVersion), Message: req.Message,
+		})
+	} else {
+		analysis, analyzeErr := contextbuilder.NewPatchFacade().Analyze(contextbuilder.PatchAnalysisRequest{Diff: req.Diff})
+		if analyzeErr != nil {
+			return ReviewResponse{}, fmt.Errorf("analyze inline patch: %w", analyzeErr)
 		}
+		prepared, prepareErr := h.agenticSvc.Prepare(ctx, agenticreview.PrepareInput{
+			Mode: reviewsession.ModeInlinePatch,
+			Snapshot: agenticreview.SnapshotSpec{
+				Kind: workspacesnapshot.KindMutableCopy, WorkspacePath: repoPath,
+				PatchRef: req.RequestID, Allowlist: []string{"."},
+			},
+			Patch: analysis.FilteredDiff,
+			BuildInput: contextbuilder.BuildInput{
+				PatchEventContent: analysis.FilteredDiff, RepoPath: repoPath,
+			},
+			Target: inlineTarget(ideSession, req, repoPath, analysis.FilteredDiff),
+		})
+		if prepareErr != nil {
+			h.logger.Warn("agentic preparation failed", "request_id", req.RequestID, "error", prepareErr)
+			return ReviewResponse{}, fmt.Errorf("prepare inline review: %w", prepareErr)
+		}
+		defer h.agenticSvc.ReleasePrepared(prepared)
+		bundle := prepared.Bundle()
+		if !samePathSet(bundle.ChangedFiles, analysis.ChangedFiles) {
+			return ReviewResponse{}, fmt.Errorf("finalized bundle changed files disagree with authoritative patch")
+		}
+		for _, status := range bundle.LayerStatuses {
+			metrics.ContextLayersByStatus.With(status.Status).Inc()
+			if status.Status != "used" {
+				h.logger.Warn("context layer not fully available", "request_id", req.RequestID, "layer", status.Layer, "status", status.Status, "message", status.Message)
+			}
+		}
+		sessionResult, err = h.agenticSvc.StartSession(ctx, agenticreview.StartSessionInput{
+			Prepared: prepared, Owner: owner, RequestID: req.RequestID,
+			Options: agenticreview.ReviewOptions{SkipWalkthrough: true},
+		})
 	}
-
-	// Run the review engine.
-	result, err := h.engine.Run(ctx, reviewengine.RunInput{
-		ContextBundle:   bundle.Content,
-		ChangedFiles:    req.ChangedFiles,
-		SkipWalkthrough: true, // IDEs don't need walkthrough
-	})
 	if err != nil {
-		h.logger.Warn("review engine failed", "request_id", req.RequestID, "error", err)
+		h.logger.Warn("agentic review failed", "request_id", req.RequestID, "chat_id", req.ChatID, "error", err)
 		return ReviewResponse{}, fmt.Errorf("review failed: %w", err)
 	}
+	result := sessionResult.Output
 
-	// Convert findings to diagnostics.
+	// Convert findings to diagnostics. Fix identifiers are scoped to the
+	// persisted chat turn, not the transport request alone.
 	diagnostics := make([]Diagnostic, 0, len(result.Review.Findings))
 	for i, f := range result.Review.Findings {
 		fixID := ""
 		if f.HasSuggestion() {
-			fixID = generateFixID(req.RequestID, f.File, f.Line, i)
+			fixID = generateFixID(sessionResult.ChatID, sessionResult.Version, f.File, f.Line, i)
 			if err := h.storeFix(ctx, fixID, storedFix{
 				SessionID:    req.SessionID,
 				AuthorPubKey: event.PubKey.Hex(),
@@ -488,13 +547,17 @@ func (h *Handler) processReviewRequest(ctx context.Context, event nostr.Event, _
 		diagnostics = append(diagnostics, FindingToDiagnostic(f, fixID))
 	}
 
-	// Build response.
+	// Build response. expected_version is the version clients must echo on
+	// their next optional follow-up request.
+	version := int64(sessionResult.Version)
 	response := ReviewResponse{
-		RequestID:    req.RequestID,
-		SessionID:    req.SessionID,
-		Diagnostics:  diagnostics,
-		Summary:      result.Review.Summary,
-		ReviewTimeMs: time.Since(start).Milliseconds(),
+		RequestID:       req.RequestID,
+		SessionID:       req.SessionID,
+		Diagnostics:     diagnostics,
+		Summary:         result.Review.Summary,
+		ReviewTimeMs:    time.Since(start).Milliseconds(),
+		ChatID:          sessionResult.ChatID,
+		ExpectedVersion: &version,
 	}
 
 	metrics.IDEReviewResponsesSent.Inc()
@@ -783,9 +846,39 @@ func hasTagValue(tags nostr.Tags, name, value string) bool {
 	return false
 }
 
-// generateFixID creates a deterministic fix ID from finding details.
-func generateFixID(requestID string, file string, line, index int) string {
-	key := fmt.Sprintf("%s:%s:%d:%d", requestID, file, line, index)
+func inlineTarget(session IDESession, req ReviewRequest, repoPath, patch string) agenticreview.TargetInput {
+	repoID := strings.TrimSpace(session.RepoID)
+	if repoID == "" {
+		repoID = "ide:" + targetidentity.SHA256(repoPath)
+	}
+	return agenticreview.TargetInput{
+		RepoID: repoID, RootID: targetidentity.SHA256(session.SessionID),
+		PatchEventID:            targetidentity.SHA256(session.SessionID + "\x00" + req.RequestID),
+		CanonicalRemoteIdentity: "ide-workspace:" + targetidentity.SHA256(repoPath),
+		PreparedDiffSHA256:      targetidentity.SHA256(patch),
+	}
+}
+
+func samePathSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[string]int, len(left))
+	for _, path := range left {
+		counts[path]++
+	}
+	for _, path := range right {
+		counts[path]--
+		if counts[path] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// generateFixID creates a deterministic turn-scoped fix ID from finding details.
+func generateFixID(chatID string, version int, file string, line, index int) string {
+	key := fmt.Sprintf("%s:%d:%s:%d:%d", chatID, version, file, line, index)
 	hash := sha256.Sum256([]byte(key))
 	return fmt.Sprintf("%x", hash[:8])
 }

@@ -26,6 +26,10 @@
         "title": "Drydock: Review Uncommitted Changes"
       },
       {
+        "command": "drydock.continueReview",
+        "title": "Drydock: Continue Review"
+      },
+      {
         "command": "drydock.applyFix",
         "title": "Drydock: Apply Suggested Fix"
       },

@@ -4,6 +4,7 @@ import {
     buildSessionAnnouncementTags,
     hasResponseCorrelationTags,
     isTrustedGatewayEvent,
+    reviewSessionState,
     type ResponseCorrelation
 } from './protocol';
 
@@ -24,6 +25,15 @@ describe('IDE Nostr protocol validation', () => {
         const tags = buildSessionAnnouncementTags('session-1', '0.1.0', gatewayPubkey);
 
         expect(tags).toContainEqual(['p', gatewayPubkey]);
+    });
+
+    it('uses optional session metadata when supported and tolerates legacy responses', () => {
+        expect(reviewSessionState({ chat_id: 'chat-1', expected_version: 0 })).toEqual({
+            chatId: 'chat-1',
+            expectedVersion: 0
+        });
+        expect(reviewSessionState({})).toBeUndefined();
+        expect(reviewSessionState({ chat_id: 'chat-1' })).toBeUndefined();
     });
 
     it('rejects forged or unsigned gateway events', () => {

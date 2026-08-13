@@ -1,5 +1,22 @@
 import { verifyEvent, type Event } from 'nostr-tools';
 
+export interface ReviewSessionState {
+    chatId: string;
+    expectedVersion: number;
+}
+
+export interface ReviewSessionResponse {
+    chat_id?: string;
+    expected_version?: number;
+}
+
+export function reviewSessionState(response: ReviewSessionResponse): ReviewSessionState | undefined {
+    if (!response.chat_id || !Number.isInteger(response.expected_version) || response.expected_version! < 0) {
+        return undefined;
+    }
+    return { chatId: response.chat_id, expectedVersion: response.expected_version! };
+}
+
 export interface ResponseCorrelation {
     clientPubkey: string;
     requestEventId: string;

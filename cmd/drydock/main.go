@@ -641,8 +641,10 @@ func main() {
 
 	if signer != nil {
 		ideHandler = idegateway.New(
-			idegateway.Config{DefaultRelays: writeRelays}, store, ctxBuilder, engine, signer, relayPub, logger,
+			idegateway.Config{DefaultRelays: writeRelays, AgenticTimeout: cfg.IDEAgenticTimeout},
+			store, ctxBuilder, engine, signer, relayPub, logger,
 			idegateway.WithPatchOrderer(reviewOrders),
+			idegateway.WithAgenticReviewService(agenticReviewSvc),
 		)
 		processorOpts = append(processorOpts, ingest.WithIDEGateway(ideHandler))
 		if err := contextvm.RegisterIDEMethods(contextVMRouter, ideHandler); err != nil {
