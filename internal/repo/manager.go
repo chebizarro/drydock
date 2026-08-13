@@ -28,6 +28,8 @@ type Manager struct {
 	evictionMu   sync.Mutex
 	maxCount     int   // 0 = unlimited
 	maxSizeBytes int64 // 0 = unlimited
+	maxDiffFiles int
+	maxDiffBytes int64
 }
 
 // ManagerOption configures a Manager.
@@ -43,10 +45,37 @@ func WithMaxCacheSizeMB(mb int) ManagerOption {
 	return func(m *Manager) { m.maxSizeBytes = int64(mb) * 1024 * 1024 }
 }
 
+// WithMaxPRDiffFiles sets the maximum number of files allowed in a PR diff.
+// Values less than one retain the fail-closed default.
+func WithMaxPRDiffFiles(n int) ManagerOption {
+	return func(m *Manager) {
+		if n > 0 {
+			m.maxDiffFiles = n
+		}
+	}
+}
+
+// WithMaxPRDiffBytes sets the maximum unified-diff size allowed for a PR.
+// Values less than one retain the fail-closed default.
+func WithMaxPRDiffBytes(n int64) ManagerOption {
+	return func(m *Manager) {
+		if n > 0 {
+			m.maxDiffBytes = n
+		}
+	}
+}
+
+const (
+	defaultMaxPRDiffFiles = 1000
+	defaultMaxPRDiffBytes = 10 * 1024 * 1024
+)
+
 func NewManager(baseDir string, logger *slog.Logger, opts ...ManagerOption) *Manager {
 	m := &Manager{
-		baseDir: baseDir,
-		logger:  logger,
+		baseDir:      baseDir,
+		logger:       logger,
+		maxDiffFiles: defaultMaxPRDiffFiles,
+		maxDiffBytes: defaultMaxPRDiffBytes,
 	}
 	for _, o := range opts {
 		o(m)
@@ -234,14 +263,23 @@ func (m *Manager) CheckoutCommitOnBranch(ctx context.Context, repoPath, branch, 
 	return nil
 }
 
-// DiffAgainstDefaultBranch returns a unified diff of tip relative to its
-// merge-base with the repository's default branch. Exactly one authoritative
-// default ref is used (origin/HEAD, falling back to origin/main then
-// origin/master only when the earlier refs do not exist) so a stale secondary
-// branch can never substitute for the real default. Errors are returned when
-// no default ref exists, when the histories are unrelated, or when the
-// default branch already contains tip (nothing to review).
-func (m *Manager) DiffAgainstDefaultBranch(ctx context.Context, repoPath, tip string) (string, error) {
+// PRDiff is a provenance-bearing unified diff for a PR tip.
+type PRDiff struct {
+	BaseCommit string
+	TipCommit  string
+	Diff       string
+	SHA256     string
+	FileCount  int
+	ByteCount  int64
+}
+
+// DiffAgainstDefaultBranch returns a verified PR diff. When assertedBase is
+// present (the NIP-34 merge-base tag), it is preferred over a merge-base
+// inferred from the cached default ref. The asserted base must be an ancestor
+// of tip and must be comparable with the default branch history. This accepts
+// a canonical clone whose default ref is stale while rejecting unrelated or
+// fork-invented histories.
+func (m *Manager) DiffAgainstDefaultBranch(ctx context.Context, repoPath, tip, assertedBase string) (PRDiff, error) {
 	mu := m.getRepoLock(repoPath)
 	mu.Lock()
 	defer mu.Unlock()
@@ -254,22 +292,69 @@ func (m *Manager) DiffAgainstDefaultBranch(ctx context.Context, repoPath, tip st
 		}
 	}
 	if defaultRef == "" {
-		return "", fmt.Errorf("no default branch ref found for diff base of %s", tip)
+		return PRDiff{}, fmt.Errorf("no default branch ref found for diff base of %s", tip)
 	}
 
-	base, err := m.runGit(ctx, repoPath, "merge-base", defaultRef, tip)
+	resolvedTip, err := m.runGit(ctx, repoPath, "rev-parse", "--verify", tip+"^{commit}")
 	if err != nil {
-		return "", fmt.Errorf("no merge-base between %s and %s (unrelated histories?): %w", defaultRef, tip, err)
+		return PRDiff{}, fmt.Errorf("resolve PR tip %s: %w", tip, err)
 	}
-	if strings.EqualFold(base, tip) {
-		return "", fmt.Errorf("commit %s is already contained in %s; nothing to review", tip, defaultRef)
+	if _, err := m.runGit(ctx, repoPath, "merge-base", "--is-ancestor", resolvedTip, defaultRef); err == nil {
+		return PRDiff{}, fmt.Errorf("commit %s is already contained in %s; nothing to review", resolvedTip, defaultRef)
 	}
 
-	diff, err := m.runGitStdout(ctx, repoPath, "diff", base, tip)
-	if err != nil {
-		return "", fmt.Errorf("diff %s..%s: %w", base, tip, err)
+	base := strings.TrimSpace(assertedBase)
+	if base != "" {
+		base, err = m.runGit(ctx, repoPath, "rev-parse", "--verify", base+"^{commit}")
+		if err != nil {
+			return PRDiff{}, fmt.Errorf("resolve event-asserted merge-base %s: %w", assertedBase, err)
+		}
+		if _, err := m.runGit(ctx, repoPath, "merge-base", "--is-ancestor", base, resolvedTip); err != nil {
+			return PRDiff{}, fmt.Errorf("event-asserted merge-base %s is not an ancestor of PR tip %s", base, resolvedTip)
+		}
+		_, baseBeforeDefaultErr := m.runGit(ctx, repoPath, "merge-base", "--is-ancestor", base, defaultRef)
+		_, defaultBeforeBaseErr := m.runGit(ctx, repoPath, "merge-base", "--is-ancestor", defaultRef, base)
+		if baseBeforeDefaultErr != nil && defaultBeforeBaseErr != nil {
+			return PRDiff{}, fmt.Errorf("event-asserted merge-base %s is not comparable with canonical default history %s", base, defaultRef)
+		}
+	} else {
+		base, err = m.runGit(ctx, repoPath, "merge-base", defaultRef, resolvedTip)
+		if err != nil {
+			return PRDiff{}, fmt.Errorf("no merge-base between %s and %s (unrelated histories?): %w", defaultRef, resolvedTip, err)
+		}
 	}
-	return diff, nil
+	if strings.EqualFold(base, resolvedTip) {
+		return PRDiff{}, fmt.Errorf("commit %s has no changes after verified base %s", resolvedTip, base)
+	}
+
+	fileCount, tooManyFiles, err := m.runGitNULCountLimited(ctx, repoPath, m.maxDiffFiles, "diff", "--name-only", "-z", base, resolvedTip, "--")
+	if err != nil {
+		return PRDiff{}, fmt.Errorf("list changed files %s..%s: %w", base, resolvedTip, err)
+	}
+	if tooManyFiles {
+		return PRDiff{}, fmt.Errorf("PR diff %s..%s changes more than %d files; refusing oversized delta", base, resolvedTip, m.maxDiffFiles)
+	}
+	if fileCount == 0 {
+		return PRDiff{}, fmt.Errorf("PR diff %s..%s changes no files", base, resolvedTip)
+	}
+
+	diff, tooManyBytes, err := m.runGitStdoutLimited(ctx, repoPath, m.maxDiffBytes, "diff", base, resolvedTip, "--")
+	if err != nil {
+		return PRDiff{}, fmt.Errorf("diff %s..%s: %w", base, resolvedTip, err)
+	}
+	if tooManyBytes {
+		return PRDiff{}, fmt.Errorf("PR diff %s..%s exceeds configured limit %d bytes; refusing oversized delta", base, resolvedTip, m.maxDiffBytes)
+	}
+	byteCount := int64(len(diff))
+	sum := sha256.Sum256([]byte(diff))
+	return PRDiff{
+		BaseCommit: strings.ToLower(base),
+		TipCommit:  strings.ToLower(resolvedTip),
+		Diff:       diff,
+		SHA256:     hex.EncodeToString(sum[:]),
+		FileCount:  fileCount,
+		ByteCount:  byteCount,
+	}, nil
 }
 
 // ReadFileAtRef reads a file from the repository at the specified git ref
@@ -422,6 +507,87 @@ func (m *Manager) runGitStdout(ctx context.Context, repoPath string, args ...str
 		return "", fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.String(), nil
+}
+
+// runGitNULCountLimited streams NUL-delimited stdout and terminates Git as
+// soon as count exceeds limit, avoiding unbounded memory use for huge diffs.
+func (m *Manager) runGitNULCountLimited(ctx context.Context, repoPath string, limit int, args ...string) (int, bool, error) {
+	validatedPath, err := m.validateRepoPath(repoPath)
+	if err != nil {
+		return 0, false, err
+	}
+	fullArgs := append([]string{"-C", validatedPath}, args...)
+	cmd := exec.CommandContext(ctx, "git", fullArgs...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, false, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return 0, false, err
+	}
+
+	count := 0
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := stdout.Read(buf)
+		if n > 0 {
+			count += bytes.Count(buf[:n], []byte{0})
+			if count > limit {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				return count, true, nil
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return 0, false, readErr
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		return 0, false, fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return count, false, nil
+}
+
+// runGitStdoutLimited returns stdout only up to limit bytes. Git is terminated
+// and reaped as soon as it produces limit+1 bytes.
+func (m *Manager) runGitStdoutLimited(ctx context.Context, repoPath string, limit int64, args ...string) (string, bool, error) {
+	validatedPath, err := m.validateRepoPath(repoPath)
+	if err != nil {
+		return "", false, err
+	}
+	fullArgs := append([]string{"-C", validatedPath}, args...)
+	cmd := exec.CommandContext(ctx, "git", fullArgs...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", false, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return "", false, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(stdout, limit+1))
+	if readErr != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return "", false, readErr
+	}
+	if int64(len(data)) > limit {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return "", true, nil
+	}
+	if err := cmd.Wait(); err != nil {
+		return "", false, fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return string(data), false, nil
 }
 
 func (m *Manager) repoPath(repoID string) string {

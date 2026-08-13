@@ -438,16 +438,49 @@ func TestDiffAgainstDefaultBranch(t *testing.T) {
 	run(t, repoPath, "git", "commit", "-m", "add feature")
 	tip := run(t, repoPath, "git", "rev-parse", "HEAD")
 
-	diff, err := mgr.DiffAgainstDefaultBranch(ctx, repoPath, tip)
+	result, err := mgr.DiffAgainstDefaultBranch(ctx, repoPath, tip, "")
 	if err != nil {
 		t.Fatalf("diff against default branch: %v", err)
 	}
-	if !strings.Contains(diff, "diff --git") || !strings.Contains(diff, "feature.go") {
-		t.Fatalf("expected unified diff containing feature.go, got %q", diff)
+	if !strings.Contains(result.Diff, "diff --git") || !strings.Contains(result.Diff, "feature.go") {
+		t.Fatalf("expected unified diff containing feature.go, got %q", result.Diff)
+	}
+	if result.BaseCommit != baseTip || result.TipCommit != tip || result.FileCount != 1 || result.ByteCount != int64(len(result.Diff)) {
+		t.Fatalf("unexpected diff provenance: %+v", result)
+	}
+	wantHash := fmt.Sprintf("%x", sha256.Sum256([]byte(result.Diff)))
+	if result.SHA256 != wantHash {
+		t.Fatalf("diff hash = %s, want %s", result.SHA256, wantHash)
 	}
 
 	// A tip already contained in the default branch has nothing to review.
-	if _, err := mgr.DiffAgainstDefaultBranch(ctx, repoPath, baseTip); err == nil {
+	if _, err := mgr.DiffAgainstDefaultBranch(ctx, repoPath, baseTip, ""); err == nil {
 		t.Fatal("expected error when tip is already contained in the default branch")
+	}
+}
+
+func TestDiffAgainstDefaultBranchRejectsOversizedDelta(t *testing.T) {
+	ctx := context.Background()
+	repoPath := initWorkRepo(t, filepath.Join(t.TempDir(), "repo"))
+	origin := filepath.Join(t.TempDir(), "origin")
+	run(t, "", "git", "init", "--bare", origin)
+	run(t, repoPath, "git", "remote", "add", "origin", origin)
+	run(t, repoPath, "git", "push", "origin", "HEAD:refs/heads/main")
+	base := run(t, repoPath, "git", "rev-parse", "HEAD")
+
+	writeFile(t, filepath.Join(repoPath, "one.go"), "package one\n")
+	writeFile(t, filepath.Join(repoPath, "two.go"), "package two\n")
+	run(t, repoPath, "git", "add", ".")
+	run(t, repoPath, "git", "commit", "-m", "two files")
+	tip := run(t, repoPath, "git", "rev-parse", "HEAD")
+
+	filesMgr := NewManager(filepath.Dir(repoPath), testLogger(), WithMaxPRDiffFiles(1))
+	if _, err := filesMgr.DiffAgainstDefaultBranch(ctx, repoPath, tip, base); err == nil || !strings.Contains(err.Error(), "more than 1 files") {
+		t.Fatalf("expected file-limit rejection, got %v", err)
+	}
+
+	bytesMgr := NewManager(filepath.Dir(repoPath), testLogger(), WithMaxPRDiffBytes(32))
+	if _, err := bytesMgr.DiffAgainstDefaultBranch(ctx, repoPath, tip, base); err == nil || !strings.Contains(err.Error(), "bytes") || !strings.Contains(err.Error(), "refusing oversized delta") {
+		t.Fatalf("expected byte-limit rejection, got %v", err)
 	}
 }

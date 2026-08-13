@@ -72,6 +72,9 @@ func TestPublishReviewSummaryAndHighDetail(t *testing.T) {
 		ContextHash:       "abc123",
 		Confidence:        0.82,
 		ContextLayersUsed: []string{"patch", "modified-files"},
+		BaseCommit:        strings.Repeat("a", 40),
+		TipCommit:         strings.Repeat("b", 40),
+		DiffSHA256:        strings.Repeat("c", 64),
 		Findings: []reviewengine.Finding{
 			{Severity: "high", Category: "correctness", File: "main.go", Line: 12, Evidence: "x", Explanation: "bug", Suggestion: "fix", Confidence: 0.9},
 			{Severity: "low", Category: "style", File: "main.go", Line: 18, Evidence: "y", Explanation: "style", Suggestion: "optional", Confidence: 0.99},
@@ -100,6 +103,16 @@ func TestPublishReviewSummaryAndHighDetail(t *testing.T) {
 		assertHasTag(t, c.event.Tags, "e")
 		assertHasTag(t, c.event.Tags, "k")
 		assertHasTag(t, c.event.Tags, "p")
+		for key, want := range map[string]string{
+			"base_commit": strings.Repeat("a", 40),
+			"tip_commit":  strings.Repeat("b", 40),
+			"diff_sha256": strings.Repeat("c", 64),
+		} {
+			tag := c.event.Tags.Find(key)
+			if tag == nil || len(tag) < 2 || tag[1] != want {
+				t.Fatalf("%s tag = %v, want %s", key, tag, want)
+			}
+		}
 		if strings.Contains(c.event.Content, "##") || strings.Contains(c.event.Content, "**") {
 			t.Fatalf("expected plaintext comment content, got markdown-like formatting: %q", c.event.Content)
 		}

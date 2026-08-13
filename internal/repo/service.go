@@ -28,11 +28,15 @@ type PrepareResult struct {
 	// BaseRepoConfig is the raw .drydock.yaml content from the canonical
 	// base branch (before patch application). Nil if the file is absent.
 	BaseRepoConfig []byte
-	// Diff is the unified diff of the prepared change. It is populated for
-	// PR-style events (kind 1618/1619), whose event content is a cover
-	// letter rather than a diff. Empty for kind 1617 patch series, where
-	// the event content already carries the diff.
-	Diff string
+	// Diff and its provenance fields are populated for PR-style events
+	// (kind 1618/1619), whose event content is a cover letter rather than a
+	// diff. They remain empty for kind 1617 patch series.
+	Diff       string
+	BaseCommit string
+	TipCommit  string
+	DiffSHA256 string
+	DiffFiles  int
+	DiffBytes  int64
 }
 
 func NewService(store *db.Store, manager *Manager, logger *slog.Logger) *Service {
@@ -162,29 +166,46 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 	if err != nil {
 		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, FailureHint: err.Error()}, err
 	}
+	assertedBase, err := prMergeBaseCommit(target)
+	if err != nil {
+		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID}, err
+	}
 	if err := s.manager.EnsureCommitAvailable(ctx, repoPath, target.ID.Hex(), tip, cloneURLs); err != nil {
 		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, FailureHint: err.Error()}, err
+	}
+	if assertedBase != "" {
+		if err := s.manager.EnsureCommitAvailable(ctx, repoPath, target.ID.Hex(), assertedBase, cloneURLs); err != nil {
+			return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID}, fmt.Errorf("fetch event-asserted merge-base %s: %w", assertedBase, err)
+		}
 	}
 	branch := "review/" + shortID(rec.EventID)
 	if err := s.manager.CheckoutCommitOnBranch(ctx, repoPath, branch, tip); err != nil {
 		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, FailureHint: err.Error()}, err
 	}
 
-	// PR event content is a cover letter, not a diff — compute the real diff
-	// of the PR tip against its merge-base with the default branch so the
-	// review pipeline sees actual code changes. Prefer the canonical clone as
-	// the diff repository: the PR clone's origin is fork-controlled, and a
-	// fork must not be able to choose the diff base and hide changes.
-	diffRepoPath := repoPath
-	if canonPath != "" {
-		if fetchErr := s.manager.EnsureCommitAvailable(ctx, canonPath, rec.EventID, tip, cloneURLs); fetchErr == nil {
-			diffRepoPath = canonPath
-		} else {
-			s.logger.Warn("could not fetch PR tip into canonical clone, diffing in PR clone",
-				"repo_id", rec.RepoID, "tip", tip, "error", fetchErr)
+	// PR event content is a cover letter, not a diff. Prefer the canonical
+	// clone so a fork cannot choose the implicit default ref. If the tip cannot
+	// be made available there, fallback to the PR clone is allowed only when
+	// the event asserted an explicit merge-base; fork-controlled origin/HEAD
+	// is never allowed to choose an implicit base.
+	diffRepoPath := canonPath
+	if fetchErr := s.manager.EnsureCommitAvailable(ctx, canonPath, rec.EventID, tip, cloneURLs); fetchErr != nil {
+		if assertedBase == "" {
+			s.CleanupReviewBranch(ctx, repoPath, branch)
+			return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
+				fmt.Errorf("fetch PR tip %s into canonical clone for implicit-base diff: %w", tip, fetchErr)
+		}
+		diffRepoPath = repoPath
+		s.logger.Warn("could not fetch PR tip into canonical clone; using event-asserted base in PR clone",
+			"repo_id", rec.RepoID, "tip", tip, "base", assertedBase, "error", fetchErr)
+	} else if assertedBase != "" {
+		if fetchErr := s.manager.EnsureCommitAvailable(ctx, canonPath, rec.EventID, assertedBase, cloneURLs); fetchErr != nil {
+			diffRepoPath = repoPath
+			s.logger.Warn("could not fetch asserted PR base into canonical clone; verifying it in PR clone",
+				"repo_id", rec.RepoID, "tip", tip, "base", assertedBase, "error", fetchErr)
 		}
 	}
-	diff, diffErr := s.manager.DiffAgainstDefaultBranch(ctx, diffRepoPath, tip)
+	diffResult, diffErr := s.manager.DiffAgainstDefaultBranch(ctx, diffRepoPath, tip, assertedBase)
 	if diffErr != nil {
 		// Internal failure to determine the diff base — clean up the review
 		// branch (the runner only installs its cleanup on success) and do NOT
@@ -194,8 +215,16 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID}, fmt.Errorf("diff PR tip %s: %w", tip, diffErr)
 	}
 
-	result := PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, Branch: branch, AppliedIDs: []string{target.ID.Hex()}, BaseRepoConfig: baseConfig, Diff: diff}
-	s.logger.Info("prepared PR tip on review branch", "patch_event_id", rec.EventID, "repo_id", rec.RepoID, "branch", branch, "tip", tip)
+	result := PrepareResult{
+		RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, Branch: branch,
+		AppliedIDs: []string{target.ID.Hex()}, BaseRepoConfig: baseConfig,
+		Diff: diffResult.Diff, BaseCommit: diffResult.BaseCommit, TipCommit: diffResult.TipCommit,
+		DiffSHA256: diffResult.SHA256, DiffFiles: diffResult.FileCount, DiffBytes: diffResult.ByteCount,
+	}
+	s.logger.Info("prepared PR tip on review branch",
+		"patch_event_id", rec.EventID, "repo_id", rec.RepoID, "branch", branch,
+		"base", result.BaseCommit, "tip", result.TipCommit, "diff_sha256", result.DiffSHA256,
+		"diff_files", result.DiffFiles, "diff_bytes", result.DiffBytes)
 	return result, nil
 }
 
@@ -265,6 +294,21 @@ func prTipCommit(event nostr.Event) (string, error) {
 		return "", fmt.Errorf("PR event %s has invalid c tag commit", event.ID.Hex())
 	}
 	return strings.ToLower(tip), nil
+}
+
+func prMergeBaseCommit(event nostr.Event) (string, error) {
+	tag := event.Tags.Find("merge-base")
+	if tag == nil {
+		return "", nil
+	}
+	if len(tag) < 2 {
+		return "", fmt.Errorf("PR event %s has empty merge-base tag", event.ID.Hex())
+	}
+	base := strings.TrimSpace(tag[1])
+	if len(base) != 40 || !isHexString(base) {
+		return "", fmt.Errorf("PR event %s has invalid merge-base commit", event.ID.Hex())
+	}
+	return strings.ToLower(base), nil
 }
 
 func isHexString(v string) bool {

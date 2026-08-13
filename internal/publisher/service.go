@@ -46,6 +46,9 @@ type PublishInput struct {
 	ContextLayersUsed    []string
 	ContextLayersDropped []string
 	ExcludedFiles        []string
+	BaseCommit           string
+	TipCommit            string
+	DiffSHA256           string
 	Superseded           bool
 	// DetailSeverityFloor overrides the service-level detail severity floor
 	// for this specific review. Empty means use the service default.
@@ -132,7 +135,7 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 		summaryEvent = nostr.Event{
 			Kind:      nostr.KindComment,
 			CreatedAt: nostr.Now(),
-			Tags:      buildCommonTags(scope, in.RepoID, expiresAt),
+			Tags:      buildCommonTags(scope, in.RepoID, expiresAt, in),
 			Content:   buildSummaryContent(in),
 		}
 		if err := s.signer.SignEvent(ctx, &summaryEvent); err != nil {
@@ -209,7 +212,7 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 			detail = nostr.Event{
 				Kind:      nostr.KindComment,
 				CreatedAt: nostr.Now(),
-				Tags:      buildCommonTags(scope, in.RepoID, expiresAt),
+				Tags:      buildCommonTags(scope, in.RepoID, expiresAt, in),
 				Content:   buildFindingContent(finding, in),
 			}
 			if err := s.signer.SignEvent(ctx, &detail); err != nil {
@@ -296,7 +299,7 @@ type commentScope struct {
 	ParentPubKey string
 }
 
-func buildCommonTags(scope commentScope, repoID, expiration string) nostr.Tags {
+func buildCommonTags(scope commentScope, repoID, expiration string, in PublishInput) nostr.Tags {
 	tags := nostr.Tags{
 		{"E", scope.RootID, "", scope.RootPubKey},
 		{"K", strconv.Itoa(int(scope.RootKind))},
@@ -304,6 +307,15 @@ func buildCommonTags(scope commentScope, repoID, expiration string) nostr.Tags {
 		{"k", strconv.Itoa(int(scope.ParentKind))},
 		{"A", "30617:" + repoID},
 		{"expiration", expiration},
+	}
+	if in.BaseCommit != "" {
+		tags = append(tags, nostr.Tag{"base_commit", strings.ToLower(in.BaseCommit)})
+	}
+	if in.TipCommit != "" {
+		tags = append(tags, nostr.Tag{"tip_commit", strings.ToLower(in.TipCommit)})
+	}
+	if in.DiffSHA256 != "" {
+		tags = append(tags, nostr.Tag{"diff_sha256", strings.ToLower(in.DiffSHA256)})
 	}
 	if scope.RootPubKey != "" {
 		tags = append(tags, nostr.Tag{"P", scope.RootPubKey})

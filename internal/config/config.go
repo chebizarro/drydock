@@ -49,6 +49,8 @@ type Config struct {
 	RepoCacheDir          string
 	RepoCacheMaxCount     int
 	RepoCacheMaxSizeMB    int
+	PRDiffMaxFiles        int
+	PRDiffMaxBytes        int64
 	RepoAllowlist         []string
 	RepoOwnerAllowlist    []string
 	MonitoredReposAuthor  string
@@ -156,6 +158,8 @@ func FromEnv() Config {
 		RepoCacheDir:         envOrDefault("DRYDOCK_REPO_CACHE_DIR", "repos"),
 		RepoCacheMaxCount:    parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_COUNT", "50"), 50),
 		RepoCacheMaxSizeMB:   parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_SIZE_MB", "10240"), 10240),
+		PRDiffMaxFiles:       parseIntOrDefault(envOrDefault("DRYDOCK_PR_DIFF_MAX_FILES", "1000"), 1000),
+		PRDiffMaxBytes:       int64(parseIntOrDefault(envOrDefault("DRYDOCK_PR_DIFF_MAX_BYTES", "10485760"), 10*1024*1024)),
 		RepoAllowlist:        normalizeRepositoryAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_ALLOWLIST", ""))),
 		RepoOwnerAllowlist:   normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_OWNER_ALLOWLIST", ""))),
 		MonitoredReposAuthor: scope.NormalizePubkey(envOrDefault("DRYDOCK_MONITORED_REPOS_AUTHOR", "")),

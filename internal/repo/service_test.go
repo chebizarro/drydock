@@ -40,6 +40,7 @@ func TestPreparePRTipReadsConfigFromCanonicalCache(t *testing.T) {
 	run(t, "", "git", "init", "--bare", forkOrigin)
 	run(t, forkPath, "git", "remote", "add", "origin", forkOrigin)
 	run(t, forkPath, "git", "push", "origin", "HEAD:refs/heads/main")
+	forkBase := run(t, forkPath, "git", "rev-parse", "HEAD")
 
 	writeFile(t, filepath.Join(forkPath, ".drydock.yaml"), "policy: fork\n")
 	run(t, forkPath, "git", "add", ".drydock.yaml")
@@ -65,6 +66,7 @@ func TestPreparePRTipReadsConfigFromCanonicalCache(t *testing.T) {
 			// fork URL is ever attempted in this test (no network access).
 			{"clone", filepath.Join(t.TempDir(), "nonexistent-fork.git")},
 			{"c", forkTip},
+			{"merge-base", forkBase},
 		},
 	}
 	rec := db.PatchEventRecord{EventID: target.ID.Hex(), RepoID: repoID, RootID: target.ID.Hex(), Kind: 1618}
@@ -81,6 +83,132 @@ func TestPreparePRTipReadsConfigFromCanonicalCache(t *testing.T) {
 	}
 	if !strings.Contains(result.Diff, "diff --git") || !strings.Contains(result.Diff, ".drydock.yaml") {
 		t.Fatalf("expected PR prepare to produce a unified diff of the tip, got %q", result.Diff)
+	}
+	if result.BaseCommit != forkBase || result.TipCommit != forkTip || len(result.DiffSHA256) != 64 {
+		t.Fatalf("unexpected PR diff provenance: %+v", result)
+	}
+}
+
+func TestPreparePRTipUsesAssertedBaseWithStaleCanonicalDefault(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	repoID := "owner:stale"
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO repositories
+		(repo_id, pubkey, identifier, announcement_event_id, name, description, clone_urls, relays, raw_event_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		repoID, "owner", "stale", "announcement", "stale", "", "https://canonical.example/stale.git", "", "{}", int64(1), int64(1)); err != nil {
+		t.Fatalf("seed repository: %v", err)
+	}
+
+	mgr := NewManager(t.TempDir(), testLogger())
+	forkPath := mgr.repoPath(repoID)
+	initWorkRepo(t, forkPath)
+	staleCanonicalTip := run(t, forkPath, "git", "rev-parse", "HEAD")
+
+	forkOrigin := filepath.Join(t.TempDir(), "fork-origin")
+	run(t, "", "git", "init", "--bare", forkOrigin)
+	run(t, forkPath, "git", "remote", "add", "origin", forkOrigin)
+	run(t, forkPath, "git", "push", "origin", "HEAD:refs/heads/main")
+
+	writeFile(t, filepath.Join(forkPath, "historical.go"), "package historical\n")
+	run(t, forkPath, "git", "add", "historical.go")
+	run(t, forkPath, "git", "commit", "-m", "history after stale canonical")
+	assertedBase := run(t, forkPath, "git", "rev-parse", "HEAD")
+
+	writeFile(t, filepath.Join(forkPath, "feature.go"), "package feature\n")
+	run(t, forkPath, "git", "add", "feature.go")
+	run(t, forkPath, "git", "commit", "-m", "PR feature")
+	tip := run(t, forkPath, "git", "rev-parse", "HEAD")
+
+	// Seed the canonical cache with all objects while leaving origin/main at
+	// the old commit. The asserted base must win over this stale default.
+	canonicalPath := mgr.canonicalRepoPath(repoID)
+	run(t, "", "git", "clone", forkPath, canonicalPath)
+	canonicalOrigin := filepath.Join(t.TempDir(), "canonical-origin")
+	run(t, "", "git", "init", "--bare", canonicalOrigin)
+	run(t, forkPath, "git", "push", canonicalOrigin, staleCanonicalTip+":refs/heads/main")
+	run(t, canonicalPath, "git", "remote", "set-url", "origin", canonicalOrigin)
+	run(t, canonicalPath, "git", "fetch", "origin")
+
+	target := nostr.Event{
+		ID:   nostr.MustIDFromHex("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+		Kind: 1618,
+		Tags: nostr.Tags{
+			{"clone", filepath.Join(t.TempDir(), "nonexistent-fork.git")},
+			{"c", tip},
+			{"merge-base", assertedBase},
+		},
+	}
+	rec := db.PatchEventRecord{EventID: target.ID.Hex(), RepoID: repoID, RootID: target.ID.Hex(), Kind: 1618}
+
+	result, err := NewService(store, mgr, testLogger()).preparePRTip(ctx, rec, target)
+	if err != nil {
+		t.Fatalf("prepare PR tip against stale canonical clone: %v", err)
+	}
+	if result.BaseCommit != assertedBase || result.TipCommit != tip {
+		t.Fatalf("unexpected selected commits: base=%s tip=%s", result.BaseCommit, result.TipCommit)
+	}
+	if !strings.Contains(result.Diff, "feature.go") || strings.Contains(result.Diff, "historical.go") {
+		t.Fatalf("expected only asserted-base delta, got %q", result.Diff)
+	}
+	if result.DiffFiles != 1 || result.DiffBytes != int64(len(result.Diff)) || len(result.DiffSHA256) != 64 {
+		t.Fatalf("unexpected diff metadata: %+v", result)
+	}
+}
+
+func TestPreparePRTipRefusesImplicitBaseInForkClone(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repoID := "owner:no-fork-default"
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO repositories
+		(repo_id, pubkey, identifier, announcement_event_id, name, description, clone_urls, relays, raw_event_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		repoID, "owner", "repo", "announcement", "repo", "", "https://canonical.example/repo.git", "", "{}", int64(1), int64(1)); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := NewManager(t.TempDir(), testLogger())
+	forkPath := mgr.repoPath(repoID)
+	initWorkRepo(t, forkPath)
+	forkOrigin := filepath.Join(t.TempDir(), "fork-origin")
+	run(t, "", "git", "init", "--bare", forkOrigin)
+	run(t, forkPath, "git", "remote", "add", "origin", forkOrigin)
+	run(t, forkPath, "git", "push", "origin", "HEAD:refs/heads/main")
+	writeFile(t, filepath.Join(forkPath, "feature.go"), "package feature\n")
+	run(t, forkPath, "git", "add", "feature.go")
+	run(t, forkPath, "git", "commit", "-m", "feature")
+	tip := run(t, forkPath, "git", "rev-parse", "HEAD")
+
+	canonicalPath := mgr.canonicalRepoPath(repoID)
+	initWorkRepo(t, canonicalPath) // unrelated history; does not contain tip
+	canonicalOrigin := filepath.Join(t.TempDir(), "canonical-origin")
+	run(t, "", "git", "init", "--bare", canonicalOrigin)
+	run(t, canonicalPath, "git", "remote", "add", "origin", canonicalOrigin)
+	run(t, canonicalPath, "git", "push", "origin", "HEAD:refs/heads/main")
+
+	target := nostr.Event{
+		ID:   nostr.MustIDFromHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+		Kind: 1618,
+		Tags: nostr.Tags{{"clone", filepath.Join(t.TempDir(), "unsafe-local.git")}, {"c", tip}},
+	}
+	rec := db.PatchEventRecord{EventID: target.ID.Hex(), RepoID: repoID, RootID: target.ID.Hex(), Kind: 1618}
+	if _, err := NewService(store, mgr, testLogger()).preparePRTip(ctx, rec, target); err == nil || !strings.Contains(err.Error(), "canonical clone for implicit-base diff") {
+		t.Fatalf("expected implicit fork-base rejection, got %v", err)
 	}
 }
 
@@ -175,5 +303,16 @@ func TestPRTipCommitMissing(t *testing.T) {
 	evt := nostr.Event{ID: nostr.MustIDFromHex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")}
 	if _, err := prTipCommit(evt); err == nil {
 		t.Fatalf("expected error for missing c tag")
+	}
+}
+
+func TestPRMergeBaseCommit(t *testing.T) {
+	evt := nostr.Event{ID: nostr.MustIDFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), Tags: nostr.Tags{{"merge-base", "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD"}}}
+	base, err := prMergeBaseCommit(evt)
+	if err != nil || base != "abcdefabcdefabcdefabcdefabcdefabcdefabcd" {
+		t.Fatalf("merge base = %q, err=%v", base, err)
+	}
+	if _, err := prMergeBaseCommit(nostr.Event{ID: evt.ID, Tags: nostr.Tags{{"merge-base", "bad"}}}); err == nil {
+		t.Fatal("expected invalid merge-base error")
 	}
 }

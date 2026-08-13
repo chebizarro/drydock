@@ -319,6 +319,13 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// Clean up the throwaway review branch when done (success or failure)
 	defer r.repoSvc.CleanupReviewBranch(ctx, prep.RepoPath, prep.Branch)
 
+	// Persist PR diff provenance before any context construction or publication.
+	if prep.BaseCommit != "" || prep.TipCommit != "" || prep.DiffSHA256 != "" {
+		if err := r.store.RecordReviewDiffProvenance(ctx, task.PatchEventID, task.RepoID, prep.BaseCommit, prep.TipCommit, prep.DiffSHA256); err != nil {
+			return fmt.Errorf("persist PR diff provenance: %w", err)
+		}
+	}
+
 	// 1b. Load per-repo config from the base branch (before patches).
 	repoCfg := repoconfig.Default()
 	if len(prep.BaseRepoConfig) > 0 {
@@ -465,6 +472,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			ContextLayersUsed:    bundle.LayersUsed,
 			ContextLayersDropped: bundle.LayersDropped,
 			ExcludedFiles:        bundle.ExcludedFiles,
+			BaseCommit:           prep.BaseCommit,
+			TipCommit:            prep.TipCommit,
+			DiffSHA256:           prep.DiffSHA256,
 		})
 		if pubErr != nil {
 			return fmt.Errorf("publish exclusion-only review: %w", pubErr)
@@ -619,6 +629,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			ContextLayersUsed:    bundle.LayersUsed,
 			ContextLayersDropped: bundle.LayersDropped,
 			ExcludedFiles:        bundle.ExcludedFiles,
+			BaseCommit:           prep.BaseCommit,
+			TipCommit:            prep.TipCommit,
+			DiffSHA256:           prep.DiffSHA256,
 			Superseded:           superseded,
 			DetailSeverityFloor:  repoCfg.Review.DetailSeverityFloor,
 			Walkthrough:          result.Walkthrough,

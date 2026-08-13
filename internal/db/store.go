@@ -610,6 +610,28 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 12,
+		name:    "review_diff_provenance",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			for _, col := range []struct{ name, ddl string }{
+				{"base_commit", "ALTER TABLE review_log ADD COLUMN base_commit TEXT NOT NULL DEFAULT ''"},
+				{"tip_commit", "ALTER TABLE review_log ADD COLUMN tip_commit TEXT NOT NULL DEFAULT ''"},
+				{"diff_sha256", "ALTER TABLE review_log ADD COLUMN diff_sha256 TEXT NOT NULL DEFAULT ''"},
+			} {
+				exists, err := hasColumn(ctx, tx, "review_log", col.name)
+				if err != nil {
+					return fmt.Errorf("check review_log.%s: %w", col.name, err)
+				}
+				if !exists {
+					if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+						return fmt.Errorf("add review_log.%s: %w", col.name, err)
+					}
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -1404,6 +1426,46 @@ func beginReviewTx(ctx context.Context, tx *sql.Tx, patchEventID, repoID string,
 		return false, ErrReviewAlreadyPublished
 	}
 	return false, nil
+}
+
+// RecordReviewDiffProvenance durably binds a prepared PR review to the
+// verified base, tip, and exact unified-diff digest before publication.
+func (s *Store) RecordReviewDiffProvenance(ctx context.Context, patchEventID, repoID, baseCommit, tipCommit, diffSHA256 string) error {
+	if strings.TrimSpace(baseCommit) == "" || strings.TrimSpace(tipCommit) == "" || strings.TrimSpace(diffSHA256) == "" {
+		return errors.New("base commit, tip commit, and diff sha256 are required")
+	}
+	now := time.Now().Unix()
+	baseCommit = strings.ToLower(baseCommit)
+	tipCommit = strings.ToLower(tipCommit)
+	diffSHA256 = strings.ToLower(diffSHA256)
+	res, err := s.db.ExecContext(ctx, `UPDATE review_log
+		SET base_commit=?, tip_commit=?, diff_sha256=?, updated_at=?
+		WHERE patch_event_id=? AND repo_id=?
+		AND ((base_commit='' AND tip_commit='' AND diff_sha256='')
+			OR (base_commit=? AND tip_commit=? AND diff_sha256=?))`,
+		baseCommit, tipCommit, diffSHA256, now, patchEventID, repoID,
+		baseCommit, tipCommit, diffSHA256)
+	if err != nil {
+		return fmt.Errorf("record review diff provenance: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("record review diff provenance rows affected: %w", err)
+	}
+	if n == 0 {
+		var storedBase, storedTip, storedHash string
+		if err := s.db.QueryRowContext(ctx, `SELECT base_commit, tip_commit, diff_sha256
+			FROM review_log WHERE patch_event_id=? AND repo_id=?`, patchEventID, repoID).
+			Scan(&storedBase, &storedTip, &storedHash); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrReviewNotFound
+			}
+			return fmt.Errorf("read existing review diff provenance: %w", err)
+		}
+		return fmt.Errorf("review diff provenance mismatch: stored %s..%s/%s, prepared %s..%s/%s",
+			storedBase, storedTip, storedHash, baseCommit, tipCommit, diffSHA256)
+	}
+	return nil
 }
 
 func (s *Store) MarkReviewPublished(ctx context.Context, patchEventID, repoID, reviewEventID string) error {

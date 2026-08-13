@@ -80,6 +80,36 @@ func TestResetListenerHighWaterMarkCanRecoverFromFutureValue(t *testing.T) {
 	}
 }
 
+func TestRecordReviewDiffProvenance(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	patchID := strings.Repeat("a", 64)
+	repoID := "owner:repo"
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+	base := strings.Repeat("b", 40)
+	tip := strings.Repeat("c", 40)
+	diffHash := strings.Repeat("d", 64)
+	if err := store.RecordReviewDiffProvenance(ctx, patchID, repoID, base, tip, diffHash); err != nil {
+		t.Fatalf("record diff provenance: %v", err)
+	}
+	var gotBase, gotTip, gotHash string
+	if err := store.db.QueryRowContext(ctx, `SELECT base_commit, tip_commit, diff_sha256
+		FROM review_log WHERE patch_event_id=? AND repo_id=?`, patchID, repoID).Scan(&gotBase, &gotTip, &gotHash); err != nil {
+		t.Fatalf("read diff provenance: %v", err)
+	}
+	if gotBase != base || gotTip != tip || gotHash != diffHash {
+		t.Fatalf("persisted provenance = %s/%s/%s", gotBase, gotTip, gotHash)
+	}
+	if err := store.RecordReviewDiffProvenance(ctx, patchID, repoID, base, tip, diffHash); err != nil {
+		t.Fatalf("record identical provenance idempotently: %v", err)
+	}
+	if err := store.RecordReviewDiffProvenance(ctx, patchID, repoID, strings.Repeat("e", 40), tip, diffHash); err == nil || !strings.Contains(err.Error(), "provenance mismatch") {
+		t.Fatalf("expected provenance mismatch, got %v", err)
+	}
+}
+
 func TestMigrateAppliesVersionedMigrationsIdempotently(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)

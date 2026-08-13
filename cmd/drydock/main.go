@@ -339,6 +339,8 @@ func main() {
 	repoManager := repo.NewManager(cfg.RepoCacheDir, logger,
 		repo.WithMaxRepoCount(cfg.RepoCacheMaxCount),
 		repo.WithMaxCacheSizeMB(cfg.RepoCacheMaxSizeMB),
+		repo.WithMaxPRDiffFiles(cfg.PRDiffMaxFiles),
+		repo.WithMaxPRDiffBytes(cfg.PRDiffMaxBytes),
 	)
 	repoSvc := repo.NewService(store, repoManager, logger)
 

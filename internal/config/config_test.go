@@ -9,6 +9,15 @@ import (
 	"fiatjaf.com/nostr/nip19"
 )
 
+func TestFromEnvPRDiffLimits(t *testing.T) {
+	t.Setenv("DRYDOCK_PR_DIFF_MAX_FILES", "25")
+	t.Setenv("DRYDOCK_PR_DIFF_MAX_BYTES", "4096")
+	cfg := FromEnv()
+	if cfg.PRDiffMaxFiles != 25 || cfg.PRDiffMaxBytes != 4096 {
+		t.Fatalf("unexpected PR diff limits: %d files, %d bytes", cfg.PRDiffMaxFiles, cfg.PRDiffMaxBytes)
+	}
+}
+
 func TestFromEnvManagementDefaults(t *testing.T) {
 	t.Setenv("DRYDOCK_HEALTH_ADDR", "")
 	t.Setenv("DRYDOCK_DASHBOARD_BEARER_TOKEN", "")

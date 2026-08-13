@@ -132,6 +132,9 @@ CREATE TABLE IF NOT EXISTS review_log (
     CHECK (invocation IN ('reactive', 'ide', 'contextvm')),
   requester_pubkey TEXT NOT NULL DEFAULT '',
   order_id TEXT NOT NULL DEFAULT '',
+  base_commit TEXT NOT NULL DEFAULT '',
+  tip_commit TEXT NOT NULL DEFAULT '',
+  diff_sha256 TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE(patch_event_id, repo_id)
