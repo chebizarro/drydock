@@ -1,7 +1,7 @@
 # Investigation: Drydock review/PR mismatch (2-week ~800-review corpus)
 
 ## Summary
-(TBD)
+Review/target mismatch stems from four independent, confirmed defects — a pre-July-19 bug that fed PR cover-letter prose instead of a diff (55 reviews), stale merge-base computation producing 1,700–4,600-file diffs for 1–17-file PRs (all 300/300 sampled mismatched file references explained), unlocked shared per-repo checkouts racing across concurrent reviews (87/324 prepared tasks overlapped), and kind-1617 series-vs-revision confusion (15 misattributed failures). Meta-review triggered 50 times but failed every time (17 context overflows from embedding the full unbounded diff; 31 strict-JSON schema failures; 2 circuit-breaker), so meta_review_log has zero rows.
 
 ## Symptoms
 - Reviews sometimes reference files not in the PR/patch diff, or clearly from a different PR
@@ -139,10 +139,22 @@ The oversized requests have a direct code cause: `metaReviewUserPrompt` embeds *
 5. Cap/summarize meta-review diffs, validate/repair structured output before giving up, record failed attempts in a separate audit table, expose metrics/alerts, and use a detached service context with graceful shutdown rather than making quality-control failures publication-invisible.
 
 
-## Investigation Log
-
 ## Root Cause
+See Investigator Findings §1–§6 (all spot-checked against source):
+1. Historical cover-letter-as-diff bug for kinds 1618/1619 — fixed in `e090e6d` (2026-07-19); explains the 55 explicit "missing diff" reviews.
+2. Stale/overbroad merge-base: `DiffAgainstDefaultBranch` (internal/repo/manager.go:235-274) diffs PR tip vs cached `origin/HEAD` with no event-asserted base; huge wrong diffs "authorize" unrelated files past the changed-set guard, then the 40 KiB patch cap (internal/contextbuilder/providers.go:71-74) biases the LLM toward early unrelated paths. Primary driver of "files from a different PR".
+3. Shared mutable checkout per repo_id with per-git-op locks only (internal/repo/manager.go); concurrent reviews swap the working tree under each other (87/324 overlaps observed).
+4. Kind-1617 root-series applied cumulatively while prompt/publication target a single revision (internal/repo/service.go:80-117, internal/pipeline/runner.go:412-420).
+5. Meta-review: always constructed (cmd/drydock/main.go:536-556), triggers on security/low-confidence/15% sample, but `metaReviewUserPrompt` embeds full unbounded PatchDiff+bundle (internal/metareview/service.go:328-335) → context overflow; strict schema parsing rejects near-miss JSON; failures are async and invisible. Default endpoint is a local llama-3.3-70b, not a frontier model.
 
 ## Recommendations
+1. Provenance-checked base commit for PR events; publish base/tip/diff hashes; reject implausibly large deltas instead of truncating (internal/repo/manager.go, service.go).
+2. Per-review git worktrees held for the full review lifetime (internal/repo/manager.go, pipeline/runner.go).
+3. Explicit kind-1617 scope: review the cumulative set diff or a single revision — same scope for prompt and publication.
+4. Bind changed-file filter and context_hash to a target-identity envelope (repo_id, root_id, patch_event_id, base, tip, diff_sha256).
+5. Meta-review: cap/summarize the diff, tolerant JSON repair before rejection, persist failed attempts to an audit table, surface metrics; point it at an actual frontier endpoint via config if "frontier" is intended.
 
 ## Preventive Measures
+- Publish target-identity metadata in every review event so mismatches are mechanically detectable.
+- Alert on model:none rate (40% of corpus reviews were apply/fetch failures published as reviews) and on meta-review failure rate.
+- Add integration tests for concurrent same-repo reviews and for stale canonical clones.
