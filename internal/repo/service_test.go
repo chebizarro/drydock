@@ -2,14 +2,25 @@ package repo
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"drydock/internal/db"
 
 	"fiatjaf.com/nostr"
 )
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
+}
 
 func TestPreparePRTipReadsConfigFromCanonicalCache(t *testing.T) {
 	ctx := context.Background()
@@ -78,8 +89,12 @@ func TestPreparePRTipReadsConfigFromCanonicalCache(t *testing.T) {
 	if got, want := string(result.BaseRepoConfig), "policy: canonical"; got != want {
 		t.Fatalf("expected canonical config %q, got %q", want, got)
 	}
-	if result.RepoPath != forkPath {
-		t.Fatalf("expected PR checkout to use fork cache path %s, got %s", forkPath, result.RepoPath)
+	defer svc.CleanupPreparedReview(ctx, result)
+	if result.RepoPath == forkPath || result.RepoPath == canonicalPath || !strings.Contains(result.RepoPath, ".worktrees") {
+		t.Fatalf("expected isolated PR worktree, got %s", result.RepoPath)
+	}
+	if result.ExpectedCommit != forkTip || run(t, result.RepoPath, "git", "rev-parse", "HEAD") != forkTip {
+		t.Fatalf("PR worktree not pinned to tip %s: %+v", forkTip, result)
 	}
 	if !strings.Contains(result.Diff, "diff --git") || !strings.Contains(result.Diff, ".drydock.yaml") {
 		t.Fatalf("expected PR prepare to produce a unified diff of the tip, got %q", result.Diff)
@@ -149,12 +164,14 @@ func TestPreparePRTipUsesAssertedBaseWithStaleCanonicalDefault(t *testing.T) {
 	}
 	rec := db.PatchEventRecord{EventID: target.ID.Hex(), RepoID: repoID, RootID: target.ID.Hex(), Kind: 1618}
 
-	result, err := NewService(store, mgr, testLogger()).preparePRTip(ctx, rec, target)
+	svc := NewService(store, mgr, testLogger())
+	result, err := svc.preparePRTip(ctx, rec, target)
 	if err != nil {
 		t.Fatalf("prepare PR tip against stale canonical clone: %v", err)
 	}
-	if result.BaseCommit != assertedBase || result.TipCommit != tip {
-		t.Fatalf("unexpected selected commits: base=%s tip=%s", result.BaseCommit, result.TipCommit)
+	defer svc.CleanupPreparedReview(ctx, result)
+	if result.BaseCommit != assertedBase || result.TipCommit != tip || result.ExpectedCommit != tip {
+		t.Fatalf("unexpected selected commits: base=%s tip=%s expected=%s", result.BaseCommit, result.TipCommit, result.ExpectedCommit)
 	}
 	if !strings.Contains(result.Diff, "feature.go") || strings.Contains(result.Diff, "historical.go") {
 		t.Fatalf("expected only asserted-base delta, got %q", result.Diff)
@@ -251,6 +268,7 @@ func TestPreparePatchSeriesReadsConfigFromCanonicalCache(t *testing.T) {
 	canonicalOrigin := filepath.Join(t.TempDir(), "canonical-origin")
 	initWorkRepo(t, canonicalOrigin)
 	run(t, canonicalPath, "git", "remote", "add", "origin", canonicalOrigin)
+	canonicalHead := run(t, canonicalPath, "git", "rev-parse", "HEAD")
 
 	svc := NewService(store, mgr, testLogger())
 	target := nostr.Event{
@@ -272,8 +290,131 @@ func TestPreparePatchSeriesReadsConfigFromCanonicalCache(t *testing.T) {
 	if got, want := string(result.BaseRepoConfig), "policy: canonical"; got != want {
 		t.Fatalf("expected canonical config %q, got %q", want, got)
 	}
-	if result.RepoPath != canonicalPath {
-		t.Fatalf("expected patch series to use canonical cache path %s, got %s", canonicalPath, result.RepoPath)
+	defer svc.CleanupPreparedReview(ctx, result)
+	if result.RepoPath == canonicalPath || !strings.Contains(result.RepoPath, ".worktrees") {
+		t.Fatalf("expected isolated patch-series worktree, got %s", result.RepoPath)
+	}
+	if result.ExpectedCommit != canonicalHead || run(t, result.RepoPath, "git", "rev-parse", "HEAD") != canonicalHead {
+		t.Fatalf("patch-series worktree not pinned to canonical HEAD %s: %+v", canonicalHead, result)
+	}
+	if got := string(mustReadFile(t, filepath.Join(result.RepoPath, "README.md"))); !strings.Contains(got, "patched") {
+		t.Fatalf("patch-series worktree missing applied patch: %q", got)
+	}
+}
+
+func TestConcurrentSameRepoReviewsUseIsolatedWorktrees(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	repoID := "owner:concurrent"
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO repositories
+		(repo_id, pubkey, identifier, announcement_event_id, name, description, clone_urls, relays, raw_event_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		repoID, "owner", "concurrent", "announcement", "concurrent", "", "https://canonical.example/concurrent.git", "", "{}", int64(1), int64(1)); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := NewManager(t.TempDir(), testLogger())
+	sourcePath := mgr.repoPath(repoID)
+	initWorkRepo(t, sourcePath)
+	origin := filepath.Join(t.TempDir(), "origin")
+	run(t, "", "git", "init", "--bare", origin)
+	run(t, origin, "git", "symbolic-ref", "HEAD", "refs/heads/main")
+	run(t, sourcePath, "git", "remote", "add", "origin", origin)
+	run(t, sourcePath, "git", "push", "origin", "HEAD:refs/heads/main")
+	base := run(t, sourcePath, "git", "rev-parse", "HEAD")
+
+	writeFile(t, filepath.Join(sourcePath, "isolated.txt"), "review A\n")
+	run(t, sourcePath, "git", "add", "isolated.txt")
+	run(t, sourcePath, "git", "commit", "-m", "review A")
+	tipA := run(t, sourcePath, "git", "rev-parse", "HEAD")
+	run(t, sourcePath, "git", "branch", "review-a", tipA)
+
+	run(t, sourcePath, "git", "checkout", "--detach", base)
+	writeFile(t, filepath.Join(sourcePath, "isolated.txt"), "review B\n")
+	run(t, sourcePath, "git", "add", "isolated.txt")
+	run(t, sourcePath, "git", "commit", "-m", "review B")
+	tipB := run(t, sourcePath, "git", "rev-parse", "HEAD")
+	run(t, sourcePath, "git", "branch", "review-b", tipB)
+
+	canonicalPath := mgr.canonicalRepoPath(repoID)
+	run(t, "", "git", "clone", origin, canonicalPath)
+	run(t, canonicalPath, "git", "fetch", sourcePath, "review-a", "review-b")
+
+	targets := []nostr.Event{
+		{
+			ID:   nostr.MustIDFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+			Kind: 1618,
+			Tags: nostr.Tags{{"clone", filepath.Join(t.TempDir(), "unsafe-local.git")}, {"c", tipA}, {"merge-base", base}},
+		},
+		{
+			ID:   nostr.MustIDFromHex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+			Kind: 1618,
+			Tags: nostr.Tags{{"clone", filepath.Join(t.TempDir(), "unsafe-local.git")}, {"c", tipB}, {"merge-base", base}},
+		},
+	}
+
+	svc := NewService(store, mgr, testLogger())
+	results := make([]PrepareResult, len(targets))
+	errs := make([]error, len(targets))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range targets {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			rec := db.PatchEventRecord{
+				EventID: targets[i].ID.Hex(), RepoID: repoID,
+				RootID: targets[i].ID.Hex(), Kind: int(targets[i].Kind),
+			}
+			results[i], errs[i] = svc.preparePRTip(ctx, rec, targets[i])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("prepare concurrent review %d: %v", i, err)
+		}
+	}
+	defer svc.CleanupPreparedReview(ctx, results[0])
+	defer svc.CleanupPreparedReview(ctx, results[1])
+
+	if results[0].RepoPath == results[1].RepoPath {
+		t.Fatalf("concurrent reviews shared worktree %s", results[0].RepoPath)
+	}
+	for i, want := range []struct {
+		tip     string
+		content string
+	}{{tipA, "review A\n"}, {tipB, "review B\n"}} {
+		if err := svc.AssertPreparedReview(ctx, results[i]); err != nil {
+			t.Fatalf("review %d checkout assertion: %v", i, err)
+		}
+		if results[i].ExpectedCommit != want.tip {
+			t.Fatalf("review %d expected commit = %s, want %s", i, results[i].ExpectedCommit, want.tip)
+		}
+		if got := string(mustReadFile(t, filepath.Join(results[i].RepoPath, "isolated.txt"))); got != want.content {
+			t.Fatalf("review %d read cross-review content %q, want %q", i, got, want.content)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(canonicalPath, "isolated.txt")); !os.IsNotExist(err) {
+		t.Fatalf("canonical checkout was mutated by concurrent reviews: %v", err)
+	}
+
+	firstPath, secondPath := results[0].RepoPath, results[1].RepoPath
+	svc.CleanupPreparedReview(ctx, results[0])
+	svc.CleanupPreparedReview(ctx, results[1])
+	listed := run(t, canonicalPath, "git", "worktree", "list", "--porcelain")
+	if strings.Contains(listed, firstPath) || strings.Contains(listed, secondPath) {
+		t.Fatalf("concurrent review worktrees were not pruned:\n%s", listed)
 	}
 }
 

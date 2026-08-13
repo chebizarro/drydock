@@ -26,6 +26,8 @@ type Manager struct {
 	logger       *slog.Logger
 	repoLocks    sync.Map
 	evictionMu   sync.Mutex
+	activeMu     sync.Mutex
+	activeRepos  map[string]int
 	maxCount     int   // 0 = unlimited
 	maxSizeBytes int64 // 0 = unlimited
 	maxDiffFiles int
@@ -74,6 +76,7 @@ func NewManager(baseDir string, logger *slog.Logger, opts ...ManagerOption) *Man
 	m := &Manager{
 		baseDir:      baseDir,
 		logger:       logger,
+		activeRepos:  make(map[string]int),
 		maxDiffFiles: defaultMaxPRDiffFiles,
 		maxDiffBytes: defaultMaxPRDiffBytes,
 	}
@@ -91,16 +94,54 @@ const (
 )
 
 func (m *Manager) EnsureRepo(ctx context.Context, repoID string, cloneURLs []string) (string, error) {
-	return m.ensureRepoAtPath(ctx, m.repoPath(repoID), repoID, cloneURLs)
+	return m.ensureRepoAtPath(ctx, m.repoPath(repoID), repoID, cloneURLs, false)
 }
 
 // EnsureCanonicalRepo ensures a clone of the canonical repository under a
 // cache entry that cannot be shared with PR/fork clones for the same repo ID.
 func (m *Manager) EnsureCanonicalRepo(ctx context.Context, repoID string, cloneURLs []string) (string, error) {
-	return m.ensureRepoAtPath(ctx, m.canonicalRepoPath(repoID), repoID, cloneURLs)
+	return m.ensureRepoAtPath(ctx, m.canonicalRepoPath(repoID), repoID, cloneURLs, false)
 }
 
-func (m *Manager) ensureRepoAtPath(ctx context.Context, repoPath, repoID string, cloneURLs []string) (string, error) {
+type repoLease struct {
+	manager  *Manager
+	repoPath string
+	mu       sync.Mutex
+	released bool
+}
+
+func (m *Manager) acquireRepoLease(ctx context.Context, repoID string, cloneURLs []string, canonical bool) (*repoLease, error) {
+	repoPath := m.repoPath(repoID)
+	if canonical {
+		repoPath = m.canonicalRepoPath(repoID)
+	}
+	repoPath, err := m.ensureRepoAtPath(ctx, repoPath, repoID, cloneURLs, true)
+	if err != nil {
+		return nil, err
+	}
+	return &repoLease{manager: m, repoPath: repoPath}, nil
+}
+
+func (l *repoLease) release() {
+	if l == nil || l.manager == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released {
+		return
+	}
+	l.manager.activeMu.Lock()
+	if count := l.manager.activeRepos[l.repoPath]; count <= 1 {
+		delete(l.manager.activeRepos, l.repoPath)
+	} else {
+		l.manager.activeRepos[l.repoPath] = count - 1
+	}
+	l.manager.activeMu.Unlock()
+	l.released = true
+}
+
+func (m *Manager) ensureRepoAtPath(ctx context.Context, repoPath, repoID string, cloneURLs []string, pin bool) (string, error) {
 	if len(cloneURLs) == 0 {
 		return "", fmt.Errorf("no clone urls for repository %s", repoID)
 	}
@@ -124,6 +165,9 @@ func (m *Manager) ensureRepoAtPath(ctx context.Context, repoPath, repoID string,
 			return "", fmt.Errorf("git fetch: %w", err)
 		}
 		m.touchAccess(repoPath)
+		if pin {
+			m.pinRepo(repoPath)
+		}
 		return repoPath, nil
 	}
 
@@ -159,37 +203,219 @@ func (m *Manager) ensureRepoAtPath(ctx context.Context, repoPath, repoID string,
 		return "", fmt.Errorf("git clone %s: %w: %s", cloneURL, err, strings.TrimSpace(string(out)))
 	}
 	m.touchAccess(repoPath)
+	if pin {
+		m.pinRepo(repoPath)
+	}
 	return repoPath, nil
 }
 
-func (m *Manager) ApplyPatchSeries(ctx context.Context, repoPath, patchEventID string, events []nostr.Event) (string, error) {
-	if len(events) == 0 {
-		return "", fmt.Errorf("empty patch series")
+func (m *Manager) pinRepo(repoPath string) {
+	m.activeMu.Lock()
+	m.activeRepos[repoPath]++
+	m.activeMu.Unlock()
+}
+
+func (m *Manager) repoPinned(repoPath string) bool {
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	return m.activeRepos[repoPath] > 0
+}
+
+type reviewWorktree struct {
+	manager        *Manager
+	source         *repoLease
+	path           string
+	expectedCommit string
+	mu             sync.Mutex
+	cleaned        bool
+}
+
+func (m *Manager) createReviewWorktree(ctx context.Context, source *repoLease, reviewID, commit string) (*reviewWorktree, error) {
+	if source == nil || source.manager != m {
+		return nil, fmt.Errorf("valid repository lease is required")
 	}
-	branch := "review/" + shortID(patchEventID)
+	source.mu.Lock()
+	released := source.released
+	source.mu.Unlock()
+	if released {
+		return nil, fmt.Errorf("repository lease has already been released")
+	}
+
+	sourcePath, err := m.validateRepoPath(source.repoPath)
+	if err != nil {
+		return nil, err
+	}
+	mu := m.getRepoLock(sourcePath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	resolved, err := m.runGit(ctx, sourcePath, "rev-parse", "--verify", strings.TrimSpace(commit)+"^{commit}")
+	if err != nil {
+		return nil, fmt.Errorf("resolve review commit %s: %w", commit, err)
+	}
+	resolved = strings.ToLower(strings.TrimSpace(resolved))
+
+	root := filepath.Join(m.baseDir, ".worktrees")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, fmt.Errorf("create review worktree root: %w", err)
+	}
+	prefix := hashedRepoPathComponent(reviewID)
+	if len(prefix) > 12 {
+		prefix = prefix[:12]
+	}
+	worktreePath, err := os.MkdirTemp(root, prefix+"-")
+	if err != nil {
+		return nil, fmt.Errorf("allocate review worktree path: %w", err)
+	}
+	if err := os.Remove(worktreePath); err != nil {
+		return nil, fmt.Errorf("prepare review worktree path: %w", err)
+	}
+	worktreePath, err = m.validateRepoPath(worktreePath)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := m.runGit(ctx, sourcePath, "worktree", "prune", "--expire", "now"); err != nil {
+		return nil, fmt.Errorf("prune stale review worktrees: %w", err)
+	}
+	if _, err := m.runGit(ctx, sourcePath, "worktree", "add", "--detach", worktreePath, resolved); err != nil {
+		_ = os.RemoveAll(worktreePath)
+		return nil, fmt.Errorf("create review worktree at %s: %w", resolved, err)
+	}
+	workspace := &reviewWorktree{manager: m, source: source, path: worktreePath, expectedCommit: resolved}
+	observed, err := m.runGit(ctx, worktreePath, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return workspace, fmt.Errorf("verify review worktree HEAD: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(observed), resolved) {
+		return workspace, fmt.Errorf("review worktree HEAD mismatch: expected %s, got %s", resolved, strings.TrimSpace(observed))
+	}
+	m.touchAccess(sourcePath)
+	return workspace, nil
+}
+
+func (m *Manager) assertReviewWorktree(ctx context.Context, workspace *reviewWorktree, repoPath, expectedCommit string) error {
+	if workspace == nil || workspace.manager != m {
+		return fmt.Errorf("prepared review worktree is required")
+	}
+	workspace.mu.Lock()
+	defer workspace.mu.Unlock()
+	if workspace.cleaned {
+		return fmt.Errorf("prepared review worktree has already been cleaned")
+	}
+	validatedPath, err := m.validateRepoPath(repoPath)
+	if err != nil {
+		return err
+	}
+	if validatedPath != workspace.path {
+		return fmt.Errorf("prepared review path mismatch: expected %s, got %s", workspace.path, validatedPath)
+	}
+	if !strings.EqualFold(strings.TrimSpace(expectedCommit), workspace.expectedCommit) {
+		return fmt.Errorf("prepared review commit mismatch: expected %s, got %s", workspace.expectedCommit, expectedCommit)
+	}
+	observed, err := m.runGit(ctx, workspace.path, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return fmt.Errorf("resolve prepared review HEAD: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(observed), workspace.expectedCommit) {
+		return fmt.Errorf("prepared review checkout changed: expected HEAD %s, got %s", workspace.expectedCommit, strings.TrimSpace(observed))
+	}
+	return nil
+}
+
+func (m *Manager) cleanupReviewWorktree(ctx context.Context, workspace *reviewWorktree) error {
+	if workspace == nil || workspace.manager != m {
+		return nil
+	}
+	workspace.mu.Lock()
+	defer workspace.mu.Unlock()
+	if workspace.cleaned {
+		return nil
+	}
+
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gitFetchTimeout)
+	defer cancel()
+	sourcePath := workspace.source.repoPath
+	mu := m.getRepoLock(sourcePath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	var removeErr error
+	if _, err := m.runGit(cleanupCtx, sourcePath, "worktree", "remove", "--force", workspace.path); err != nil {
+		removeErr = err
+	}
+	_, pruneErr := m.runGit(cleanupCtx, sourcePath, "worktree", "prune", "--expire", "now")
+	if removeErr != nil {
+		if _, statErr := os.Stat(workspace.path); !os.IsNotExist(statErr) {
+			return fmt.Errorf("remove review worktree: %w", removeErr)
+		}
+	}
+	if pruneErr != nil {
+		return fmt.Errorf("prune review worktree: %w", pruneErr)
+	}
+	if err := os.RemoveAll(workspace.path); err != nil {
+		return fmt.Errorf("remove review worktree directory: %w", err)
+	}
+	m.repoLocks.Delete(workspace.path)
+	workspace.cleaned = true
+	workspace.source.release()
+	m.touchAccess(sourcePath)
+	return nil
+}
+
+func (m *Manager) importCommit(ctx context.Context, destinationRepoPath, sourceRepoPath, commit string) error {
+	destinationRepoPath, err := m.validateRepoPath(destinationRepoPath)
+	if err != nil {
+		return err
+	}
+	sourceRepoPath, err = m.validateRepoPath(sourceRepoPath)
+	if err != nil {
+		return err
+	}
+	mu := m.getRepoLock(destinationRepoPath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	resolved, err := m.runGit(ctx, sourceRepoPath, "rev-parse", "--verify", strings.TrimSpace(commit)+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("resolve source commit %s: %w", commit, err)
+	}
+	if _, err := m.runGit(ctx, destinationRepoPath, "fetch", "--no-tags", sourceRepoPath, resolved); err != nil {
+		return fmt.Errorf("import commit %s from cached repository: %w", resolved, err)
+	}
+	if _, err := m.runGit(ctx, destinationRepoPath, "cat-file", "-e", resolved+"^{commit}"); err != nil {
+		return fmt.Errorf("verify imported commit %s: %w", resolved, err)
+	}
+	return nil
+}
+
+func (m *Manager) resolveCommit(ctx context.Context, repoPath, ref string) (string, error) {
+	mu := m.getRepoLock(repoPath)
+	mu.Lock()
+	defer mu.Unlock()
+	resolved, err := m.runGit(ctx, repoPath, "rev-parse", "--verify", strings.TrimSpace(ref)+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("resolve commit %s: %w", ref, err)
+	}
+	return strings.ToLower(strings.TrimSpace(resolved)), nil
+}
+
+func (m *Manager) ApplyPatchSeries(ctx context.Context, repoPath string, events []nostr.Event) error {
+	if len(events) == 0 {
+		return fmt.Errorf("empty patch series")
+	}
 
 	mu := m.getRepoLock(repoPath)
 	mu.Lock()
 	defer mu.Unlock()
 
-	if _, err := m.runGit(ctx, repoPath, "reset", "--hard", "HEAD"); err != nil {
-		return branch, fmt.Errorf("git reset before apply: %w", err)
-	}
-	if _, err := m.runGit(ctx, repoPath, "clean", "-fd"); err != nil {
-		return branch, fmt.Errorf("git clean before apply: %w", err)
-	}
-
-	if _, err := m.runGit(ctx, repoPath, "checkout", "-B", branch); err != nil {
-		return branch, fmt.Errorf("checkout throwaway branch: %w", err)
-	}
-
 	for _, event := range events {
 		if err := m.applySinglePatch(ctx, repoPath, event.Content); err != nil {
-			return branch, fmt.Errorf("patch %s does not apply cleanly: %w", event.ID.Hex(), err)
+			return fmt.Errorf("patch %s does not apply cleanly: %w", event.ID.Hex(), err)
 		}
 	}
 
-	return branch, nil
+	return nil
 }
 
 func (m *Manager) EnsureCommitAvailable(ctx context.Context, repoPath, eventID, commit string, cloneURLs []string) error {
@@ -724,7 +950,7 @@ func (m *Manager) listCachedRepos() ([]cachedRepo, error) {
 
 	var repos []cachedRepo
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || e.Name() == ".worktrees" {
 			continue
 		}
 		repoPath, err := m.validateRepoPath(filepath.Join(m.baseDir, e.Name()))
@@ -736,7 +962,8 @@ func (m *Manager) listCachedRepos() ([]cachedRepo, error) {
 		if !mu.TryLock() {
 			continue
 		}
-		// Only count directories that look like git repos.
+		// Only count directories that look like git repos. Pinned repositories
+		// still count toward cache limits, but eviction skips them below.
 		if _, err := os.Stat(filepath.Join(repoPath, ".git")); err != nil {
 			mu.Unlock()
 			continue
@@ -806,6 +1033,10 @@ func (m *Manager) evictIfNeeded() {
 		r := repos[i]
 		mu := m.getRepoLock(r.path)
 		if !mu.TryLock() {
+			continue
+		}
+		if m.repoPinned(r.path) {
+			mu.Unlock()
 			continue
 		}
 		validatedPath, err := m.validateRepoPath(r.path)

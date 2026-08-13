@@ -19,12 +19,13 @@ type Service struct {
 }
 
 type PrepareResult struct {
-	RepoID      string
-	RepoPath    string
-	Branch      string
-	RootID      string
-	AppliedIDs  []string
-	FailureHint string
+	RepoID         string
+	RepoPath       string
+	ExpectedCommit string
+	RootID         string
+	AppliedIDs     []string
+	FailureHint    string
+	workspace      *reviewWorktree
 	// BaseRepoConfig is the raw .drydock.yaml content from the canonical
 	// base branch (before patch application). Nil if the file is absent.
 	BaseRepoConfig []byte
@@ -86,15 +87,26 @@ func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecor
 	if err != nil {
 		return PrepareResult{}, err
 	}
-	repoPath, err := s.manager.EnsureCanonicalRepo(ctx, rec.RepoID, cloneURLs)
+	lease, err := s.manager.acquireRepoLease(ctx, rec.RepoID, cloneURLs, true)
 	if err != nil {
 		return PrepareResult{}, err
 	}
+	leaseOwned := true
+	defer func() {
+		if leaseOwned {
+			lease.release()
+		}
+	}()
 
-	// Read .drydock.yaml from the canonical base ref BEFORE applying patches.
-	baseConfig, cfgErr := s.manager.ReadFileAtDefaultRef(ctx, repoPath, ".drydock.yaml")
+	// Preserve the existing kind-1617 base semantics while isolating the
+	// mutable patch application in its own worktree.
+	baseCommit, err := s.manager.resolveCommit(ctx, lease.repoPath, "HEAD")
+	if err != nil {
+		return PrepareResult{}, err
+	}
+	baseConfig, cfgErr := s.manager.ReadFileAtDefaultRef(ctx, lease.repoPath, ".drydock.yaml")
 	if cfgErr != nil {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
 			fmt.Errorf("read canonical .drydock.yaml: %w", cfgErr)
 	}
 
@@ -107,17 +119,42 @@ func (s *Service) preparePatchSeries(ctx context.Context, rec db.PatchEventRecor
 		ordered = []nostr.Event{target}
 	}
 
-	branch, err := s.manager.ApplyPatchSeries(ctx, repoPath, rec.EventID, ordered)
+	workspace, err := s.manager.createReviewWorktree(ctx, lease, rec.EventID, baseCommit)
 	if err != nil {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, FailureHint: err.Error()}, err
+		if workspace == nil {
+			return PrepareResult{}, err
+		}
+		leaseOwned = false
+		if cleanupErr := s.manager.cleanupReviewWorktree(ctx, workspace); cleanupErr != nil {
+			s.logger.Warn("failed to clean up partially created review worktree", "error", cleanupErr)
+		}
+		return PrepareResult{
+			RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
+			RootID: rec.RootID, workspace: workspace,
+		}, err
+	}
+	leaseOwned = false
+	if err := s.manager.ApplyPatchSeries(ctx, workspace.path, ordered); err != nil {
+		if cleanupErr := s.manager.cleanupReviewWorktree(ctx, workspace); cleanupErr != nil {
+			s.logger.Warn("failed to clean up review worktree after patch apply failure", "error", cleanupErr)
+		}
+		return PrepareResult{
+			RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
+			RootID: rec.RootID, FailureHint: err.Error(), workspace: workspace,
+		}, err
 	}
 	applied := make([]string, 0, len(ordered))
 	for _, evt := range ordered {
 		applied = append(applied, evt.ID.Hex())
 	}
 
-	result := PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, Branch: branch, AppliedIDs: applied, BaseRepoConfig: baseConfig}
-	s.logger.Info("prepared patch series on review branch", "patch_event_id", rec.EventID, "repo_id", rec.RepoID, "branch", branch, "series_len", len(applied))
+	result := PrepareResult{
+		RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
+		RootID: rec.RootID, AppliedIDs: applied, BaseRepoConfig: baseConfig, workspace: workspace,
+	}
+	s.logger.Info("prepared patch series in isolated worktree",
+		"patch_event_id", rec.EventID, "repo_id", rec.RepoID,
+		"worktree", workspace.path, "expected_commit", baseCommit, "series_len", len(applied))
 	return result, nil
 }
 
@@ -130,99 +167,116 @@ func (s *Service) preparePRTip(ctx context.Context, rec db.PatchEventRecord, tar
 			return PrepareResult{}, err
 		}
 	}
-	repoPath, err := s.manager.EnsureRepo(ctx, rec.RepoID, cloneURLs)
+	sourceLease, err := s.manager.acquireRepoLease(ctx, rec.RepoID, cloneURLs, false)
 	if err != nil {
 		return PrepareResult{}, err
 	}
+	defer sourceLease.release()
 
-	// Read .drydock.yaml from the canonical base repo, NOT the PR clone.
-	// For PRs, cloneURLs may come from the fork — we must source config
-	// from the canonical repository to prevent a fork/PR from influencing
-	// its own review policy.
-	var baseConfig []byte
-	canonicalURLs, canonErr := s.store.GetRepositoryCloneURLs(ctx, rec.RepoID)
-	if canonErr != nil {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
-			fmt.Errorf("load canonical repository URLs: %w", canonErr)
+	canonicalURLs, err := s.store.GetRepositoryCloneURLs(ctx, rec.RepoID)
+	if err != nil {
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
+			fmt.Errorf("load canonical repository URLs: %w", err)
 	}
 	if len(canonicalURLs) == 0 {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
 			fmt.Errorf("no canonical clone URLs for repository %s", rec.RepoID)
 	}
-	// Ensure the canonical repo is available in a cache entry that is
-	// distinct from any PR/fork clone for this repo ID.
-	canonPath, ensureErr := s.manager.EnsureCanonicalRepo(ctx, rec.RepoID, canonicalURLs)
-	if ensureErr != nil {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
-			fmt.Errorf("ensure canonical repo for config read: %w", ensureErr)
+	canonicalLease, err := s.manager.acquireRepoLease(ctx, rec.RepoID, canonicalURLs, true)
+	if err != nil {
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
+			fmt.Errorf("ensure canonical repo for review: %w", err)
 	}
-	baseConfig, canonErr = s.manager.ReadFileAtDefaultRef(ctx, canonPath, ".drydock.yaml")
-	if canonErr != nil {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
-			fmt.Errorf("read canonical .drydock.yaml: %w", canonErr)
+	canonicalOwned := true
+	defer func() {
+		if canonicalOwned {
+			canonicalLease.release()
+		}
+	}()
+
+	baseConfig, err := s.manager.ReadFileAtDefaultRef(ctx, canonicalLease.repoPath, ".drydock.yaml")
+	if err != nil {
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
+			fmt.Errorf("read canonical .drydock.yaml: %w", err)
 	}
 
 	tip, err := prTipCommit(target)
 	if err != nil {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, FailureHint: err.Error()}, err
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureHint: err.Error()}, err
 	}
 	assertedBase, err := prMergeBaseCommit(target)
 	if err != nil {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID}, err
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID}, err
 	}
-	if err := s.manager.EnsureCommitAvailable(ctx, repoPath, target.ID.Hex(), tip, cloneURLs); err != nil {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, FailureHint: err.Error()}, err
+	if err := s.manager.EnsureCommitAvailable(ctx, sourceLease.repoPath, target.ID.Hex(), tip, cloneURLs); err != nil {
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID, FailureHint: err.Error()}, err
 	}
 	if assertedBase != "" {
-		if err := s.manager.EnsureCommitAvailable(ctx, repoPath, target.ID.Hex(), assertedBase, cloneURLs); err != nil {
-			return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID}, fmt.Errorf("fetch event-asserted merge-base %s: %w", assertedBase, err)
+		if err := s.manager.EnsureCommitAvailable(ctx, sourceLease.repoPath, target.ID.Hex(), assertedBase, cloneURLs); err != nil {
+			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
+				fmt.Errorf("fetch event-asserted merge-base %s: %w", assertedBase, err)
 		}
-	}
-	branch := "review/" + shortID(rec.EventID)
-	if err := s.manager.CheckoutCommitOnBranch(ctx, repoPath, branch, tip); err != nil {
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, FailureHint: err.Error()}, err
 	}
 
-	// PR event content is a cover letter, not a diff. Prefer the canonical
-	// clone so a fork cannot choose the implicit default ref. If the tip cannot
-	// be made available there, fallback to the PR clone is allowed only when
-	// the event asserted an explicit merge-base; fork-controlled origin/HEAD
-	// is never allowed to choose an implicit base.
-	diffRepoPath := canonPath
-	if fetchErr := s.manager.EnsureCommitAvailable(ctx, canonPath, rec.EventID, tip, cloneURLs); fetchErr != nil {
+	// Preserve the provenance selection added in bdfdd0b: implicit bases are
+	// canonical-only, while an asserted base may be verified in the PR cache.
+	diffRepoPath := canonicalLease.repoPath
+	canonicalTipErr := s.manager.EnsureCommitAvailable(ctx, canonicalLease.repoPath, rec.EventID, tip, cloneURLs)
+	if canonicalTipErr != nil {
 		if assertedBase == "" {
-			s.CleanupReviewBranch(ctx, repoPath, branch)
-			return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID},
-				fmt.Errorf("fetch PR tip %s into canonical clone for implicit-base diff: %w", tip, fetchErr)
+			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
+				fmt.Errorf("fetch PR tip %s into canonical clone for implicit-base diff: %w", tip, canonicalTipErr)
 		}
-		diffRepoPath = repoPath
+		diffRepoPath = sourceLease.repoPath
 		s.logger.Warn("could not fetch PR tip into canonical clone; using event-asserted base in PR clone",
-			"repo_id", rec.RepoID, "tip", tip, "base", assertedBase, "error", fetchErr)
+			"repo_id", rec.RepoID, "tip", tip, "base", assertedBase, "error", canonicalTipErr)
 	} else if assertedBase != "" {
-		if fetchErr := s.manager.EnsureCommitAvailable(ctx, canonPath, rec.EventID, assertedBase, cloneURLs); fetchErr != nil {
-			diffRepoPath = repoPath
+		if fetchErr := s.manager.EnsureCommitAvailable(ctx, canonicalLease.repoPath, rec.EventID, assertedBase, cloneURLs); fetchErr != nil {
+			diffRepoPath = sourceLease.repoPath
 			s.logger.Warn("could not fetch asserted PR base into canonical clone; verifying it in PR clone",
 				"repo_id", rec.RepoID, "tip", tip, "base", assertedBase, "error", fetchErr)
 		}
 	}
 	diffResult, diffErr := s.manager.DiffAgainstDefaultBranch(ctx, diffRepoPath, tip, assertedBase)
 	if diffErr != nil {
-		// Internal failure to determine the diff base — clean up the review
-		// branch (the runner only installs its cleanup on success) and do NOT
-		// set a FailureHint: that would publish a misleading "patch does not
-		// apply, please rebase" review for what is not an apply failure.
-		s.CleanupReviewBranch(ctx, repoPath, branch)
-		return PrepareResult{RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID}, fmt.Errorf("diff PR tip %s: %w", tip, diffErr)
+		return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
+			fmt.Errorf("diff PR tip %s: %w", tip, diffErr)
 	}
 
+	// The review tree is always linked to the canonical clone. If provenance
+	// verification used the asserted-base fallback, import only the already
+	// verified commit objects from the manager-owned PR cache; canonical refs
+	// remain unchanged.
+	if canonicalTipErr != nil {
+		if err := s.manager.importCommit(ctx, canonicalLease.repoPath, sourceLease.repoPath, diffResult.TipCommit); err != nil {
+			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID},
+				fmt.Errorf("import verified PR tip into canonical clone: %w", err)
+		}
+	}
+	workspace, err := s.manager.createReviewWorktree(ctx, canonicalLease, rec.EventID, diffResult.TipCommit)
+	if err != nil {
+		if workspace == nil {
+			return PrepareResult{RepoID: rec.RepoID, RootID: rec.RootID}, err
+		}
+		canonicalOwned = false
+		if cleanupErr := s.manager.cleanupReviewWorktree(ctx, workspace); cleanupErr != nil {
+			s.logger.Warn("failed to clean up partially created PR worktree", "error", cleanupErr)
+		}
+		return PrepareResult{
+			RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: diffResult.TipCommit,
+			RootID: rec.RootID, workspace: workspace,
+		}, err
+	}
+	canonicalOwned = false
+
 	result := PrepareResult{
-		RepoID: rec.RepoID, RepoPath: repoPath, RootID: rec.RootID, Branch: branch,
-		AppliedIDs: []string{target.ID.Hex()}, BaseRepoConfig: baseConfig,
+		RepoID: rec.RepoID, RepoPath: workspace.path, ExpectedCommit: diffResult.TipCommit, RootID: rec.RootID,
+		AppliedIDs: []string{target.ID.Hex()}, BaseRepoConfig: baseConfig, workspace: workspace,
 		Diff: diffResult.Diff, BaseCommit: diffResult.BaseCommit, TipCommit: diffResult.TipCommit,
 		DiffSHA256: diffResult.SHA256, DiffFiles: diffResult.FileCount, DiffBytes: diffResult.ByteCount,
 	}
-	s.logger.Info("prepared PR tip on review branch",
-		"patch_event_id", rec.EventID, "repo_id", rec.RepoID, "branch", branch,
+	s.logger.Info("prepared PR tip in isolated worktree",
+		"patch_event_id", rec.EventID, "repo_id", rec.RepoID, "worktree", workspace.path,
 		"base", result.BaseCommit, "tip", result.TipCommit, "diff_sha256", result.DiffSHA256,
 		"diff_files", result.DiffFiles, "diff_bytes", result.DiffBytes)
 	return result, nil
@@ -242,10 +296,9 @@ type AutoFixResult struct {
 	AppliedFiles []string // files modified by applied fixes
 }
 
-// BuildAutoFixPatch synthesizes a combined diff from the given suggestions on
-// the current review branch. Only suggestions whose diffs apply cleanly are
-// included. The working tree is restored to its pre-fix state afterward so
-// branch cleanup can proceed normally.
+// BuildAutoFixPatch synthesizes a combined diff from the given suggestions in
+// the isolated review worktree. Only suggestions whose diffs apply cleanly are
+// included. The worktree is restored to its pre-fix state afterward.
 func (s *Service) BuildAutoFixPatch(ctx context.Context, repoPath string, suggestions []AutoFixSuggestion) (AutoFixResult, error) {
 	if len(suggestions) == 0 {
 		return AutoFixResult{}, nil
@@ -253,12 +306,25 @@ func (s *Service) BuildAutoFixPatch(ctx context.Context, repoPath string, sugges
 	return s.manager.buildAutoFixPatch(ctx, repoPath, suggestions)
 }
 
-func (s *Service) CleanupReviewBranch(ctx context.Context, repoPath, branch string) {
-	if branch == "" || repoPath == "" {
+func (s *Service) AssertPreparedReview(ctx context.Context, prep PrepareResult) error {
+	if err := s.manager.assertReviewWorktree(ctx, prep.workspace, prep.RepoPath, prep.ExpectedCommit); err != nil {
+		return fmt.Errorf("checkout identity assertion: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) CleanupPreparedReview(ctx context.Context, prep PrepareResult) {
+	if prep.workspace == nil {
 		return
 	}
-	if err := s.manager.CleanupReviewBranch(ctx, repoPath, branch); err != nil {
-		s.logger.Warn("failed to clean up review branch", "branch", branch, "error", err)
+	if err := s.manager.cleanupReviewWorktree(ctx, prep.workspace); err != nil {
+		// Retry once: a successful remove followed by a transient prune error
+		// is recoverable and should not leave the canonical cache pinned.
+		if retryErr := s.manager.cleanupReviewWorktree(ctx, prep.workspace); retryErr != nil {
+			s.logger.Warn("failed to clean up review worktree",
+				"repo_id", prep.RepoID, "worktree", prep.RepoPath,
+				"error", err, "retry_error", retryErr)
+		}
 	}
 }
 

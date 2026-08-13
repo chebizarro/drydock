@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"fiatjaf.com/nostr"
 )
 
 func testLogger() *slog.Logger {
@@ -180,6 +182,96 @@ func TestCleanupReviewBranchNoop(t *testing.T) {
 	// Empty branch name should be a no-op
 	if err := mgr.CleanupReviewBranch(context.Background(), "/tmp", ""); err != nil {
 		t.Fatalf("expected nil for empty branch, got: %v", err)
+	}
+}
+
+func TestReviewWorktreeLifecycleAndIdentity(t *testing.T) {
+	ctx := context.Background()
+	cacheDir := t.TempDir()
+	mgr := NewManager(cacheDir, testLogger())
+	repoID := "test:review-worktree"
+	repoPath := mgr.repoPath(repoID)
+	initWorkRepo(t, repoPath)
+
+	origin := filepath.Join(t.TempDir(), "origin")
+	run(t, "", "git", "init", "--bare", origin)
+	run(t, repoPath, "git", "remote", "add", "origin", origin)
+	run(t, repoPath, "git", "push", "origin", "HEAD:refs/heads/main")
+	head := run(t, repoPath, "git", "rev-parse", "HEAD")
+
+	lease, err := mgr.acquireRepoLease(ctx, repoID, []string{"https://example.com/unused.git"}, false)
+	if err != nil {
+		t.Fatalf("acquire repository lease: %v", err)
+	}
+	workspace, err := mgr.createReviewWorktree(ctx, lease, "review-one", head)
+	if err != nil {
+		lease.release()
+		t.Fatalf("create review worktree: %v", err)
+	}
+	if !mgr.repoPinned(repoPath) {
+		t.Fatal("source repository was not pinned for worktree lifetime")
+	}
+	cached, err := mgr.listCachedRepos()
+	if err != nil {
+		t.Fatalf("list cached repositories: %v", err)
+	}
+	foundPinned := false
+	for _, entry := range cached {
+		if entry.path == repoPath {
+			foundPinned = true
+		}
+	}
+	if !foundPinned {
+		t.Fatal("pinned source repository was omitted from cache accounting")
+	}
+
+	otherPath := mgr.repoPath("test:evictable")
+	initWorkRepo(t, otherPath)
+	mgr.maxCount = 1
+	mgr.evictIfNeeded()
+	if _, err := os.Stat(repoPath); err != nil {
+		t.Fatalf("active worktree source was evicted: %v", err)
+	}
+	if _, err := os.Stat(otherPath); !os.IsNotExist(err) {
+		t.Fatalf("expected unpinned repository eviction, got %v", err)
+	}
+
+	event := nostr.Event{
+		Content: "diff --git a/README.md b/README.md\n" +
+			"--- a/README.md\n" +
+			"+++ b/README.md\n" +
+			"@@ -1 +1,2 @@\n" +
+			" # Test\n" +
+			"+isolated\n",
+	}
+	if err := mgr.ApplyPatchSeries(ctx, workspace.path, []nostr.Event{event}); err != nil {
+		t.Fatalf("apply patch in worktree: %v", err)
+	}
+	if err := mgr.assertReviewWorktree(ctx, workspace, workspace.path, head); err != nil {
+		t.Fatalf("assert staged-patch worktree identity: %v", err)
+	}
+	if got := string(mustReadFile(t, filepath.Join(workspace.path, "README.md"))); !strings.Contains(got, "isolated") {
+		t.Fatalf("worktree missing isolated patch: %q", got)
+	}
+
+	run(t, workspace.path, "git", "commit", "-am", "unexpected head change")
+	if err := mgr.assertReviewWorktree(ctx, workspace, workspace.path, head); err == nil ||
+		!strings.Contains(err.Error(), "checkout changed") {
+		t.Fatalf("expected checkout identity mismatch, got %v", err)
+	}
+
+	worktreePath := workspace.path
+	if err := mgr.cleanupReviewWorktree(context.Background(), workspace); err != nil {
+		t.Fatalf("cleanup review worktree: %v", err)
+	}
+	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+		t.Fatalf("review worktree still exists after cleanup: %v", err)
+	}
+	if mgr.repoPinned(repoPath) {
+		t.Fatal("source repository remained pinned after cleanup")
+	}
+	if listed := run(t, repoPath, "git", "worktree", "list", "--porcelain"); strings.Contains(listed, worktreePath) {
+		t.Fatalf("worktree registration was not pruned:\n%s", listed)
 	}
 }
 

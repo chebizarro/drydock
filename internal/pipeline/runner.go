@@ -307,6 +307,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		return prepErr
 	})
 	if prepErr != nil {
+		// Preparation may have returned an owned worktree after a failed patch
+		// apply. Retry its idempotent cleanup before leaving the task.
+		defer r.repoSvc.CleanupPreparedReview(ctx, prep)
 		// Publish a review comment about the apply failure so the patch author gets feedback
 		if prep.FailureHint != "" && r.pubSvc != nil {
 			if gateErr := r.requireReactiveMonitoring(ctx, task, "pre_publication"); gateErr != nil {
@@ -316,8 +319,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		}
 		return fmt.Errorf("prepare patch series: %w", prepErr)
 	}
-	// Clean up the throwaway review branch when done (success or failure)
-	defer r.repoSvc.CleanupReviewBranch(ctx, prep.RepoPath, prep.Branch)
+	// Hold the isolated review worktree through every filesystem-dependent
+	// stage, then remove and prune it even if the task context was cancelled.
+	defer r.repoSvc.CleanupPreparedReview(ctx, prep)
 
 	// Persist PR diff provenance before any context construction or publication.
 	if prep.BaseCommit != "" || prep.TipCommit != "" || prep.DiffSHA256 != "" {
@@ -430,6 +434,10 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 3b. Validate that the patch diff is non-empty to avoid wasting an LLM call.
 	if strings.TrimSpace(patchDiffContent) == "" {
 		return fmt.Errorf("patch event %s has empty diff content", task.PatchEventID)
+	}
+
+	if err := r.repoSvc.AssertPreparedReview(ctx, prep); err != nil {
+		return fmt.Errorf("verify checkout before context build: %w", err)
 	}
 
 	// 4. Build context bundle (with repo-config overrides)
@@ -559,6 +567,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	generalSecurity := repoCfg.Security.Enabled || reviewengine.IsSecuritySensitive(changedFiles)
 	nostrConfigured := repoCfg.Security.Nostr.Enabled != "" && repoCfg.Security.Nostr.Enabled != "false"
 	if r.securityReviewer != nil && (generalSecurity || nostrConfigured) {
+		if err := r.repoSvc.AssertPreparedReview(ctx, prep); err != nil {
+			return fmt.Errorf("verify checkout before security review: %w", err)
+		}
 		stageConfig := repoCfg.Security
 		stageConfig.Enabled = generalSecurity
 		securityResult := r.securityReviewer.Run(ctx, bundle, prep.RepoPath, stageConfig)
@@ -573,7 +584,10 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// but kept sequential here for simplicity and determinism).
 	var scanFindings []securityscan.SecurityFinding
 	if r.secScanner != nil && len(changedFiles) > 0 {
-		timer.Time(tracing.StageSecurityScan, func() error {
+		if err := timer.Time(tracing.StageSecurityScan, func() error {
+			if err := r.repoSvc.AssertPreparedReview(ctx, prep); err != nil {
+				return fmt.Errorf("verify checkout before security scan: %w", err)
+			}
 			scanResult := r.secScanner.ScanFiles(ctx, prep.RepoPath, changedFiles, patchDiffContent)
 			scanFindings = scanResult.Findings
 			if len(scanFindings) > 0 {
@@ -583,7 +597,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 					"findings", len(scanFindings))
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	// 7. Compute context hash
