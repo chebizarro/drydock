@@ -26,9 +26,10 @@ const (
 )
 
 var (
-	ErrSelectionFinalized = errors.New("agent tools: selection is finalized")
-	ErrMandatoryArtifact  = errors.New("agent tools: mandatory artifact cannot be removed")
-	ErrBudgetExceeded     = errors.New("agent tools: exact context package exceeds token budget")
+	ErrSelectionFinalized                = errors.New("agent tools: selection is finalized")
+	ErrMandatoryArtifact                 = errors.New("agent tools: mandatory artifact cannot be removed")
+	ErrBudgetExceeded                    = errors.New("agent tools: exact context package exceeds token budget")
+	ErrAuthoritativeTokenCounterRequired = errors.New("agent tools: authoritative token counter is required")
 )
 
 const DefaultTokenHeadroom = 0.10
@@ -95,6 +96,10 @@ func NewSelection(cfg SelectionConfig) (*Selection, error) {
 	if cfg.Counter == nil {
 		return nil, contextbuilder.ErrTokenCounterRequired
 	}
+	switch cfg.Counter.(type) {
+	case contextbuilder.ApproxTokenCounter, *contextbuilder.ApproxTokenCounter:
+		return nil, ErrAuthoritativeTokenCounterRequired
+	}
 	if cfg.TokenBudget <= 0 {
 		cfg.TokenBudget = contextbuilder.DefaultTokenBudget
 	}
@@ -114,7 +119,7 @@ func NewSelection(cfg SelectionConfig) (*Selection, error) {
 		codemaps: make(map[string]SelectionArtifact),
 	}
 	selection.patch = SelectionArtifact{
-		Kind: ArtifactPatch, Hash: cfg.Snapshot.PatchHash, Mandatory: true,
+		Kind: ArtifactPatch, Hash: cfg.Snapshot.PatchDigest(), Mandatory: true,
 	}
 	seen := make(map[string]struct{}, len(cfg.ChangedFiles))
 	for _, path := range cfg.ChangedFiles {
@@ -122,13 +127,18 @@ func NewSelection(cfg SelectionConfig) (*Selection, error) {
 			continue
 		}
 		content, err := cfg.Snapshot.ReadFile(context.Background(), path)
-		if err != nil {
+		if err != nil && !errors.Is(err, workspacesnapshot.ErrNotFound) {
 			return nil, fmt.Errorf("agent tools: seed changed file %s: %w", path, err)
 		}
 		seen[path] = struct{}{}
 		selection.changedFiles = append(selection.changedFiles, path)
 		selection.files[path] = SelectionArtifact{
-			Kind: ArtifactFile, Path: path, Hash: selectionHash(content), Mandatory: true,
+			Kind: ArtifactFile, Path: path, Mandatory: true,
+		}
+		if err == nil {
+			selection.files[path] = SelectionArtifact{
+				Kind: ArtifactFile, Path: path, Hash: selectionHash(content), Mandatory: true,
+			}
 		}
 	}
 	sort.Strings(selection.changedFiles)
@@ -375,6 +385,10 @@ func (s *Selection) renderLocked(ctx context.Context) (string, error) {
 	for _, path := range filePaths {
 		artifact := s.files[path]
 		content, err := s.snapshot.ReadFile(ctx, path)
+		if artifact.Mandatory && artifact.Hash == "" && errors.Is(err, workspacesnapshot.ErrNotFound) {
+			sections = append(sections, "## file: "+path+"\n[deleted in snapshot]")
+			continue
+		}
 		if err != nil {
 			return "", err
 		}

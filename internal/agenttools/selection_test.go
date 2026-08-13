@@ -67,6 +67,34 @@ func TestSelectionCoalescesRangesAndProtectsMandatoryArtifacts(t *testing.T) {
 	}
 }
 
+func TestSelectionKeepsDeletedChangedFileAsMandatoryMetadata(t *testing.T) {
+	snapshot := mutableSnapshot(t, map[string]string{"remaining.go": "package p"})
+	selection, err := NewSelection(SelectionConfig{
+		Snapshot: snapshot, ChangedFiles: []string{"deleted.go"},
+		Counter: byteCounter{}, TokenBudget: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := selection.Finalize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(bundle.Content, "## file: deleted.go\n[deleted in snapshot]") {
+		t.Fatalf("deleted file metadata missing:\n%s", bundle.Content)
+	}
+	status := selection.Status()
+	found := false
+	for _, artifact := range status.Artifacts {
+		if artifact.Kind == ArtifactFile && artifact.Path == "deleted.go" && artifact.Mandatory {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("deleted mandatory artifact missing: %#v", status.Artifacts)
+	}
+}
+
 func TestSelectionFinalizeRendersExactImmutableBundle(t *testing.T) {
 	snapshot := mutableSnapshot(t, map[string]string{
 		"changed.go": "package p\nfunc Changed() {}\n",
@@ -112,6 +140,17 @@ func TestSelectionFinalizeRendersExactImmutableBundle(t *testing.T) {
 	stored, ok := selection.Bundle()
 	if !ok || stored.Content != bundle.Content {
 		t.Fatalf("stored bundle = %#v, ok=%v", stored, ok)
+	}
+}
+
+func TestSelectionRejectsApproximateCounter(t *testing.T) {
+	snapshot := mutableSnapshot(t, map[string]string{"changed.go": "content"})
+	_, err := NewSelection(SelectionConfig{
+		Snapshot: snapshot, ChangedFiles: []string{"changed.go"},
+		Counter: contextbuilder.ApproxTokenCounter{}, TokenBudget: 1_000,
+	})
+	if !errors.Is(err, ErrAuthoritativeTokenCounterRequired) {
+		t.Fatalf("approximate counter error = %v", err)
 	}
 }
 

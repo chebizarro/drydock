@@ -39,7 +39,7 @@ func TestPinnedSnapshotReadsCommitAndEnforcesScope(t *testing.T) {
 	if _, err := snapshot.ReadFile(context.Background(), "docs/readme.md"); !errors.Is(err, ErrOutsideScope) {
 		t.Fatalf("outside allowlist error = %v", err)
 	}
-	for _, path := range []string{"/etc/passwd", "../src/main.go", "src/../../etc/passwd"} {
+	for _, path := range []string{"/etc/passwd", "C:\\Windows\\system.ini", "../src/main.go", "src/../../etc/passwd"} {
 		if _, err := snapshot.ReadFile(context.Background(), path); !errors.Is(err, ErrInvalidPath) {
 			t.Errorf("path %q error = %v, want ErrInvalidPath", path, err)
 		}
@@ -53,6 +53,37 @@ func TestPinnedSnapshotReadsCommitAndEnforcesScope(t *testing.T) {
 	ref := strings.TrimSpace(run(t, repo, "git", "rev-parse", snapshot.refName))
 	if ref != snapshot.Commit {
 		t.Fatalf("lease ref = %q, commit = %q", ref, snapshot.Commit)
+	}
+}
+
+func TestPinnedSnapshotDoesNotTrustMutableExportedMetadata(t *testing.T) {
+	repo := initRepo(t)
+	writeFile(t, repo, "src/main.go", "pinned")
+	writeFile(t, repo, "outside.txt", "outside")
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-m", "initial")
+	manager := newTestManager(t, nil)
+	snapshot, err := manager.CreatePinned(context.Background(), PinnedGitOptions{
+		RepoPath: repo, Ref: "HEAD", Patch: []byte("patch"), Allowlist: []string{"src"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repo, "src/main.go", "later")
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-m", "later")
+	snapshot.Commit = strings.TrimSpace(run(t, repo, "git", "rev-parse", "HEAD"))
+	snapshot.Allowlist = []string{"."}
+	snapshot.Kind = KindMutableCopy
+	snapshot.PatchHash = "attacker"
+	if got, err := snapshot.ReadFile(context.Background(), "src/main.go"); err != nil || string(got) != "pinned" {
+		t.Fatalf("read after metadata mutation = %q, %v", got, err)
+	}
+	if _, err := snapshot.ReadFile(context.Background(), "outside.txt"); !errors.Is(err, ErrOutsideScope) {
+		t.Fatalf("allowlist mutation escaped scope: %v", err)
+	}
+	if err := snapshot.Verify(); err != nil {
+		t.Fatalf("public metadata mutation affected verification: %v", err)
 	}
 }
 
@@ -110,6 +141,25 @@ func TestMutableSnapshotCopiesAndVerifiesManifest(t *testing.T) {
 	}
 	if err := snapshot.Verify(); !errors.Is(err, ErrHashMismatch) {
 		t.Fatalf("tampered verify error = %v, want ErrHashMismatch", err)
+	}
+}
+
+func TestMutableSnapshotCollapsesOverlappingAllowlist(t *testing.T) {
+	workspace := t.TempDir()
+	writeFile(t, workspace, "src/main.go", "package p")
+	manager := newTestManager(t, nil)
+	snapshot, err := manager.CreateMutable(context.Background(), MutableCopyOptions{
+		WorkspacePath: workspace, Allowlist: []string{".", "src", "src/main.go"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := snapshot.List(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Path != "src/main.go" {
+		t.Fatalf("entries = %#v", entries)
 	}
 }
 

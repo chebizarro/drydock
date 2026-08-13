@@ -82,6 +82,13 @@ type Snapshot struct {
 	refName   string
 	patch     []byte
 	entries   map[string]ManifestEntry
+
+	immutableKind         Kind
+	immutableCommit       string
+	immutablePatchRef     string
+	immutablePatchHash    string
+	immutableManifestHash string
+	immutableAllowlist    []string
 }
 
 type PinnedGitOptions struct {
@@ -195,8 +202,13 @@ func (m *Manager) CreatePinned(ctx context.Context, opts PinnedGitOptions) (_ *S
 		PatchHash: hashBytes(opts.Patch), Allowlist: allowlist, CreatedAt: now,
 		ExpiresAt: now.Add(ttl), manager: m, repoRoot: repoRoot, refName: refName,
 		patch: append([]byte(nil), opts.Patch...), entries: entries,
+		immutableKind: KindPinnedGit, immutableCommit: commit,
+		immutablePatchRef:  strings.TrimSpace(opts.PatchRef),
+		immutablePatchHash: hashBytes(opts.Patch),
+		immutableAllowlist: append([]string(nil), allowlist...),
 	}
 	s.ManifestHash = manifestHash(s.Kind, commit, s.PatchRef, s.PatchHash, allowlist, entries)
+	s.immutableManifestHash = s.ManifestHash
 	m.mu.Lock()
 	m.snapshots[id] = s
 	m.mu.Unlock()
@@ -262,8 +274,12 @@ func (m *Manager) CreateMutable(ctx context.Context, opts MutableCopyOptions) (_
 		PatchHash: hashBytes(opts.Patch), Allowlist: allowlist, CreatedAt: now,
 		ExpiresAt: now.Add(ttl), manager: m, filesRoot: filesRoot,
 		patch: append([]byte(nil), opts.Patch...), entries: entries,
+		immutableKind: KindMutableCopy, immutablePatchRef: strings.TrimSpace(opts.PatchRef),
+		immutablePatchHash: hashBytes(opts.Patch),
+		immutableAllowlist: append([]string(nil), allowlist...),
 	}
 	s.ManifestHash = manifestHash(s.Kind, "", s.PatchRef, s.PatchHash, allowlist, entries)
+	s.immutableManifestHash = s.ManifestHash
 	if err := writeManifest(snapshotRoot, s); err != nil {
 		return nil, err
 	}
@@ -363,7 +379,7 @@ func (m *Manager) GC(ctx context.Context) ([]string, error) {
 		if now.Before(s.ExpiresAt) || m.hasActiveLeaseLocked(id, now) {
 			continue
 		}
-		switch s.Kind {
+		switch s.immutableKind {
 		case KindPinnedGit:
 			if _, err := runGit(ctx, s.repoRoot, "update-ref", "-d", s.refName); err != nil {
 				return removed, fmt.Errorf("workspace snapshot: delete lease ref: %w", err)
@@ -394,16 +410,16 @@ func (s *Snapshot) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !pathAllowed(normalized, s.Allowlist) {
+	if !pathAllowed(normalized, s.immutableAllowlist) {
 		return nil, ErrOutsideScope
 	}
 	entry, ok := s.entries[normalized]
 	if !ok {
 		return nil, ErrNotFound
 	}
-	switch s.Kind {
+	switch s.immutableKind {
 	case KindPinnedGit:
-		out, err := runGitBytes(ctx, s.repoRoot, "show", s.Commit+":"+normalized)
+		out, err := runGitBytes(ctx, s.repoRoot, "show", s.immutableCommit+":"+normalized)
 		if err != nil {
 			return nil, fmt.Errorf("workspace snapshot: read pinned file: %w", err)
 		}
@@ -425,19 +441,19 @@ func (s *Snapshot) ReadFile(ctx context.Context, path string) ([]byte, error) {
 		}
 		return out, nil
 	default:
-		return nil, fmt.Errorf("workspace snapshot: unsupported kind %q", s.Kind)
+		return nil, fmt.Errorf("workspace snapshot: unsupported kind %q", s.immutableKind)
 	}
 }
 
 func (s *Snapshot) Resolve(path string) (string, error) {
-	if s.Kind != KindMutableCopy {
+	if s.immutableKind != KindMutableCopy {
 		return "", ErrNotMaterialized
 	}
 	normalized, err := normalizePath(path, false)
 	if err != nil {
 		return "", err
 	}
-	if !pathAllowed(normalized, s.Allowlist) {
+	if !pathAllowed(normalized, s.immutableAllowlist) {
 		return "", ErrOutsideScope
 	}
 	entry, ok := s.entries[normalized]
@@ -466,7 +482,7 @@ func (s *Snapshot) List(prefix string) ([]ManifestEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if normalized != "." && !pathAllowed(normalized, s.Allowlist) && !allowlistBelow(normalized, s.Allowlist) {
+	if normalized != "." && !pathAllowed(normalized, s.immutableAllowlist) && !allowlistBelow(normalized, s.immutableAllowlist) {
 		return nil, ErrOutsideScope
 	}
 	var entries []ManifestEntry
@@ -481,6 +497,67 @@ func (s *Snapshot) List(prefix string) ([]ManifestEntry, error) {
 
 func (s *Snapshot) PatchContent() []byte { return append([]byte(nil), s.patch...) }
 
+func (s *Snapshot) PatchDigest() string    { return s.immutablePatchHash }
+func (s *Snapshot) ManifestDigest() string { return s.immutableManifestHash }
+func (s *Snapshot) SnapshotKind() Kind     { return s.immutableKind }
+func (s *Snapshot) PinnedCommit() string   { return s.immutableCommit }
+func (s *Snapshot) AllowedPaths() []string {
+	return append([]string(nil), s.immutableAllowlist...)
+}
+
+// Materialize writes verified snapshot files into an empty destination. It is
+// used for deterministic analysis that requires a filesystem root and never
+// reads from the live workspace.
+func (s *Snapshot) Materialize(ctx context.Context, destination string) error {
+	if strings.TrimSpace(destination) == "" {
+		return fmt.Errorf("workspace snapshot: materialization destination is required")
+	}
+	root, err := filepath.Abs(destination)
+	if err != nil {
+		return fmt.Errorf("workspace snapshot: materialization destination: %w", err)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return fmt.Errorf("workspace snapshot: inspect materialization destination: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("workspace snapshot: materialization destination is not a directory")
+	}
+	existing, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	if len(existing) != 0 {
+		return fmt.Errorf("workspace snapshot: materialization destination must be empty")
+	}
+	paths := make([]string, 0, len(s.entries))
+	for path := range s.entries {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		content, err := s.ReadFile(ctx, path)
+		if err != nil {
+			return err
+		}
+		entry := s.entries[path]
+		target := filepath.Join(root, filepath.FromSlash(path))
+		if !insideRoot(root, target) {
+			return ErrOutsideScope
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, content, entry.Mode.Perm()&0o700); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // GitReadRequest is the closed, read-only action set exposed to agent tools.
 type GitReadRequest struct {
 	Action    string
@@ -493,7 +570,7 @@ type GitReadRequest struct {
 // GitRead executes a read-only operation against the pinned commit. Mutable
 // copies intentionally have no live-repository fallback.
 func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, error) {
-	if s.Kind != KindPinnedGit {
+	if s.immutableKind != KindPinnedGit {
 		return nil, fmt.Errorf("workspace snapshot: git.read requires a pinned git snapshot")
 	}
 	path := ""
@@ -503,31 +580,21 @@ func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, err
 		if err != nil {
 			return nil, err
 		}
-		if !pathAllowed(path, s.Allowlist) {
+		if !pathAllowed(path, s.immutableAllowlist) {
 			return nil, ErrOutsideScope
 		}
 	}
 	switch req.Action {
 	case "diff":
-		if len(s.patch) > 0 && path == "" {
-			return append([]byte(nil), s.patch...), nil
-		}
-		args := []string{"show", "--format=", "--no-ext-diff", "--no-textconv", s.Commit, "--"}
 		if path != "" {
-			args = append(args, path)
-		} else {
-			for _, allowed := range s.Allowlist {
-				if allowed != "." {
-					args = append(args, allowed)
-				}
-			}
+			return nil, fmt.Errorf("workspace snapshot: authoritative diff does not support path filtering")
 		}
-		return runGitBytes(ctx, s.repoRoot, args...)
+		return append([]byte(nil), s.patch...), nil
 	case "show":
 		if path != "" {
 			return s.ReadFile(ctx, path)
 		}
-		return runGitBytes(ctx, s.repoRoot, "show", "--no-ext-diff", "--no-textconv", "--stat", "--oneline", s.Commit)
+		return runGitBytes(ctx, s.repoRoot, "show", "--no-ext-diff", "--no-textconv", "--stat", "--oneline", s.immutableCommit)
 	case "log":
 		limit := req.Limit
 		if limit <= 0 {
@@ -536,11 +603,11 @@ func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, err
 		if limit > 100 {
 			limit = 100
 		}
-		args := []string{"log", "-n", strconv.Itoa(limit), "--format=%H%x09%an%x09%aI%x09%s", s.Commit, "--"}
+		args := []string{"log", "-n", strconv.Itoa(limit), "--format=%H%x09%an%x09%aI%x09%s", s.immutableCommit, "--"}
 		if path != "" {
 			args = append(args, path)
 		} else {
-			for _, allowed := range s.Allowlist {
+			for _, allowed := range s.immutableAllowlist {
 				if allowed != "." {
 					args = append(args, allowed)
 				}
@@ -559,7 +626,7 @@ func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, err
 			}
 			args = append(args, "-L", fmt.Sprintf("%d,%d", req.StartLine, end))
 		}
-		args = append(args, s.Commit, "--", path)
+		args = append(args, s.immutableCommit, "--", path)
 		return runGitBytes(ctx, s.repoRoot, args...)
 	default:
 		return nil, fmt.Errorf("workspace snapshot: unsupported git action %q", req.Action)
@@ -567,10 +634,10 @@ func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, err
 }
 
 func (s *Snapshot) Verify() error {
-	if hashBytes(s.patch) != s.PatchHash {
+	if hashBytes(s.patch) != s.immutablePatchHash {
 		return ErrHashMismatch
 	}
-	if manifestHash(s.Kind, s.Commit, s.PatchRef, s.PatchHash, s.Allowlist, s.entries) != s.ManifestHash {
+	if manifestHash(s.immutableKind, s.immutableCommit, s.immutablePatchRef, s.immutablePatchHash, s.immutableAllowlist, s.entries) != s.immutableManifestHash {
 		return ErrHashMismatch
 	}
 	for path := range s.entries {
@@ -599,12 +666,22 @@ func normalizeAllowlist(paths []string) ([]string, error) {
 		out = append(out, normalized)
 	}
 	sort.Strings(out)
-	return out, nil
+	var collapsed []string
+	for _, candidate := range out {
+		if pathAllowed(candidate, collapsed) {
+			continue
+		}
+		collapsed = append(collapsed, candidate)
+	}
+	return collapsed, nil
 }
 
 func normalizePath(path string, allowDot bool) (string, error) {
 	path = strings.TrimSpace(strings.ReplaceAll(path, "\\", "/"))
-	if path == "" || strings.ContainsRune(path, 0) || filepath.IsAbs(path) || filepath.VolumeName(path) != "" {
+	windowsAbsolute := len(path) >= 3 &&
+		((path[0] >= 'a' && path[0] <= 'z') || (path[0] >= 'A' && path[0] <= 'Z')) &&
+		path[1] == ':' && path[2] == '/'
+	if path == "" || strings.ContainsRune(path, 0) || windowsAbsolute || filepath.IsAbs(path) || filepath.VolumeName(path) != "" {
 		return "", ErrInvalidPath
 	}
 	for _, part := range strings.Split(path, "/") {
@@ -688,7 +765,7 @@ func copyAllowed(ctx context.Context, source, target, allowed string, entries ma
 			return fmt.Errorf("workspace snapshot: unsupported file type %s", rel)
 		}
 		dst := filepath.Join(target, filepath.FromSlash(rel))
-		entry, err := copyFile(path, dst, rel, info.Mode())
+		entry, err := copyFile(path, dst, rel, info)
 		if err != nil {
 			return err
 		}
@@ -697,16 +774,26 @@ func copyAllowed(ctx context.Context, source, target, allowed string, entries ma
 	})
 }
 
-func copyFile(source, target, rel string, mode fs.FileMode) (ManifestEntry, error) {
+func copyFile(source, target, rel string, expected fs.FileInfo) (ManifestEntry, error) {
+	if expected == nil || !expected.Mode().IsRegular() {
+		return ManifestEntry{}, fmt.Errorf("workspace snapshot: invalid source file %s", rel)
+	}
 	in, err := os.Open(source)
 	if err != nil {
 		return ManifestEntry{}, err
 	}
 	defer in.Close()
+	opened, err := in.Stat()
+	if err != nil {
+		return ManifestEntry{}, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(expected, opened) {
+		return ManifestEntry{}, fmt.Errorf("%w: source changed while copying %s", ErrSymlink, rel)
+	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return ManifestEntry{}, err
 	}
-	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode.Perm()&0o700)
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, expected.Mode().Perm()&0o700)
 	if err != nil {
 		return ManifestEntry{}, err
 	}
@@ -719,7 +806,7 @@ func copyFile(source, target, rel string, mode fs.FileMode) (ManifestEntry, erro
 	if closeErr != nil {
 		return ManifestEntry{}, closeErr
 	}
-	return ManifestEntry{Path: rel, Hash: hex.EncodeToString(h.Sum(nil)), Size: size, Mode: mode.Perm()}, nil
+	return ManifestEntry{Path: rel, Hash: hex.EncodeToString(h.Sum(nil)), Size: size, Mode: expected.Mode().Perm()}, nil
 }
 
 func gitManifest(ctx context.Context, repoRoot, commit string, allowlist []string) (map[string]ManifestEntry, error) {

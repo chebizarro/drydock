@@ -161,6 +161,57 @@ func TestResultLimitAndReplayCache(t *testing.T) {
 	}
 }
 
+func TestConcurrentDuplicateToolCallIsSingleFlight(t *testing.T) {
+	snapshot := mutableSnapshot(t, map[string]string{"file.txt": "content"})
+	registry := NewRegistry()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	if err := registry.Register(Definition{
+		Name: "test.concurrent", Capability: CapabilityRead,
+		InputSchema: json.RawMessage(`{"type":"object"}`), MaxResultBytes: 100,
+	}, func(context.Context, Invocation) (Result, error) {
+		calls.Add(1)
+		close(started)
+		<-release
+		return Result{Content: "once"}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invocation := Invocation{
+		ToolCallID: "concurrent-id", Name: "test.concurrent",
+		Arguments: json.RawMessage(`{}`),
+		Scope:     NewScope("concurrent-run", snapshot, RoleExternalReadonly),
+	}
+	results := make(chan Result, 2)
+	errs := make(chan error, 2)
+	go func() {
+		result, err := registry.Dispatch(context.Background(), invocation)
+		results <- result
+		errs <- err
+	}()
+	<-started
+	go func() {
+		result, err := registry.Dispatch(context.Background(), invocation)
+		results <- result
+		errs <- err
+	}()
+	close(release)
+	first, second := <-results, <-results
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("handler calls = %d", calls.Load())
+	}
+	if first.Replay == second.Replay {
+		t.Fatalf("expected exactly one replay: first=%#v second=%#v", first, second)
+	}
+}
+
 func TestGitReadClosedActionSet(t *testing.T) {
 	repo := t.TempDir()
 	runAgent(t, repo, "git", "init", "-q")

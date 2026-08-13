@@ -97,14 +97,23 @@ type replayEntry struct {
 	result Result
 }
 
+type replayFlight struct {
+	digest string
+	done   chan struct{}
+}
+
 type Registry struct {
-	mu     sync.RWMutex
-	tools  map[string]registeredTool
-	replay map[string]replayEntry
+	mu      sync.RWMutex
+	tools   map[string]registeredTool
+	replay  map[string]replayEntry
+	flights map[string]*replayFlight
 }
 
 func NewRegistry() *Registry {
-	registry := &Registry{tools: make(map[string]registeredTool), replay: make(map[string]replayEntry)}
+	registry := &Registry{
+		tools: make(map[string]registeredTool), replay: make(map[string]replayEntry),
+		flights: make(map[string]*replayFlight),
+	}
 	registerCoreTools(registry)
 	return registry
 }
@@ -170,10 +179,9 @@ func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result,
 
 	digest := invocationDigest(invocation.Name, invocation.Arguments)
 	replayKey := invocation.Scope.ID + "\x00" + invocation.ToolCallID
-	r.mu.RLock()
-	cached, replayed := r.replay[replayKey]
-	r.mu.RUnlock()
-	if replayed {
+	r.mu.Lock()
+	if cached, replayed := r.replay[replayKey]; replayed {
+		r.mu.Unlock()
 		if cached.digest != digest {
 			return Result{}, ErrReplayConflict
 		}
@@ -181,9 +189,38 @@ func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result,
 		result.Replay = true
 		return result, nil
 	}
+	if flight, running := r.flights[replayKey]; running {
+		if flight.digest != digest {
+			r.mu.Unlock()
+			return Result{}, ErrReplayConflict
+		}
+		done := flight.done
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return Result{}, ctx.Err()
+		case <-done:
+		}
+		r.mu.RLock()
+		cached, ok := r.replay[replayKey]
+		r.mu.RUnlock()
+		if !ok {
+			return Result{}, fmt.Errorf("agent tools: replayed invocation failed before caching")
+		}
+		result := cloneResult(cached.result)
+		result.Replay = true
+		return result, nil
+	}
+	flight := &replayFlight{digest: digest, done: make(chan struct{})}
+	r.flights[replayKey] = flight
+	r.mu.Unlock()
 
 	result, err := tool.handler(ctx, invocation)
 	if err != nil {
+		r.mu.Lock()
+		delete(r.flights, replayKey)
+		close(flight.done)
+		r.mu.Unlock()
 		return Result{}, err
 	}
 	limit := tool.definition.MaxResultBytes
@@ -193,16 +230,9 @@ func (r *Registry) Dispatch(ctx context.Context, invocation Invocation) (Result,
 	result = limitResult(result, limit)
 
 	r.mu.Lock()
-	if existing, exists := r.replay[replayKey]; exists {
-		r.mu.Unlock()
-		if existing.digest != digest {
-			return Result{}, ErrReplayConflict
-		}
-		replayed := cloneResult(existing.result)
-		replayed.Replay = true
-		return replayed, nil
-	}
 	r.replay[replayKey] = replayEntry{digest: digest, result: cloneResult(result)}
+	delete(r.flights, replayKey)
+	close(flight.done)
 	r.mu.Unlock()
 	return result, nil
 }
@@ -216,6 +246,8 @@ func (r *Registry) ClearScopeReplay(scopeID string) {
 			delete(r.replay, key)
 		}
 	}
+	// In-flight calls are not cancelled; their results remain scoped and can
+	// be cleared by a subsequent lifecycle cleanup after they complete.
 }
 
 func roleAllows(role Role, capability Capability) bool {
