@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -539,10 +540,13 @@ func TestFromEnvAgenticReviewDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET", "32000")
 	t.Setenv("DRYDOCK_AGENTIC_TOKEN_HEADROOM", "0.2")
 	t.Setenv("DRYDOCK_REVIEW_SNAPSHOT_STORAGE_PATH", "/tmp/drydock-test-snapshots")
+	owner := strings.Repeat("a", 64)
+	t.Setenv("DRYDOCK_IDE_WORKSPACE_BINDINGS", owner+"=/tmp/workspace-a,"+owner+"=/tmp/workspace-b")
 	cfg = FromEnv()
 	if cfg.AgenticDiscoveryModel != "discovery-model" || cfg.AgenticDiscoveryMaxTurns != 12 ||
 		cfg.AgenticReviewerMaxToolCalls != 48 || cfg.AgenticPackageTokenBudget != 32_000 ||
-		cfg.AgenticTokenHeadroom != 0.2 || cfg.SnapshotStoragePath != "/tmp/drydock-test-snapshots" {
+		cfg.AgenticTokenHeadroom != 0.2 || cfg.SnapshotStoragePath != "/tmp/drydock-test-snapshots" ||
+		len(cfg.IDEWorkspaceBindings[owner]) != 2 || cfg.IDEWorkspaceBindings[owner][0] != "/tmp/workspace-a" {
 		t.Fatalf("unexpected agentic overrides: %#v", cfg)
 	}
 }
@@ -595,6 +599,7 @@ func clearConfigEnv(t *testing.T) {
 		"DRYDOCK_META_API_KEY",
 		"DRYDOCK_META_MAX_INPUT_BYTES",
 		"DRYDOCK_AGENTIC_REVIEW_FALLBACK",
+		"DRYDOCK_IDE_WORKSPACE_BINDINGS",
 		"DRYDOCK_AGENTIC_DISCOVERY_BASE_URL",
 		"DRYDOCK_AGENTIC_DISCOVERY_MODEL",
 		"DRYDOCK_AGENTIC_DISCOVERY_API_KEY",

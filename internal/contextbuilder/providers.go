@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -105,8 +104,7 @@ func analyzeModifiedFiles(in BuildInput) (string, error) {
 		if path == "" || isExcludedPath(path) {
 			continue
 		}
-		abs := filepath.Join(in.RepoPath, path)
-		content, err := os.ReadFile(abs)
+		content, err := readRepositoryFile(in.RepoPath, path)
 		if err != nil {
 			continue
 		}
@@ -240,8 +238,7 @@ func (p symbolsCallsitesProvider) extractWithTreeSitter(in BuildInput, extractor
 			continue
 		}
 
-		abs := filepath.Join(in.RepoPath, path)
-		source, err := os.ReadFile(abs)
+		source, err := readRepositoryFile(in.RepoPath, path)
 		if err != nil {
 			continue
 		}
@@ -556,8 +553,7 @@ func analyzeDocsContent(in BuildInput) (string, error) {
 
 	var out bytes.Buffer
 	for _, rel := range candidates {
-		path := filepath.Join(in.RepoPath, rel)
-		data, err := os.ReadFile(path)
+		data, err := readRepositoryFile(in.RepoPath, rel)
 		if err != nil || len(data) == 0 {
 			continue
 		}

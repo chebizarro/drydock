@@ -20,7 +20,6 @@ func main() {
 	var (
 		target      = flag.String("target", "", "git repository path to freeze before binding stdio")
 		ref         = flag.String("ref", "HEAD", "git ref to pin")
-		roleName    = flag.String("role", string(agenttools.RoleExternalReadonly), "bound capability role")
 		allowPaths  = flag.String("allow-paths", ".", "comma-separated repository-relative path allowlist")
 		patchPath   = flag.String("patch-file", "", "optional authoritative patch file")
 		storagePath = flag.String("snapshot-storage", filepath.Join(os.TempDir(), "drydock-mcp-snapshots"), "snapshot descriptor storage")
@@ -32,10 +31,6 @@ func main() {
 	logger := log.New(os.Stderr, "drydock-mcp: ", log.LstdFlags)
 	if strings.TrimSpace(*target) == "" {
 		logger.Fatal("-target is required")
-	}
-	role := agenttools.Role(strings.TrimSpace(*roleName))
-	if !role.Valid() {
-		logger.Fatalf("unsupported -role %q", *roleName)
 	}
 	allowed := splitCSV(*allowPaths)
 	if len(allowed) == 0 {
@@ -71,7 +66,7 @@ func main() {
 		logger.Fatalf("freeze target: %v", err)
 	}
 
-	scope := agenttools.NewScope("stdio:"+snapshot.ID, snapshot, role)
+	scope := agenttools.NewScope("stdio:"+snapshot.ID, snapshot, agenttools.RoleExternalReadonly)
 	scope.MaxResultBytes = *maxResult
 	bound, err := mcpserver.NewBoundServer(agenttools.NewRegistry(), scope)
 	if err != nil {

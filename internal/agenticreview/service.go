@@ -301,6 +301,16 @@ type ReviewOptions struct {
 	Ensemble                     *reviewengine.EnsembleConfig
 }
 
+// GateDeterministicBundle applies the same authoritative exact-token gate used
+// by selection.finalize to the explicit rollout fallback before any reviewer
+// can consume it.
+func (s *Service) GateDeterministicBundle(bundle contextbuilder.ContextBundle) (contextbuilder.ContextBundle, error) {
+	if s == nil || s.counter == nil || s.discovery == nil {
+		return contextbuilder.ContextBundle{}, ErrInvalidPrepared
+	}
+	return agenttools.GateBundle(bundle, s.counter, s.discovery.config.TokenBudget, s.discovery.config.Headroom)
+}
+
 func (s *Service) ReviewPrepared(ctx context.Context, prepared *PreparedReview, options ReviewOptions) (reviewengine.RunOutput, error) {
 	state, err := s.validatePrepared(prepared)
 	if err != nil {

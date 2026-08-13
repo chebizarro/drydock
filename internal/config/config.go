@@ -3,12 +3,14 @@ package config
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -145,6 +147,7 @@ type Config struct {
 	ReviewSessionLifetime               time.Duration
 	SnapshotGCInterval                  time.Duration
 	IDEAgenticTimeout                   time.Duration
+	IDEWorkspaceBindings                map[string][]string
 	MCPHTTPEnabled                      bool
 	MCPHTTPAddr                         string
 	MCPHTTPBearerToken                  string
@@ -291,6 +294,7 @@ func FromEnv() Config {
 		ReviewSessionLifetime:               parseDurationOrDefault(envOrDefault("DRYDOCK_REVIEW_SESSION_LIFETIME", "24h"), 24*time.Hour),
 		SnapshotGCInterval:                  parseDurationOrDefault(envOrDefault("DRYDOCK_REVIEW_SNAPSHOT_GC_INTERVAL", "15m"), 15*time.Minute),
 		IDEAgenticTimeout:                   parseDurationOrDefault(envOrDefault("DRYDOCK_IDE_AGENTIC_TIMEOUT", "10m"), 10*time.Minute),
+		IDEWorkspaceBindings:                parseIDEWorkspaceBindings(envOrDefault("DRYDOCK_IDE_WORKSPACE_BINDINGS", "")),
 		MCPHTTPEnabled:                      parseBoolOrDefault(envOrDefault("DRYDOCK_MCP_HTTP_ENABLED", "false"), false),
 		MCPHTTPAddr:                         envOrDefault("DRYDOCK_MCP_HTTP_ADDR", "127.0.0.1:8090"),
 		MCPHTTPBearerToken:                  envOrDefault("DRYDOCK_MCP_HTTP_BEARER_TOKEN", ""),
@@ -375,6 +379,7 @@ func configuredEnv() map[string]bool {
 		"DRYDOCK_REVIEW_SESSION_LIFETIME",
 		"DRYDOCK_REVIEW_SNAPSHOT_GC_INTERVAL",
 		"DRYDOCK_IDE_AGENTIC_TIMEOUT",
+		"DRYDOCK_IDE_WORKSPACE_BINDINGS",
 		"DRYDOCK_MCP_HTTP_ENABLED",
 		"DRYDOCK_MCP_HTTP_ADDR",
 		"DRYDOCK_MCP_HTTP_BEARER_TOKEN",
@@ -418,6 +423,20 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+func parseIDEWorkspaceBindings(value string) map[string][]string {
+	bindings := make(map[string][]string)
+	for _, entry := range strings.Split(value, ",") {
+		owner, root, ok := strings.Cut(strings.TrimSpace(entry), "=")
+		owner = strings.ToLower(strings.TrimSpace(owner))
+		root = strings.TrimSpace(root)
+		if !ok || owner == "" || root == "" {
+			continue
+		}
+		bindings[owner] = append(bindings[owner], root)
+	}
+	return bindings
 }
 
 func normalizeRepositoryAllowlist(values []string) []string {
@@ -617,6 +636,17 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 	if c.IDEAgenticTimeout <= 0 {
 		result.Errors = append(result.Errors, "DRYDOCK_IDE_AGENTIC_TIMEOUT must be greater than 0")
+	}
+	for owner, roots := range c.IDEWorkspaceBindings {
+		decoded, err := hex.DecodeString(owner)
+		if err != nil || len(decoded) != 32 || strings.ToLower(owner) != owner {
+			result.Errors = append(result.Errors, "DRYDOCK_IDE_WORKSPACE_BINDINGS owners must be lowercase 64-character hex pubkeys")
+		}
+		for _, root := range roots {
+			if !filepath.IsAbs(root) {
+				result.Errors = append(result.Errors, "DRYDOCK_IDE_WORKSPACE_BINDINGS paths must be absolute")
+			}
+		}
 	}
 	if c.MCPHTTPEnabled {
 		if _, _, err := net.SplitHostPort(c.MCPHTTPAddr); err != nil {

@@ -157,7 +157,7 @@ func TestIntegrationIDEGatewayNostrSessionReviewAndFixCycle(t *testing.T) {
 	gatewaySigner := integSigner{sk: nostr.Generate()}
 	clientSK := nostr.Generate()
 	handler := New(
-		Config{DefaultRelays: []string{"wss://relay.test"}},
+		Config{DefaultRelays: []string{"wss://relay.test"}, WorkspaceBindings: map[string][]string{nostr.GetPublicKey(clientSK).Hex(): {workspace}}},
 		database,
 		contextbuilder.NewDefault(),
 		engine,

@@ -724,7 +724,7 @@ func main() {
 
 	if signer != nil {
 		ideHandler = idegateway.New(
-			idegateway.Config{DefaultRelays: writeRelays, AgenticTimeout: cfg.IDEAgenticTimeout},
+			idegateway.Config{DefaultRelays: writeRelays, AgenticTimeout: cfg.IDEAgenticTimeout, WorkspaceBindings: cfg.IDEWorkspaceBindings},
 			store, ctxBuilder, engine, signer, relayPub, logger,
 			idegateway.WithPatchOrderer(reviewOrders),
 			idegateway.WithAgenticReviewService(agenticReviewSvc),

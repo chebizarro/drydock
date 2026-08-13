@@ -3,6 +3,8 @@ package contextbuilder
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -39,6 +41,35 @@ func TestBuilderBuildRejectsCounterRemovedAfterConstruction(t *testing.T) {
 	builder.Counter = nil
 	if _, err := builder.Build(context.Background(), BuildInput{}); !errors.Is(err, ErrTokenCounterRequired) {
 		t.Fatalf("Build error = %v, want ErrTokenCounterRequired", err)
+	}
+}
+
+func TestBuilderRejectsTraversingAndSymlinkedPatchPaths(t *testing.T) {
+	repo := t.TempDir()
+	builder, err := NewBuilder(10_000, byteCounter{}, []Provider{fileContextProvider{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	traversal := "diff --git a/../secret b/../secret\n--- a/../secret\n+++ b/../secret\n@@ -1 +1 @@\n-old\n+new\n"
+	if _, err := builder.Build(context.Background(), BuildInput{RepoPath: repo, PatchEventContent: traversal}); !errors.Is(err, ErrUnsafeRepositoryPath) {
+		t.Fatalf("traversal error = %v, want ErrUnsafeRepositoryPath", err)
+	}
+
+	secretRoot := t.TempDir()
+	secret := filepath.Join(secretRoot, "secret.txt")
+	if err := os.WriteFile(secret, []byte("host secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(repo, "changed.go")); err != nil {
+		t.Fatal(err)
+	}
+	patch := "diff --git a/changed.go b/changed.go\n--- a/changed.go\n+++ b/changed.go\n@@ -1 +1 @@\n-old\n+new\n"
+	out, err := builder.Build(context.Background(), BuildInput{RepoPath: repo, PatchEventContent: patch})
+	if !errors.Is(err, ErrUnsafeRepositoryPath) {
+		t.Fatalf("symlink error = %v, want ErrUnsafeRepositoryPath", err)
+	}
+	if strings.Contains(out.Content, "host secret") {
+		t.Fatal("builder returned content from outside the repository")
 	}
 }
 

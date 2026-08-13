@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -145,6 +147,68 @@ func TestBuildSessionDTag(t *testing.T) {
 	}
 }
 
+func TestAuthorizedWorkspaceRootRejectsUnapprovedAndEscapingPaths(t *testing.T) {
+	approved := t.TempDir()
+	outside := t.TempDir()
+	got, err := authorizedWorkspaceRoot(approved, []string{approved})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, _ := filepath.EvalSymlinks(approved)
+	if got != canonical {
+		t.Fatalf("authorized workspace = %q, want %q", got, canonical)
+	}
+	child := filepath.Join(approved, "child")
+	if err := os.Mkdir(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, requested := range []string{outside, child, "/", "/etc", "../relative"} {
+		if _, err := authorizedWorkspaceRoot(requested, []string{approved}); err == nil {
+			t.Fatalf("unauthorized workspace %q was accepted", requested)
+		}
+	}
+	link := filepath.Join(t.TempDir(), "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authorizedWorkspaceRoot(link, []string{approved}); err == nil {
+		t.Fatal("symlinked workspace escape was accepted")
+	}
+}
+
+func TestHandleSessionBindsWorkspaceToConfiguredIdentity(t *testing.T) {
+	h := newTestHandler(&mockPublisher{})
+	workspace := t.TempDir()
+	owner := nostr.GetPublicKey(nostr.Generate())
+	h.cfg.WorkspaceBindings = map[string][]string{owner.Hex(): {workspace}}
+	event := nostr.Event{
+		PubKey:  owner,
+		Content: `{"workspace_path":"` + workspace + `"}`,
+		Tags:    nostr.Tags{{"p", h.ourPubKey}, {"d", BuildSessionDTag("owner-session")}},
+	}
+	encoded, err := json.Marshal(IDESession{WorkspacePath: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event.Content = string(encoded)
+	if err := h.handleSession(context.Background(), event, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.sessions["owner-session"].Session.WorkspacePath; got == "" {
+		t.Fatal("identity-bound workspace was not retained")
+	}
+
+	other := nostr.GetPublicKey(nostr.Generate())
+	event.PubKey = other
+	event.Tags = nostr.Tags{{"p", h.ourPubKey}, {"d", BuildSessionDTag("other-session")}}
+	if err := h.handleSession(context.Background(), event, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.sessions["other-session"].Session.WorkspacePath; got != "" {
+		t.Fatalf("unbound identity selected another workspace: %q", got)
+	}
+}
+
 func TestHandleSessionUsesNIP78DTag(t *testing.T) {
 	pub := &mockPublisher{}
 	h := newTestHandler(pub)
@@ -174,6 +238,9 @@ func TestHandleSessionUsesNIP78DTag(t *testing.T) {
 	}
 	if session.Session.SessionID != "sess-1" {
 		t.Fatalf("SessionID = %q, want %q", session.Session.SessionID, "sess-1")
+	}
+	if session.Session.WorkspacePath != "" {
+		t.Fatalf("unapproved workspace path was retained: %q", session.Session.WorkspacePath)
 	}
 }
 

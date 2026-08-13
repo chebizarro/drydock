@@ -231,6 +231,14 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 	patchAnalysis, patchErr := AnalyzePatchStructure(PatchAnalysisRequest{
 		Diff: in.PatchEventContent, ExcludePaths: in.ExcludePaths,
 	})
+	if errors.Is(patchErr, ErrUnsafeRepositoryPath) {
+		return ContextBundle{}, patchErr
+	}
+	if patchErr == nil && in.RepoPath != "" {
+		if err := validateRepositoryPaths(in.RepoPath, patchAnalysis.ChangedFiles); err != nil {
+			return ContextBundle{}, err
+		}
+	}
 
 	// Auto-detect workspace boundaries for monorepo context isolation.
 	if in.RepoPath != "" && len(in.WorkspaceRoots) == 0 {

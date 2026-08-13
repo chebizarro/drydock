@@ -258,7 +258,10 @@ func (e *Engine) ModelForRoute(route ModelRoute) string {
 	if err != nil || strings.TrimSpace(endpoint.Model) == "" {
 		return string(route)
 	}
-	return e.identity.Load().Resolve(endpoint.BaseURL, endpoint.APIKey, endpoint.Model)
+	if identity := e.identity.Load(); identity != nil {
+		return identity.Resolve(endpoint.BaseURL, endpoint.APIKey, endpoint.Model)
+	}
+	return endpoint.Model
 }
 
 func (e *Engine) routeEndpoint(route ModelRoute) (ModelEndpoint, error) {

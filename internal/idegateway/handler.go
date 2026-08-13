@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +58,9 @@ type PatchOrderer interface {
 type Config struct {
 	DefaultRelays  []string
 	AgenticTimeout time.Duration
+	// WorkspaceBindings maps lowercase IDE pubkeys to the exact operator-approved
+	// filesystem roots that identity may freeze for inline review.
+	WorkspaceBindings map[string][]string
 }
 
 // Handler processes IDE integration events.
@@ -218,11 +223,28 @@ func (h *Handler) handleSession(ctx context.Context, event nostr.Event, relayURL
 	}
 
 	sender := event.PubKey.Hex()
+	if strings.TrimSpace(session.WorkspacePath) != "" {
+		workspace, err := authorizedWorkspaceRoot(session.WorkspacePath, h.cfg.WorkspaceBindings[strings.ToLower(sender)])
+		if err != nil {
+			h.logger.Warn("IDE session workspace is not operator-authorized", "event_id", event.ID.Hex(), "session_id", session.SessionID)
+			session.WorkspacePath = ""
+		} else {
+			session.WorkspacePath = workspace
+		}
+	}
+
 	h.mu.Lock()
-	if existing, ok := h.sessions[session.SessionID]; ok && existing.PubKey != "" && !strings.EqualFold(existing.PubKey, sender) {
-		h.mu.Unlock()
-		h.logger.Warn("rejecting IDE session update from unauthorized sender", "event_id", event.ID.Hex(), "session_id", session.SessionID)
-		return nil
+	if existing, ok := h.sessions[session.SessionID]; ok {
+		if existing.PubKey != "" && !strings.EqualFold(existing.PubKey, sender) {
+			h.mu.Unlock()
+			h.logger.Warn("rejecting IDE session update from unauthorized sender", "event_id", event.ID.Hex(), "session_id", session.SessionID)
+			return nil
+		}
+		if existing.Session.WorkspacePath != "" && session.WorkspacePath != existing.Session.WorkspacePath {
+			h.mu.Unlock()
+			h.logger.Warn("rejecting IDE session workspace rebinding", "event_id", event.ID.Hex(), "session_id", session.SessionID)
+			return nil
+		}
 	}
 	h.sessions[session.SessionID] = &activeSession{
 		Session:     session,
@@ -485,6 +507,9 @@ func (h *Handler) processReviewRequest(ctx context.Context, event nostr.Event, _
 			ExpectedVersion: int(*req.ExpectedVersion), Message: req.Message,
 		})
 	} else {
+		if repoPath == "" {
+			return ReviewResponse{}, fmt.Errorf("IDE workspace is not operator-authorized for filesystem review")
+		}
 		analysis, analyzeErr := contextbuilder.NewPatchFacade().Analyze(contextbuilder.PatchAnalysisRequest{Diff: req.Diff})
 		if analyzeErr != nil {
 			return ReviewResponse{}, fmt.Errorf("analyze inline patch: %w", analyzeErr)
@@ -844,6 +869,38 @@ func hasTagValue(tags nostr.Tags, name, value string) bool {
 		}
 	}
 	return false
+}
+
+func authorizedWorkspaceRoot(requested string, approved []string) (string, error) {
+	if strings.TrimSpace(requested) == "" || !filepath.IsAbs(requested) {
+		return "", fmt.Errorf("IDE workspace path must be absolute")
+	}
+	resolved, err := filepath.EvalSymlinks(requested)
+	if err != nil {
+		return "", fmt.Errorf("resolve IDE workspace: %w", err)
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", fmt.Errorf("resolve IDE workspace: %w", err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("IDE workspace is not a directory")
+	}
+	for _, root := range approved {
+		if strings.TrimSpace(root) == "" || !filepath.IsAbs(root) {
+			continue
+		}
+		canonical, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			continue
+		}
+		canonical, err = filepath.Abs(canonical)
+		if err == nil && canonical == resolved {
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("IDE workspace is outside the operator-approved roots")
 }
 
 func inlineTarget(session IDESession, req ReviewRequest, repoPath, patch string) agenticreview.TargetInput {

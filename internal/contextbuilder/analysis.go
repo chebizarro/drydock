@@ -1,5 +1,7 @@
 package contextbuilder
 
+import "fmt"
+
 // PatchAnalysisRequest parameterizes authoritative patch parsing/filtering.
 type PatchAnalysisRequest struct {
 	Diff         string
@@ -37,6 +39,12 @@ func AnalyzePatchStructure(req PatchAnalysisRequest) (PatchAnalysisResult, error
 			continue
 		}
 		path := pickPath(file)
+		if path != "" {
+			path, err = normalizeRepositoryRelativePath(path)
+			if err != nil {
+				return PatchAnalysisResult{}, fmt.Errorf("analyze patch path %q: %w", pickPath(file), err)
+			}
+		}
 		result.Files = append(result.Files, PatchFileAnalysis{
 			Path: path, OldPath: file.OldName, NewPath: file.NewName, AddedLines: extractChangedLineNumbers(file),
 		})

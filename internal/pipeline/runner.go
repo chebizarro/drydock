@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"drydock/internal/agenticreview"
+	"drydock/internal/agenttools"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/eventkind"
@@ -537,8 +538,18 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			return nil // pipeline-owned exclusion-only decision; no model call
 		}
 		if r.agenticReviewFallback {
-			var buildErr error
-			bundle, buildErr = r.ctxBuilder.Build(ctx, buildInput)
+			built, buildErr := r.ctxBuilder.Build(ctx, buildInput)
+			if buildErr != nil {
+				return buildErr
+			}
+			if r.agenticSvc != nil {
+				bundle, buildErr = r.agenticSvc.GateDeterministicBundle(built)
+			} else {
+				// Compatibility-only construction used by legacy embedders still
+				// receives an exact serialized-package gate; production always uses
+				// the service-owned authoritative counter above.
+				bundle, buildErr = agenttools.GateBundle(built, r.ctxBuilder.Counter, built.TokenBudget, agenttools.DefaultTokenHeadroom)
+			}
 			return buildErr
 		}
 		if r.agenticSvc == nil {

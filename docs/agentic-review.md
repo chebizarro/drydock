@@ -114,6 +114,7 @@ A continuation requires `chat_id`, owner, request ID, `expected_version`, and a 
 | `DRYDOCK_AGENTIC_TOKEN_HEADROOM` | `0.10` | Fraction reserved for tokenizer/model skew |
 | `DRYDOCK_AGENTIC_HISTORY_TOKEN_BUDGET` | `64000` | Compacted conversation-history budget |
 | `DRYDOCK_IDE_AGENTIC_TIMEOUT` | `10m` | End-to-end IDE review/continuation deadline |
+| `DRYDOCK_IDE_WORKSPACE_BINDINGS` | none | Comma-separated `lowercase-pubkey=/absolute/workspace` bindings for inline snapshots; repeat a pubkey for multiple roots; empty disables inline filesystem review |
 
 All integer limits must be positive. Headroom must be at least 0 and less than 1.
 
@@ -150,12 +151,11 @@ For local read-only stdio use:
 drydock-mcp \
   -target /path/to/repository \
   -ref HEAD \
-  -role external_readonly \
   -allow-paths . \
   -snapshot-storage /var/lib/drydock/mcp-snapshots
 ```
 
-The process freezes the target before starting transport. Prefer `external_readonly`; selection and submission handlers require server-owned state and are intentionally unavailable in a standalone read-only scope.
+The process freezes the target before starting transport and always binds `external_readonly`. Selection and submission handlers require server-owned state and are intentionally unavailable in the standalone command.
 
 For HTTP, configure the environment variables above on `drydock-core`. The bearer authorizer binds each authenticated connection to the configured server-created session and rejects non-external roles. Rotate the bearer token by restarting the listener with the new secret.
 
