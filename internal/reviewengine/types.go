@@ -62,11 +62,17 @@ type ModelFailure struct {
 	Error string     `json:"error"`
 }
 
+type EnsembleReviewerTrace struct {
+	Route ModelRoute    `json:"route"`
+	Trace ReviewerTrace `json:"trace"`
+}
+
 type EnsembleStatus struct {
-	RequiredReviewers  int            `json:"required_reviewers"`
-	SucceededReviewers []ModelRoute   `json:"succeeded_reviewers"`
-	FailedReviewers    []ModelFailure `json:"failed_reviewers,omitempty"`
-	Degraded           bool           `json:"degraded"`
+	RequiredReviewers  int                     `json:"required_reviewers"`
+	SucceededReviewers []ModelRoute            `json:"succeeded_reviewers"`
+	FailedReviewers    []ModelFailure          `json:"failed_reviewers,omitempty"`
+	ReviewerTraces     []EnsembleReviewerTrace `json:"reviewer_traces,omitempty"`
+	Degraded           bool                    `json:"degraded"`
 }
 
 // Priority is the canonical review urgency used by agentic review flows.

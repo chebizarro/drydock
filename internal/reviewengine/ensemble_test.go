@@ -286,23 +286,30 @@ func (f *failingEnsembleReviewerClient) ChatCompletion(_ context.Context, req Ch
 	return ChatResult{Content: `{"summary":"single model success","findings":[],"needs_more_context":[]}`}, nil
 }
 
-func TestRunEnsembleFailsClosedWhenRequiredReviewerFails(t *testing.T) {
+func TestRunEnsembleDropsFailedReviewerWhenAnotherSucceeds(t *testing.T) {
 	engine := New(Config{
 		Planner:  ModelEndpoint{Model: "planner"},
 		Coder32B: ModelEndpoint{Model: "coder32b"},
 		LLM70B:   ModelEndpoint{Model: "llm70b"},
 	}, &failingEnsembleReviewerClient{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	_, err := engine.RunEnsemble(context.Background(), RunInput{
+	out, err := engine.RunEnsemble(context.Background(), RunInput{
 		ContextBundle:   "ctx",
 		ChangedFiles:    []string{"main.go"},
 		SkipWalkthrough: true,
 	}, EnsembleConfig{Enabled: true, Models: []ModelRoute{RouteCoder32B, RouteLLM70B}})
-	if err == nil {
-		t.Fatal("expected ensemble to fail closed when a required reviewer fails")
+	if err != nil {
+		t.Fatalf("expected degraded ensemble success, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "ensemble failed closed") || !strings.Contains(err.Error(), "llm70b") {
-		t.Fatalf("expected clear fail-closed error naming failed reviewer, got: %v", err)
+	if !out.EnsembleStatus.Degraded || len(out.EnsembleStatus.SucceededReviewers) != 1 ||
+		len(out.EnsembleStatus.FailedReviewers) != 1 {
+		t.Fatalf("unexpected ensemble status: %#v", out.EnsembleStatus)
+	}
+	if out.EnsembleStatus.FailedReviewers[0].Route != RouteLLM70B {
+		t.Fatalf("expected llm70b failure, got %#v", out.EnsembleStatus.FailedReviewers)
+	}
+	if out.Review.Summary != "single model success" {
+		t.Fatalf("unexpected surviving review: %#v", out.Review)
 	}
 }
 

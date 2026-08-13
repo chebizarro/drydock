@@ -40,174 +40,166 @@ type modelResult struct {
 	Route  ModelRoute
 	Review ReviewerOutput
 	Served string // model identifier the endpoint reported serving
+	Trace  ReviewerTrace
 	Err    error
 }
 
-// RunEnsemble runs the review engine with multiple models in parallel and
-// merges their findings using consensus scoring.
+// RunEnsemble preserves legacy single-shot review through a fresh executor per
+// member.
 func (e *Engine) RunEnsemble(ctx context.Context, in RunInput, cfg EnsembleConfig) (RunOutput, error) {
-	// Run planner first (single model)
-	planner, err := e.completeStructured(ctx, ChatRequest{
-		BaseURL:     e.cfg.Planner.BaseURL,
-		APIKey:      e.cfg.Planner.APIKey,
-		Model:       e.cfg.Planner.Model,
-		Temperature: e.cfg.PlannerTemp,
-		System:      plannerSystemPrompt(),
-		User:        plannerUserPrompt(in.ContextBundle, in.ChangedFiles),
-	}, "planner", ParsePlannerOutput)
+	return e.RunEnsembleWithExecutors(ctx, in, cfg, func(ModelRoute) ReviewerExecutor {
+		return e.singleShotExecutor()
+	})
+}
+
+// RunEnsembleWithExecutors runs one shared planner/prompt preparation, creates
+// an isolated executor for every member, drops failed members, and merges all
+// successful reviews before running one post-consensus walkthrough.
+func (e *Engine) RunEnsembleWithExecutors(ctx context.Context, in RunInput, cfg EnsembleConfig, factory ReviewerExecutorFactory) (RunOutput, error) {
+	if factory == nil {
+		return RunOutput{}, fmt.Errorf("review engine: reviewer executor factory is required")
+	}
+	prepared, err := e.prepareReviewer(ctx, in)
 	if err != nil {
 		return RunOutput{}, err
 	}
-
-	// Build shared reviewer prompt
-	checklist := BuildChecklist(in.ChangedFiles)
-	if len(in.TestCoverageGaps) > 0 {
-		checklist = append(checklist,
-			fmt.Sprintf("Missing test coverage: symbols %s have no test references — consider flagging as a finding",
-				strings.Join(in.TestCoverageGaps, ", ")))
-	}
-	system := reviewerSystemPrompt(in.ReviewerSystemPromptOverride, in.AdditionalInstructions, checklist, IsSecuritySensitive(in.ChangedFiles), in.FewShot)
-	user := reviewerUserPrompt(in.ContextBundle, planner)
-
-	// Determine which models to use
-	models := cfg.Models
+	models := append([]ModelRoute(nil), cfg.Models...)
 	if len(models) == 0 {
 		models = []ModelRoute{RouteCoder32B, RouteLLM70B}
 	}
 
-	// Run all models in parallel
 	var wg sync.WaitGroup
 	results := make(chan modelResult, len(models))
-
 	for _, route := range models {
+		executor := factory(route)
+		if executor == nil {
+			results <- modelResult{Route: route, Err: fmt.Errorf("review engine: factory returned nil executor")}
+			continue
+		}
 		wg.Add(1)
-		go func(r ModelRoute) {
+		go func(r ModelRoute, member ReviewerExecutor) {
 			defer wg.Done()
-			endpoint, err := e.routeEndpoint(r)
-			if err != nil {
-				results <- modelResult{Route: r, Err: err}
+			endpoint, routeErr := e.routeEndpoint(r)
+			if routeErr != nil {
+				results <- modelResult{Route: r, Err: routeErr}
 				return
 			}
-			review, served, err := e.completeStructuredReviewer(ctx, ChatRequest{
-				BaseURL:     endpoint.BaseURL,
-				APIKey:      endpoint.APIKey,
-				Model:       endpoint.Model,
-				Temperature: e.cfg.ReviewerTemp,
-				System:      system,
-				User:        user,
-			}, fmt.Sprintf("reviewer %s", r))
-			if err != nil {
-				results <- modelResult{Route: r, Err: err}
+			executed, executeErr := member.ExecuteReviewer(ctx, ReviewerExecutionRequest{
+				Route: r, Endpoint: endpoint, Temperature: e.cfg.ReviewerTemp,
+				System: prepared.system, User: prepared.user,
+				Label: fmt.Sprintf("reviewer %s", r),
+			})
+			if executeErr == nil {
+				executed, executeErr = normalizeReviewerExecution(executed)
+			}
+			if executeErr != nil {
+				results <- modelResult{Route: r, Err: executeErr}
 				return
 			}
-			results <- modelResult{Route: r, Review: review, Served: served}
-		}(route)
+			results <- modelResult{
+				Route: r, Review: executed.Review, Served: executed.ServedModel,
+				Trace: executed.Trace,
+			}
+		}(route, executor)
 	}
-
-	// Close results channel when all goroutines complete
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collect results
 	var reviews []modelResult
 	var errs []error
 	var failures []ModelFailure
 	var succeeded []ModelRoute
-	for res := range results {
-		if res.Err != nil {
-			errs = append(errs, res.Err)
-			failures = append(failures, ModelFailure{Route: res.Route, Error: res.Err.Error()})
-			e.logger.Warn("ensemble model failed", "route", res.Route, "error", res.Err)
-		} else {
-			reviews = append(reviews, res)
-			succeeded = append(succeeded, res.Route)
-			e.logger.Info("ensemble model completed", "route", res.Route, "findings", len(res.Review.Findings))
+	var traces []EnsembleReviewerTrace
+	for result := range results {
+		if result.Err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", result.Route, result.Err))
+			failures = append(failures, ModelFailure{Route: result.Route, Error: result.Err.Error()})
+			if e.logger != nil {
+				e.logger.Warn("ensemble model failed", "route", result.Route, "error", result.Err)
+			}
+			continue
+		}
+		reviews = append(reviews, result)
+		succeeded = append(succeeded, result.Route)
+		traces = append(traces, EnsembleReviewerTrace{Route: result.Route, Trace: result.Trace})
+		if e.logger != nil {
+			e.logger.Info("ensemble model completed", "route", result.Route, "findings", len(result.Review.Findings))
 		}
 	}
+	sort.Slice(reviews, func(i, j int) bool { return reviews[i].Route < reviews[j].Route })
+	sort.Slice(succeeded, func(i, j int) bool { return succeeded[i] < succeeded[j] })
+	sort.Slice(failures, func(i, j int) bool { return failures[i].Route < failures[j].Route })
+	sort.Slice(traces, func(i, j int) bool { return traces[i].Route < traces[j].Route })
 
 	status := EnsembleStatus{
-		RequiredReviewers:  len(models),
-		SucceededReviewers: succeeded,
-		FailedReviewers:    failures,
-		Degraded:           len(failures) > 0,
-	}
-
-	// Fail closed: every configured ensemble reviewer is required. Publishing a
-	// single-model success as an ensemble review hides reviewer failures.
-	if len(errs) > 0 {
-		return RunOutput{}, fmt.Errorf("ensemble failed closed: %d of %d required reviewer(s) failed: %s", len(errs), len(models), joinErrors(errs))
+		RequiredReviewers: len(models), SucceededReviewers: succeeded,
+		FailedReviewers: failures, ReviewerTraces: traces, Degraded: len(failures) > 0,
 	}
 	if len(reviews) == 0 {
-		return RunOutput{}, fmt.Errorf("no models configured for ensemble")
+		return RunOutput{}, fmt.Errorf("all %d ensemble reviewer(s) failed: %s", len(models), joinErrors(errs))
 	}
 
-	// Merge findings with consensus scoring
 	merged := mergeFindings(reviews, cfg, e.logger)
-	merged, err = filterFindingsToChangedFiles(merged, in.ChangedFiles, in.TargetEnvelope, in.PatchDiff, in.ContextBundle, e.logger, "ensemble")
+	merged, err = filterFindingsToChangedFiles(
+		merged,
+		in.ChangedFiles,
+		in.TargetEnvelope,
+		in.PatchDiff,
+		in.ContextBundle,
+		e.logger,
+		"ensemble",
+	)
 	if err != nil {
 		return RunOutput{}, err
 	}
 
-	// Use first successful review's summary (or synthesize one)
 	summary := reviews[0].Review.Summary
-	if len(reviews) > 1 {
-		// Prefer the model with the most findings for the summary
-		maxFindings := 0
-		for _, r := range reviews {
-			if len(r.Review.Findings) > maxFindings {
-				maxFindings = len(r.Review.Findings)
-				summary = r.Review.Summary
-			}
+	maxFindings := len(reviews[0].Review.Findings)
+	for _, review := range reviews[1:] {
+		if len(review.Review.Findings) > maxFindings {
+			maxFindings = len(review.Review.Findings)
+			summary = review.Review.Summary
 		}
 	}
-
-	// Collect unique needs_more_context from all models
-	needsCtx := collectNeedsMoreContext(reviews)
-
 	review := ReviewerOutput{
-		Summary:          summary,
-		Findings:         merged,
-		NeedsMoreContext: needsCtx,
+		Summary: summary, Findings: merged,
+		NeedsMoreContext: collectNeedsMoreContext(reviews),
 	}
 
-	// Generate walkthrough (using planner model — lightweight 14B)
+	// This is deliberately after consensus: ensemble members never generate
+	// their own walkthroughs.
 	walkthrough, walkthroughStatus := e.generateWalkthrough(ctx, in)
 
-	// Record ensemble metrics
 	metrics.EnsembleReviewsRun.Inc()
-	for _, r := range reviews {
-		metrics.EnsembleModelsUsed.With(string(r.Route)).Inc()
+	for _, member := range reviews {
+		metrics.EnsembleModelsUsed.With(string(member.Route)).Inc()
 	}
 	metrics.EnsembleFindingsMerged.Add(int64(len(merged)))
+	if e.logger != nil {
+		e.logger.Info("ensemble review completed",
+			"models", len(reviews),
+			"failed_models", len(failures),
+			"findings_merged", len(merged),
+			"checklist_items", len(prepared.checklist),
+			"walkthrough_status", walkthroughStatus.State,
+			"has_walkthrough", walkthrough.Walkthrough != "",
+		)
+	}
 
-	e.logger.Info("ensemble review completed",
-		"models", len(reviews),
-		"findings_merged", len(merged),
-		"checklist_items", len(checklist),
-		"walkthrough_status", walkthroughStatus.State,
-		"has_walkthrough", walkthrough.Walkthrough != "")
-
-	// Label the output with the served model of the planner's primary route
-	// when that reviewer participated, otherwise the first successful one.
-	servedModel := reviews[0].Served
-	for _, r := range reviews {
-		if r.Route == planner.ModelRoute {
-			servedModel = r.Served
+	primary := reviews[0]
+	for _, member := range reviews {
+		if member.Route == prepared.planner.ModelRoute {
+			primary = member
 			break
 		}
 	}
-
 	return RunOutput{
-		Planner:           planner,
-		Review:            review,
-		Route:             planner.ModelRoute, // Primary route from planner
-		ServedModel:       servedModel,
-		Checklist:         checklist,
-		Walkthrough:       walkthrough,
-		WalkthroughStatus: walkthroughStatus,
-		EnsembleStatus:    status,
+		Planner: prepared.planner, Review: review, Route: prepared.planner.ModelRoute,
+		ServedModel: primary.Served, Checklist: prepared.checklist,
+		Walkthrough: walkthrough, WalkthroughStatus: walkthroughStatus,
+		ReviewerTrace: primary.Trace, EnsembleStatus: status,
 	}, nil
 }
 

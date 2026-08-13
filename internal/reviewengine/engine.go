@@ -62,6 +62,7 @@ type RunOutput struct {
 	Checklist         []string
 	Walkthrough       WalkthroughOutput
 	WalkthroughStatus StepStatus
+	ReviewerTrace     ReviewerTrace
 	EnsembleStatus    EnsembleStatus
 }
 
@@ -76,7 +77,14 @@ func New(cfg Config, client LLMClient, logger *slog.Logger) *Engine {
 	return &Engine{cfg: cfg, client: client, logger: logger}
 }
 
-func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
+type reviewerPreparation struct {
+	planner   PlannerOutput
+	checklist []string
+	system    string
+	user      string
+}
+
+func (e *Engine) prepareReviewer(ctx context.Context, in RunInput) (reviewerPreparation, error) {
 	planner, err := e.completeStructured(ctx, ChatRequest{
 		BaseURL:     e.cfg.Planner.BaseURL,
 		APIKey:      e.cfg.Planner.APIKey,
@@ -86,7 +94,7 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 		User:        plannerUserPrompt(in.ContextBundle, in.ChangedFiles),
 	}, "planner", ParsePlannerOutput)
 	if err != nil {
-		return RunOutput{}, err
+		return reviewerPreparation{}, err
 	}
 
 	checklist := BuildChecklist(in.ChangedFiles)
@@ -95,10 +103,38 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 			fmt.Sprintf("Missing test coverage: symbols %s have no test references — consider flagging as a finding",
 				strings.Join(in.TestCoverageGaps, ", ")))
 	}
-	system := reviewerSystemPrompt(in.ReviewerSystemPromptOverride, in.AdditionalInstructions, checklist, IsSecuritySensitive(in.ChangedFiles), in.FewShot)
-	user := reviewerUserPrompt(in.ContextBundle, planner)
+	return reviewerPreparation{
+		planner:   planner,
+		checklist: checklist,
+		system: reviewerSystemPrompt(
+			in.ReviewerSystemPromptOverride,
+			in.AdditionalInstructions,
+			checklist,
+			IsSecuritySensitive(in.ChangedFiles),
+			in.FewShot,
+		),
+		user: reviewerUserPrompt(in.ContextBundle, planner),
+	}, nil
+}
 
-	reviewerRoute := planner.ModelRoute
+// Run preserves the legacy single-shot reviewer behavior through the
+// ReviewerExecutor seam.
+func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
+	return e.RunWithExecutor(ctx, in, e.singleShotExecutor())
+}
+
+// RunWithExecutor runs planning and prompt assembly, delegates only the
+// reviewer stage, then applies engine-owned finding filtering and walkthrough.
+func (e *Engine) RunWithExecutor(ctx context.Context, in RunInput, executor ReviewerExecutor) (RunOutput, error) {
+	if executor == nil {
+		return RunOutput{}, fmt.Errorf("review engine: reviewer executor is required")
+	}
+	prepared, err := e.prepareReviewer(ctx, in)
+	if err != nil {
+		return RunOutput{}, err
+	}
+
+	reviewerRoute := prepared.planner.ModelRoute
 	if in.ReviewerRoute != "" {
 		reviewerRoute = in.ReviewerRoute
 	}
@@ -106,34 +142,49 @@ func (e *Engine) Run(ctx context.Context, in RunInput) (RunOutput, error) {
 	if err != nil {
 		return RunOutput{}, err
 	}
-	review, servedModel, err := e.completeStructuredReviewer(ctx, ChatRequest{
-		BaseURL:     endpoint.BaseURL,
-		APIKey:      endpoint.APIKey,
-		Model:       endpoint.Model,
-		Temperature: e.cfg.ReviewerTemp,
-		System:      system,
-		User:        user,
-	}, "reviewer")
+	executed, err := executor.ExecuteReviewer(ctx, ReviewerExecutionRequest{
+		Route: reviewerRoute, Endpoint: endpoint, Temperature: e.cfg.ReviewerTemp,
+		System: prepared.system, User: prepared.user, Label: "reviewer",
+	})
 	if err != nil {
 		return RunOutput{}, err
 	}
-	review.Findings, err = filterFindingsToChangedFiles(review.Findings, in.ChangedFiles, in.TargetEnvelope, in.PatchDiff, in.ContextBundle, e.logger, "reviewer")
+	executed, err = normalizeReviewerExecution(executed)
+	if err != nil {
+		return RunOutput{}, err
+	}
+	executed.Review.Findings, err = filterFindingsToChangedFiles(
+		executed.Review.Findings,
+		in.ChangedFiles,
+		in.TargetEnvelope,
+		in.PatchDiff,
+		in.ContextBundle,
+		e.logger,
+		"reviewer",
+	)
 	if err != nil {
 		return RunOutput{}, err
 	}
 
-	// Generate walkthrough (using planner model — lightweight 14B)
 	walkthrough, walkthroughStatus := e.generateWalkthrough(ctx, in)
-
-	e.logger.Info("review engine completed", "route", reviewerRoute, "findings", len(review.Findings), "checklist_items", len(checklist), "walkthrough_status", walkthroughStatus.State, "has_walkthrough", walkthrough.Walkthrough != "")
+	if e.logger != nil {
+		e.logger.Info("review engine completed",
+			"route", reviewerRoute,
+			"findings", len(executed.Review.Findings),
+			"checklist_items", len(prepared.checklist),
+			"walkthrough_status", walkthroughStatus.State,
+			"has_walkthrough", walkthrough.Walkthrough != "",
+		)
+	}
 	return RunOutput{
-		Planner:           planner,
-		Review:            review,
+		Planner:           prepared.planner,
+		Review:            executed.Review,
 		Route:             reviewerRoute,
-		ServedModel:       servedModel,
-		Checklist:         checklist,
+		ServedModel:       executed.ServedModel,
+		Checklist:         prepared.checklist,
 		Walkthrough:       walkthrough,
 		WalkthroughStatus: walkthroughStatus,
+		ReviewerTrace:     executed.Trace,
 	}, nil
 }
 
