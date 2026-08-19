@@ -1,0 +1,17 @@
+[
+  {
+    "RuleID": "aws-access-token",
+    "File": "config/secrets.go",
+    "StartLine": 10,
+    "EndLine": 10,
+    "Match": "AWS_KEY=SUPER_SECRET_VALID_MATCH",
+    "Secret": "SUPER_SECRET_VALID_SECRET",
+    "Description": "fixture",
+    "Fingerprint": "fixture:10",
+    "Entropy": 4.2,
+    "Attributes": {"ignored": "SUPER_SECRET_VALID_ATTRIBUTE"},
+    "ValidationStatus": "valid",
+    "ValidationReason": "SUPER_SECRET_VALID_REASON",
+    "ValidationMeta": {"ignored": "SUPER_SECRET_VALID_META"}
+  }
+]

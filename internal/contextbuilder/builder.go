@@ -49,6 +49,9 @@ type BuildInput struct {
 	ExcludePaths []string
 	// DisableDocs, if true, skips documentation providers and marks them as dropped.
 	DisableDocs bool
+	// SecretScanContext is pre-rendered, redacted secret-scan output. Providers
+	// pass it through without executing another scan.
+	SecretScanContext string
 }
 
 type LayerStatus struct {

@@ -1,0 +1,57 @@
+[
+  {
+    "RuleID": "fixture-needs-validation",
+    "File": "config/secrets.go",
+    "StartLine": 11,
+    "EndLine": 11,
+    "Match": "SUPER_SECRET_NEEDS_MATCH",
+    "Secret": "SUPER_SECRET_NEEDS_SECRET",
+    "ValidationStatus": "needs_validation"
+  },
+  {
+    "RuleID": "fixture-invalid",
+    "File": "config/secrets.go",
+    "StartLine": 12,
+    "EndLine": 12,
+    "Match": "SUPER_SECRET_INVALID_MATCH",
+    "Secret": "SUPER_SECRET_INVALID_SECRET",
+    "ValidationStatus": "invalid"
+  },
+  {
+    "RuleID": "fixture-revoked",
+    "File": "config/secrets.go",
+    "StartLine": 13,
+    "EndLine": 13,
+    "Match": "SUPER_SECRET_REVOKED_MATCH",
+    "Secret": "SUPER_SECRET_REVOKED_SECRET",
+    "ValidationStatus": "revoked"
+  },
+  {
+    "RuleID": "fixture-unknown",
+    "File": "config/secrets.go",
+    "StartLine": 14,
+    "EndLine": 14,
+    "Match": "SUPER_SECRET_UNKNOWN_MATCH",
+    "Secret": "SUPER_SECRET_UNKNOWN_SECRET",
+    "ValidationStatus": "unknown"
+  },
+  {
+    "RuleID": "fixture-error",
+    "File": "config/secrets.go",
+    "StartLine": 15,
+    "EndLine": 15,
+    "Match": "SUPER_SECRET_ERROR_MATCH",
+    "Secret": "SUPER_SECRET_ERROR_SECRET",
+    "ValidationStatus": "error",
+    "ValidationReason": "SUPER_SECRET_ERROR_REASON",
+    "ValidationMeta": {"diagnostic": "SUPER_SECRET_ERROR_META"}
+  },
+  {
+    "RuleID": "fixture-absent",
+    "File": "config/secrets.go",
+    "StartLine": 16,
+    "EndLine": 16,
+    "Match": "SUPER_SECRET_ABSENT_MATCH",
+    "Secret": "SUPER_SECRET_ABSENT_SECRET"
+  }
+]
