@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"drydock/internal/agenticreview"
 	"drydock/internal/agenttools"
+	"drydock/internal/betterleaks"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/metareview"
@@ -23,6 +25,7 @@ import (
 	"drydock/internal/repo"
 	"drydock/internal/reviewengine"
 	"drydock/internal/reviewsession"
+	"drydock/internal/securityscan"
 	"drydock/internal/testutil"
 	"drydock/internal/workspacesnapshot"
 
@@ -156,7 +159,193 @@ func seedIntegrationDBWithDiff(t *testing.T, ctx context.Context, store *db.Stor
 	return patchEvt.ID.Hex(), rID
 }
 
+type betterleaksPipelineFixture struct {
+	runner            *Runner
+	fakeLLM           *testutil.FakeLLM
+	relayPub          *collectingRelayPublisher
+	task              db.ReviewTask
+	baseCommit        string
+	canonicalRepoPath string
+}
+
+func newBetterleaksPipelineFixture(
+	t *testing.T,
+	secretScan bool,
+	scanner BetterleaksScanner,
+) betterleaksPipelineFixture {
+	t.Helper()
+	ctx := context.Background()
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	store, err := db.Open(ctx, filepath.Join(t.TempDir(), "betterleaks-pipeline.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	patchID, repoID := seedIntegrationDB(t, ctx, store)
+	cacheDir := filepath.Join(t.TempDir(), "repos")
+	canonicalRepoPath := initRepoInCanonicalCache(t, cacheDir, repoID)
+	if secretScan {
+		config := []byte(`security:
+  secret_scan: true
+`)
+		if err := os.WriteFile(filepath.Join(canonicalRepoPath, ".drydock.yaml"), config, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(t, canonicalRepoPath, "add", ".drydock.yaml")
+		gitRun(t, canonicalRepoPath, "commit", "-m", "enable secret scan")
+	}
+	baseCmd := exec.Command("git", "rev-parse", "HEAD")
+	baseCmd.Dir = canonicalRepoPath
+	baseBytes, err := baseCmd.Output()
+	if err != nil {
+		t.Fatalf("resolve base commit: %v", err)
+	}
+	baseCommit := strings.TrimSpace(string(baseBytes))
+
+	repoSvc := repo.NewService(store, repo.NewManager(cacheDir, logger), logger)
+	ctxBuilder := contextbuilder.NewWithOptions(contextbuilder.NewBuilderOptions(
+		contextbuilder.WithExtraProviders(betterleaks.NewProvider()),
+	))
+	fakeLLM := &testutil.FakeLLM{Responses: []string{
+		`{"change_type":"bugfix","risk_areas":["security"],"needed_context":[],"review_focus":"secrets","model_route":"coder32b"}`,
+		`{"summary":"Secret review completed.","findings":[{"severity":"high","category":"correctness","file":"main.go","line":2,"evidence":"RAW_LLM_SECRET","explanation":"RAW_LLM_DESCRIPTION","suggestion":"RAW_LLM_SUGGESTION","confidence":0.85}],"needs_more_context":[]}`,
+		`{"walkthrough":"The patch adds a reviewed marker.","file_summaries":[{"file":"main.go","summary":"Adds a comment"}]}`,
+	}}
+	engine := reviewengine.New(reviewengine.Config{
+		Planner:  reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "planner"},
+		Coder32B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "coder32b"},
+		LLM70B:   reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "llm70b"},
+		Coder14B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "coder14b"},
+	}, fakeLLM, logger)
+	relayPub := &collectingRelayPublisher{}
+	pubSvc := publisher.New(publisher.Config{
+		DefaultRelays: []string{"wss://relay.test"}, DetailSeverityFloor: "high",
+		DefaultTTL: 90 * 24 * time.Hour, SupersededTTL: 7 * 24 * time.Hour,
+	}, store, testSigner{sk: nostr.Generate()}, relayPub, logger)
+
+	opts := []func(*Runner){WithMonitoringRegistry(allowAllRegistry{})}
+	if scanner != nil {
+		opts = append(opts, WithBetterleaksScanner(scanner))
+	}
+	runner := New(
+		Config{Workers: 1, AgenticReviewFallback: true},
+		store, repoSvc, ctxBuilder, engine, pubSvc, nil,
+		make(chan db.ReviewTask, 1), logger, opts...,
+	)
+	return betterleaksPipelineFixture{
+		runner: runner, fakeLLM: fakeLLM, relayPub: relayPub,
+		task:       db.ReviewTask{PatchEventID: patchID, RepoID: repoID},
+		baseCommit: baseCommit, canonicalRepoPath: canonicalRepoPath,
+	}
+}
+
 // --- Integration tests ---
+
+func TestIntegrationBetterleaksScansOnceBuildsContextAndPublishesSanitizedFinding(t *testing.T) {
+	scanner := &recordingBetterleaksScanner{
+		result: betterleaks.ScanResult{Findings: []securityscan.SecurityFinding{sensitiveScannerFinding()}},
+	}
+	fixture := newBetterleaksPipelineFixture(t, true, scanner)
+	if err := fixture.runner.process(context.Background(), fixture.task); err != nil {
+		t.Fatalf("process failed: %v", err)
+	}
+
+	if scanner.calls != 1 || len(scanner.requests) != 1 {
+		t.Fatalf("betterleaks calls = %d, requests = %d; want exactly one", scanner.calls, len(scanner.requests))
+	}
+	req := scanner.requests[0]
+	if strings.TrimSpace(req.RepoPath) == "" {
+		t.Fatal("scanner did not receive the prepared repository path")
+	}
+	if req.RepoPath == fixture.canonicalRepoPath {
+		t.Fatal("scanner received the mutable canonical cache instead of the prepared review checkout")
+	}
+	if req.PolicyRef != fixture.baseCommit {
+		t.Fatalf("PolicyRef = %q, want base commit %q", req.PolicyRef, fixture.baseCommit)
+	}
+	if len(req.AllowedFiles) != 1 || req.AllowedFiles[0] != "main.go" {
+		t.Fatalf("AllowedFiles = %#v, want authoritative main.go allowlist", req.AllowedFiles)
+	}
+	if strings.TrimSpace(req.Diff) != strings.TrimSpace(makePatchDiff()) {
+		t.Fatalf("Diff was not the authoritative filtered patch: %q", req.Diff)
+	}
+	if len(fixture.fakeLLM.Requests) != 3 {
+		t.Fatalf("LLM calls = %d, want 3", len(fixture.fakeLLM.Requests))
+	}
+	for i, request := range fixture.fakeLLM.Requests[:2] {
+		if !strings.Contains(request.User, "BETTERLEAKS SECRET SCAN: 1 potential secret(s) detected.") {
+			t.Fatalf("LLM request %d missing redacted secret-scan context: %s", i, request.User)
+		}
+		if strings.Contains(request.User, "RAW_SCANNER_SECRET") ||
+			strings.Contains(request.User, "RAW_SCANNER_DESCRIPTION") ||
+			strings.Contains(request.User, "RAW_SCANNER_SUGGESTION") {
+			t.Fatalf("LLM request %d leaked scanner text: %s", i, request.User)
+		}
+	}
+
+	var published strings.Builder
+	for _, event := range fixture.relayPub.events {
+		published.WriteString(event.Content)
+	}
+	output := published.String()
+	for _, secretText := range []string{
+		"RAW_SCANNER_SECRET", "RAW_SCANNER_DESCRIPTION", "RAW_SCANNER_SUGGESTION",
+		"RAW_LLM_SECRET", "RAW_LLM_DESCRIPTION", "RAW_LLM_SUGGESTION",
+	} {
+		if strings.Contains(output, secretText) {
+			t.Fatalf("published output leaked %q: %s", secretText, output)
+		}
+	}
+	if !strings.Contains(output, "[REDACTED: sensitive finding]") {
+		t.Fatalf("published output did not sanitize merged sensitive finding: %s", output)
+	}
+}
+
+func TestIntegrationBetterleaksDisabledNeverInvokesScanner(t *testing.T) {
+	scanner := &recordingBetterleaksScanner{err: errors.New("must not run")}
+	fixture := newBetterleaksPipelineFixture(t, false, scanner)
+	if err := fixture.runner.process(context.Background(), fixture.task); err != nil {
+		t.Fatalf("process failed with secret scanning disabled: %v", err)
+	}
+	if scanner.calls != 0 {
+		t.Fatalf("betterleaks calls = %d, want 0 when disabled", scanner.calls)
+	}
+}
+
+func TestIntegrationBetterleaksFailureStopsBeforeLLM(t *testing.T) {
+	scanner := &recordingBetterleaksScanner{err: errors.New("scanner exploded")}
+	fixture := newBetterleaksPipelineFixture(t, true, scanner)
+	err := fixture.runner.process(context.Background(), fixture.task)
+	if err == nil || !strings.Contains(err.Error(), "betterleaks secret scan") ||
+		!strings.Contains(err.Error(), "scanner exploded") {
+		t.Fatalf("process error = %v, want fail-closed scanner error", err)
+	}
+	if scanner.calls != 1 {
+		t.Fatalf("betterleaks calls = %d, want 1", scanner.calls)
+	}
+	if len(fixture.fakeLLM.Requests) != 0 {
+		t.Fatalf("LLM calls = %d after scanner failure, want 0", len(fixture.fakeLLM.Requests))
+	}
+	if len(fixture.relayPub.events) != 0 {
+		t.Fatalf("published %d events after scanner failure, want 0", len(fixture.relayPub.events))
+	}
+}
+
+func TestIntegrationBetterleaksEnabledWithoutScannerIsConfigurationError(t *testing.T) {
+	fixture := newBetterleaksPipelineFixture(t, true, nil)
+	err := fixture.runner.process(context.Background(), fixture.task)
+	if err == nil || !strings.Contains(err.Error(), "configuration error") ||
+		!strings.Contains(err.Error(), "no betterleaks scanner") {
+		t.Fatalf("process error = %v, want missing-scanner configuration error", err)
+	}
+	if len(fixture.fakeLLM.Requests) != 0 {
+		t.Fatalf("LLM calls = %d with missing scanner, want 0", len(fixture.fakeLLM.Requests))
+	}
+}
 
 type pipelineTokenCounter struct{}
 

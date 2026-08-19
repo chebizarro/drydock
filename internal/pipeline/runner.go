@@ -11,6 +11,7 @@ import (
 
 	"drydock/internal/agenticreview"
 	"drydock/internal/agenttools"
+	"drydock/internal/betterleaks"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/eventkind"
@@ -84,6 +85,11 @@ type SecurityReviewStage interface {
 	Run(context.Context, contextbuilder.ContextBundle, string, repoconfig.SecurityConfig) securityreview.SecurityResult
 }
 
+// BetterleaksScanner is the secret-scanner seam used by patch reviews.
+type BetterleaksScanner interface {
+	Scan(context.Context, betterleaks.ScanRequest) (betterleaks.ScanResult, error)
+}
+
 type Runner struct {
 	store                   *db.Store
 	repoSvc                 *repo.Service
@@ -97,6 +103,7 @@ type Runner struct {
 	docIngester             DocIngester
 	codeIndexer             CodeIndexer
 	secScanner              *securityscan.Scanner
+	betterleaksScanner      BetterleaksScanner
 	securityReviewer        SecurityReviewStage
 	paymentAuth             PaymentAuthorizer
 	monitoring              MonitoringRegistry
@@ -173,6 +180,14 @@ func WithCodeIndexer(ci CodeIndexer) func(*Runner) {
 func WithSecurityScanner(scanner *securityscan.Scanner) func(*Runner) {
 	return func(r *Runner) {
 		r.secScanner = scanner
+	}
+}
+
+// WithBetterleaksScanner enables fail-closed secret scanning for repositories
+// whose base-branch configuration enables security.secret_scan.
+func WithBetterleaksScanner(scanner BetterleaksScanner) func(*Runner) {
+	return func(r *Runner) {
+		r.betterleaksScanner = scanner
 	}
 }
 
@@ -515,10 +530,37 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 	authoritativePatch := analysis.FilteredDiff
 	patchDiffContent = authoritativePatch
+
+	// Secret scanning is intentionally performed once, before context construction.
+	// The trusted base commit supplies policy, while the authoritative patch analysis
+	// supplies both the file allowlist and added-line filter.
+	var secretScanResult betterleaks.ScanResult
+	if repoCfg.Security.SecretScan {
+		if r.betterleaksScanner == nil {
+			return fmt.Errorf("configuration error: security.secret_scan is enabled but no betterleaks scanner is configured")
+		}
+		if err := timer.Time(tracing.StageSecurityScan, func() error {
+			var scanErr error
+			secretScanResult, scanErr = r.betterleaksScanner.Scan(ctx, betterleaks.ScanRequest{
+				RepoPath:     prep.RepoPath,
+				PolicyRef:    prep.BaseCommit,
+				AllowedFiles: analysis.ChangedFiles,
+				Diff:         analysis.FilteredDiff,
+			})
+			return scanErr
+		}); err != nil {
+			return fmt.Errorf("betterleaks secret scan: %w", err)
+		}
+		if len(secretScanResult.Findings) > 0 {
+			metrics.SecurityScanFindings.Add(int64(len(secretScanResult.Findings)))
+		}
+		log.Info("betterleaks secret scan complete", "findings", len(secretScanResult.Findings))
+	}
+
 	buildInput := contextbuilder.BuildInput{
 		PatchEventContent: authoritativePatch, RepoPath: prep.RepoPath, RepoID: task.RepoID,
 		TokenBudgetOverride: repoCfg.Context.TokenBudget, ExcludePaths: repoCfg.Context.ExcludePaths,
-		DisableDocs: !repoCfg.DocsEnabled(),
+		DisableDocs: !repoCfg.DocsEnabled(), SecretScanContext: betterleaks.FormatContext(secretScanResult),
 	}
 
 	var bundle contextbuilder.ContextBundle
@@ -741,20 +783,21 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	// 6e. Run security scanner (deterministic SAST, parallel with LLM review is possible
-	// but kept sequential here for simplicity and determinism).
-	var scanFindings []securityscan.SecurityFinding
+	// but kept sequential here for simplicity and determinism). Betterleaks findings
+	// were retained from the pre-context scan and share this existing merge path.
+	scanFindings := append([]securityscan.SecurityFinding(nil), secretScanResult.Findings...)
 	if r.secScanner != nil && len(changedFiles) > 0 {
 		if err := timer.Time(tracing.StageSecurityScan, func() error {
 			if err := r.repoSvc.AssertPreparedReview(ctx, prep); err != nil {
 				return fmt.Errorf("verify checkout before security scan: %w", err)
 			}
 			scanResult := r.secScanner.ScanFiles(ctx, prep.RepoPath, changedFiles, patchDiffContent)
-			scanFindings = scanResult.Findings
-			if len(scanFindings) > 0 {
-				metrics.SecurityScanFindings.Add(int64(len(scanFindings)))
+			scanFindings = append(scanFindings, scanResult.Findings...)
+			if len(scanResult.Findings) > 0 {
+				metrics.SecurityScanFindings.Add(int64(len(scanResult.Findings)))
 				log.Info("security scan complete",
 					"files_scanned", scanResult.FilesScanned,
-					"findings", len(scanFindings))
+					"findings", len(scanResult.Findings))
 			}
 			return nil
 		}); err != nil {

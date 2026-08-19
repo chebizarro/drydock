@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"drydock/internal/betterleaks"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
 	"drydock/internal/metareview"
@@ -19,6 +20,7 @@ import (
 	"drydock/internal/repo"
 	"drydock/internal/repoconfig"
 	"drydock/internal/reviewengine"
+	"drydock/internal/securityscan"
 	"drydock/internal/testutil"
 	"fiatjaf.com/nostr"
 )
@@ -65,6 +67,28 @@ type mockCodeIndexer struct {
 
 func (m mockCodeIndexer) IndexRepo(ctx context.Context, repoPath, repoID string) error {
 	return m.err
+}
+
+type recordingBetterleaksScanner struct {
+	calls    int
+	requests []betterleaks.ScanRequest
+	result   betterleaks.ScanResult
+	err      error
+}
+
+func (s *recordingBetterleaksScanner) Scan(_ context.Context, req betterleaks.ScanRequest) (betterleaks.ScanResult, error) {
+	s.calls++
+	s.requests = append(s.requests, req)
+	return s.result, s.err
+}
+
+func sensitiveScannerFinding() securityscan.SecurityFinding {
+	return securityscan.SecurityFinding{
+		RuleID: "test-secret", Severity: "high", Category: "security",
+		File: "main.go", Line: 2, EndLine: 2,
+		Evidence: "RAW_SCANNER_SECRET", Description: "RAW_SCANNER_DESCRIPTION",
+		Suggestion: "RAW_SCANNER_SUGGESTION", Confidence: 0.90, Sensitive: true,
+	}
 }
 
 // --- Test helpers ---
@@ -131,6 +155,15 @@ func seedPatchForPipeline(t *testing.T, ctx context.Context, store *db.Store) (p
 }
 
 // --- Tests ---
+
+func TestWithBetterleaksScanner(t *testing.T) {
+	scanner := &recordingBetterleaksScanner{}
+	runner := &Runner{}
+	WithBetterleaksScanner(scanner)(runner)
+	if runner.betterleaksScanner != scanner {
+		t.Fatal("WithBetterleaksScanner did not install the scanner")
+	}
+}
 
 func TestProcessEndToEndPersistsAndPublishesReview(t *testing.T) {
 	ctx := context.Background()
