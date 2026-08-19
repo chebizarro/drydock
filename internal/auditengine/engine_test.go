@@ -15,6 +15,7 @@ import (
 
 	"drydock/internal/agenticreview"
 	"drydock/internal/agenttools"
+	"drydock/internal/betterleaks"
 	"drydock/internal/codemap"
 	"drydock/internal/db"
 	"drydock/internal/nostrscan"
@@ -271,10 +272,15 @@ func (fixedAuditRepo) CheckoutCommitOnBranch(context.Context, string, string, st
 	return nil
 }
 
-type fixedAuditCodeMap struct{}
+type fixedAuditCodeMap struct {
+	files map[string]codemap.File
+}
 
-func (fixedAuditCodeMap) Build(context.Context, string, string) (*codemap.Map, error) {
-	return &codemap.Map{Files: map[string]codemap.File{"main.go": {Path: "main.go"}}}, nil
+func (m fixedAuditCodeMap) Build(context.Context, string, string) (*codemap.Map, error) {
+	if m.files == nil {
+		m.files = map[string]codemap.File{"main.go": {Path: "main.go"}}
+	}
+	return &codemap.Map{Files: m.files}, nil
 }
 
 type coverageErrorScanner struct{}
@@ -483,11 +489,180 @@ func (passAuditVerifier) Run(_ context.Context, findings []reviewengine.Finding)
 	return findings, nil
 }
 
-type recordingAuditPublisher struct{ called bool }
+type recordingAuditPublisher struct {
+	called bool
+	input  publisher.PublishSecurityAuditInput
+}
 
-func (p *recordingAuditPublisher) PublishSecurityAudit(context.Context, publisher.PublishSecurityAuditInput) (publisher.PublishSecurityAuditResult, error) {
+func (p *recordingAuditPublisher) PublishSecurityAudit(_ context.Context, input publisher.PublishSecurityAuditInput) (publisher.PublishSecurityAuditResult, error) {
 	p.called = true
+	p.input = input
 	return publisher.PublishSecurityAuditResult{}, nil
+}
+
+type emptyAuditScanner struct{}
+
+func (emptyAuditScanner) ScanFiles(_ context.Context, _ string, files []string, _ string) securityscan.ScanResult {
+	return securityscan.ScanResult{FilesScanned: len(files)}
+}
+
+func (emptyAuditScanner) LocateSurface(_ context.Context, _ string, files []string) surface.Result {
+	return surface.Result{FilesScanned: len(files)}
+}
+
+type fakeSecretScanner struct {
+	requests []betterleaks.ScanRequest
+	result   betterleaks.ScanResult
+	err      error
+}
+
+func (s *fakeSecretScanner) Scan(_ context.Context, req betterleaks.ScanRequest) (betterleaks.ScanResult, error) {
+	s.requests = append(s.requests, req)
+	return s.result, s.err
+}
+
+type secretAuditFixture struct {
+	engine *Engine
+	store  *coverageAuditStore
+	pub    *recordingAuditPublisher
+	repo   string
+	commit string
+}
+
+func newSecretAuditFixture(t *testing.T, scanner betterleaks.Scanner) secretAuditFixture {
+	t.Helper()
+	repoPath := t.TempDir()
+	files := map[string]string{
+		"main.go":        "package main\n",
+		"src/allowed.go": "package src\n",
+		"outside.go":     "package outside\n",
+	}
+	codeMapFiles := make(map[string]codemap.File, len(files))
+	for path, contents := range files {
+		fullPath := filepath.Join(repoPath, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		codeMapFiles[path] = codemap.File{Path: path}
+	}
+	runGitForAuditTest(t, repoPath, "init", "-q")
+	runGitForAuditTest(t, repoPath, "add", ".")
+	runGitForAuditTest(t, repoPath, "-c", "user.name=drydock-test", "-c", "user.email=drydock@example.test", "commit", "-qm", "initial")
+	commitBytes, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := &coverageAuditStore{}
+	pub := &recordingAuditPublisher{}
+	engine := New(Config{Workers: 1, NostrEnabled: "false"}, Dependencies{
+		Repos:           fixedAuditRepo{path: repoPath},
+		Store:           store,
+		CodeMap:         fixedAuditCodeMap{files: codeMapFiles},
+		Scanner:         emptyAuditScanner{},
+		SecretScanner:   scanner,
+		VerifierFactory: func(int) Verifier { return passAuditVerifier{} },
+		Publisher:       pub,
+	}, nil)
+	return secretAuditFixture{
+		engine: engine,
+		store:  store,
+		pub:    pub,
+		repo:   repoPath,
+		commit: strings.TrimSpace(string(commitBytes)),
+	}
+}
+
+func runSecretAudit(t *testing.T, fixture secretAuditFixture, enabled bool, subtree string) (Result, error) {
+	t.Helper()
+	return fixture.engine.Run(context.Background(), Request{
+		RepoID: "repo", CloneURLs: []string{"https://example.test/repo.git"},
+		Depth: DepthQuick, RequestedBy: "requester", EnableSecrets: enabled, Subtree: subtree,
+	})
+}
+
+func hasAuditTool(tools []publisher.AuditTool, name string) bool {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRunSecretScannerUsesAuditedCommitAndSubtreeAllowlist(t *testing.T) {
+	secretScanner := &fakeSecretScanner{result: betterleaks.ScanResult{
+		Findings: []securityscan.SecurityFinding{{
+			RuleID: "generic-api-key", Severity: "high", Category: "security",
+			File: "src/allowed.go", Line: 1, EndLine: 1,
+			Evidence:    "Secret value redacted by betterleaks.",
+			Description: "A potential secret was detected.", Suggestion: "Remove and rotate it.",
+			Confidence: 0.9, Sensitive: true,
+		}},
+	}}
+	fixture := newSecretAuditFixture(t, secretScanner)
+
+	result, err := runSecretAudit(t, fixture, true, "src")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(secretScanner.requests) != 1 {
+		t.Fatalf("secret scanner calls = %d, want 1", len(secretScanner.requests))
+	}
+	req := secretScanner.requests[0]
+	if req.RepoPath != fixture.repo || req.PolicyRef != fixture.commit {
+		t.Fatalf("secret scan request repo=%q policy=%q, want repo=%q policy=%q", req.RepoPath, req.PolicyRef, fixture.repo, fixture.commit)
+	}
+	if len(req.AllowedFiles) != 1 || req.AllowedFiles[0] != "src/allowed.go" {
+		t.Fatalf("secret scan allowlist = %#v, want subtree file only", req.AllowedFiles)
+	}
+	if req.Diff != "" {
+		t.Fatalf("audit secret scan diff = %q, want empty", req.Diff)
+	}
+	if len(result.Findings) != 1 || !result.Findings[0].Sensitive {
+		t.Fatalf("audit secret findings = %#v, want one sensitive finding", result.Findings)
+	}
+	if !hasAuditTool(fixture.pub.input.Tools, betterleaks.BinaryName) {
+		t.Fatalf("published tools = %#v, want betterleaks", fixture.pub.input.Tools)
+	}
+}
+
+func TestRunSecretScannerDisabledDoesNotRunOrReportTool(t *testing.T) {
+	secretScanner := &fakeSecretScanner{err: errors.New("must not run")}
+	fixture := newSecretAuditFixture(t, secretScanner)
+
+	if _, err := runSecretAudit(t, fixture, false, ""); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(secretScanner.requests) != 0 {
+		t.Fatalf("disabled secret scanner calls = %d, want 0", len(secretScanner.requests))
+	}
+	if hasAuditTool(fixture.pub.input.Tools, betterleaks.BinaryName) {
+		t.Fatalf("published tools = %#v, must not report betterleaks", fixture.pub.input.Tools)
+	}
+}
+
+func TestRunSecretScannerFailureFailsAuditClosed(t *testing.T) {
+	scanErr := errors.New("scanner unavailable")
+	secretScanner := &fakeSecretScanner{err: scanErr}
+	fixture := newSecretAuditFixture(t, secretScanner)
+
+	_, err := runSecretAudit(t, fixture, true, "")
+	if !errors.Is(err, scanErr) || !strings.Contains(err.Error(), "scan secrets with betterleaks") {
+		t.Fatalf("Run() error = %v, want wrapped scanner failure", err)
+	}
+	if len(secretScanner.requests) != 1 {
+		t.Fatalf("secret scanner calls = %d, want 1", len(secretScanner.requests))
+	}
+	if fixture.pub.called || fixture.store.published {
+		t.Fatal("audit with failed secret scan was published")
+	}
+	if !fixture.store.failed {
+		t.Fatal("audit with failed secret scan was not marked failed")
+	}
 }
 
 func TestRunFailsAndPersistsCoverageOnScanErrors(t *testing.T) {

@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	"drydock/internal/agenticreview"
+	"drydock/internal/betterleaks"
 	"drydock/internal/codemap"
 	"drydock/internal/contextbuilder"
 	"drydock/internal/db"
@@ -127,6 +128,7 @@ type Dependencies struct {
 	Store           AuditStore
 	CodeMap         CodeMapBuilder
 	Scanner         Scanner
+	SecretScanner   betterleaks.Scanner
 	AgenticReview   AgenticReviewer
 	VerifierFactory VerifierFactory
 	Publisher       AuditPublisher
@@ -294,7 +296,24 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	}
 	result.ScannedFiles = scan.FilesScanned
 	result.Coverage = coverage
-	allDeterministic := append(scanFindings(scan.Findings), e.runOptionalTools(ctx, repoPath, req)...)
+	allDeterministic := scanFindings(scan.Findings)
+	allDeterministic = append(allDeterministic, e.runSCATools(ctx, repoPath, req.EnableSCA)...)
+	betterleaksRan := false
+	if req.EnableSecrets {
+		if e.deps.SecretScanner == nil {
+			return result, errors.New("auditengine: betterleaks secret scanner is not configured")
+		}
+		secretScan, scanErr := e.deps.SecretScanner.Scan(ctx, betterleaks.ScanRequest{
+			RepoPath:     repoPath,
+			PolicyRef:    result.Commit,
+			AllowedFiles: files,
+		})
+		if scanErr != nil {
+			return result, fmt.Errorf("scan secrets with betterleaks: %w", scanErr)
+		}
+		allDeterministic = append(allDeterministic, scanFindings(secretScan.Findings)...)
+		betterleaksRan = true
+	}
 
 	var nostrContext, nostrPreamble string
 	var probeEvidence []nostrprobe.SecurityEvidence
@@ -423,6 +442,9 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		pubFindings = append(pubFindings, publisher.SecurityAuditFinding{CWE: findingCWE(finding), Severity: finding.Severity, Message: finding.Explanation, File: finding.File, Line: finding.Line, Evidence: finding.Evidence, Remediation: finding.Suggestion, Confidence: finding.Confidence})
 	}
 	tools := []publisher.AuditTool{{Name: "drydock-securityscan"}, {Name: "drydock-sec70b"}}
+	if betterleaksRan {
+		tools = append(tools, publisher.AuditTool{Name: betterleaks.BinaryName})
+	}
 	if len(probeEvidence) > 0 {
 		tools = append(tools, publisher.AuditTool{Name: "nostr-secprobe"})
 	}
@@ -501,7 +523,7 @@ func scanFindings(findings []securityscan.SecurityFinding) []reviewengine.Findin
 		if cwe != "" {
 			evidence = "[" + cwe + "] " + evidence
 		}
-		out = append(out, reviewengine.Finding{Severity: finding.Severity, Category: "security", File: finding.File, Line: finding.Line, Evidence: evidence, Explanation: finding.Description, Suggestion: finding.Suggestion, Confidence: finding.Confidence})
+		out = append(out, reviewengine.Finding{Severity: finding.Severity, Category: "security", File: finding.File, Line: finding.Line, Evidence: evidence, Explanation: finding.Description, Suggestion: finding.Suggestion, Sensitive: finding.Sensitive, Confidence: finding.Confidence})
 	}
 	return out
 }
@@ -869,9 +891,9 @@ func gitOutput(ctx context.Context, repoPath string, args ...string) (string, er
 	return strings.TrimSpace(string(out)), nil
 }
 
-func (e *Engine) runOptionalTools(ctx context.Context, repoPath string, req Request) []reviewengine.Finding {
+func (e *Engine) runSCATools(ctx context.Context, repoPath string, enabled bool) []reviewengine.Finding {
 	var findings []reviewengine.Finding
-	if req.EnableSCA {
+	if enabled {
 		tools := []struct {
 			names []string
 			args  func(string) []string
@@ -888,27 +910,6 @@ func (e *Engine) runOptionalTools(ctx context.Context, repoPath string, req Requ
 				continue
 			}
 			findings = append(findings, parseExternalFindings(name, out)...)
-		}
-	}
-	if req.EnableSecrets {
-		name, ok := e.availableTool("gitleaks")
-		if !ok {
-			e.logger.Info("optional security scanner unavailable; skipping", "tools", []string{"gitleaks"})
-		} else {
-			// --exit-code=0 keeps gitleaks from exiting non-zero when it
-			// FINDS leaks, which would otherwise be mistaken for tool failure
-			// and silently discard positive results.
-			out, err := e.deps.Tools.Run(ctx, name, "detect", "--source", repoPath, "--report-format", "json", "--report-path", "-", "--exit-code", "0")
-			if err != nil {
-				// Older gitleaks may reject --exit-code; fall back and salvage
-				// parseable findings even on non-zero exit.
-				out, err = e.deps.Tools.Run(ctx, name, "detect", "--source", repoPath, "--report-format", "json", "--report-path", "-")
-			}
-			if leaked := parseExternalFindings(name, out); len(leaked) > 0 {
-				findings = append(findings, leaked...)
-			} else if err != nil {
-				e.logger.Warn("optional security scanner failed", "tool", name, "error", err)
-			}
 		}
 	}
 	return findings
