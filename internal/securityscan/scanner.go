@@ -20,10 +20,12 @@ type SecurityFinding struct {
 	Category    string  `json:"category"`
 	File        string  `json:"file"`
 	Line        int     `json:"line"`
+	EndLine     int     `json:"end_line,omitempty"`
 	Evidence    string  `json:"evidence"`
 	Description string  `json:"description"`
 	Suggestion  string  `json:"suggestion"`
 	Confidence  float64 `json:"confidence"`
+	Sensitive   bool    `json:"sensitive,omitempty"`
 }
 
 // ScanResult holds the output of a security scan.
@@ -61,7 +63,7 @@ func NewWithRuleSets(rules, surfaceRules []Rule) *Scanner {
 // is provided, to avoid flagging pre-existing issues.
 func (s *Scanner) ScanFiles(ctx context.Context, repoPath string, changedFiles []string, diffContent string) ScanResult {
 	// Parse the diff to extract added lines per file.
-	addedLines := parseDiffAddedLines(diffContent)
+	addedLines := ParseDiffAddedLines(diffContent)
 	hasDiff := diffContent != ""
 
 	result := ScanResult{
@@ -175,6 +177,7 @@ func (s *Scanner) scanFile(_ context.Context, relPath, absPath string, addedLine
 					Category:    rule.Category,
 					File:        relPath,
 					Line:        lineNum,
+					EndLine:     lineNum,
 					Evidence:    evidence,
 					Description: rule.Description,
 					Suggestion:  rule.Suggestion,
@@ -233,9 +236,10 @@ func (s *Scanner) scanSurfaceFile(ctx context.Context, relPath, absPath string) 
 	return locations, nil
 }
 
-// parseDiffAddedLines extracts a map of file → {lineNumber: true} for all lines
+// ParseDiffAddedLines extracts a map of file → {lineNumber: true} for all lines
 // added in the diff (lines starting with "+", excluding the "+++ b/" header).
-func parseDiffAddedLines(diffContent string) map[string]map[int]bool {
+// The result can be reused by scanners that need to restrict findings to patch additions.
+func ParseDiffAddedLines(diffContent string) map[string]map[int]bool {
 	result := make(map[string]map[int]bool)
 	if diffContent == "" {
 		return result

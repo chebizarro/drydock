@@ -94,6 +94,16 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 	if err != nil {
 		return "", fmt.Errorf("normalize publication findings: %w", err)
 	}
+	for i := range normalizedFindings {
+		finding := &normalizedFindings[i]
+		sanitizeSensitiveFindingText(finding.Sensitive,
+			&finding.Evidence,
+			&finding.Explanation,
+			&finding.Suggestion,
+			&finding.SuggestedDiff,
+			&finding.SuggestedCode,
+		)
+	}
 	in.Findings = normalizedFindings
 	if in.TargetEnvelope != (targetidentity.Envelope{}) {
 		if err := in.TargetEnvelope.Validate(); err != nil {
@@ -408,6 +418,21 @@ func dedupeNonEmpty(items []string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+const sensitiveFindingSafeText = "[REDACTED: sensitive finding]"
+
+// sanitizeSensitiveFindingText applies the publisher's final defense-in-depth
+// redaction to every serialized text field supplied by a sensitive finding.
+func sanitizeSensitiveFindingText(sensitive bool, fields ...*string) {
+	if !sensitive {
+		return
+	}
+	for _, field := range fields {
+		if field != nil {
+			*field = sensitiveFindingSafeText
+		}
+	}
 }
 
 // maxSuggestionBytes is the maximum size for suggested_diff/suggested_code

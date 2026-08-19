@@ -134,6 +134,66 @@ func TestPublishReviewSummaryAndHighDetail(t *testing.T) {
 	}
 }
 
+func TestPublishReviewRedactsSensitiveFindingText(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedRepoAndPatch(t, ctx, store)
+	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+		t.Fatalf("begin review: %v", err)
+	}
+
+	fakePub := &fakeRelayPublisher{}
+	svc := New(Config{
+		DefaultRelays:       []string{"wss://fallback.example"},
+		DetailSeverityFloor: "high",
+	}, store, fakeSigner{sk: nostr.Generate()}, fakePub, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	rawText := []string{
+		"raw-evidence-token",
+		"raw-explanation-token",
+		"raw-suggestion-token",
+		"raw-diff-old-token",
+		"raw-diff-new-token",
+		"raw-code-token",
+	}
+	_, err := svc.PublishReview(ctx, PublishInput{
+		PatchEventID: patchID,
+		RepoID:       repoID,
+		Summary:      "A sensitive finding was detected.",
+		Model:        "test-model",
+		ContextHash:  "sensitive-test",
+		Findings: []reviewengine.Finding{{
+			Severity:      "high",
+			Category:      "security",
+			File:          "config.go",
+			Line:          7,
+			Evidence:      rawText[0],
+			Explanation:   rawText[1],
+			Suggestion:    rawText[2],
+			SuggestedDiff: "@@ -1 +1 @@\n-" + rawText[3] + "\n+" + rawText[4],
+			SuggestedCode: rawText[5],
+			Sensitive:     true,
+			Confidence:    0.99,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("PublishReview() error = %v", err)
+	}
+	if len(fakePub.calls) != 2 {
+		t.Fatalf("published events = %d, want summary and detail", len(fakePub.calls))
+	}
+	for _, call := range fakePub.calls {
+		for _, raw := range rawText {
+			if strings.Contains(call.event.Content, raw) {
+				t.Fatalf("published event leaked %q: %s", raw, call.event.Content)
+			}
+		}
+		if !strings.Contains(call.event.Content, sensitiveFindingSafeText) {
+			t.Fatalf("published event missing fixed redaction text: %s", call.event.Content)
+		}
+	}
+}
+
 func seedRepoAndPatch(t *testing.T, ctx context.Context, store *db.Store) (patchID string, repoID string) {
 	t.Helper()
 	repoOwner := nostr.MustPubKeyFromHex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")

@@ -2,6 +2,7 @@ package securityscan
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -70,6 +71,12 @@ const apiKey = "sk-1234567890abcdef1234567890abcdef"
 			}
 			if f.Line != 3 {
 				t.Errorf("expected line 3, got %d", f.Line)
+			}
+			if f.EndLine != f.Line {
+				t.Errorf("expected single-line span ending at %d, got %d", f.Line, f.EndLine)
+			}
+			if f.Sensitive {
+				t.Error("builtin SAST finding should not be marked sensitive")
 			}
 			if f.File != "config.go" {
 				t.Errorf("expected file config.go, got %s", f.File)
@@ -442,6 +449,57 @@ func TestProviderLayerNameAndPriority(t *testing.T) {
 	}
 	if provider.Priority() != 1 {
 		t.Errorf("expected priority 1, got %d", provider.Priority())
+	}
+}
+
+func TestParseDiffAddedLines(t *testing.T) {
+	diff := `diff --git a/first.go b/first.go
+--- a/first.go
++++ b/first.go
+@@ -8,2 +10,3 @@
+ context
++first addition
++second addition
+diff --git a/second.go b/second.go
+--- a/second.go
++++ b/second.go
+@@ -1 +3 @@
++third addition
+`
+	got := ParseDiffAddedLines(diff)
+	for file, lines := range map[string][]int{
+		"first.go":  {11, 12},
+		"second.go": {3},
+	} {
+		for _, line := range lines {
+			if !got[file][line] {
+				t.Errorf("ParseDiffAddedLines() missing %s:%d in %#v", file, line, got)
+			}
+		}
+	}
+	if got["first.go"][10] {
+		t.Fatalf("context line was reported as added: %#v", got["first.go"])
+	}
+}
+
+func TestSecurityFindingMetadataJSONRoundTrip(t *testing.T) {
+	want := SecurityFinding{
+		RuleID:    "SECRET",
+		File:      "config.go",
+		Line:      7,
+		EndLine:   9,
+		Sensitive: true,
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var got SecurityFinding
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if got.EndLine != want.EndLine || got.Sensitive != want.Sensitive {
+		t.Fatalf("metadata round trip = %+v, want end_line=%d sensitive=%t", got, want.EndLine, want.Sensitive)
 	}
 }
 

@@ -178,6 +178,85 @@ func TestPublishSecurityAuditEventsKeepDetailPrivate(t *testing.T) {
 	}
 }
 
+func TestPublishSecurityAuditRedactsSensitiveFindingText(t *testing.T) {
+	ctx := context.Background()
+	store, auditID := newSecurityAuditTestStore(t, ctx)
+	sender := keyer.NewPlainKeySigner(nostr.Generate())
+	recipient := keyer.NewPlainKeySigner(nostr.Generate())
+	requester, err := recipient.GetPublicKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	announcement := nostr.Event{
+		ID:        nostr.MustIDFromHex("3333333333333333333333333333333333333333333333333333333333333333"),
+		PubKey:    nostr.GetPublicKey(nostr.Generate()),
+		Kind:      30617,
+		CreatedAt: 1700000000,
+		Tags:      nostr.Tags{{"d", "widgets"}},
+	}
+	relays := &fakeRelayPublisher{}
+	svc := New(Config{DefaultRelays: []string{"wss://relay.test"}}, store, sender, relays, testLogger())
+	rawText := []string{
+		"raw-audit-message-token",
+		"raw-audit-evidence-token",
+		"raw-audit-taint-token",
+		"raw-audit-remediation-token",
+	}
+	result, err := svc.PublishSecurityAudit(ctx, PublishSecurityAuditInput{
+		AuditID:      auditID,
+		Announcement: announcement,
+		Commit:       "abc123",
+		Complete:     true,
+		Coverage:     SecurityAuditCoverage{ScanOperationsScanned: 1},
+		Requester:    requester,
+		Findings: []SecurityAuditFinding{{
+			RuleID:      "SECRET",
+			Severity:    "critical",
+			Message:     rawText[0],
+			File:        "config.go",
+			Line:        7,
+			Evidence:    rawText[1],
+			Taint:       rawText[2],
+			Remediation: rawText[3],
+			Sensitive:   true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("PublishSecurityAudit() error = %v", err)
+	}
+
+	var wrapped nostr.Event
+	for _, call := range relays.calls {
+		for _, raw := range rawText {
+			if strings.Contains(call.event.Content, raw) {
+				t.Fatalf("published event leaked %q", raw)
+			}
+		}
+		if call.event.Kind == nostr.KindGiftWrap {
+			wrapped = call.event
+		}
+	}
+	if wrapped.ID == nostr.ZeroID {
+		t.Fatal("missing gift-wrapped detail event")
+	}
+	rumor, err := nip59.GiftUnwrap(wrapped, func(other nostr.PubKey, ciphertext string) (string, error) {
+		return recipient.Decrypt(ctx, ciphertext, other)
+	})
+	if err != nil {
+		t.Fatalf("GiftUnwrap() error = %v", err)
+	}
+	for _, serialized := range []string{rumor.Content, string(result.SARIF)} {
+		for _, raw := range rawText {
+			if strings.Contains(serialized, raw) {
+				t.Fatalf("serialized audit output leaked %q: %s", raw, serialized)
+			}
+		}
+		if !strings.Contains(serialized, sensitiveFindingSafeText) {
+			t.Fatalf("serialized audit output missing fixed redaction text: %s", serialized)
+		}
+	}
+}
+
 type failOnceSecurityAuditPublisher struct {
 	calls  []publishCall
 	failAt int

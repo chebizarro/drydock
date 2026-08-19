@@ -97,6 +97,7 @@ type Finding struct {
 	Suggestion    string   `json:"suggestion"`
 	SuggestedDiff string   `json:"suggested_diff,omitempty"`
 	SuggestedCode string   `json:"suggested_code,omitempty"`
+	Sensitive     bool     `json:"sensitive,omitempty"`
 	Confidence    float64  `json:"confidence"`
 }
 

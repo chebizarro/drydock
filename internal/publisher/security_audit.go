@@ -50,6 +50,7 @@ type SecurityAuditFinding struct {
 	Taint       string  `json:"taint,omitempty"`
 	Remediation string  `json:"remediation,omitempty"`
 	Confidence  float64 `json:"confidence,omitempty"`
+	Sensitive   bool    `json:"sensitive,omitempty"`
 }
 
 type SeverityCounts struct {
@@ -149,6 +150,17 @@ func (s *Service) PublishSecurityAudit(ctx context.Context, in PublishSecurityAu
 	keyer, ok := s.signer.(GiftWrapSigner)
 	if !ok {
 		return out, errors.New("security audit publisher signer does not support NIP-44 encryption")
+	}
+
+	in.Findings = append([]SecurityAuditFinding(nil), in.Findings...)
+	for i := range in.Findings {
+		finding := &in.Findings[i]
+		sanitizeSensitiveFindingText(finding.Sensitive,
+			&finding.Message,
+			&finding.Evidence,
+			&finding.Taint,
+			&finding.Remediation,
+		)
 	}
 
 	sarif, err := GenerateSARIF(in.Findings, in.Tools)
