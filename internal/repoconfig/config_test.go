@@ -270,6 +270,17 @@ reveiw:
 	}
 }
 
+func TestRepoSuppliedBetterleaksValidationRejected(t *testing.T) {
+	yaml := "version: 1\nsecurity:\n  secret_scan: true\n  validation: true\n"
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected repo-supplied security.validation to be rejected")
+	}
+	if !strings.Contains(err.Error(), "field validation not found") {
+		t.Errorf("error = %q, want unknown validation field", err.Error())
+	}
+}
+
 func TestStatusConfigDefaults(t *testing.T) {
 	cfg := Default()
 	if cfg.Status.Enabled {

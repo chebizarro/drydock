@@ -18,6 +18,7 @@ import (
 	"drydock/internal/agenticreview"
 	"drydock/internal/agenttools"
 	"drydock/internal/auditengine"
+	"drydock/internal/betterleaks"
 	"drydock/internal/circuitbreaker"
 	"drydock/internal/codechat"
 	"drydock/internal/codeindex"
@@ -438,14 +439,16 @@ func main() {
 		}
 	}
 
-	// --- Security scanner ---
+	// --- Security scanners ---
 	secScanner := securityscan.New()
+	betterleaksScanner := betterleaks.New(cfg.BetterleaksValidation)
 	secProvider := securityscan.NewProvider(secScanner)
 	builderOpts = append(builderOpts, contextbuilder.WithExtraProviders(
 		secProvider,
+		betterleaks.NewProvider(),
 		contextbuilder.NewSecuritySurfaceProvider(secScanner),
 	))
-	logger.Info("security scanner enabled", "rules", len(securityscan.BuiltinRules()))
+	logger.Info("security scanners enabled", "rules", len(securityscan.BuiltinRules()), "betterleaks_validation", cfg.BetterleaksValidation)
 
 	// --- Context builder ---
 	ctxBuilder := contextbuilder.NewWithOptions(contextbuilder.NewBuilderOptions(builderOpts...))
@@ -644,6 +647,7 @@ func main() {
 				Repos:         repoManager,
 				Store:         store,
 				Scanner:       secScanner,
+				SecretScanner: betterleaksScanner,
 				AgenticReview: agenticReviewSvc,
 				VerifierFactory: func(votes int) auditengine.Verifier {
 					return securityverify.New(llmClient, securityverify.Config{
@@ -787,6 +791,7 @@ func main() {
 		pipelineOpts = append(pipelineOpts, pipeline.WithPromptRefiner(prSvc))
 		pipelineOpts = append(pipelineOpts, pipeline.WithAgenticReviewService(agenticReviewSvc))
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityScanner(secScanner))
+		pipelineOpts = append(pipelineOpts, pipeline.WithBetterleaksScanner(betterleaksScanner))
 		pipelineOpts = append(pipelineOpts, pipeline.WithSecurityReviewer(securityStage))
 		pipelineOpts = append(pipelineOpts, pipeline.WithActivityHeartbeat(healthSrv.RecordActivity))
 		if monitoredRepos != nil {

@@ -155,6 +155,7 @@ type Config struct {
 	MCPMaxRequestBodyBytes              int64
 	MCPShutdownTimeout                  time.Duration
 	SecurityEnabled                     bool
+	BetterleaksValidation               bool
 	SecurityAuditWorkers                int
 	SecurityNostrEnabled                string
 	SecurityNostrProbeTargets           []string
@@ -302,6 +303,7 @@ func FromEnv() Config {
 		MCPMaxRequestBodyBytes:              int64(parseIntOrDefault(envOrDefault("DRYDOCK_MCP_MAX_REQUEST_BODY_BYTES", "4194304"), 4*1024*1024)),
 		MCPShutdownTimeout:                  parseDurationOrDefault(envOrDefault("DRYDOCK_MCP_SHUTDOWN_TIMEOUT", "30s"), 30*time.Second),
 		SecurityEnabled:                     parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_ENABLED", "false"), false),
+		BetterleaksValidation:               parseBoolOrDefault(envOrDefault("DRYDOCK_BETTERLEAKS_VALIDATION", "false"), false),
 		SecurityAuditWorkers:                parseIntOrDefault(envOrDefault("DRYDOCK_SECURITY_AUDIT_WORKERS", "2"), 2),
 		SecurityNostrEnabled:                parseNostrEnabled(envOrDefault("DRYDOCK_SECURITY_NOSTR_ENABLED", "auto")),
 		SecurityNostrProbeTargets:           splitCSV(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_TARGETS", "")),

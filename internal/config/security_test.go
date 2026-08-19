@@ -47,6 +47,28 @@ func TestFromEnvSecurity(t *testing.T) {
 	}
 }
 
+func TestFromEnvBetterleaksValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "default off", want: false},
+		{name: "explicit on", value: "true", want: true},
+		{name: "invalid value fails closed", value: "not-a-bool", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DRYDOCK_BETTERLEAKS_VALIDATION", tt.value)
+
+			if got := FromEnv().BetterleaksValidation; got != tt.want {
+				t.Errorf("BetterleaksValidation = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFromEnvSecurityNostr(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -36,6 +36,23 @@ Reactive processing is fail-closed until an authoritative list state is loaded. 
 
 The list contract is kind `30001`, authored by `DRYDOCK_MONITORED_REPOS_AUTHOR`, with exactly one `d` tag equal to `drydock:monitored-repositories:v1` and zero or more canonical kind-30617 repository `a` tags. Publish this list before deploying the new binary.
 
+## Betterleaks Secret Scanning
+
+Repository policy enables secret scanning with `security.secret_scan: true` in the root `.drydock.yaml`. The same setting applies to patch/PR reviews and full-repository audits. The shipped runtime image includes betterleaks; custom deployments must install `betterleaks` on `PATH`. Once enabled, scanning fails closed if the binary is missing, the command fails, or its JSON report is malformed.
+
+Scanner policy files are root-level fixed names; repository configuration cannot supply arbitrary paths:
+
+1. `.betterleaks.toml`, falling back to `.gitleaks.toml`
+2. `.betterleaks-baseline.json`, falling back to `.gitleaks-baseline.json`
+
+Patch reviews read those files from the trusted **base commit**, not from the proposed patch. Consequently, a PR that introduces or changes scanner policy is evaluated under the previous base policy; the new policy becomes active after merge. Full audits read policy from the audited commit.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_BETTERLEAKS_VALIDATION` | boolean | `false` | Operator-only live credential validation for every repository with `security.secret_scan: true`. Invalid values fail closed to `false`. Enabling this may send detected credentials to third-party validation endpoints from the Drydock network; repositories cannot opt in themselves. |
+
+Betterleaks always runs with redaction. Drydock discards secret and match fields from scanner output, emits only canonical safe finding text, and sanitizes sensitive fields again before Nostr and SARIF publication. Validated credentials map to `critical` severity at `0.99` confidence; all other validation states map to `high` at `0.90`.
+
 ## ContextVM Rate Limits
 
 | Variable | Type | Default | Description |

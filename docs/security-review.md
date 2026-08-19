@@ -20,7 +20,7 @@ This design adds security review as a distinct concern with two entry points:
 1. *The model is the judgment layer, not the search layer.* Deterministic tooling (SAST, taint, graphs) finds and narrows; the LLM confirms, explains, rates severity, and catches logic-class flaws that rules miss. Hybrid pipelines outperform raw model calls by a wide margin.
 2. *Fail closed, anchor to reality.* Reuse Drydock's existing guards: empty changed-file set aborts before any LLM call; findings are filtered to a deterministic file set. Extend the same discipline to audit (findings must anchor to real files/lines the scan actually read).
 3. *Suppress false positives explicitly.* An adversarial verification stage is the single highest-leverage quality lever for security review, where false-positive fatigue kills adoption.
-4. *Everything stays local and Nostr-native.* No code leaves the operator's infrastructure; all inter-component signalling is event-driven per `AGENTS.md`.
+4. *Local and Nostr-native by default.* Code analysis and inter-component signalling stay inside the operator's infrastructure. The sole exception is operator-enabled betterleaks credential validation, which can contact third-party credential endpoints and is therefore off by default.
 
 **Non-goals:** offensive tooling / exploit generation; replacing dedicated SCA (dependency CVE) or secret-scanning products (we integrate them, we don't reimplement them); cloud-model dependence.
 
@@ -84,7 +84,7 @@ No new trigger — it runs inside `pipeline.Runner.work` for kinds 1617/1618/161
 
 Add a stage that runs when `.drydock.yaml` `security.enabled` is true (or a changed file is security-sensitive per `IsSecuritySensitive`). It:
 
-1. **Assembles a security evidence packet** (see §6) from the already-built `ContextBundle` plus new providers: SAST findings (existing), taint paths (new), and the security-surface tags (new). These already flow in as context layers; the stage additionally extracts them into a structured `SecurityEvidence` struct so the verify stage can reason over them.
+1. **Runs deterministic scanners and assembles a security evidence packet** (see §6). When `security.secret_scan` is enabled, the pipeline runs betterleaks once against the pinned checkout before context construction, restricts findings to changed files and added lines, injects its redacted results through the `secret-scan` context provider, and reuses the same findings during the final merge. SAST findings, taint paths, and security-surface tags also flow in as context layers.
 2. **Runs a security-routed reviewer.** Introduce a dedicated route (`RouteSec70B`, §7) so the security lens can target a stronger/security-tuned model independent of the general reviewer route the planner picks. The reviewer prompt is the existing reviewer prompt with a security-specialized system preamble (trace source→sink, enumerate trust boundaries, map each finding to a CWE).
 3. **Adversarial verify** (§8) each candidate finding before it is allowed to gate.
 4. **Classify + severity** via the Foundation-Sec route (§7), attaching CWE IDs and a calibrated severity.
@@ -118,7 +118,7 @@ The audit is a fan-out/verify pipeline over the repository, bounded by a work bu
 
 1. **Prepare** — `repo.Manager` provides a checkout at `ref` (reuse existing clone/LRU cache and per-repo mutex).
 2. **Build the code-map cache** (§6.1) once for the checkout, keyed by tree hash. Cached on disk under the repo cache dir; incremental audits reuse it.
-3. **Deterministic sweep** — run `securityscan` across the whole tree (not diff-scoped: call `ScanFiles` with `diffContent==""` so it scans full files), plus optional SCA (Trivy/Grype/OSV) and secret-scan (gitleaks) shell-outs whose JSON is parsed into evidence. This is the free first pass; it produces the initial candidate set and, importantly, seeds the security-surface map.
+3. **Deterministic sweep** — run `securityscan` across the whole tree (not diff-scoped: call `ScanFiles` with `diffContent==""` so it scans full files), plus optional SCA and betterleaks secret scanning. Betterleaks scans the pinned repository snapshot with the code-map file allowlist and returns normalized, redacted findings. This is the free first pass; it produces the initial candidate set and, importantly, seeds the security-surface map.
 4. **Localize & prioritize** — rank files/units by security relevance. Two strategies, config-selected: (a) heuristic — union of SAST hits, security-surface sinks, and recently-changed files by `git log`; (b) model-assisted — the optional **Antares localizer** provider (§6.4) given a CWE prompt returns candidate files. Localization exists to keep the deep-model budget focused; log what was dropped (never silently cap).
 5. **Per-unit review** — for each prioritized unit (a function/file plus its blast radius from the code map), assemble a security packet (§6.5) and run the `sec70b` reviewer. Units are processed by a bounded worker pool mirroring `DRYDOCK_PIPELINE_WORKERS`.
 6. **Adversarial verify + classify** (§8) — same stage as Pathway B, but audit defaults to the full multi-vote refute panel.
@@ -253,7 +253,7 @@ security:
   taint: true                 # taint/data-flow provider
   surface: true               # security-surface provider
   sca: false                  # dependency CVE scan (trivy/grype/osv), if installed
-  secret_scan: false          # gitleaks, if installed
+  secret_scan: false          # betterleaks for patch reviews and full audits
 
   audit:                      # Pathway A defaults
     localizer: heuristic      # heuristic | antares
@@ -267,7 +267,15 @@ Validation mirrors existing repoconfig rules (strict unknown-field rejection, se
 
 ### 10.2 Environment variables
 
-`DRYDOCK_SEC70B_BASE_URL`/`_MODEL`, `DRYDOCK_SECCLASSIFY_BASE_URL`/`_MODEL`, `DRYDOCK_SECLOCALIZE_BASE_URL`/`_MODEL`, `DRYDOCK_SECURITY_ENABLED`, `DRYDOCK_SECURITY_AUDIT_WORKERS`. All optional with graceful degradation: no `sec70b` endpoint → fall back to `llm70b`; no localizer → heuristic; no SCA/secret-scan binaries → skip with a logged notice (never a hard fail).
+`DRYDOCK_SEC70B_BASE_URL`/`_MODEL`, `DRYDOCK_SECCLASSIFY_BASE_URL`/`_MODEL`, `DRYDOCK_SECLOCALIZE_BASE_URL`/`_MODEL`, `DRYDOCK_SECURITY_ENABLED`, `DRYDOCK_SECURITY_AUDIT_WORKERS`, and `DRYDOCK_BETTERLEAKS_VALIDATION`. Missing model routes and optional SCA tools degrade as described above. Betterleaks is different: when repository policy enables `security.secret_scan`, a missing binary, command failure, or malformed report fails the patch review or audit closed.
+
+### 10.3 Betterleaks secret scanning
+
+The shared `internal/betterleaks` scanner serves both pathways. It invokes `betterleaks dir` on a pinned checkout with `--redact`, parses only rule, file, line-span, and validation-status fields, and never copies raw `Secret`, `Match`, or stderr data into a finding. Scanner evidence is canonical safe text, and findings are marked sensitive so publication sanitization redacts evidence, explanations, suggestions, and suggested code before Nostr or SARIF output. This defense also covers an LLM finding that overlaps a scanner finding.
+
+Secret scanning is fail closed whenever `security.secret_scan` is true. Patch reviews scan once before model context construction and reuse the result during deduplication; full audits scan once as part of their deterministic sweep. A successfully validated credential is `critical` with confidence `0.99`. Every other validation state—including disabled, unsupported, invalid, revoked, unknown, or error—is still reported as `high` with confidence `0.90` because committing credential-shaped material is unsafe even when it is not currently usable.
+
+Live validation is operator-only and defaults off. Setting `DRYDOCK_BETTERLEAKS_VALIDATION=true` adds betterleaks validation to every enabled secret scan; repositories cannot request it in `.drydock.yaml`. Validation may transmit detected credentials to third-party service endpoints from the Drydock network, so operators must explicitly accept that trust boundary.
 
 ---
 
@@ -328,7 +336,7 @@ Each phase is independently shippable; Phase 2 delivers user-visible value on it
 2. *Taint accuracy* without full dataflow analysis is approximate; the design leans on the verify stage to suppress the resulting noise. May want per-language LSP requirements documented.
 3. *Whole-repo prefill cost on P40* is real; audit depth budgeting and localization are the mitigations, but very large repos may need a subtree-only default there.
 4. *Antares/Foundation-Sec licensing* is defensive-use-restricted — fine for this feature, but document it so operators don't repurpose the endpoints.
-5. *SCA/secret-scan* are integrations, not builds; decide whether to vendor invocations or leave them operator-installed (current design: operator-installed, skipped-if-absent).
+5. *SCA/secret-scan* are integrations rather than reimplementations. The shipped image includes pinned betterleaks; custom deployments must provide `betterleaks` on `PATH`, and enabled secret scans fail closed if it is unavailable.
 
 ---
 
