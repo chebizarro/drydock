@@ -431,6 +431,148 @@ func TestDeduplicateFindings_UnmatchedPrepended(t *testing.T) {
 	}
 }
 
+func TestDeduplicateFindings_SensitiveMatchCanonicalizesSpan(t *testing.T) {
+	scanFindings := []SecurityFinding{
+		{
+			RuleID:      "SECRET-001",
+			Severity:    "critical",
+			Category:    "security",
+			File:        "config.go",
+			Line:        10,
+			EndLine:     15,
+			Evidence:    "secret detected (redacted)",
+			Description: "A credential is present in source.",
+			Suggestion:  "Remove the credential and rotate it.",
+			Confidence:  0.99,
+			Sensitive:   true,
+		},
+	}
+	llmFindings := []reviewengine.Finding{
+		{
+			Severity:      "high",
+			Category:      "security",
+			File:          "config.go",
+			Line:          18,
+			Evidence:      "raw LLM evidence",
+			Explanation:   "raw LLM explanation",
+			Suggestion:    "raw LLM suggestion",
+			SuggestedDiff: "@@ -1 +1 @@",
+			SuggestedCode: "raw secret",
+			Confidence:    0.8,
+		},
+	}
+
+	merged := DeduplicateFindings(scanFindings, llmFindings)
+	if len(merged) != 1 {
+		t.Fatalf("expected 1 merged finding, got %d", len(merged))
+	}
+	got := merged[0]
+	if !got.Sensitive {
+		t.Error("merged finding should be sensitive")
+	}
+	if got.Evidence != scanFindings[0].Evidence ||
+		got.Explanation != "A credential is present in source. [SECRET-001]" ||
+		got.Suggestion != scanFindings[0].Suggestion {
+		t.Fatalf("merged finding did not use canonical scanner text: %+v", got)
+	}
+	if got.SuggestedDiff != "" || got.SuggestedCode != "" {
+		t.Error("sensitive merged finding should clear suggested diff and code")
+	}
+}
+
+func TestDeduplicateFindings_SensitiveUnmatched(t *testing.T) {
+	scanFindings := []SecurityFinding{
+		{
+			RuleID:      "SECRET-002",
+			Severity:    "high",
+			Category:    "secrets",
+			File:        "env.go",
+			Line:        5,
+			EndLine:     5,
+			Evidence:    "secret detected (redacted)",
+			Description: "A credential is present in source.",
+			Suggestion:  "Remove the credential.",
+			Confidence:  0.9,
+			Sensitive:   true,
+		},
+	}
+
+	merged := DeduplicateFindings(scanFindings, nil)
+	if len(merged) != 1 {
+		t.Fatalf("expected 1 unmatched scanner finding, got %d", len(merged))
+	}
+	if !merged[0].Sensitive {
+		t.Error("unmatched scanner finding should be sensitive")
+	}
+	if merged[0].Category != "security" {
+		t.Fatalf("expected security category, got %q", merged[0].Category)
+	}
+}
+
+func TestDeduplicateFindings_SensitiveCategoryMismatchMerges(t *testing.T) {
+	scanFindings := []SecurityFinding{
+		{
+			RuleID:      "SECRET-003",
+			Severity:    "high",
+			Category:    "security",
+			File:        "config.go",
+			Line:        20,
+			EndLine:     22,
+			Evidence:    "secret detected (redacted)",
+			Description: "A credential is present in source.",
+			Suggestion:  "Remove it.",
+			Confidence:  0.9,
+			Sensitive:   true,
+		},
+	}
+	llmFindings := []reviewengine.Finding{
+		{Severity: "medium", Category: "correctness", File: "config.go", Line: 21, Evidence: "raw", Confidence: 0.8},
+	}
+
+	merged := DeduplicateFindings(scanFindings, llmFindings)
+	if len(merged) != 1 {
+		t.Fatalf("expected category mismatch to merge, got %d findings", len(merged))
+	}
+	if merged[0].Category != "security" || !merged[0].Sensitive {
+		t.Fatalf("expected sensitive security finding, got %+v", merged[0])
+	}
+}
+
+func TestDeduplicateFindings_SensitiveMatchesMultipleOverlaps(t *testing.T) {
+	scanFindings := []SecurityFinding{
+		{
+			RuleID:      "SECRET-004",
+			Severity:    "high",
+			Category:    "security",
+			File:        "config.go",
+			Line:        10,
+			EndLine:     12,
+			Evidence:    "secret detected (redacted)",
+			Description: "A credential is present in source.",
+			Suggestion:  "Remove it.",
+			Confidence:  0.9,
+			Sensitive:   true,
+		},
+	}
+	llmFindings := []reviewengine.Finding{
+		{Severity: "medium", Category: "security", File: "config.go", Line: 7, Evidence: "raw first", Confidence: 0.8},
+		{Severity: "medium", Category: "correctness", File: "config.go", Line: 15, Evidence: "raw second", Confidence: 0.8},
+	}
+
+	merged := DeduplicateFindings(scanFindings, llmFindings)
+	if len(merged) != 2 {
+		t.Fatalf("expected both overlapping LLM findings to merge, got %d findings", len(merged))
+	}
+	for i, finding := range merged {
+		if !finding.Sensitive || finding.Category != "security" {
+			t.Errorf("finding %d was not canonicalized: %+v", i, finding)
+		}
+		if finding.Evidence != scanFindings[0].Evidence {
+			t.Errorf("finding %d retained non-canonical evidence %q", i, finding.Evidence)
+		}
+	}
+}
+
 func TestDeduplicateFindings_EmptyScan(t *testing.T) {
 	llmFindings := []reviewengine.Finding{
 		{Severity: "medium", File: "main.go", Line: 1},
