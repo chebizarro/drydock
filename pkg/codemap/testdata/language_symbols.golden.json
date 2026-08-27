@@ -1,0 +1,103 @@
+{
+  "Language": {
+    "ID": "go",
+    "Extensions": [
+      ".go"
+    ],
+    "Available": true
+  },
+  "Languages": [
+    {
+      "ID": "c",
+      "Extensions": [
+        ".c",
+        ".h"
+      ],
+      "Available": true
+    },
+    {
+      "ID": "cpp",
+      "Extensions": [
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".hh",
+        ".hpp",
+        ".hxx"
+      ],
+      "Available": true
+    },
+    {
+      "ID": "go",
+      "Extensions": [
+        ".go"
+      ],
+      "Available": true
+    },
+    {
+      "ID": "java",
+      "Extensions": [
+        ".java"
+      ],
+      "Available": true
+    },
+    {
+      "ID": "javascript",
+      "Extensions": [
+        ".cjs",
+        ".js",
+        ".jsx",
+        ".mjs"
+      ],
+      "Available": true
+    },
+    {
+      "ID": "python",
+      "Extensions": [
+        ".py",
+        ".pyw"
+      ],
+      "Available": true
+    },
+    {
+      "ID": "ruby",
+      "Extensions": [
+        ".erb",
+        ".rb"
+      ],
+      "Available": true
+    },
+    {
+      "ID": "rust",
+      "Extensions": [
+        ".rs"
+      ],
+      "Available": true
+    },
+    {
+      "ID": "typescript",
+      "Extensions": [
+        ".mts",
+        ".ts",
+        ".tsx"
+      ],
+      "Available": true
+    }
+  ],
+  "Symbols": [
+    {
+      "Name": "Item",
+      "Kind": "type",
+      "StartLine": 2,
+      "EndLine": 2,
+      "Parent": ""
+    },
+    {
+      "Name": "Build",
+      "Kind": "function",
+      "StartLine": 3,
+      "EndLine": 3,
+      "Parent": ""
+    }
+  ]
+}

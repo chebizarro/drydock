@@ -1,0 +1,173 @@
+{
+  "Version": 1,
+  "TreeHash": "0c36718c5753b4b1744a662791f3904d7be09ff0",
+  "Ref": "HEAD",
+  "Files": {
+    "lib/item.go": {
+      "Path": "lib/item.go",
+      "BlobHash": "152fc96959c2fcb300a7d49389dfa7b9d81b120e",
+      "Language": "go",
+      "Symbols": [
+        {
+          "ID": "lib/item.go:3:Item",
+          "Name": "Item",
+          "Kind": "type",
+          "Path": "lib/item.go",
+          "Language": "go",
+          "StartLine": 3,
+          "EndLine": 3,
+          "Parent": ""
+        },
+        {
+          "ID": "lib/item.go:4:NewItem",
+          "Name": "NewItem",
+          "Kind": "function",
+          "Path": "lib/item.go",
+          "Language": "go",
+          "StartLine": 4,
+          "EndLine": 4,
+          "Parent": ""
+        }
+      ],
+      "Imports": null
+    },
+    "main.go": {
+      "Path": "main.go",
+      "BlobHash": "f9f9021d19ef5e9530a7f62a95575e847e598a2d",
+      "Language": "go",
+      "Symbols": [
+        {
+          "ID": "main.go:3:main",
+          "Name": "main",
+          "Kind": "function",
+          "Path": "main.go",
+          "Language": "go",
+          "StartLine": 3,
+          "EndLine": 3,
+          "Parent": ""
+        },
+        {
+          "ID": "main.go:4:Helper",
+          "Name": "Helper",
+          "Kind": "function",
+          "Path": "main.go",
+          "Language": "go",
+          "StartLine": 4,
+          "EndLine": 4,
+          "Parent": ""
+        }
+      ],
+      "Imports": null
+    }
+  },
+  "SymbolIndex": {
+    "Helper": [
+      {
+        "ID": "main.go:4:Helper",
+        "Name": "Helper",
+        "Kind": "function",
+        "Path": "main.go",
+        "Language": "go",
+        "StartLine": 4,
+        "EndLine": 4,
+        "Parent": ""
+      }
+    ],
+    "Item": [
+      {
+        "ID": "lib/item.go:3:Item",
+        "Name": "Item",
+        "Kind": "type",
+        "Path": "lib/item.go",
+        "Language": "go",
+        "StartLine": 3,
+        "EndLine": 3,
+        "Parent": ""
+      }
+    ],
+    "NewItem": [
+      {
+        "ID": "lib/item.go:4:NewItem",
+        "Name": "NewItem",
+        "Kind": "function",
+        "Path": "lib/item.go",
+        "Language": "go",
+        "StartLine": 4,
+        "EndLine": 4,
+        "Parent": ""
+      }
+    ],
+    "main": [
+      {
+        "ID": "main.go:3:main",
+        "Name": "main",
+        "Kind": "function",
+        "Path": "main.go",
+        "Language": "go",
+        "StartLine": 3,
+        "EndLine": 3,
+        "Parent": ""
+      }
+    ]
+  },
+  "CallGraph": {
+    "lib/item.go:3:Item": null,
+    "lib/item.go:4:NewItem": [
+      "lib/item.go:3:Item"
+    ],
+    "main.go:3:main": [
+      "main.go:4:Helper"
+    ],
+    "main.go:4:Helper": null
+  },
+  "ReverseCallGraph": {
+    "lib/item.go:3:Item": [
+      "lib/item.go:4:NewItem"
+    ],
+    "lib/item.go:4:NewItem": null,
+    "main.go:3:main": null,
+    "main.go:4:Helper": [
+      "main.go:3:main"
+    ]
+  },
+  "ImportGraph": {},
+  "RepoMap": [
+    {
+      "SymbolID": "lib/item.go:3:Item",
+      "Name": "Item",
+      "Path": "lib/item.go",
+      "Line": 3,
+      "Kind": "type",
+      "Score": 0.3245614035088126
+    },
+    {
+      "SymbolID": "main.go:4:Helper",
+      "Name": "Helper",
+      "Path": "main.go",
+      "Line": 4,
+      "Kind": "function",
+      "Score": 0.3245614035088126
+    },
+    {
+      "SymbolID": "lib/item.go:4:NewItem",
+      "Name": "NewItem",
+      "Path": "lib/item.go",
+      "Line": 4,
+      "Kind": "function",
+      "Score": 0.17543859649118737
+    },
+    {
+      "SymbolID": "main.go:3:main",
+      "Name": "main",
+      "Path": "main.go",
+      "Line": 3,
+      "Kind": "function",
+      "Score": 0.17543859649118737
+    }
+  ],
+  "Cache": {
+    "TreeHit": false,
+    "ReusedFiles": 0,
+    "ParsedFiles": 0
+  }
+}

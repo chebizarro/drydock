@@ -1,5 +1,7 @@
 package symbols
 
+import "sort"
+
 // SymbolKind classifies what kind of declaration a symbol is.
 type SymbolKind string
 
@@ -32,6 +34,32 @@ func LangFromExt(ext string) string {
 		return ""
 	}
 	return lang
+}
+
+// LanguageMetadata describes one recognized source language.
+type LanguageMetadata struct {
+	ID         string
+	Extensions []string
+	Available  bool
+}
+
+// LanguageMetadataList returns every recognized language in stable order.
+// Available reports whether this build includes its tree-sitter grammar.
+func LanguageMetadataList() []LanguageMetadata {
+	extensions := make(map[string][]string)
+	for ext, language := range extToLang {
+		extensions[language] = append(extensions[language], ext)
+	}
+	languages := make([]LanguageMetadata, 0, len(extensions))
+	for id, values := range extensions {
+		sort.Strings(values)
+		languages = append(languages, LanguageMetadata{
+			ID: id, Extensions: values,
+			Available: TreeSitterAvailable() && SupportedLanguage(id),
+		})
+	}
+	sort.Slice(languages, func(i, j int) bool { return languages[i].ID < languages[j].ID })
+	return languages
 }
 
 var extToLang = map[string]string{

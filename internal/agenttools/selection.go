@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/contextselection"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
@@ -466,73 +467,77 @@ func effectiveTokenLimit(budget int, headroom float64) int {
 }
 
 func (s *Selection) renderLocked(ctx context.Context) (string, error) {
-	var sections []string
 	patch := s.snapshot.PatchContent()
 	if selectionHash(patch) != s.patch.Hash {
 		return "", workspacesnapshot.ErrHashMismatch
 	}
-	sections = append(sections, "## patch\n"+string(patch))
-	sections = append(sections, "## changed-files\n"+strings.Join(s.changedFiles, "\n"))
-
-	filePaths := sortedArtifactPaths(s.files)
-	for _, path := range filePaths {
-		artifact := s.files[path]
-		content, err := s.snapshot.ReadFile(ctx, path)
-		if artifact.Mandatory && artifact.Hash == "" && errors.Is(err, workspacesnapshot.ErrNotFound) {
-			sections = append(sections, "## file: "+path+"\n[deleted in snapshot]")
-			continue
-		}
-		if err != nil {
-			return "", err
-		}
-		if selectionHash(content) != artifact.Hash {
-			return "", fmt.Errorf("%w: %s", workspacesnapshot.ErrHashMismatch, path)
-		}
-		sections = append(sections, "## file: "+path+"\n"+string(content))
+	sections := []string{
+		"## patch\n" + string(patch),
+		"## changed-files\n" + strings.Join(s.changedFiles, "\n"),
 	}
 
+	deleted := make(map[string]bool)
+	entries := make([]contextselection.Entry, 0, len(s.files)+len(s.ranges)+len(s.codemaps))
+	for _, path := range sortedArtifactPaths(s.files) {
+		artifact := s.files[path]
+		if artifact.Mandatory && artifact.Hash == "" {
+			deleted[path] = true
+		}
+		entries = append(entries, contextselection.Entry{
+			RootID: "repository", Path: path, Variant: contextselection.VariantWholeFile,
+			ExpectedSHA256: artifact.Hash,
+		})
+	}
 	rangePaths := make([]string, 0, len(s.ranges))
 	for path := range s.ranges {
 		rangePaths = append(rangePaths, path)
 	}
 	sort.Strings(rangePaths)
 	for _, path := range rangePaths {
-		content, err := s.snapshot.ReadFile(ctx, path)
-		if err != nil {
-			return "", err
-		}
-		if selectionHash(content) != s.rangeHashes[path] {
-			return "", fmt.Errorf("%w: %s", workspacesnapshot.ErrHashMismatch, path)
-		}
-		lines := strings.Split(string(content), "\n")
+		ranges := make([]contextselection.LineRange, 0, len(s.ranges[path]))
 		for _, lineRange := range s.ranges[path] {
-			sections = append(sections, fmt.Sprintf("## line-range: %s:%d-%d\n%s",
-				path, lineRange.StartLine, lineRange.EndLine,
-				strings.Join(lines[lineRange.StartLine-1:lineRange.EndLine], "\n")))
+			ranges = append(ranges, contextselection.LineRange{
+				StartLine: lineRange.StartLine, EndLine: lineRange.EndLine,
+			})
 		}
+		entries = append(entries, contextselection.Entry{
+			RootID: "repository", Path: path, Variant: contextselection.VariantLineSlice,
+			Ranges: ranges, ExpectedSHA256: s.rangeHashes[path],
+		})
+	}
+	for _, path := range sortedArtifactPaths(s.codemaps) {
+		entries = append(entries, contextselection.Entry{
+			RootID: "repository", Path: path, Variant: contextselection.VariantCodemap,
+			ExpectedSHA256: s.codemaps[path].Hash,
+		})
 	}
 
-	codemapPaths := sortedArtifactPaths(s.codemaps)
-	for _, path := range codemapPaths {
-		artifact := s.codemaps[path]
-		content, err := s.snapshot.ReadFile(ctx, path)
-		if err != nil {
-			return "", err
+	rendered, err := contextselection.Render(ctx, []contextselection.Root{{
+		ID: "repository", Source: selectionSnapshotSource{snapshot: s.snapshot, deleted: deleted},
+	}}, entries)
+	if err != nil {
+		if errors.Is(err, contextselection.ErrSourceDigestMismatch) {
+			return "", workspacesnapshot.ErrHashMismatch
 		}
-		if selectionHash(content) != artifact.Hash {
-			return "", fmt.Errorf("%w: %s", workspacesnapshot.ErrHashMismatch, path)
-		}
-		structure, err := contextbuilder.NewStructureFacade().Analyze(contextbuilder.StructureRequest{Path: path, Content: content})
-		if err != nil {
-			return "", fmt.Errorf("agent tools: render codemap %s: %w", path, err)
-		}
-		encoded, err := json.Marshal(structure)
-		if err != nil {
-			return "", err
-		}
-		sections = append(sections, "## codemap: "+path+"\n"+string(encoded))
+		return "", err
+	}
+	if rendered.Content != "" {
+		sections = append(sections, rendered.Content)
 	}
 	return strings.Join(sections, "\n\n"), nil
+}
+
+type selectionSnapshotSource struct {
+	snapshot *workspacesnapshot.Snapshot
+	deleted  map[string]bool
+}
+
+func (s selectionSnapshotSource) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	content, err := s.snapshot.ReadFile(ctx, path)
+	if err != nil && s.deleted[path] && errors.Is(err, workspacesnapshot.ErrNotFound) {
+		return []byte("[deleted in snapshot]"), nil
+	}
+	return content, err
 }
 
 func (s *Selection) artifactsLocked() []SelectionArtifact {

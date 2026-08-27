@@ -1,0 +1,65 @@
+{
+  "Content": "## file: beta:b.go\npackage beta\nfunc Beta() {}\n\n\n## file: alpha:a.go\npackage alpha\nfunc Alpha() {}\n\n\n## line-range: alpha:slice.txt:2-4\none\ntwo\nthree",
+  "Manifest": {
+    "Version": 1,
+    "Roots": [
+      {
+        "RootID": "beta",
+        "Digest": "digest-beta"
+      },
+      {
+        "RootID": "alpha",
+        "Digest": "digest-alpha"
+      }
+    ],
+    "Included": [
+      {
+        "RootID": "beta",
+        "Path": "b.go",
+        "Variant": "whole_file",
+        "Ranges": null,
+        "SourceSHA256": "f77f826005334e68466b8287abe9391f8254eccb2a72104778320f984f632c13",
+        "RenderedSHA256": "f77f826005334e68466b8287abe9391f8254eccb2a72104778320f984f632c13"
+      },
+      {
+        "RootID": "alpha",
+        "Path": "a.go",
+        "Variant": "whole_file",
+        "Ranges": null,
+        "SourceSHA256": "a9762b224b3dd10191b2036d3fd3c4e51173a6ed4a3ff5cfa8db6530d1b07c2a",
+        "RenderedSHA256": "a9762b224b3dd10191b2036d3fd3c4e51173a6ed4a3ff5cfa8db6530d1b07c2a"
+      },
+      {
+        "RootID": "alpha",
+        "Path": "slice.txt",
+        "Variant": "line_slice",
+        "Ranges": [
+          {
+            "StartLine": 2,
+            "EndLine": 4
+          }
+        ],
+        "SourceSHA256": "14d26036be54fbd9d19b7766d40b736669e5732c4b831c969b3092ce952b50c6",
+        "RenderedSHA256": "058053d87c818d699cde0f00d670bca0e1c6ad857caa9758ea6a556d7c64fcee"
+      }
+    ],
+    "TokenCount": 149,
+    "TokenBudget": 2000,
+    "EffectiveLimit": 1900,
+    "Exclusions": [
+      {
+        "RootID": "beta",
+        "Path": "generated.go",
+        "Variant": "whole_file",
+        "Reason": "generated file policy"
+      }
+    ],
+    "Tokenizer": {
+      "Name": "bytes",
+      "Version": "test-v1",
+      "Encoding": "utf-8"
+    },
+    "ContentSHA256": "c27dfe5acf95e9e8c012afee62fed8f44a5d4ec5987f8405cc3d53da3a90cc11",
+    "ManifestSHA256": "5796e144ecadf58e5851ad0e8b2067c6c6e2eab473b7fd12bd980fa8eeda63c8"
+  }
+}
