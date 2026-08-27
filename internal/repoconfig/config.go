@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/reviewengine"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 	"gopkg.in/yaml.v3"

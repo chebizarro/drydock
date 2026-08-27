@@ -11,8 +11,8 @@ import (
 	"slices"
 	"strings"
 
-	"drydock/internal/lspbridge"
-	"drydock/internal/symbols"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/symbols"
 
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
 )

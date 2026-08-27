@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"drydock/internal/nostrscan/knowledge"
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan/knowledge"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 func verifierSystemPrompt(vote int, lens string) string {

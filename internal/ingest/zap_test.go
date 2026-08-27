@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"testing"
 
-	"drydock/internal/db"
-	"drydock/internal/revieworder"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/revieworder"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 	"github.com/btcsuite/btcd/btcutil/bech32"

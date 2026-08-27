@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/scope"
-	"drydock/internal/vectorstore"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 
 	_ "modernc.org/sqlite" // Register sqlite driver for validation
 )

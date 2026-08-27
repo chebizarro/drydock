@@ -6,15 +6,15 @@ import (
 	"fmt"
 	"strings"
 
-	"drydock/internal/codemap"
-	"drydock/internal/contextbuilder"
-	"drydock/internal/metrics"
-	"drydock/internal/nostrscan"
-	"drydock/internal/nostrscan/knowledge"
-	"drydock/internal/repoconfig"
-	"drydock/internal/reviewengine"
-	"drydock/internal/securityscan"
-	"drydock/internal/securityverify"
+	"git.sharegap.net/cascadia/drydock/internal/codemap"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan"
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan/knowledge"
+	"git.sharegap.net/cascadia/drydock/internal/repoconfig"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/securityverify"
 )
 
 // SecurityEvidence is the structured security-specific subset of a context bundle.

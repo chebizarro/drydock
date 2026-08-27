@@ -8,10 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/eventkind"
-	"drydock/internal/metrics"
-	"drydock/internal/monitoring"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/eventkind"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/monitoring"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip59"

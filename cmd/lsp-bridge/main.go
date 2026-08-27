@@ -20,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"drydock/internal/lspbridge/server"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge/server"
 )
 
 type bridgeConfig struct {

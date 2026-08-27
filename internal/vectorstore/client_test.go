@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
 func TestEnsureCollection_AlreadyExists(t *testing.T) {

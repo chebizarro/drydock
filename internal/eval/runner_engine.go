@@ -3,7 +3,7 @@ package eval
 import (
 	"context"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 type EngineRunner struct {

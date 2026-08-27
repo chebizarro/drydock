@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 func TestSeverityFromString(t *testing.T) {

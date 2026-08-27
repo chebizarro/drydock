@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
 // ExpiryConfig configures the assignment expiry service.

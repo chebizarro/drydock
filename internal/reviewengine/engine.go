@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"drydock/internal/targetidentity"
+	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 )
 
 type ModelEndpoint struct {

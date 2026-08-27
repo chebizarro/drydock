@@ -21,9 +21,9 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/repoconfig"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/repoconfig"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )

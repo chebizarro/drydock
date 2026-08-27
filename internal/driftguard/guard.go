@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/db"
 )
 
 // Service provides the convention drift guard workflow.

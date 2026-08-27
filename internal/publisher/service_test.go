@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/db"
-	"drydock/internal/reviewengine"
-	"drydock/internal/targetidentity"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 
 	"fiatjaf.com/nostr"
 )

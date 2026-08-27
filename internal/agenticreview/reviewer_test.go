@@ -8,11 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/agenttools"
-	"drydock/internal/reviewengine"
-	"drydock/internal/targetidentity"
-	"drydock/internal/testutil"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/agenttools"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 func reviewerPatch() string {

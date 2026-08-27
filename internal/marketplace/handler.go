@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/contextvm"
-	"drydock/internal/db"
-	"drydock/internal/metrics"
-	"drydock/internal/ratelimit"
+	"git.sharegap.net/cascadia/drydock/internal/contextvm"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/ratelimit"
 
 	"fiatjaf.com/nostr"
 )

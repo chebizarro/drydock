@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 func TestManagerCommandConfigOverride(t *testing.T) {

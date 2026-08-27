@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
 func TestEmbedSuccess(t *testing.T) {

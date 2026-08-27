@@ -10,9 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"drydock/internal/db"
-	"drydock/internal/eventkind"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/eventkind"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )

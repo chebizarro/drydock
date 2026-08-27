@@ -8,7 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	"drydock/internal/symbols"
+	"git.sharegap.net/cascadia/drydock/internal/symbols"
 )
 
 // ContentSource is the narrow immutable repository view used by tool-facing

@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"time"
 
-	"drydock/internal/circuitbreaker"
-	"drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/circuitbreaker"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
 // DefaultDimension is the default embedding vector size used when the central

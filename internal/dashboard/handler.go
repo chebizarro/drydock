@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
 //go:embed assets

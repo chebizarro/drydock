@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/contextvm"
-	"drydock/internal/db"
-	"drydock/internal/ingest"
-	"drydock/internal/revieworder"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/contextvm"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/ingest"
+	"git.sharegap.net/cascadia/drydock/internal/revieworder"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )

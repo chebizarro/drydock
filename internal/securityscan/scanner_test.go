@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 func TestBuiltinRulesCompile(t *testing.T) {

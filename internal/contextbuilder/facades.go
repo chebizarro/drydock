@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 // PatchFacade owns structured patch analysis and deterministic patch/file rendering.

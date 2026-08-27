@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 
 	"git.sharegap.net/cascadia/nostr-secprobe/pkg/report"
 )

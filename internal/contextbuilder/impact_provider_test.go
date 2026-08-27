@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/symbols"
+	"git.sharegap.net/cascadia/drydock/internal/symbols"
 )
 
 func initImpactTestRepo(t *testing.T) string {

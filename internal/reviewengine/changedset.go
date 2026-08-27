@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"drydock/internal/targetidentity"
+	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 )
 
 // changedSet is a normalized membership set of deterministically parsed

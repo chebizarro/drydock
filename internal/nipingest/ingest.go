@@ -18,8 +18,8 @@ import (
 	"strconv"
 	"strings"
 
-	"drydock/internal/embedding"
-	"drydock/internal/vectorstore"
+	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
 // Chunk represents a single section extracted from a NIP markdown file.

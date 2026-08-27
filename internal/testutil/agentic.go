@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 // CompletionStep scripts one Complete call. Model is matched exactly when set;

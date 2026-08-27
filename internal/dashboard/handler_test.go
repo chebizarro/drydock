@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"drydock/internal/db"
-	"drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
 func mustOpenStore(t *testing.T) *db.Store {

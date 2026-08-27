@@ -3,7 +3,7 @@ package contextbuilder
 import (
 	"context"
 
-	"drydock/internal/nostrscan/knowledge"
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan/knowledge"
 )
 
 const LayerNostrProtocol = "nostr-protocol"

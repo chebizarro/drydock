@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 const DefaultTokenBudget = 64_000

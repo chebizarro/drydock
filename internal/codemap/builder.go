@@ -10,8 +10,8 @@ import (
 	"sort"
 	"strings"
 
-	"drydock/internal/lspbridge"
-	"drydock/internal/symbols"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/symbols"
 )
 
 const maxSourceBytes = 2 * 1024 * 1024

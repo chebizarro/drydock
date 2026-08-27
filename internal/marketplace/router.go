@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/metrics"
-	"drydock/internal/payment"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/payment"
 
 	"fiatjaf.com/nostr"
 )

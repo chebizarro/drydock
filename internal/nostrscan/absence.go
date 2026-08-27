@@ -9,10 +9,10 @@ import (
 	"sort"
 	"strings"
 
-	"drydock/internal/codemap"
-	"drydock/internal/nostrscan/knowledge"
-	"drydock/internal/securityscan"
-	"drydock/internal/securityscan/surface"
+	"git.sharegap.net/cascadia/drydock/internal/codemap"
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan/knowledge"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan/surface"
 )
 
 // AbsenceConfidence is intentionally below the review gating threshold.

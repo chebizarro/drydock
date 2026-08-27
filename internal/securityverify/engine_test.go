@@ -6,9 +6,9 @@ import (
 	"sync"
 	"testing"
 
-	"drydock/internal/metrics"
-	"drydock/internal/reviewengine"
-	"drydock/internal/testutil"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 )
 
 type lockedFakeLLM struct {

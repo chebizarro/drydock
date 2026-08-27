@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/db"
 
 	"fiatjaf.com/nostr"
 )

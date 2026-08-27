@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	evaldata "drydock/internal/eval"
-	"drydock/internal/reviewengine"
-	"drydock/internal/securityverify"
-	"drydock/internal/testutil"
+	evaldata "git.sharegap.net/cascadia/drydock/internal/eval"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/securityverify"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 )
 
 const prLensCIBudget = 5 * time.Second

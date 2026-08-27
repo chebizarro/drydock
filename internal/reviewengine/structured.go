@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"drydock/internal/llmutil"
+	"git.sharegap.net/cascadia/drydock/internal/llmutil"
 )
 
 const maxStructuredRepairAttempts = 2

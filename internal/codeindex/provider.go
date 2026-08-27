@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"strings"
 
-	"drydock/internal/contextbuilder"
-	"drydock/internal/embedding"
-	"drydock/internal/vectorstore"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
 const (

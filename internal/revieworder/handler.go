@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/contextvm"
-	"drydock/internal/db"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/contextvm"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )

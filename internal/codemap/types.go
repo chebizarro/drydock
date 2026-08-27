@@ -1,7 +1,7 @@
 // Package codemap builds and caches whole-repository symbol and reference maps.
 package codemap
 
-import "drydock/internal/symbols"
+import "git.sharegap.net/cascadia/drydock/internal/symbols"
 
 const cacheVersion = 1
 

@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/contextbuilder"
-	"drydock/internal/lspbridge"
-	"drydock/internal/securityscan"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 func TestReviewSubmitSchemaRequiresEvidenceAndCoverage(t *testing.T) {

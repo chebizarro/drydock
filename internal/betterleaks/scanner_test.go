@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/contextbuilder"
-	"drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
 )
 
 type commandCall struct {

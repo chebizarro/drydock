@@ -9,13 +9,13 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/contextvm"
-	"drydock/internal/db"
-	"drydock/internal/eventkind"
-	"drydock/internal/metrics"
-	"drydock/internal/monitoring"
-	"drydock/internal/revieworder"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/contextvm"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/eventkind"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/monitoring"
+	"git.sharegap.net/cascadia/drydock/internal/revieworder"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )

@@ -12,9 +12,9 @@ import (
 	"strings"
 	"sync"
 
-	"drydock/internal/contextbuilder"
-	"drydock/internal/metrics"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 type ArtifactKind string

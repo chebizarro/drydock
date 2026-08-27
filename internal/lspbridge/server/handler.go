@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 const analyzeTimeout = 30 * time.Second

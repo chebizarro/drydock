@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 type callsite struct {

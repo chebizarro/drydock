@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
 )
 
 const LayerSecurityScan = "security-scan"

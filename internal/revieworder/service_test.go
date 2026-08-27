@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"drydock/internal/db"
-	"drydock/internal/monitoring"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/monitoring"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )

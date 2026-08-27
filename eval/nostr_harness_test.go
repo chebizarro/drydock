@@ -14,8 +14,8 @@ import (
 	"strings"
 	"testing"
 
-	evaldata "drydock/internal/eval"
-	"drydock/internal/nostrscan"
+	evaldata "git.sharegap.net/cascadia/drydock/internal/eval"
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan"
 )
 
 const (

@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"drydock/internal/targetidentity"
+	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 )
 
 func TestFilterFindingsToChangedFiles(t *testing.T) {

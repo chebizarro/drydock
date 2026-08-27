@@ -7,7 +7,7 @@ import (
 	"slices"
 	"strings"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 // ReferencesFacade is the authoritative LSP-backed references analysis used by

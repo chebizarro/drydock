@@ -14,12 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/agenttools"
-	"drydock/internal/db"
-	"drydock/internal/reviewengine"
-	"drydock/internal/reviewsession"
-	"drydock/internal/testutil"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/agenttools"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewsession"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 type serviceClient struct {

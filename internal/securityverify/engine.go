@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"drydock/internal/metrics"
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 const (

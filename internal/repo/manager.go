@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"drydock/internal/metrics"
-	"drydock/internal/targetidentity"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 
 	"fiatjaf.com/nostr"
 )

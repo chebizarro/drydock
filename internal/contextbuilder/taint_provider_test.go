@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 func TestTaintProviderMeta(t *testing.T) {

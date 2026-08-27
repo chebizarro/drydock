@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/contextbuilder"
-	"drydock/internal/metrics"
-	"drydock/internal/repoconfig"
-	"drydock/internal/reviewengine"
-	"drydock/internal/testutil"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/repoconfig"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 )
 
 func TestStageRunExtractsEvidenceRoutesVerifiesAndClassifies(t *testing.T) {

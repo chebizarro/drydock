@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/ingest"
-	"drydock/internal/monitoring"
-	"drydock/internal/revieworder"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/ingest"
+	"git.sharegap.net/cascadia/drydock/internal/monitoring"
+	"git.sharegap.net/cascadia/drydock/internal/revieworder"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )

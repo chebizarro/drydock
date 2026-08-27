@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"testing"
 
-	"drydock/internal/contextvm"
-	"drydock/internal/ingest"
+	"git.sharegap.net/cascadia/drydock/internal/contextvm"
+	"git.sharegap.net/cascadia/drydock/internal/ingest"
 
 	"fiatjaf.com/nostr"
 )

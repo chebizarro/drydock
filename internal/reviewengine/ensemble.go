@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
 // EnsembleConfig controls multi-model ensemble review behavior.

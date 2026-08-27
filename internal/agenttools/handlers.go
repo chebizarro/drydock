@@ -13,8 +13,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"drydock/internal/contextbuilder"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 const DefaultMaxResultBytes = 16 * 1024

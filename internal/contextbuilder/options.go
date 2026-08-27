@@ -1,9 +1,9 @@
 package contextbuilder
 
 import (
-	"drydock/internal/embedding"
-	"drydock/internal/lspbridge"
-	"drydock/internal/vectorstore"
+	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
 // WithChartRoom configures Chartroom-backed retrieval for the context builder.

@@ -3,7 +3,7 @@ package metareview
 import (
 	"testing"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 const validMetaReviewJSON = `{"missed_findings":[{"type":"correctness","description":"missed nil check","evidence":"foo dereferences bar","why_missed":"prompt_gap"}],"false_positives":[{"finding_index":0,"reason":"the reported issue is guarded"}],"reasoning_quality":0.8,"context_utilization":0.7,"prompt_gaps":["emphasize nil checks"],"suggested_few_shot":true}`

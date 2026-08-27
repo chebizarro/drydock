@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/agenttools"
-	"drydock/internal/driftguard"
-	"drydock/internal/reviewsession"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/agenttools"
+	"git.sharegap.net/cascadia/drydock/internal/driftguard"
+	"git.sharegap.net/cascadia/drydock/internal/reviewsession"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 func TestResolveMCPHTTPScopeBindsServerSessionReadonly(t *testing.T) {

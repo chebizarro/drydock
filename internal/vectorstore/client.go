@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/circuitbreaker"
-	"drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/circuitbreaker"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
 // Client interacts with a Qdrant instance via its REST API.

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"drydock/internal/targetidentity"
+	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 )
 
 func TestRunWithExecutorRequiresValidatedSnapshotScope(t *testing.T) {

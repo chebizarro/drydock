@@ -20,8 +20,8 @@ package idegateway
 import (
 	"encoding/json"
 
-	"drydock/internal/eventkind"
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/eventkind"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 // Event kinds for IDE integration.

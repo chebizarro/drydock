@@ -13,12 +13,12 @@ import (
 	"sync"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/embedding"
-	"drydock/internal/metrics"
-	"drydock/internal/ratelimit"
-	"drydock/internal/reviewengine"
-	"drydock/internal/vectorstore"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/ratelimit"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip59"

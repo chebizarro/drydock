@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	"drydock/internal/agenttools"
+	"git.sharegap.net/cascadia/drydock/internal/agenttools"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )

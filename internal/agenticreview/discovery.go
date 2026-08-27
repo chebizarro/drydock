@@ -8,11 +8,11 @@ import (
 	"os"
 	"strings"
 
-	"drydock/internal/agenttools"
-	"drydock/internal/contextbuilder"
-	"drydock/internal/metrics"
-	"drydock/internal/reviewengine"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/agenttools"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 type DiscoveryFallbackReason string

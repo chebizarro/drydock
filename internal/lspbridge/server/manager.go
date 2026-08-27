@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 const (

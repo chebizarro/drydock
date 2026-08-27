@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 type Mode string

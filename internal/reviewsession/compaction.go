@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 type TokenCounter interface {

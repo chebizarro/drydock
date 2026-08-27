@@ -13,7 +13,7 @@ import (
 	"strings"
 	"unicode"
 
-	"drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
 )
 
 const (

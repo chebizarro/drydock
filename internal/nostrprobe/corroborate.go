@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 // Corroborate confirms matching static findings with conclusive live evidence.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"drydock/internal/targetidentity"
+	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 )
 
 type FindingScope string

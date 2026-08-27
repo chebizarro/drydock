@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/contextvm"
-	"drydock/internal/db"
-	"drydock/internal/payment"
+	"git.sharegap.net/cascadia/drydock/internal/contextvm"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/payment"
 
 	"fiatjaf.com/nostr"
 )

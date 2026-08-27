@@ -10,13 +10,13 @@ import (
 	"sync"
 	"time"
 
-	"drydock/internal/agenttools"
-	"drydock/internal/contextbuilder"
-	"drydock/internal/metrics"
-	"drydock/internal/reviewengine"
-	"drydock/internal/reviewsession"
-	"drydock/internal/targetidentity"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/agenttools"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewsession"
+	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 var (

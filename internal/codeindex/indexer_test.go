@@ -13,10 +13,10 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/contextbuilder"
-	"drydock/internal/embedding"
-	"drydock/internal/symbols"
-	"drydock/internal/vectorstore"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/symbols"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
 // --- Test helpers ---

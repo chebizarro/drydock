@@ -13,7 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 // jsonRPCRequest is a JSON-RPC 2.0 request.

@@ -24,7 +24,7 @@ import (
 	"strconv"
 	"time"
 
-	"drydock/internal/eventkind"
+	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 
 	"fiatjaf.com/nostr"
 )

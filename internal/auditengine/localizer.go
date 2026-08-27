@@ -8,8 +8,8 @@ import (
 	"slices"
 	"strings"
 
-	"drydock/internal/codemap"
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/codemap"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 // Localizer returns repository files likely to contain a vulnerability class.

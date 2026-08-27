@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/repoconfig"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/repoconfig"
 
 	"fiatjaf.com/nostr"
 )

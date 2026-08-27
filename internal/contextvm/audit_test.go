@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"drydock/internal/auditengine"
+	"git.sharegap.net/cascadia/drydock/internal/auditengine"
 
 	"fiatjaf.com/nostr"
 )

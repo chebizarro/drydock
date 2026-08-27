@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 type MetaReviewOutput struct {

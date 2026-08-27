@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
 // Checker can verify a dependency is healthy.

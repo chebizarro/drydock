@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/securityscan/surface"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan/surface"
 )
 
 type fakeSecuritySurfaceLocator struct {

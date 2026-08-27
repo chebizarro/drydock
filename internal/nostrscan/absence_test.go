@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/codemap"
-	"drydock/internal/securityscan"
-	"drydock/internal/securityscan/surface"
+	"git.sharegap.net/cascadia/drydock/internal/codemap"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan/surface"
 )
 
 func TestAbsenceV2WrapperDominatesUse(t *testing.T) {

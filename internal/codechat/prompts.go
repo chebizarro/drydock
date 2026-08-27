@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/db"
 )
 
 // codeChatSystemPrompt returns the system prompt for codebase chat.

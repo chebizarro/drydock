@@ -5,7 +5,7 @@ package testutil
 import (
 	"context"
 
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 // FakeLLM is a test double for reviewengine.LLMClient that returns canned responses.

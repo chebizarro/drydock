@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"drydock/internal/symbols"
+	"git.sharegap.net/cascadia/drydock/internal/symbols"
 
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
 )

@@ -6,11 +6,11 @@ import (
 	"log/slog"
 	"os"
 
-	"drydock/internal/config"
-	"drydock/internal/db"
-	"drydock/internal/eval"
-	"drydock/internal/promptrefine"
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/config"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/eval"
+	"git.sharegap.net/cascadia/drydock/internal/promptrefine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 func main() {

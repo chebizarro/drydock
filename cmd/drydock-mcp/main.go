@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"drydock/internal/agenttools"
-	"drydock/internal/mcpserver"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/agenttools"
+	"git.sharegap.net/cascadia/drydock/internal/mcpserver"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 func main() {

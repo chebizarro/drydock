@@ -1,4 +1,4 @@
-module drydock
+module git.sharegap.net/cascadia/drydock
 
 go 1.26
 

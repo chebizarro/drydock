@@ -3,7 +3,7 @@ package pipeline
 import (
 	"context"
 
-	"drydock/internal/docsingest"
+	"git.sharegap.net/cascadia/drydock/internal/docsingest"
 )
 
 // DocsIngesterAdapter adapts docsingest.Ingester to the DocIngester interface.

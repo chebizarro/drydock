@@ -18,8 +18,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"drydock/internal/embedding"
-	"drydock/internal/vectorstore"
+	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
 // Chunk represents a single section extracted from a project documentation file.

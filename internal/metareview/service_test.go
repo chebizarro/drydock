@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/db"
-	"drydock/internal/metrics"
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 type fakeClient struct {

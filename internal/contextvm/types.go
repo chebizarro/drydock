@@ -3,7 +3,7 @@ package contextvm
 import (
 	"encoding/json"
 
-	"drydock/internal/eventkind"
+	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 
 	"fiatjaf.com/nostr"
 	shared "git.sharegap.net/cascadia/cascadia-go/contextvm"

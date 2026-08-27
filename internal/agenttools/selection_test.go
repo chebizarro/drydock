@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/contextbuilder"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
 type byteCounter struct{}

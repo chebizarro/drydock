@@ -3,7 +3,7 @@ package betterleaks
 import (
 	"context"
 
-	"drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
 )
 
 const (

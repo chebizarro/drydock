@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/agenttools"
-	"drydock/internal/workspacesnapshot"
+	"git.sharegap.net/cascadia/drydock/internal/agenttools"
+	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/nostrscan/knowledge"
-	"drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan/knowledge"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
 )
 
 func TestPresenceRulesVulnerableAndFixedFixtures(t *testing.T) {

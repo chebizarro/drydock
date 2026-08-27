@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 type byteCounter struct{}

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"regexp"
 
-	"drydock/internal/nostrscan/knowledge"
-	"drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan/knowledge"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
 )
 
 var nostrLanguages = []string{".go", ".js", ".jsx", ".ts", ".tsx", ".swift", ".rs", ".py", ".kt", ".java", ".dart"}

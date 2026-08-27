@@ -1,7 +1,7 @@
 package securityscan
 
 import (
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 // DeduplicateFindings merges scanner findings with LLM findings. Non-sensitive

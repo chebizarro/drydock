@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/circuitbreaker"
+	"git.sharegap.net/cascadia/drydock/internal/circuitbreaker"
 )
 
 type fakeLLM struct {

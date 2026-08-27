@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"drydock/internal/securityscan/surface"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan/surface"
 )
 
 const LayerSecuritySurface = "security-surface"

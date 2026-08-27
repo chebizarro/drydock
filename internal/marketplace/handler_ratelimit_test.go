@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/ratelimit"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/ratelimit"
 
 	"fiatjaf.com/nostr"
 )

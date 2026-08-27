@@ -20,9 +20,9 @@ import (
 	"sync"
 	"time"
 
-	"drydock/internal/embedding"
-	"drydock/internal/symbols"
-	"drydock/internal/vectorstore"
+	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/symbols"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
 const (

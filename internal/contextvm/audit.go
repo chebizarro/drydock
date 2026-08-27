@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/auditengine"
-	"drydock/internal/metrics"
-	"drydock/internal/repoconfig"
-	"drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/auditengine"
+	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/repoconfig"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 )

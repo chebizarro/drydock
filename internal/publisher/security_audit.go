@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/nostrprobe"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/nostrprobe"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip59"

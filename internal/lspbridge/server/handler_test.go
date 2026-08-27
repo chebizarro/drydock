@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/lspbridge"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 )
 
 type fakeManager struct {

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/db"
 
 	"fiatjaf.com/nostr"
 )

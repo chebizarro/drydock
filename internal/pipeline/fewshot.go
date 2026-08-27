@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"drydock/internal/db"
-	"drydock/internal/embedding"
-	"drydock/internal/symbols"
-	"drydock/internal/vectorstore"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/symbols"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
 // FewShotQuery describes the context for a few-shot retrieval request.

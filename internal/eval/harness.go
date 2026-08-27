@@ -8,8 +8,8 @@ import (
 	"math"
 	"strings"
 
-	"drydock/internal/db"
-	"drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 const DefaultLineTolerance = 2

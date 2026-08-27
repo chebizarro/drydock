@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/db"
 )
 
 func testStore(t *testing.T) *db.Store {

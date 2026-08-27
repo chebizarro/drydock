@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"drydock/internal/securityscan/surface"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan/surface"
 )
 
 // SecurityFinding represents a single security issue found by the scanner.
