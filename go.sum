@@ -1,5 +1,5 @@
-fiatjaf.com/nostr v0.0.0-20260731140316-a8080728893f h1:v5ybW845FCm5CK3m/wfTFqvOW7umZELBX/Stkn/+1q8=
-fiatjaf.com/nostr v0.0.0-20260731140316-a8080728893f/go.mod h1:b1EIUDnd133Ie8Pg8O/biaKdFyCMz28aD4n64g1GqvM=
+fiatjaf.com/nostr v0.0.0-20260902034142-316ef6591fa2 h1:w8nKifd91TaKbcjgQVqZrgGCSqZRBM56SOwdk+649Fo=
+fiatjaf.com/nostr v0.0.0-20260902034142-316ef6591fa2/go.mod h1:b1EIUDnd133Ie8Pg8O/biaKdFyCMz28aD4n64g1GqvM=
 git.sharegap.net/cascadia/cascadia-go v1.0.2 h1:fhmiBi37BeorboQlpGlw0goUMIcaWoIpj51bO1h4sXA=
 git.sharegap.net/cascadia/cascadia-go v1.0.2/go.mod h1:4gZR4rS9vec7ufmq7Bb9U7T175COytwDirgJu3+NqCM=
 git.sharegap.net/cascadia/nostr-secprobe v0.2.0 h1:dVn33nCa9rc72uoa+ZJkyviWd/Vbj9pKiSC1ued3VYw=

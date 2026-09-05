@@ -5,7 +5,7 @@ go 1.26
 toolchain go1.26.0
 
 require (
-	fiatjaf.com/nostr v0.0.0-20260731140316-a8080728893f
+	fiatjaf.com/nostr v0.0.0-20260902034142-316ef6591fa2
 	git.sharegap.net/cascadia/cascadia-go v1.0.2
 	git.sharegap.net/cascadia/nostr-secprobe v0.2.0
 	github.com/bluekeyes/go-gitdiff v0.7.1
