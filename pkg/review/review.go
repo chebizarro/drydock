@@ -87,11 +87,13 @@ type Request struct {
 // Usage is cumulative token accounting reported by a provider.
 type Usage struct {
 	// InputTokens is the provider-reported prompt token count.
-	InputTokens int
+	InputTokens int `json:"input_tokens,omitempty"`
 	// OutputTokens is the provider-reported generated token count.
-	OutputTokens int
+	OutputTokens int `json:"output_tokens,omitempty"`
 	// TotalTokens is the provider-reported total token count.
-	TotalTokens int
+	TotalTokens int `json:"total_tokens,omitempty"`
+	// CostUSD is the provider-reported cost in USD when available.
+	CostUSD float64 `json:"cost_usd,omitempty"`
 }
 
 // OperationStatus reports progress for a tool call or provider operation.
@@ -152,15 +154,15 @@ type Result struct {
 // Error is a stable provider-neutral failure description.
 type Error struct {
 	// Code is a stable provider-neutral error code.
-	Code string
+	Code string `json:"code,omitempty"`
 	// Message is a human-readable failure description.
-	Message string
+	Message string `json:"message,omitempty"`
 	// Provider identifies the selected provider.
-	Provider string
+	Provider string `json:"provider,omitempty"`
 	// StatusCode is an HTTP status when applicable.
-	StatusCode int
+	StatusCode int `json:"status_code,omitempty"`
 	// Retryable indicates whether a later attempt may succeed.
-	Retryable bool
+	Retryable bool `json:"retryable,omitempty"`
 }
 
 // Event is one incremental or terminal stream item. Result is populated only
@@ -494,9 +496,9 @@ func mapError(provider string, err error) *Error {
 }
 
 func toInternalUsage(usage Usage) reviewengine.CompletionUsage {
-	return reviewengine.CompletionUsage{PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens}
+	return reviewengine.CompletionUsage{PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens, CostUSD: usage.CostUSD}
 }
 
 func fromInternalUsage(usage reviewengine.CompletionUsage) Usage {
-	return Usage{InputTokens: usage.PromptTokens, OutputTokens: usage.CompletionTokens, TotalTokens: usage.TotalTokens}
+	return Usage{InputTokens: usage.PromptTokens, OutputTokens: usage.CompletionTokens, TotalTokens: usage.TotalTokens, CostUSD: usage.CostUSD}
 }
