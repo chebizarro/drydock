@@ -63,32 +63,6 @@ func TestLimiter_RefundRestoresAllowance(t *testing.T) {
 	}
 }
 
-func TestLimiter_Check_DoesNotConsume(t *testing.T) {
-	ctx := context.Background()
-	store := NewMemoryStore()
-	limiter := New(Config{
-		Window:      time.Minute,
-		MaxRequests: 2,
-		KeyPrefix:   "test:",
-	}, store)
-
-	key := "user456"
-
-	// Check multiple times - should not consume quota
-	for i := 0; i < 5; i++ {
-		result, err := limiter.Check(ctx, key)
-		if err != nil {
-			t.Fatalf("Check failed: %v", err)
-		}
-		if !result.Allowed {
-			t.Errorf("check %d should be allowed (check doesn't consume)", i+1)
-		}
-		if result.Remaining != 2 {
-			t.Errorf("check %d: remaining = %d, want 2", i+1, result.Remaining)
-		}
-	}
-}
-
 func TestLimiter_DifferentKeys(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore()
@@ -142,10 +116,13 @@ func TestLimiter_Cleanup(t *testing.T) {
 		t.Errorf("removed = %d, want 3", removed)
 	}
 
-	// User1 should have full quota again
-	result, _ := limiter.Check(ctx, "user1")
-	if result.Remaining != 10 {
-		t.Errorf("remaining = %d, want 10 after cleanup", result.Remaining)
+	// User1's window should be empty again.
+	count, err := store.GetRateLimitCount(ctx, "test:user1", time.Now().Add(-time.Minute).Unix())
+	if err != nil {
+		t.Fatalf("GetRateLimitCount failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("count = %d, want 0 after cleanup", count)
 	}
 }
 
@@ -172,31 +149,6 @@ func TestMemoryStore_GetRateLimitCount(t *testing.T) {
 	}
 }
 
-func TestDefaultConfigs(t *testing.T) {
-	tests := []struct {
-		name   string
-		config Config
-	}{
-		{"CodeChat", DefaultCodeChatConfig()},
-		{"Marketplace", DefaultMarketplaceConfig()},
-		{"Feedback", DefaultFeedbackConfig()},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.config.Window == 0 {
-				t.Error("Window should not be zero")
-			}
-			if tc.config.MaxRequests == 0 {
-				t.Error("MaxRequests should not be zero")
-			}
-			if tc.config.KeyPrefix == "" {
-				t.Error("KeyPrefix should not be empty")
-			}
-		})
-	}
-}
-
 func TestResult_ResetAt(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore()
@@ -213,30 +165,6 @@ func TestResult_ResetAt(t *testing.T) {
 	diff := result.ResetAt.Sub(expectedReset)
 	if diff < -time.Second || diff > time.Second {
 		t.Errorf("ResetAt = %v, expected around %v", result.ResetAt, expectedReset)
-	}
-}
-
-func TestLimiter_EvictExpiredCache(t *testing.T) {
-	limiter := New(Config{
-		Window:      time.Minute,
-		MaxRequests: 10,
-		KeyPrefix:   "test:",
-	}, NewMemoryStore())
-
-	limiter.mu.Lock()
-	limiter.cache["expired"] = &cacheEntry{count: 1, expiresAt: time.Now().Add(-time.Second)}
-	limiter.cache["active"] = &cacheEntry{count: 1, expiresAt: time.Now().Add(time.Minute)}
-	limiter.mu.Unlock()
-
-	limiter.evictExpiredCache()
-
-	limiter.mu.RLock()
-	defer limiter.mu.RUnlock()
-	if _, ok := limiter.cache["expired"]; ok {
-		t.Fatal("expected expired cache entry to be evicted")
-	}
-	if _, ok := limiter.cache["active"]; !ok {
-		t.Fatal("expected active cache entry to remain")
 	}
 }
 

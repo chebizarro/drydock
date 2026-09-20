@@ -23,26 +23,20 @@ type Signer interface {
 	SignEvent(ctx context.Context, evt *nostr.Event) error
 }
 
-// RelayPublisher publishes events to Nostr relays.
-type RelayPublisher interface {
-	Publish(ctx context.Context, relays []string, event nostr.Event) error
-}
-
-// ContextVMTransport publishes ContextVM intents to Nostr relays.
+// PayoutExecutor settles and reconciles marketplace reviewer payouts.
 type PayoutExecutor interface {
 	SubmitPayout(ctx context.Context, destination string, amountSats int64, idempotencyKey string) (payment.PayoutEvidence, error)
 	ReconcilePayout(ctx context.Context, destination string, amountSats int64) (payment.PayoutEvidence, error)
 }
 
+// ContextVMTransport publishes ContextVM intents to Nostr relays.
 type ContextVMTransport interface {
 	SendWithID(ctx context.Context, id, method string, params any, recipients ...nostr.PubKey) (string, error)
 }
 
 // RouterConfig holds router configuration.
 type RouterConfig struct {
-	DefaultRelays        []string
 	MaxReviewersPerPatch int           // Max reviewers to assign per patch
-	AssignmentTimeout    time.Duration // How long to wait for acceptance
 	DefaultDeadline      time.Duration // Default review deadline
 	MinReputation        float64       // Minimum reputation to be assigned
 }
@@ -53,7 +47,6 @@ type Router struct {
 	registry           *Registry
 	store              *db.Store
 	signer             Signer
-	publisher          RelayPublisher
 	contextVMTransport ContextVMTransport
 	payoutExecutor     PayoutExecutor
 	logger             *slog.Logger
@@ -65,29 +58,12 @@ func NewRouter(
 	registry *Registry,
 	store *db.Store,
 	signer Signer,
-	publisher RelayPublisher,
-	args ...any,
+	contextVMTransport ContextVMTransport,
+	payoutExecutor PayoutExecutor,
+	logger *slog.Logger,
 ) *Router {
-	var contextVMTransport ContextVMTransport
-	var payoutExecutor PayoutExecutor
-	var logger *slog.Logger
-	for _, arg := range args {
-		switch v := arg.(type) {
-		case ContextVMTransport:
-			contextVMTransport = v
-		case PayoutExecutor:
-			payoutExecutor = v
-		case *slog.Logger:
-			logger = v
-		case nil:
-			// ignore
-		}
-	}
 	if cfg.MaxReviewersPerPatch <= 0 {
 		cfg.MaxReviewersPerPatch = 2
-	}
-	if cfg.AssignmentTimeout == 0 {
-		cfg.AssignmentTimeout = DefaultResponseTimeout
 	}
 	if cfg.DefaultDeadline == 0 {
 		cfg.DefaultDeadline = DefaultAssignmentDeadline
@@ -101,7 +77,6 @@ func NewRouter(
 		registry:           registry,
 		store:              store,
 		signer:             signer,
-		publisher:          publisher,
 		contextVMTransport: contextVMTransport,
 		payoutExecutor:     payoutExecutor,
 		logger:             logger,

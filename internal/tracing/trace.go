@@ -189,7 +189,6 @@ func (s *Span) EndWithError(err error) time.Duration {
 // PipelineStages are the standard pipeline stages for timing.
 const (
 	StageRepoPrepare      = "repo_prepare"
-	StageDocIngest        = "doc_ingest"
 	StageCodeIndex        = "code_index"
 	StageFewShotRetrieval = "fewshot_retrieval"
 	StageContextBuild     = "context_build"

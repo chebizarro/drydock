@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"git.sharegap.net/cascadia/drydock/internal/llmutil"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
@@ -199,7 +200,7 @@ func (e *Engine) runVerifier(ctx context.Context, finding reviewengine.Finding, 
 	}
 
 	var response verifierResponse
-	if err := json.Unmarshal([]byte(result.Content), &response); err != nil {
+	if err := json.Unmarshal([]byte(llmutil.ExtractJSON(result.Content)), &response); err != nil {
 		return verdictIndeterminate
 	}
 	if response.Refuted {
@@ -270,7 +271,7 @@ func (c *llmClassifier) Classify(ctx context.Context, finding reviewengine.Findi
 	}
 
 	var response classificationResponse
-	if err := json.Unmarshal([]byte(result.Content), &response); err != nil {
+	if err := json.Unmarshal([]byte(llmutil.ExtractJSON(result.Content)), &response); err != nil {
 		return reviewengine.Finding{}, fmt.Errorf("parse classification: %w", err)
 	}
 	response.CWE = strings.ToUpper(strings.TrimSpace(response.CWE))

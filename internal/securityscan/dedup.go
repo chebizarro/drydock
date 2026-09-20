@@ -120,10 +120,3 @@ func mergeSensitiveFinding(llmFinding *reviewengine.Finding, scannerFinding Secu
 	llmFinding.SuggestedCode = ""
 	llmFinding.Sensitive = true
 }
-
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
-}

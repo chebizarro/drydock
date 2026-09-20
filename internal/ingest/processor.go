@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/contextvm"
@@ -256,7 +255,7 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 				"pubkey", p.localAutofixPubKey)
 			return nil
 		}
-		repository, err := repositoryRefFromPatch(event)
+		repository, err := scope.RepositoryRefFromTags(event.Tags)
 		if err != nil {
 			p.logger.Warn("patch event missing unique canonical repository pointer", "event_id", event.ID.Hex(), "kind", int(event.Kind), "error", err)
 			return nil
@@ -474,26 +473,6 @@ func (p *Processor) handleContextVM(ctx context.Context, event nostr.Event, rela
 		return nil
 	}
 	return p.contextVMResponder.SendResponseToEvent(ctx, event.ID.Hex(), resp.ID, resp.Result, resp.Error, event.PubKey)
-}
-
-func repositoryRefFromPatch(event nostr.Event) (scope.RepositoryRef, error) {
-	var repository scope.RepositoryRef
-	count := 0
-	for _, tag := range event.Tags {
-		if len(tag) < 2 || tag[0] != "a" || !strings.HasPrefix(strings.TrimSpace(tag[1]), "30617:") {
-			continue
-		}
-		ref, err := scope.ParseRepositoryRef(tag[1])
-		if err != nil {
-			return scope.RepositoryRef{}, err
-		}
-		count++
-		repository = ref
-	}
-	if count != 1 {
-		return scope.RepositoryRef{}, errors.New("patch must contain exactly one canonical 30617 repository address")
-	}
-	return repository, nil
 }
 
 func eventTimestampPlausibleForKind(kind nostr.Kind, ts nostr.Timestamp, maxFutureSkew, maxPastAge time.Duration) bool {

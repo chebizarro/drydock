@@ -39,15 +39,6 @@ type Config struct {
 type Limiter struct {
 	cfg   Config
 	store Store
-
-	// In-memory cache for hot paths (optional optimization)
-	mu    sync.RWMutex
-	cache map[string]*cacheEntry
-}
-
-type cacheEntry struct {
-	count     int
-	expiresAt time.Time
 }
 
 // New creates a new rate limiter.
@@ -58,11 +49,7 @@ func New(cfg Config, store Store) *Limiter {
 	if cfg.MaxRequests == 0 {
 		cfg.MaxRequests = 100
 	}
-	return &Limiter{
-		cfg:   cfg,
-		store: store,
-		cache: make(map[string]*cacheEntry),
-	}
+	return &Limiter{cfg: cfg, store: store}
 }
 
 type refundableStore interface {
@@ -76,51 +63,9 @@ type Result struct {
 	ResetAt   time.Time
 }
 
-// Check checks if a request is allowed for the given key.
-// Returns whether the request is allowed and remaining quota.
-func (l *Limiter) Check(ctx context.Context, key string) (Result, error) {
-	l.evictExpiredCache()
-
-	fullKey := l.cfg.KeyPrefix + key
-	now := time.Now()
-	windowStart := now.Add(-l.cfg.Window).Unix()
-
-	// Check cache first (for hot paths)
-	if entry, ok := l.getCached(fullKey); ok && entry.expiresAt.After(now) {
-		remaining := l.cfg.MaxRequests - entry.count
-		if remaining <= 0 {
-			return Result{
-				Allowed:   false,
-				Remaining: 0,
-				ResetAt:   entry.expiresAt,
-			}, nil
-		}
-	}
-
-	// Query database for current count
-	count, err := l.store.GetRateLimitCount(ctx, fullKey, windowStart)
-	if err != nil {
-		return Result{}, fmt.Errorf("get rate limit count: %w", err)
-	}
-
-	remaining := l.cfg.MaxRequests - count
-	resetAt := now.Add(l.cfg.Window)
-
-	// Update cache
-	l.setCache(fullKey, count, resetAt)
-
-	return Result{
-		Allowed:   remaining > 0,
-		Remaining: max(0, remaining),
-		ResetAt:   resetAt,
-	}, nil
-}
-
 // Allow checks and increments the counter if allowed.
 // This is the typical use case - check and consume in one call.
 func (l *Limiter) Allow(ctx context.Context, key string) (Result, error) {
-	l.evictExpiredCache()
-
 	fullKey := l.cfg.KeyPrefix + key
 	now := time.Now()
 	windowStart := now.Add(-l.cfg.Window).Unix()
@@ -137,7 +82,6 @@ func (l *Limiter) Allow(ctx context.Context, key string) (Result, error) {
 	if incremented {
 		// Request was allowed and counter was incremented
 		remaining := l.cfg.MaxRequests - count - 1
-		l.setCache(fullKey, count+1, resetAt)
 		return Result{
 			Allowed:   true,
 			Remaining: max(0, remaining),
@@ -146,7 +90,6 @@ func (l *Limiter) Allow(ctx context.Context, key string) (Result, error) {
 	}
 
 	// Request was denied - limit exceeded
-	l.setCache(fullKey, count, resetAt)
 	return Result{
 		Allowed:   false,
 		Remaining: 0,
@@ -166,7 +109,6 @@ func (l *Limiter) Refund(ctx context.Context, key string) error {
 	if err := store.RefundRateLimit(ctx, fullKey); err != nil {
 		return fmt.Errorf("refund rate limit: %w", err)
 	}
-	l.decrementCache(fullKey)
 	return nil
 }
 
@@ -175,80 +117,6 @@ func (l *Limiter) Refund(ctx context.Context, key string) error {
 func (l *Limiter) Cleanup(ctx context.Context) (int64, error) {
 	olderThan := time.Now().Add(-l.cfg.Window * 2).Unix()
 	return l.store.CleanupOldRateLimits(ctx, olderThan)
-}
-
-func (l *Limiter) getCached(key string) (*cacheEntry, bool) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	entry, ok := l.cache[key]
-	return entry, ok
-}
-
-func (l *Limiter) setCache(key string, count int, expiresAt time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.cache[key] = &cacheEntry{count: count, expiresAt: expiresAt}
-}
-
-func (l *Limiter) incrementCache(key string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if entry, ok := l.cache[key]; ok {
-		entry.count++
-	}
-}
-
-func (l *Limiter) decrementCache(key string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if entry, ok := l.cache[key]; ok && entry.count > 0 {
-		entry.count--
-	}
-}
-
-func (l *Limiter) evictExpiredCache() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := time.Now()
-	for key, entry := range l.cache {
-		if entry.expiresAt.Before(now) {
-			delete(l.cache, key)
-		}
-	}
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// DefaultCodeChatConfig returns config for codebase chat rate limiting.
-func DefaultCodeChatConfig() Config {
-	return Config{
-		Window:      time.Hour,
-		MaxRequests: 20,
-		KeyPrefix:   "codechat:",
-	}
-}
-
-// DefaultMarketplaceConfig returns config for marketplace rate limiting.
-func DefaultMarketplaceConfig() Config {
-	return Config{
-		Window:      time.Hour,
-		MaxRequests: 50,
-		KeyPrefix:   "marketplace:",
-	}
-}
-
-// DefaultFeedbackConfig returns config for feedback submission rate limiting.
-func DefaultFeedbackConfig() Config {
-	return Config{
-		Window:      time.Hour * 24,
-		MaxRequests: 100,
-		KeyPrefix:   "feedback:",
-	}
 }
 
 // MemoryStore is an in-memory implementation for testing.

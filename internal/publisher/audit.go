@@ -9,13 +9,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"git.sharegap.net/cascadia/drydock/internal/eventkind"
+
 	"fiatjaf.com/nostr"
 )
 
-const (
-	KindCASAudit             nostr.Kind = 4903
-	KindClientAuthentication nostr.Kind = 22242
-)
+// KindCASAudit is re-exported from the event-kind registry so existing callers
+// and tests keep one name for it. New code should use eventkind.CASAudit.
+const KindCASAudit = eventkind.CASAudit
 
 // AuditInput describes one consequential action to record as a CAS audit event.
 type AuditInput struct {
@@ -93,7 +94,7 @@ func (p *AuditPublisher) Publish(ctx context.Context, in AuditInput) error {
 	}
 
 	evt := nostr.Event{
-		Kind:      KindCASAudit,
+		Kind:      eventkind.CASAudit,
 		CreatedAt: nostr.Timestamp(ts.Unix()),
 		Tags:      tags,
 		Content:   string(content),
@@ -159,7 +160,7 @@ func (s *AuditedSigner) SignEvent(ctx context.Context, evt *nostr.Event) error {
 	if err := s.base.SignEvent(ctx, evt); err != nil {
 		return err
 	}
-	if evt == nil || evt.Kind == KindCASAudit || evt.Kind == KindClientAuthentication {
+	if evt == nil || evt.Kind == eventkind.CASAudit || evt.Kind == nostr.KindClientAuthentication {
 		return nil
 	}
 	if err := s.audit.Publish(ctx, AuditInput{

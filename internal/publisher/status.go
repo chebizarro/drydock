@@ -48,7 +48,6 @@ type PublishStatusResult struct {
 	Reason    string
 }
 
-
 // PublishStatus evaluates the review outcome against the repo's status policy
 // and publishes a NIP-34 kind 1630 (StatusOpen) event when blocking findings
 // are present, confidence is sufficient, and the signer is authorized.
@@ -219,7 +218,7 @@ func parsePatchEvent(rawEvent string) (nostr.Event, error) {
 func buildStatusTags(scope commentScope, repoID string, patchEvent nostr.Event) nostr.Tags {
 	tags := nostr.Tags{
 		{"e", scope.RootID, "", "root"},
-		{"a", "30617:" + repoID},
+		{"a", repositoryAddress(repoID)},
 	}
 	// Tag the root author.
 	if scope.RootPubKey != "" {
@@ -263,8 +262,6 @@ func buildStatusContent(in PublishStatusInput, blockingCount int) string {
 	return b.String()
 }
 
-
-
 // buildCleanStatusContent creates content for a clean re-review that
 // supersedes a prior "changes requested" advisory status.
 func buildCleanStatusContent(in PublishStatusInput) string {
@@ -292,15 +289,15 @@ func buildCleanStatusContent(in PublishStatusInput) string {
 	return b.String()
 }
 
-// Ensure kind values match NIP-34 spec.
-func init() {
-	if nostr.KindStatusOpen != 1630 {
-		panic("unexpected KindStatusOpen value")
-	}
-	if nostr.KindStatusApplied != 1631 {
-		panic("unexpected KindStatusApplied value")
-	}
-	if nostr.KindStatusClosed != 1632 {
-		panic("unexpected KindStatusClosed value")
-	}
-}
+// Compile-time assertions that the library's NIP-34 status kinds still match
+// the spec values. These fail the build rather than panicking a running relay
+// service, which the previous init() could never actually do: it compared
+// typed constants the compiler folds away.
+const (
+	_ = uint(nostr.KindStatusOpen - 1630)
+	_ = uint(nostr.KindStatusApplied - 1631)
+	_ = uint(nostr.KindStatusClosed - 1632)
+	_ = uint(1630 - nostr.KindStatusOpen)
+	_ = uint(1631 - nostr.KindStatusApplied)
+	_ = uint(1632 - nostr.KindStatusClosed)
+)

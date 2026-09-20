@@ -163,34 +163,15 @@ func (h *Handler) HandleEvent(ctx context.Context, event nostr.Event, relayURL s
 		h.logger.Warn("rejecting IDE event with invalid signature", "event_id", event.ID.Hex(), "kind", int(event.Kind))
 		return nil
 	}
+	// ingest.Processor routes kind-25910 to the shared contextvm.Router (on
+	// which cmd/drydock registers this handler's methods) and hands the IDE
+	// gateway only kind-30078 session events.
 	switch int(event.Kind) {
 	case KindIDESession:
 		return h.handleSession(ctx, event, relayURL)
-	case KindContextVM:
-		return h.handleContextVMEvent(ctx, event, relayURL)
 	default:
 		return nil
 	}
-}
-
-// HandledKinds returns the Nostr kinds accepted by the IDE gateway.
-func HandledKinds() []nostr.Kind {
-	return []nostr.Kind{nostr.Kind(KindIDESession), nostr.Kind(KindContextVM)}
-}
-
-// IsHandled checks if a Nostr kind is accepted by the IDE gateway.
-func IsHandled(kind nostr.Kind) bool {
-	for _, handled := range HandledKinds() {
-		if kind == handled {
-			return true
-		}
-	}
-	return false
-}
-
-// IsIDEEvent checks if an event is an IDE integration event.
-func IsIDEEvent(kind nostr.Kind) bool {
-	return IsHandled(kind)
 }
 
 // handleSession registers or updates an IDE workspace session.
@@ -264,69 +245,12 @@ func (h *Handler) handleSession(ctx context.Context, event nostr.Event, relayURL
 	return nil
 }
 
-// RegisterContextVMHandlers registers IDE gateway ContextVM methods.
-func (h *Handler) RegisterContextVMHandlers(router *contextvm.Router) error {
+// RegisterContextVMMethods registers IDE gateway ContextVM methods.
+func (h *Handler) RegisterContextVMMethods(router *contextvm.Router) error {
 	if err := router.Register(MethodReviewRequest, h.HandleReviewRequest); err != nil {
 		return err
 	}
 	return router.Register(MethodApplyFix, h.HandleApplyFixRequest)
-}
-
-// handleContextVMEvent routes IDE ContextVM requests and publishes JSON-RPC responses.
-func (h *Handler) handleContextVMEvent(ctx context.Context, event nostr.Event, relayURL string) error {
-	var msg contextvm.Message
-	if err := json.Unmarshal([]byte(event.Content), &msg); err != nil {
-		h.logger.Warn("invalid ContextVM message", "event_id", event.ID.Hex(), "error", err)
-		return h.publishContextVMResponse(ctx, event, contextvm.Message{
-			JSONRPC: "2.0",
-			ID:      event.ID.Hex(),
-			Error:   &contextvm.Error{Code: contextvm.ErrorParseError, Message: "parse error"},
-		}, relayURL, "", "")
-	}
-
-	// Ignore responses and methods owned by other ContextVM handlers.
-	if msg.Method == "" || (msg.Method != MethodReviewRequest && msg.Method != MethodApplyFix) {
-		return nil
-	}
-
-	router := contextvm.NewRouter()
-	if err := h.RegisterContextVMHandlers(router); err != nil {
-		return err
-	}
-	resp, err := router.Handle(ctx, contextvm.Request{
-		Event:  event,
-		Relay:  relayURL,
-		Sender: event.PubKey,
-		Msg:    msg,
-	})
-	if err != nil {
-		h.logger.Warn("ContextVM handler failed", "event_id", event.ID.Hex(), "method", msg.Method, "error", err)
-	}
-	if resp.ID == "" {
-		return err
-	}
-
-	sessionID := ""
-	fixID := ""
-	switch msg.Method {
-	case MethodReviewRequest:
-		if req, rpcErr := contextvm.ParamsAs[ReviewRequest](contextvm.Request{Msg: msg}); rpcErr == nil {
-			sessionID = req.SessionID
-		}
-	case MethodApplyFix:
-		if req, rpcErr := contextvm.ParamsAs[FixRequest](contextvm.Request{Msg: msg}); rpcErr == nil {
-			sessionID = req.SessionID
-			fixID = req.FixID
-		}
-	}
-
-	if pubErr := h.publishContextVMResponse(ctx, event, resp, relayURL, sessionID, fixID); pubErr != nil {
-		return pubErr
-	}
-	if msg.Method == MethodApplyFix {
-		metrics.IDEFixResponsesSent.Inc()
-	}
-	return err
 }
 
 // HandleReviewRequest processes a ContextVM IDE review request.
@@ -625,94 +549,6 @@ func (h *Handler) resolveFixRequest(ctx context.Context, event nostr.Event, req 
 	}
 
 	return response, nil
-}
-
-// publishReviewResponse publishes a ContextVM JSON-RPC review response event.
-func (h *Handler) publishReviewResponse(ctx context.Context, reqEvent nostr.Event, resp ReviewResponse, relayURL string) error {
-	rpcResp := JSONRPCResponse{
-		JSONRPC: "2.0",
-		ID:      resp.RequestID,
-		Result:  resp,
-	}
-
-	content, err := json.Marshal(rpcResp)
-	if err != nil {
-		return fmt.Errorf("marshal response: %w", err)
-	}
-
-	responseEvent := nostr.Event{
-		Kind:      nostr.Kind(KindContextVM),
-		CreatedAt: nostr.Now(),
-		Content:   string(content),
-		Tags: nostr.Tags{
-			{"e", reqEvent.ID.Hex()},     // Reference the request event
-			{"p", reqEvent.PubKey.Hex()}, // Tag the requester
-			{"session", resp.SessionID},  // Session reference
-			{"request", resp.RequestID},  // Request correlation
-		},
-	}
-
-	if err := h.signer.SignEvent(ctx, &responseEvent); err != nil {
-		return fmt.Errorf("sign response: %w", err)
-	}
-
-	relays := h.resolveRelays(relayURL)
-	if err := h.publish.Publish(ctx, relays, responseEvent); err != nil {
-		return fmt.Errorf("publish response: %w", err)
-	}
-
-	return nil
-}
-
-// publishErrorResponse publishes an error response.
-func (h *Handler) publishErrorResponse(ctx context.Context, reqEvent nostr.Event, req ReviewRequest, relayURL, errMsg string) error {
-	resp := ReviewResponse{
-		RequestID:   req.RequestID,
-		SessionID:   req.SessionID,
-		Diagnostics: nil,
-		Summary:     errMsg,
-	}
-	return h.publishReviewResponse(ctx, reqEvent, resp, relayURL)
-}
-
-// publishContextVMResponse publishes a ContextVM JSON-RPC response event.
-func (h *Handler) publishContextVMResponse(ctx context.Context, reqEvent nostr.Event, resp contextvm.Message, relayURL, sessionID, fixID string) error {
-	content, err := json.Marshal(resp)
-	if err != nil {
-		return fmt.Errorf("marshal response: %w", err)
-	}
-
-	tags := nostr.Tags{
-		{"e", reqEvent.ID.Hex()},
-		{"p", reqEvent.PubKey.Hex()},
-	}
-	if sessionID != "" {
-		tags = append(tags, nostr.Tag{"session", sessionID})
-	}
-	if resp.ID != "" {
-		tags = append(tags, nostr.Tag{"request", resp.ID})
-	}
-	if fixID != "" {
-		tags = append(tags, nostr.Tag{"fix", fixID})
-	}
-
-	responseEvent := nostr.Event{
-		Kind:      nostr.Kind(KindContextVM),
-		CreatedAt: nostr.Now(),
-		Content:   string(content),
-		Tags:      tags,
-	}
-
-	if err := h.signer.SignEvent(ctx, &responseEvent); err != nil {
-		return fmt.Errorf("sign response: %w", err)
-	}
-
-	relays := h.resolveRelays(relayURL)
-	if err := h.publish.Publish(ctx, relays, responseEvent); err != nil {
-		return fmt.Errorf("publish response: %w", err)
-	}
-
-	return nil
 }
 
 func (h *Handler) resolveRelays(relayURL string) []string {

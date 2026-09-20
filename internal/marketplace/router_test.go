@@ -98,16 +98,6 @@ func (m *mockSigner) SignEvent(ctx context.Context, evt *nostr.Event) error {
 	return nil
 }
 
-// mockPublisher records published events.
-type mockPublisher struct {
-	published []nostr.Event
-}
-
-func (m *mockPublisher) Publish(ctx context.Context, relays []string, event nostr.Event) error {
-	m.published = append(m.published, event)
-	return nil
-}
-
 type mockContextVMTransport struct {
 	calls []contextVMCall
 }
@@ -131,20 +121,18 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 
 	registry := NewRegistry(store, logger)
 	signer := &mockSigner{pubkey: nostr.PubKey{}}
-	publisher := &mockPublisher{}
 	contextVMTransport := &mockContextVMTransport{}
 
 	router := NewRouter(
 		RouterConfig{
-			DefaultRelays:        []string{"wss://test.relay"},
 			MaxReviewersPerPatch: 2,
 			DefaultDeadline:      24 * time.Hour,
 		},
 		registry,
 		store,
 		signer,
-		publisher,
 		contextVMTransport,
+		nil,
 		logger,
 	)
 
@@ -224,20 +212,18 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 
 	registry := NewRegistry(store, logger)
 	signer := &mockSigner{pubkey: nostr.PubKey{}}
-	publisher := &mockPublisher{}
 	contextVMTransport := &mockContextVMTransport{}
 
 	router := NewRouter(
 		RouterConfig{
-			DefaultRelays:        []string{"wss://test.relay"},
 			MaxReviewersPerPatch: 2,
 			DefaultDeadline:      24 * time.Hour,
 		},
 		registry,
 		store,
 		signer,
-		publisher,
 		contextVMTransport,
+		nil,
 		logger,
 	)
 

@@ -14,6 +14,7 @@ import (
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/nostrprobe"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip59"
@@ -340,8 +341,8 @@ func (s *Service) validateSecurityAuditInput(in PublishSecurityAuditInput) (stri
 	if in.Coverage.ScanOperationsScanned < 0 || in.Coverage.ScanOperationsSkipped < 0 || in.Coverage.ScanOperationsErrored < 0 || in.Coverage.UnitsDropped < 0 {
 		return "", "", time.Time{}, nil, errors.New("security audit coverage cannot be negative")
 	}
-	if in.Announcement.Kind != 30617 {
-		return "", "", time.Time{}, nil, fmt.Errorf("repository announcement kind = %d, want 30617", in.Announcement.Kind)
+	if in.Announcement.Kind != scope.RepositoryAnnouncementKind {
+		return "", "", time.Time{}, nil, fmt.Errorf("repository announcement kind = %d, want %d", in.Announcement.Kind, scope.RepositoryAnnouncementKind)
 	}
 	repoTag := in.Announcement.Tags.Find("d")
 	if repoTag == nil || len(repoTag) < 2 || strings.TrimSpace(repoTag[1]) == "" {
@@ -360,7 +361,7 @@ func (s *Service) validateSecurityAuditInput(in PublishSecurityAuditInput) (stri
 		return "", "", time.Time{}, nil, errors.New("security audit commit is required")
 	}
 	repoID := strings.TrimSpace(repoTag[1])
-	repoAddress := "30617:" + in.Announcement.PubKey.Hex() + ":" + repoID
+	repoAddress := repositoryAddress(in.Announcement.PubKey.Hex() + ":" + repoID)
 	generatedAt := in.GeneratedAt
 	if generatedAt.IsZero() {
 		generatedAt = time.Now()
@@ -439,10 +440,10 @@ func buildSecurityAuditFallbackTags(announcement nostr.Event, repoAddress string
 	owner := announcement.PubKey.Hex()
 	return nostr.Tags{
 		{"E", announcement.ID.Hex(), "", owner},
-		{"K", "30617"},
+		{"K", repositoryAnnouncementKindString},
 		{"P", owner},
 		{"e", announcement.ID.Hex(), "", owner},
-		{"k", "30617"},
+		{"k", repositoryAnnouncementKindString},
 		{"p", owner},
 		{"A", repoAddress},
 	}

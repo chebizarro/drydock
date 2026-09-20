@@ -25,4 +25,5 @@ const (
 	ContextVM              nostr.Kind = 25910
 	ReviewerProfile                   = nostr.KindHandlerInformation
 	ZapReceipt             nostr.Kind = 9735
+	CASAudit               nostr.Kind = 4903
 )

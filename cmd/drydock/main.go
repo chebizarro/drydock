@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -138,6 +139,29 @@ func main() {
 		MaxRequests: cfg.FeedbackLimit,
 		KeyPrefix:   "marketplace-feedback:",
 	}, rateLimitStore)
+
+	// Every Allow() inserts a rate_limits row; Limiter.Cleanup is what deletes
+	// the expired ones. Without this ticker the table grows for the lifetime of
+	// the deployment and every rate-limited request scans more of it.
+	go func() {
+		limiters := []*ratelimit.Limiter{codeChatRateLimiter, reviewOrderRateLimiter, feedbackRateLimiter}
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				for _, limiter := range limiters {
+					if removed, err := limiter.Cleanup(ctx); err != nil {
+						logger.Warn("rate limit cleanup error", "error", err)
+					} else if removed > 0 {
+						logger.Debug("rate limit rows pruned", "count", removed)
+					}
+				}
+			}
+		}
+	}()
 
 	// Reset any entries stuck in active states from a prior crash.
 	if n, err := store.ResetStuckReviews(ctx); err != nil {
@@ -429,7 +453,10 @@ func main() {
 	// LSP bridge
 	var lspClient *lspbridge.Client
 	if cfg.LSPBridgeURL != "" {
-		lspClient = lspbridge.NewClient(cfg.LSPBridgeURL)
+		// The bridge's /healthz is not auth-gated but /analyze is, so a
+		// token-less client pings healthy and then 401s on every request,
+		// silently degrading the LSP layer to git grep.
+		lspClient = lspbridge.NewClientWithToken(cfg.LSPBridgeURL, cfg.LSPBridgeToken)
 		if err := lspClient.Ping(ctx); err != nil {
 			logger.Warn("LSP bridge not reachable, falling back to git grep", "url", cfg.LSPBridgeURL, "error", err)
 			lspClient = nil
@@ -734,27 +761,27 @@ func main() {
 			idegateway.WithAgenticReviewService(agenticReviewSvc),
 		)
 		processorOpts = append(processorOpts, ingest.WithIDEGateway(ideHandler))
-		if err := contextvm.RegisterIDEMethods(contextVMRouter, ideHandler); err != nil {
-			logger.Error("failed to register IDE ContextVM handlers", "error", err)
-			os.Exit(1)
-		}
 		reviewOrderHandler := revieworder.NewHandler(reviewOrders, servicePubkey, logger)
-		if err := contextvm.RegisterReviewOrderMethods(contextVMRouter, reviewOrderHandler); err != nil {
-			logger.Error("failed to register review order ContextVM handler", "error", err)
-			os.Exit(1)
+		contextVMProviders := []contextvm.MethodProvider{ideHandler, reviewOrderHandler}
+		// securityAuditHandler is only constructed when the audit engine is
+		// enabled. Append it by concrete type: handing a typed-nil pointer to a
+		// MethodProvider parameter yields a non-nil interface, which would
+		// register handlers that panic on the first request.
+		if securityAuditHandler != nil {
+			contextVMProviders = append(contextVMProviders, securityAuditHandler)
 		}
-		if err := contextvm.RegisterSecurityAuditMethods(contextVMRouter, securityAuditHandler); err != nil {
-			logger.Error("failed to register security audit ContextVM handler", "error", err)
+		if err := contextvm.RegisterMethods(contextVMRouter, contextVMProviders...); err != nil {
+			logger.Error("failed to register ContextVM methods", "error", err)
 			os.Exit(1)
 		}
 		processorOpts = append(processorOpts, ingest.WithContextVM(contextVMRouter, contextVMTransport))
 		logger.Info("IDE gateway handler registered")
 
 		marketRegistry := marketplace.NewRegistry(store, logger)
-		marketRouter := marketplace.NewRouter(marketplace.RouterConfig{DefaultRelays: writeRelays}, marketRegistry, store, signer, relayPub, contextVMTransport, paymentSvc, logger)
+		marketRouter := marketplace.NewRouter(marketplace.RouterConfig{}, marketRegistry, store, signer, contextVMTransport, paymentSvc, logger)
 		marketHandler := marketplace.NewHandler(marketRegistry, marketRouter, store, logger).
 			WithFeedbackLimiter(feedbackRateLimiter)
-		if err := contextvm.RegisterMarketplaceMethods(contextVMRouter, marketHandler); err != nil {
+		if err := contextvm.RegisterMethods(contextVMRouter, marketHandler); err != nil {
 			logger.Error("failed to register marketplace contextvm methods", "error", err)
 			os.Exit(1)
 		}
@@ -1246,10 +1273,12 @@ func runDriftGuard(cfg config.Config, logger *slog.Logger) {
 	case "export":
 		n := 20
 		if len(args) > 1 {
-			if _, err := fmt.Sscanf(args[1], "%d", &n); err != nil {
+			parsed, err := strconv.Atoi(args[1])
+			if err != nil {
 				logger.Error("invalid sample size", "arg", args[1])
 				os.Exit(1)
 			}
+			n = parsed
 		}
 		count, err := svc.ExportSample(ctx, os.Stdout, n)
 		if err != nil {
@@ -1263,8 +1292,8 @@ func runDriftGuard(cfg config.Config, logger *slog.Logger) {
 			logger.Error("usage: drydock flag <meta-review-id> [notes]")
 			os.Exit(1)
 		}
-		var id int64
-		if _, err := fmt.Sscanf(args[1], "%d", &id); err != nil {
+		id, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
 			logger.Error("invalid meta-review ID", "arg", args[1])
 			os.Exit(1)
 		}

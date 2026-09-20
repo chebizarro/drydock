@@ -286,8 +286,6 @@ async function reviewChanges() {
             `Drydock: Review request published to ${activeRelayUrls.length} relay(s)`
         );
 
-        console.log('Review request:', JSON.stringify(request, null, 2));
-
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         vscode.window.showErrorMessage(`Drydock: Failed to submit review request: ${message}`);

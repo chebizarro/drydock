@@ -54,18 +54,69 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
+Use the Makefile targets — they carry flags the bare `go` commands do not.
 
 ```bash
-# Example:
-# npm install
-# npm test
+make ci          # vet + build + test (the gate CI runs)
+make build       # CGO_ENABLED=1 go build ./...
+make test        # CGO_ENABLED=1 go test -count=1 ./...
+make test-nocgo  # CGO_ENABLED=0 path for internal/symbols
 ```
+
+**`CGO_ENABLED=1` is required.** Tree-sitter symbol extraction is cgo-backed;
+building without it silently falls back to the regex path that `cmd/drydock`
+warns about at startup, so a plain `go test ./...` can pass while exercising
+different code.
+
+Running the race detector needs an extra flag because of a known upstream bug
+(`fiatjaf.com/nostr` `writeJSONString` uses uintptr arithmetic that trips
+`checkptr`; tracked as DRYDOCK-2h1):
+
+```bash
+go test -race -gcflags=all=-d=checkptr=0 ./...   # race detection stays enabled
+```
+
+Docker: `make up` / `make down` / `make logs`. The LSP bridge is a separate,
+much larger image behind a compose profile: `docker compose --profile lsp up`.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+A single Go binary (`cmd/drydock`) that reviews code over Nostr. The flow is:
+
+`internal/listener` subscribes to relays → `internal/ingest` routes events by
+kind → `internal/pipeline` runs the review → `internal/publisher` signs and
+publishes results back to relays. `internal/db` (SQLite via modernc) is the
+only persistence layer. `cmd/drydock/main.go` is the single composition root —
+every interface in the codebase gets its one production implementation wired
+there.
+
+Review work itself splits into `internal/reviewengine` (prompt assembly, LLM
+client, structured-output parsing, ensembles), `internal/agenticreview` (the
+tool-calling reviewer loop), and `internal/contextbuilder` (assembles the code
+context bundle within a token budget). Static analysis lives in
+`internal/securityscan`, `internal/nostrscan`, and `internal/betterleaks`;
+`internal/securityverify` adversarially re-checks candidate findings before
+publication.
+
+Other entrypoints: `cmd/drydock-mcp` (MCP server), `cmd/lsp-bridge` (the
+language-server sidecar), `cmd/drydock-eval` (offline evaluation).
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- **Event kinds** come from `internal/eventkind` — never write a numeric kind
+  literal. **Relay URLs** come from config, never from a literal in service
+  code.
+- **Errors** wrap with `%w` and a `"verb noun: "` prefix; compare sentinels
+  with `errors.Is`/`errors.As`, never `==` or a message substring.
+  `internal/db/store_monitoring.go` and `store_review_orders.go` are the
+  reference files for the persistence house style.
+- **Paths from untrusted input** (patches, requests) must go through the
+  package's confinement helper — `contextbuilder.readRepositoryFile` or
+  `workspacesnapshot.normalizePath` — never a bare `filepath.Join`.
+- **LLM responses** are parsed via `llmutil.ExtractJSON`; `response_format:
+  json_object` is advisory on self-hosted endpoints, so fenced replies happen.
+- **Patch/diff parsing** uses `github.com/bluekeyes/go-gitdiff` via
+  `contextbuilder`'s patch analysis, which is the authoritative answer to
+  "which files changed". Do not hand-roll a diff scanner.
+- Prefer deleting over wrapping. A single-implementation interface that exists
+  only so a test can mock it is not worth its declaration.

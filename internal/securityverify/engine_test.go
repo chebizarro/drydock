@@ -203,3 +203,48 @@ func TestRunFailsWhenAllVerifierVotesIndeterminate(t *testing.T) {
 		t.Fatalf("want error when verification is unavailable, got %d findings", len(got))
 	}
 }
+
+// TestRunAcceptsFencedVerifierJSON pins the boundary this package shares with
+// reviewengine: `response_format: json_object` is advisory on self-hosted
+// OpenAI-compatible endpoints, so a verifier reply may arrive wrapped in a
+// markdown code fence. Before llmutil.ExtractJSON was applied here, every such
+// reply failed to unmarshal and became verdictIndeterminate — silently turning
+// a working verifier into "verification unavailable".
+func TestRunAcceptsFencedVerifierJSON(t *testing.T) {
+	fake := &testutil.FakeLLM{Responses: []string{
+		"```json\n{\"refuted\":false,\"certain\":true,\"reason\":\"attacker controlled\"}\n```",
+		// The surviving finding is then classified; fence that reply too, since
+		// the same endpoint produces both.
+		"```json\n{\"cwe\":\"CWE-89\",\"severity\":\"high\",\"confidence\":0.9,\"remediation\":\"use parameterized queries\"}\n```",
+	}}
+	engine := New(&lockedFakeLLM{fake: fake}, DefaultConfig())
+
+	got, err := engine.Run(context.Background(), []reviewengine.Finding{candidate()})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want the fenced not-refuted verdict to let the finding survive", len(got))
+	}
+	if got[0].Category != "CWE-89" || got[0].Suggestion != "use parameterized queries" {
+		t.Fatalf("classification not applied from the fenced reply: category=%q suggestion=%q",
+			got[0].Category, got[0].Suggestion)
+	}
+}
+
+// TestRunRefutesOnFencedRefutation is the mirror case: a fenced refutation must
+// actually refute rather than degrade to indeterminate.
+func TestRunRefutesOnFencedRefutation(t *testing.T) {
+	fake := &testutil.FakeLLM{Responses: []string{
+		"```\n{\"refuted\":true,\"certain\":true,\"reason\":\"unreachable\"}\n```",
+	}}
+	engine := New(&lockedFakeLLM{fake: fake}, DefaultConfig())
+
+	got, err := engine.Run(context.Background(), []reviewengine.Finding{candidate()})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d findings, want the fenced refutation to drop the finding", len(got))
+	}
+}

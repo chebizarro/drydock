@@ -96,7 +96,7 @@ func TestIntegrationMarketplaceContextVMAssignmentAcceptanceAndRejection(t *test
 	requester := newIntegrationSigner()
 
 	transport := &integrationContextVMTransport{}
-	router := NewRouter(RouterConfig{MaxReviewersPerPatch: 1}, registry, store, requester, nil, transport, slog.Default())
+	router := NewRouter(RouterConfig{MaxReviewersPerPatch: 1}, registry, store, requester, transport, nil, slog.Default())
 	handler := NewHandler(registry, router, store, slog.Default())
 
 	if err := registry.RegisterReviewer(ctx, ReviewerProfile{

@@ -150,9 +150,11 @@ func (p changeImpactProvider) extractChangedSymbols(ctx context.Context, in Buil
 			continue
 		}
 
-		// Read file from working tree.
-		fullPath := filepath.Join(in.RepoPath, path)
-		data, err := os.ReadFile(fullPath)
+		// Read file from working tree. Paths originate in an untrusted patch,
+		// so they must go through the package's confinement helper rather than
+		// a bare filepath.Join: callers such as LayerFacade.Analyze reach this
+		// provider without Builder.Build's validateRepositoryPaths pass.
+		data, err := readRepositoryFile(in.RepoPath, path)
 		if err != nil {
 			continue
 		}

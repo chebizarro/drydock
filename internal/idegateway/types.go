@@ -18,8 +18,6 @@
 package idegateway
 
 import (
-	"encoding/json"
-
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
@@ -28,23 +26,12 @@ import (
 const (
 	KindIDESession = int(eventkind.IDESession) // NIP-78 app-specific workspace session
 	KindContextVM  = int(eventkind.ContextVM)  // ContextVM point-to-point IDE messages
-
-	// Compatibility aliases for code/tests that use request/response names.
-	KindIDECommand        = KindContextVM
-	KindIDEReviewRequest  = KindContextVM
-	KindIDEReviewResponse = KindContextVM
-	KindIDEFixRequest     = KindContextVM
-	KindIDEFixResponse    = KindContextVM
 )
 
 const (
 	SchemaIDESession    = "drydock.ide-session.v1"
 	MethodReviewRequest = "review/request"
 	MethodApplyFix      = "review/apply-fix"
-
-	// Compatibility aliases for the previous IDE method names.
-	MethodIDEReview   = MethodReviewRequest
-	MethodIDEApplyFix = MethodApplyFix
 )
 
 // BuildSessionDTag builds the NIP-78 d-tag for an IDE session.
@@ -94,20 +81,6 @@ type ReviewResponse struct {
 	ChatID          string       `json:"chat_id,omitempty"`          // Future review-session continuation identifier
 	ExpectedVersion *int64       `json:"expected_version,omitempty"` // Echoed future optimistic session version
 	Message         string       `json:"message,omitempty"`          // Future conversational response text
-}
-
-// JSONRPCResponse is the JSON-RPC 2.0 envelope used in ContextVM responses.
-type JSONRPCResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      string      `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *RPCError   `json:"error,omitempty"`
-}
-
-// RPCError represents a JSON-RPC error.
-type RPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
 }
 
 // Diagnostic represents a single finding in LSP-compatible format.
@@ -163,20 +136,6 @@ type FixResponse struct {
 	Patch     string `json:"patch,omitempty"`      // Suggested patch to apply (upstream field)
 	Diff      string `json:"diff,omitempty"`       // Suggested diff to apply (compatibility field)
 	Error     string `json:"error,omitempty"`      // Error message (if failed)
-}
-
-// ParseReviewRequest parses a ReviewRequest from event content.
-func ParseReviewRequest(content string) (ReviewRequest, error) {
-	var req ReviewRequest
-	err := json.Unmarshal([]byte(content), &req)
-	return req, err
-}
-
-// ParseFixRequest parses a FixRequest from event content.
-func ParseFixRequest(content string) (FixRequest, error) {
-	var req FixRequest
-	err := json.Unmarshal([]byte(content), &req)
-	return req, err
 }
 
 // SeverityFromString converts a string severity to DiagnosticSeverity.

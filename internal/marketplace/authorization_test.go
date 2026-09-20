@@ -37,7 +37,7 @@ func TestRouterRejectsAcceptanceAndRejectionFromNonReviewer(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := mustOpenStore(t, ctx)
 			registry := NewRegistry(store, slog.Default())
-			router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: testPubKey()}, &mockPublisher{}, slog.Default())
+			router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: testPubKey()}, nil, nil, slog.Default())
 			reviewer := testPubKey().Hex()
 			attackerSK := nostr.Generate()
 			assignmentID := "assign-non-reviewer-" + tc.name
@@ -91,7 +91,7 @@ func TestRouterRejectsNonPendingOrExpiredAssignmentTransition(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := mustOpenStore(t, ctx)
 			registry := NewRegistry(store, slog.Default())
-			router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: testPubKey()}, &mockPublisher{}, slog.Default())
+			router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: testPubKey()}, nil, nil, slog.Default())
 			reviewerSK := nostr.Generate()
 			reviewer := nostr.GetPublicKey(reviewerSK).Hex()
 			assignmentID := "assign-transition-" + strings.ReplaceAll(tc.name, " ", "-")
@@ -146,7 +146,7 @@ func TestHandlerRejectsAssignmentIntentFromNonAuthority(t *testing.T) {
 	attackerSK := nostr.Generate()
 
 	registry := NewRegistry(store, slog.Default())
-	router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: authority}, &mockPublisher{}, slog.Default())
+	router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: authority}, nil, nil, slog.Default())
 	handler := NewHandler(registry, router, store, slog.Default())
 
 	assignment := ReviewAssignment{
@@ -173,7 +173,7 @@ func TestHandlerRejectsPaymentAssignmentMismatches(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	authority := testPubKey()
 	registry := NewRegistry(store, slog.Default())
-	router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: authority}, &mockPublisher{}, slog.Default())
+	router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: authority}, nil, nil, slog.Default())
 	handler := NewHandler(registry, router, store, slog.Default())
 	seedAuthorizedMarketplacePayment(t, ctx, store, "patch-paid", "repo-paid", "requester-paid", 100)
 
@@ -199,7 +199,7 @@ func TestHandlerRejectsUnauthorizedAndDuplicateFeedback(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
 	registry := NewRegistry(store, slog.Default())
-	handler := NewHandler(registry, NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: testPubKey()}, &mockPublisher{}, slog.Default()), store, slog.Default())
+	handler := NewHandler(registry, NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: testPubKey()}, nil, nil, slog.Default()), store, slog.Default())
 
 	requesterSK := nostr.Generate()
 	requester := nostr.GetPublicKey(requesterSK).Hex()

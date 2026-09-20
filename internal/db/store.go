@@ -1208,47 +1208,23 @@ func (s *Store) isStatusAuthorAllowed(ctx context.Context, rootID, repoID string
 	}
 
 	var rootAuthorHex string
-	if err := s.db.QueryRowContext(
+	err := s.db.QueryRowContext(
 		ctx,
 		`SELECT author_pubkey FROM patch_events WHERE event_id=? LIMIT 1`,
 		rootID,
-	).Scan(&rootAuthorHex); err == nil {
+	).Scan(&rootAuthorHex)
+	switch {
+	case err == nil:
 		if strings.EqualFold(rootAuthorHex, author.Hex()) {
 			return true, nil
 		}
+	case errors.Is(err, sql.ErrNoRows):
+		// Root patch unknown; fall through to the maintainer check.
+	default:
+		return false, fmt.Errorf("lookup root patch author for status auth: %w", err)
 	}
 
-	if strings.TrimSpace(repoID) == "" {
-		return false, nil
-	}
-
-	var rawRepo string
-	err := s.db.QueryRowContext(
-		ctx,
-		`SELECT raw_event_json FROM repositories WHERE repo_id=? LIMIT 1`,
-		repoID,
-	).Scan(&rawRepo)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, fmt.Errorf("lookup repository announcement for status auth: %w", err)
-	}
-
-	var repoEvt nostr.Event
-	if err := json.Unmarshal([]byte(rawRepo), &repoEvt); err != nil {
-		return false, fmt.Errorf("decode repository announcement for status auth: %w", err)
-	}
-	repo := nip34.ParseRepository(repoEvt)
-	if repoEvt.PubKey == author {
-		return true, nil
-	}
-	for _, maintainer := range repo.Maintainers {
-		if maintainer == author {
-			return true, nil
-		}
-	}
-	return false, nil
+	return s.CanMaintainRepository(ctx, repoID, author)
 }
 
 func (s *Store) IsRootClosedByStatus(ctx context.Context, rootID, repoID string) (bool, string, error) {
@@ -2947,7 +2923,7 @@ func (s *Store) BeginConversationTurn(ctx context.Context, turn ConversationTurn
 		turn.ReplyAuthor, turn.ReplyContent, turn.ResponseContent, nextTurn, turn.CreatedAt,
 	)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint") {
+		if isSQLiteUniqueConstraint(err) {
 			// Race with another goroutine — treat as duplicate.
 			return 0, nil
 		}

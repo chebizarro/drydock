@@ -277,7 +277,7 @@ func (s *Service) SubmitOnDemand(ctx context.Context, req OnDemandRequest) (Acce
 	if err := json.Unmarshal([]byte(patchRec.RawEvent), &patchEvent); err != nil {
 		return AcceptedOrder{}, fmt.Errorf("decode stored patch event: %w", err)
 	}
-	repository, err := repositoryRefFromPatch(patchEvent)
+	repository, err := scope.RepositoryRefFromTags(patchEvent.Tags)
 	if err != nil {
 		return AcceptedOrder{}, fmt.Errorf("%w: %v", ErrInvalidTarget, err)
 	}
@@ -498,24 +498,4 @@ func claimFromTask(task db.ReviewTask) db.ReviewClaim {
 		RequesterPubkey: task.RequesterPubkey,
 		OrderID:         task.OrderID,
 	}
-}
-
-func repositoryRefFromPatch(event nostr.Event) (scope.RepositoryRef, error) {
-	var repository scope.RepositoryRef
-	count := 0
-	for _, tag := range event.Tags {
-		if len(tag) < 2 || tag[0] != "a" || !strings.HasPrefix(strings.TrimSpace(tag[1]), "30617:") {
-			continue
-		}
-		ref, err := scope.ParseRepositoryRef(tag[1])
-		if err != nil {
-			return scope.RepositoryRef{}, err
-		}
-		count++
-		repository = ref
-	}
-	if count != 1 {
-		return scope.RepositoryRef{}, errors.New("patch must contain exactly one canonical 30617 repository address")
-	}
-	return repository, nil
 }

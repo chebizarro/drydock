@@ -110,7 +110,7 @@ Per `AGENTS.md`, the audit is requested via a **ContextVM JSON-RPC method over k
 {"kinds":[25910], "#p":["<drydock-pubkey>"], "#method":["security/audit"]}
 ```
 
-`security/audit` params (inside the gift-wrapped payload where the target is private): `repo_addr` (30617 addressable id), optional `subtree` (path prefix), optional `ref` (defaults to snapshot HEAD), `depth` (`quick|standard|deep`), `since_commit` (incremental audits). Completion and progress are signalled with NIP-90 kind 7000 job-feedback events tagged to the request `e` id — again reactive, not polled.
+`security/audit` params (inside the gift-wrapped payload where the target is private): `repo_addr` (30617 addressable id), optional `subtree` (path prefix), optional `ref` (defaults to snapshot HEAD), `depth` (`quick|standard|deep`), `since_commit` (incremental audits). Completion and progress are signalled with `security/audit/progress` notifications on kind `25910`, tagged to the request `e` id — again reactive, not polled.
 
 ### 5.2 Orchestration: `internal/auditengine`
 
@@ -127,7 +127,7 @@ The audit is a fan-out/verify pipeline over the repository, bounded by a work bu
 
 ### 5.3 Budgeting
 
-Audit depth maps to a token/agent budget so a `deep` audit of a large repo is bounded and observable: `quick` = SAST + heuristic localize + single-vote verify on high-severity only; `standard` = model review of localized units + single-vote verify; `deep` = wider unit set + 3-vote adversarial verify + classification. Emit a progress kind 7000 at each phase.
+Audit depth maps to a token/agent budget so a `deep` audit of a large repo is bounded and observable: `quick` = SAST + heuristic localize + single-vote verify on high-severity only; `standard` = model review of localized units + single-vote verify; `deep` = wider unit set + 3-vote adversarial verify + classification. Emit a `security/audit/progress` notification (kind `25910`) at each phase.
 
 ---
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"git.sharegap.net/cascadia/drydock/internal/contextvm"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
@@ -71,7 +72,7 @@ func TestFindingToDiagnostic(t *testing.T) {
 	}
 }
 
-func TestParseReviewRequest(t *testing.T) {
+func TestReviewRequestParamsDecode(t *testing.T) {
 	content := `{
 		"session_id": "sess-123",
 		"request_id": "req-456",
@@ -85,9 +86,13 @@ func TestParseReviewRequest(t *testing.T) {
 		"message": "Please check the revised function"
 	}`
 
-	req, err := ParseReviewRequest(content)
-	if err != nil {
-		t.Fatalf("ParseReviewRequest failed: %v", err)
+	// Production decodes IDE params through contextvm.ParamsAs, so exercise that
+	// path rather than a package-local wrapper.
+	req, rpcErr := contextvm.ParamsAs[ReviewRequest](contextvm.Request{
+		Msg: contextvm.Message{Params: json.RawMessage(content)},
+	})
+	if rpcErr != nil {
+		t.Fatalf("ParamsAs[ReviewRequest] failed: %v", rpcErr)
 	}
 
 	if req.SessionID != "sess-123" {
@@ -126,7 +131,7 @@ func TestIDEContinuationFieldsRemainOptional(t *testing.T) {
 	}
 }
 
-func TestParseFixRequest(t *testing.T) {
+func TestFixRequestParamsDecode(t *testing.T) {
 	content := `{
 		"session_id": "sess-123",
 		"request_id": "req-789",
@@ -134,9 +139,11 @@ func TestParseFixRequest(t *testing.T) {
 		"file": "main.go"
 	}`
 
-	req, err := ParseFixRequest(content)
-	if err != nil {
-		t.Fatalf("ParseFixRequest failed: %v", err)
+	req, rpcErr := contextvm.ParamsAs[FixRequest](contextvm.Request{
+		Msg: contextvm.Message{Params: json.RawMessage(content)},
+	})
+	if rpcErr != nil {
+		t.Fatalf("ParamsAs[FixRequest] failed: %v", rpcErr)
 	}
 
 	if req.SessionID != "sess-123" {

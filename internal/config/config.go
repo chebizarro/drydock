@@ -118,6 +118,7 @@ type Config struct {
 	PaymentNWCURI                       string
 	PaymentTrustedMints                 []string
 	LSPBridgeURL                        string
+	LSPBridgeToken                      string
 	MetaBaseURL                         string
 	MetaModel                           string
 	MetaMaxInputBytes                   int
@@ -266,6 +267,7 @@ func FromEnv() Config {
 		PaymentNWCURI:                       envOrDefault("DRYDOCK_NWC_CONNECTION_STRING", ""),
 		PaymentTrustedMints:                 paymentTrustedMints(),
 		LSPBridgeURL:                        envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
+		LSPBridgeToken:                      envOrDefault("DRYDOCK_LSP_BRIDGE_TOKEN", os.Getenv("LSP_BRIDGE_AUTH_TOKEN")),
 		MetaBaseURL:                         envOrDefault("DRYDOCK_META_BASE_URL", devDefault(production, defaultMetaBaseURL)),
 		MetaModel:                           envOrDefault("DRYDOCK_META_MODEL", devDefault(production, defaultMetaModel)),
 		MetaMaxInputBytes:                   parseIntOrDefault(envOrDefault("DRYDOCK_META_MAX_INPUT_BYTES", "131072"), defaultMetaMaxInputBytes),

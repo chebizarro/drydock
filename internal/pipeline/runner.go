@@ -41,13 +41,6 @@ type PromptRefiner interface {
 	ActiveReviewerPrompt(ctx context.Context) string
 }
 
-// DocIngester indexes project documentation into the vector store.
-// Called after repo preparation so that project docs are searchable
-// by the QdrantProvider during context building.
-type DocIngester interface {
-	IngestRepoDocs(ctx context.Context, repoPath, repoID string) error
-}
-
 // CodeIndexer indexes source code symbols into a vector store for
 // semantic code search. Called after repo preparation so that the
 // related-code provider can retrieve relevant code during context building.
@@ -100,7 +93,6 @@ type Runner struct {
 	metaSvc                 *metareview.Service
 	promptRefiner           PromptRefiner
 	fewShotRetriever        FewShotRetriever
-	docIngester             DocIngester
 	codeIndexer             CodeIndexer
 	secScanner              *securityscan.Scanner
 	betterleaksScanner      BetterleaksScanner
@@ -154,15 +146,6 @@ func WithPromptRefiner(pr *promptrefine.Service) func(*Runner) {
 func WithFewShotRetriever(fsr FewShotRetriever) func(*Runner) {
 	return func(r *Runner) {
 		r.fewShotRetriever = fsr
-	}
-}
-
-// WithDocIngester sets an optional documentation ingester. When set, the
-// runner indexes project docs after repo preparation so the QdrantProvider
-// can retrieve them during context building.
-func WithDocIngester(di DocIngester) func(*Runner) {
-	return func(r *Runner) {
-		r.docIngester = di
 	}
 }
 
@@ -479,16 +462,6 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		if !paymentAuthorized {
 			return errors.New("payment receipt churn")
 		}
-	}
-
-	// 1e. Index project documentation (non-fatal; skip if repo config disables docs).
-	if r.docIngester != nil && repoCfg.DocsEnabled() {
-		timer.Time(tracing.StageDocIngest, func() error {
-			if err := r.docIngester.IngestRepoDocs(ctx, prep.RepoPath, task.RepoID); err != nil {
-				log.Warn("doc ingestion failed, continuing without", "error", err)
-			}
-			return nil // non-fatal
-		})
 	}
 
 	// 1f. Index source code for semantic search. When configured, this is required:

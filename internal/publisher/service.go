@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
@@ -176,9 +177,8 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 		if err := s.signer.SignEvent(ctx, &summaryEvent); err != nil {
 			return "", fmt.Errorf("sign summary review event: %w", err)
 		}
-		if summaryEvent.Kind >= 1630 && summaryEvent.Kind <= 1633 {
-			return "", errors.New("PublishReview must not emit NIP-34 status events (1630-1633); use PublishStatus instead")
-		}
+		// Kind is assigned as a constant above; NIP-34 status events
+		// (eventkind.StatusOpen..StatusDraft) are emitted by PublishStatus.
 		summaryEvent, summaryDelivered, err = s.store.ReserveReviewPublication(ctx, in.PatchEventID, in.RepoID, "summary", 0, summaryEvent)
 		if err != nil {
 			return "", fmt.Errorf("reserve summary review event: %w", err)
@@ -345,7 +345,7 @@ func buildCommonTags(scope commentScope, repoID, expiration string, in PublishIn
 		{"K", strconv.Itoa(int(scope.RootKind))},
 		{"e", scope.ParentID, "", scope.ParentPubKey},
 		{"k", strconv.Itoa(int(scope.ParentKind))},
-		{"A", "30617:" + repoID},
+		{"A", repositoryAddress(repoID)},
 		{"expiration", expiration},
 	}
 	if in.BaseCommit != "" {
@@ -376,13 +376,13 @@ func deriveCommentScope(target nostr.Event) (commentScope, error) {
 		ParentPubKey: target.PubKey.Hex(),
 	}
 
-	if target.Kind == 1619 {
+	if target.Kind == eventkind.GitPullRequestUpdate {
 		rootIDTag := target.Tags.Find("E")
 		if rootIDTag == nil || len(rootIDTag) < 2 || strings.TrimSpace(rootIDTag[1]) == "" {
 			return commentScope{}, errors.New("PR update event missing required E tag")
 		}
 		scope.RootID = rootIDTag[1]
-		scope.RootKind = 1618
+		scope.RootKind = eventkind.GitPullRequest
 
 		if rootPKTag := target.Tags.Find("P"); rootPKTag != nil && len(rootPKTag) >= 2 {
 			scope.RootPubKey = rootPKTag[1]

@@ -311,8 +311,5 @@ func IsValidRating(rating int) bool {
 	return rating >= 1 && rating <= 5
 }
 
-// DefaultResponseTimeout is how long to wait for a reviewer to respond.
-const DefaultResponseTimeout = 2 * time.Hour
-
 // DefaultAssignmentDeadline is the default deadline for completing a review.
 const DefaultAssignmentDeadline = 24 * time.Hour

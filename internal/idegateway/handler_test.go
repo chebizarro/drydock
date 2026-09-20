@@ -244,63 +244,6 @@ func TestHandleSessionUsesNIP78DTag(t *testing.T) {
 	}
 }
 
-func TestPublishReviewResponseUsesContextVMJSONRPC(t *testing.T) {
-	pub := &mockPublisher{}
-	h := newTestHandler(pub)
-
-	requestID := "1111111111111111111111111111111111111111111111111111111111111111"
-	requestPubKey := "2222222222222222222222222222222222222222222222222222222222222222"
-	reqEvent := nostr.Event{
-		ID:     nostr.MustIDFromHex(requestID),
-		PubKey: nostr.MustPubKeyFromHex(requestPubKey),
-	}
-	resp := ReviewResponse{
-		RequestID:    "req-uuid",
-		SessionID:    "sess-1",
-		Diagnostics:  []Diagnostic{{File: "main.go", Severity: SeverityWarning, Message: "issue", Source: "drydock"}},
-		Summary:      "found 1 issue",
-		ReviewTimeMs: 1234,
-	}
-
-	if err := h.publishReviewResponse(context.Background(), reqEvent, resp, ""); err != nil {
-		t.Fatalf("publishReviewResponse failed: %v", err)
-	}
-
-	if len(pub.events) != 1 {
-		t.Fatalf("published events = %d, want 1", len(pub.events))
-	}
-
-	event := pub.events[0]
-	if event.Kind != nostr.Kind(KindContextVM) {
-		t.Fatalf("event kind = %d, want %d", event.Kind, KindContextVM)
-	}
-	if !hasTag(event.Tags, "e", requestID) {
-		t.Fatalf("missing e tag referencing request %s: %#v", requestID, event.Tags)
-	}
-
-	var rpcResp struct {
-		JSONRPC string         `json:"jsonrpc"`
-		ID      string         `json:"id"`
-		Result  ReviewResponse `json:"result"`
-		Error   *RPCError      `json:"error,omitempty"`
-	}
-	if err := json.Unmarshal([]byte(event.Content), &rpcResp); err != nil {
-		t.Fatalf("unmarshal JSON-RPC response: %v", err)
-	}
-	if rpcResp.JSONRPC != "2.0" {
-		t.Fatalf("jsonrpc = %q, want 2.0", rpcResp.JSONRPC)
-	}
-	if rpcResp.ID != resp.RequestID {
-		t.Fatalf("id = %q, want %q", rpcResp.ID, resp.RequestID)
-	}
-	if rpcResp.Error != nil {
-		t.Fatalf("error = %#v, want nil", rpcResp.Error)
-	}
-	if rpcResp.Result.Summary != resp.Summary || len(rpcResp.Result.Diagnostics) != 1 {
-		t.Fatalf("unexpected result: %#v", rpcResp.Result)
-	}
-}
-
 func hasTag(tags nostr.Tags, name, value string) bool {
 	for _, tag := range tags {
 		if len(tag) >= 2 && tag[0] == name && tag[1] == value {

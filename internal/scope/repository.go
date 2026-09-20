@@ -78,3 +78,31 @@ func ParsePubkey(value string) (nostr.PubKey, error) {
 	}
 	return pubkey, nil
 }
+
+// ErrAmbiguousRepositoryRef is returned when an event does not carry exactly
+// one canonical repository address tag.
+var ErrAmbiguousRepositoryRef = fmt.Errorf("patch must contain exactly one canonical %d repository address", RepositoryAnnouncementKind)
+
+// RepositoryRefFromTags resolves the single canonical repository address an
+// event belongs to. It is the authoritative answer to "which repository is this
+// patch for", which gates monitoring scope, so it requires exactly one match.
+func RepositoryRefFromTags(tags nostr.Tags) (RepositoryRef, error) {
+	addressPrefix := fmt.Sprintf("%d:", RepositoryAnnouncementKind)
+	var repository RepositoryRef
+	count := 0
+	for _, tag := range tags {
+		if len(tag) < 2 || tag[0] != "a" || !strings.HasPrefix(strings.TrimSpace(tag[1]), addressPrefix) {
+			continue
+		}
+		ref, err := ParseRepositoryRef(tag[1])
+		if err != nil {
+			return RepositoryRef{}, err
+		}
+		count++
+		repository = ref
+	}
+	if count != 1 {
+		return RepositoryRef{}, ErrAmbiguousRepositoryRef
+	}
+	return repository, nil
+}

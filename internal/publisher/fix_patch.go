@@ -19,7 +19,7 @@ import (
 
 // PublishFixPatchInput contains the data needed to publish an auto-fix patch.
 type PublishFixPatchInput struct {
-	PatchEventID  string   // the original patch event being reviewed
+	PatchEventID  string // the original patch event being reviewed
 	RepoID        string
 	ReviewEventID string   // the review comment event ID
 	PatchDiff     string   // combined unified diff of all applied fixes
@@ -121,7 +121,7 @@ func buildFixPatchTags(scope commentScope, in PublishFixPatchInput) nostr.Tags {
 		// Reference the specific patch event being fixed
 		{"e", in.PatchEventID, "", "reply"},
 		// Repository reference
-		{"a", "30617:" + in.RepoID},
+		{"a", repositoryAddress(in.RepoID)},
 		// Mark this as an autofix patch (used for loop suppression + filtering)
 		{"t", "drydock-autofix"},
 		// Expiration

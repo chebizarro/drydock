@@ -1188,8 +1188,14 @@ func (m *Manager) commitSnapshot(ctx context.Context, repoPath string) error {
 	if _, err := m.runGit(ctx, repoPath, "add", "-A"); err != nil {
 		return fmt.Errorf("stage: %w", err)
 	}
-	// Check if there's anything to commit
-	status, _ := m.runGit(ctx, repoPath, "status", "--porcelain")
+	// Check if there's anything to commit. A failed status must not be read as
+	// "clean": skipping the snapshot commit makes the later `git diff --cached
+	// HEAD` run against the pre-patch HEAD, so the published autofix patch
+	// would contain the whole reviewed diff.
+	status, err := m.runGit(ctx, repoPath, "status", "--porcelain")
+	if err != nil {
+		return fmt.Errorf("status: %w", err)
+	}
 	if strings.TrimSpace(status) == "" {
 		// Nothing to commit — working tree is already clean
 		return nil

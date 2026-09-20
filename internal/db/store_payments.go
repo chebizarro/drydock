@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 var ErrTokenHashAlreadyReserved = errors.New("payment token hash already reserved")
@@ -466,11 +468,11 @@ func (s *Store) GetActiveSubscription(ctx context.Context, authorPubkey, repoID 
 		&rec.AuthorPubkey, &rec.RepoID, &rec.SourcePatchEventID, &rec.SourceTokenHash,
 		&rec.PaidAmountSats, &rec.ExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return SubscriptionRecord{}, false, nil
 	}
 	if err != nil {
-		return SubscriptionRecord{}, false, err
+		return SubscriptionRecord{}, false, fmt.Errorf("query active subscription: %w", err)
 	}
 	return rec, true, nil
 }
@@ -611,8 +613,8 @@ func (s *Store) TryAuthorizeFreeReview(ctx context.Context, patchEventID, repoID
 	`, patchEventID).Scan(&existingStatus)
 	if err == nil && existingStatus == "authorized" {
 		return true, nil
-	} else if err != nil && err != sql.ErrNoRows {
-		return false, err
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("query review payment status: %w", err)
 	}
 
 	// Check current usage
@@ -621,8 +623,8 @@ func (s *Store) TryAuthorizeFreeReview(ctx context.Context, patchEventID, repoID
 		SELECT used_count FROM free_review_usage
 		WHERE author_pubkey = ? AND repo_id = ? AND usage_day = ?
 	`, authorPubkey, repoID, usageDay).Scan(&usedCount)
-	if err != nil && err != sql.ErrNoRows {
-		return false, err
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("query free review usage: %w", err)
 	}
 
 	if usedCount >= dailyLimit {
@@ -690,11 +692,11 @@ func (s *Store) IsTokenHashUsed(ctx context.Context, tokenHash string) (bool, er
 		SELECT 1 FROM payment_subscriptions WHERE source_token_hash = ?
 		LIMIT 1
 	`, tokenHash, tokenHash).Scan(&exists)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("query token hash use: %w", err)
 	}
 	return true, nil
 }
@@ -1046,10 +1048,22 @@ func (s *Store) ListMarketplacePayoutAudit(ctx context.Context, assignmentID int
 	return out, rows.Err()
 }
 
+// isSQLiteUniqueConstraint reports whether err is a uniqueness violation, using
+// the driver's extended result code rather than its message text. This gates
+// ErrTokenHashAlreadyReserved — the replay denial on Cashu token reservation —
+// so it must not depend on a message format the driver is free to change.
+// SQLITE_CONSTRAINT_PRIMARYKEY is included because a primary-key collision is a
+// uniqueness violation and sqlite reports it with the same "UNIQUE constraint
+// failed" text.
 func isSQLiteUniqueConstraint(err error) bool {
-	if err == nil {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "UNIQUE constraint failed") || strings.Contains(msg, "constraint failed: UNIQUE")
+	switch sqliteErr.Code() {
+	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+		return true
+	default:
+		return false
+	}
 }

@@ -1,53 +1,21 @@
 package contextvm
 
-// IDEGateway registers IDE gateway ContextVM handlers.
-type IDEGateway interface {
-	RegisterContextVMHandlers(router *Router) error
-}
-
-// RegisterIDEMethods registers IDE gateway ContextVM handlers.
-func RegisterIDEMethods(router *Router, gateway IDEGateway) error {
-	if gateway == nil {
-		return nil
-	}
-	return gateway.RegisterContextVMHandlers(router)
-}
-
-// SecurityAuditor registers security audit ContextVM handlers.
-type SecurityAuditor interface {
+// MethodProvider is implemented by any package that contributes ContextVM
+// methods to the shared router.
+type MethodProvider interface {
 	RegisterContextVMMethods(router *Router) error
 }
 
-// RegisterSecurityAuditMethods registers the security/audit handler.
-func RegisterSecurityAuditMethods(router *Router, auditor SecurityAuditor) error {
-	if auditor == nil {
-		return nil
+// RegisterMethods registers every provider's ContextVM methods on router.
+// Nil providers are skipped so callers can pass optional handlers directly.
+func RegisterMethods(router *Router, providers ...MethodProvider) error {
+	for _, provider := range providers {
+		if provider == nil {
+			continue
+		}
+		if err := provider.RegisterContextVMMethods(router); err != nil {
+			return err
+		}
 	}
-	return auditor.RegisterContextVMMethods(router)
-}
-
-// ReviewOrderer registers the generic review/order ContextVM handler.
-type ReviewOrderer interface {
-	RegisterContextVMMethods(router *Router) error
-}
-
-// RegisterReviewOrderMethods registers generic on-demand review ordering.
-func RegisterReviewOrderMethods(router *Router, orders ReviewOrderer) error {
-	if orders == nil {
-		return nil
-	}
-	return orders.RegisterContextVMMethods(router)
-}
-
-// Marketplace registers marketplace ContextVM handlers.
-type Marketplace interface {
-	RegisterContextVMMethods(router *Router) error
-}
-
-// RegisterMarketplaceMethods registers marketplace ContextVM handlers.
-func RegisterMarketplaceMethods(router *Router, marketplace Marketplace) error {
-	if marketplace == nil {
-		return nil
-	}
-	return marketplace.RegisterContextVMMethods(router)
+	return nil
 }
