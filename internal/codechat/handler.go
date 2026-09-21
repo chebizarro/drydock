@@ -16,8 +16,10 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/embedding"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/publisher"
 	"git.sharegap.net/cascadia/drydock/internal/ratelimit"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/signing"
 	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 
 	"fiatjaf.com/nostr"
@@ -41,18 +43,13 @@ const (
 	maxContextBytes = 16 * 1024
 )
 
-// Keyer provides signing and encryption for Nostr events.
-// Matches the nostr.Keyer interface (Signer + Cipher).
+// Keyer is the shared signer plus the NIP-44 encryption half of the cipher,
+// used to gift-wrap outbound codechat replies. It deliberately does not include
+// Decrypt: inbound DMs arrive as already-unwrapped NIP-17 rumors, so nothing in
+// this package decrypts.
 type Keyer interface {
-	GetPublicKey(ctx context.Context) (nostr.PubKey, error)
-	SignEvent(ctx context.Context, evt *nostr.Event) error
+	signing.Signer
 	Encrypt(ctx context.Context, plaintext string, recipient nostr.PubKey) (string, error)
-	Decrypt(ctx context.Context, base64ciphertext string, sender nostr.PubKey) (string, error)
-}
-
-// RelayPublisher publishes signed events to Nostr relays.
-type RelayPublisher interface {
-	Publish(ctx context.Context, relays []string, event nostr.Event) error
 }
 
 // Config holds codechat handler configuration.
@@ -73,7 +70,7 @@ type Handler struct {
 	embedder    *embedding.Client
 	client      reviewengine.LLMClient
 	keyer       Keyer
-	publish     RelayPublisher
+	publish     publisher.RelayPublisher
 	logger      *slog.Logger
 	ourPubKey   string             // cached hex pubkey
 	sem         chan struct{}      // bounded concurrency semaphore
@@ -88,7 +85,7 @@ func New(
 	embedder *embedding.Client,
 	client reviewengine.LLMClient,
 	keyer Keyer,
-	relayPub RelayPublisher,
+	relayPub publisher.RelayPublisher,
 	logger *slog.Logger,
 ) *Handler {
 	if cfg.Temperature == 0 {
@@ -158,14 +155,14 @@ func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL stri
 		return ctx.Err()
 	}
 
-	// 1. Decrypt the DM content.
-	plaintext, err := h.decryptDM(ctx, event)
+	// 1. Read the already-unwrapped rumor content.
+	plaintext, err := h.dmPlaintext(event)
 	if err != nil {
-		h.logger.Warn("failed to decrypt DM", "event_id", event.ID.Hex(), "error", err)
-		return nil // don't propagate decryption errors
+		h.logger.Warn("rejected unsupported DM", "event_id", event.ID.Hex(), "error", err)
+		return nil // don't propagate malformed-DM errors
 	}
 
-	h.logger.Debug("decrypted DM", "event_id", event.ID.Hex(), "length", len(plaintext))
+	h.logger.Debug("read DM rumor", "event_id", event.ID.Hex(), "length", len(plaintext))
 
 	// 2. Parse the message to extract repo context and question.
 	parsed := h.parseMessage(plaintext)
@@ -289,8 +286,10 @@ func (h *Handler) WaitIdle() {
 	wg.Wait()
 }
 
-// decryptDM returns the plaintext content of an already-unwrapped NIP-17 rumor.
-func (h *Handler) decryptDM(_ context.Context, event nostr.Event) (string, error) {
+// dmPlaintext returns the content of an already-unwrapped NIP-17 rumor. The
+// gift-wrap layer has already decrypted it upstream, so this only validates the
+// rumor kind.
+func (h *Handler) dmPlaintext(event nostr.Event) (string, error) {
 	if event.Kind != kindPrivateDirectMessage {
 		return "", fmt.Errorf("unsupported DM kind %d: expected unwrapped NIP-17 rumor", event.Kind)
 	}
@@ -366,11 +365,7 @@ func (h *Handler) queryCodeIndex(ctx context.Context, repoID, question string) (
 	}
 
 	// Search code chunks.
-	filter := map[string]any{
-		"must": []map[string]any{
-			{"key": "repo_id", "match": map[string]any{"value": repoID}},
-		},
-	}
+	filter := vectorstore.Filter(vectorstore.Match("repo_id", repoID))
 
 	results, err := h.qdrant.Search(ctx, h.qdrant.CollectionNames().CodeChunks, vec, maxQueryResults*2, filter)
 	if err != nil {

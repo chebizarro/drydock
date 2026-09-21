@@ -73,7 +73,7 @@ func TestPresenceRulesCarryKnowledgePackCitations(t *testing.T) {
 		if rule.Classification != securityscan.RuleClassificationFinding {
 			t.Errorf("rule %s classification = %q", rule.ID, rule.Classification)
 		}
-		if securityscan.SASTRuleCWE[rule.ID] == "" {
+		if securityscan.RuleCWE(rule.ID) == "" {
 			t.Errorf("rule %s has no CWE mapping", rule.ID)
 		}
 	}

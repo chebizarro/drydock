@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -244,15 +243,15 @@ func (s *Service) Run(ctx context.Context, in Input) (result Result, runErr erro
 		User:        metaReviewUserPrompt(in, s.cfg.MaxInputBytes),
 	}
 	failureStage = "completion"
-	res, err := s.client.ChatCompletion(ctx, req)
+	findingCount := len(in.LocalReview.Findings)
+	var raw string
+	parsed, _, raw, err = reviewengine.CompleteStructured(ctx, s.client, s.logger, req, "meta-review",
+		func(content string) (MetaReviewOutput, error) {
+			return ParseMetaReviewOutputForFindings(content, findingCount)
+		})
+	rawResponse = raw
 	if err != nil {
 		return result, fmt.Errorf("meta-review completion failed: %w", err)
-	}
-	rawResponse = res.Content
-	failureStage = "parse_output"
-	parsed, err = ParseMetaReviewOutputForFindings(rawResponse, len(in.LocalReview.Findings))
-	if err != nil {
-		return result, err
 	}
 
 	failureStage = "persist_result"
@@ -364,7 +363,7 @@ func (s *Service) updateFewShot(ctx context.Context, in Input, out MetaReviewOut
 				s.logger.Warn("failed to embed few-shot for Qdrant", "patch_event_id", in.PatchEventID, "error", err)
 			} else {
 				// Extract metadata for cross-repo learning.
-				lang := detectPrimaryLanguage(in.ChangedFiles)
+				lang := symbols.PrimaryLanguage(in.ChangedFiles)
 				categories := extractFindingCategories(in.LocalReview.Findings)
 				if len(in.SecurityFindings) > 0 && !slices.Contains(categories, "security") {
 					categories = append(categories, "security")
@@ -551,33 +550,6 @@ func dedupe(items []string) []string {
 // detectPrimaryLanguage returns the most common programming language
 // among the changed files, using the symbols package's extension mapping
 // for consistency with code indexing. First-seen language wins on ties.
-func detectPrimaryLanguage(changedFiles []string) string {
-	counts := make(map[string]int)
-	var order []string
-	for _, f := range changedFiles {
-		ext := strings.ToLower(filepath.Ext(f))
-		lang := symbols.LangFromExt(ext)
-		if lang != "" {
-			if counts[lang] == 0 {
-				order = append(order, lang)
-			}
-			counts[lang]++
-		}
-	}
-	if len(counts) == 0 {
-		return ""
-	}
-	best := ""
-	bestCount := 0
-	for _, lang := range order {
-		if counts[lang] > bestCount {
-			best = lang
-			bestCount = counts[lang]
-		}
-	}
-	return best
-}
-
 // extractFindingCategories returns unique finding categories from the local review.
 func extractFindingCategories(findings []reviewengine.Finding) []string {
 	seen := make(map[string]bool)

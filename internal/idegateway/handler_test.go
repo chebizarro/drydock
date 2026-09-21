@@ -100,7 +100,7 @@ func seedPatchReviewTarget(t *testing.T, store *db.Store, ownerSK, patchSK nostr
 	return patch, repoID
 }
 
-func newPatchRequestHandler(t *testing.T, requester nostr.PubKey, loader revieworder.RepositoryConfigLoader, authorizer revieworder.PaymentAuthorizer, ceilings ...scope.Matcher) (*Handler, *db.Store, *revieworder.Service) {
+func newPatchRequestHandler(t *testing.T, requester nostr.PubKey, loader revieworder.RepositoryConfigLoader, authorizer payment.PatchAuthorizer, ceilings ...scope.Matcher) (*Handler, *db.Store, *revieworder.Service) {
 	t.Helper()
 	store, err := db.Open(context.Background(), ":memory:")
 	if err != nil {
@@ -334,8 +334,21 @@ func TestPatchReviewRequestDeniesUnpaidTargetBeforeEnqueue(t *testing.T) {
 	_, rpcErr := h.processPatchReviewRequest(context.Background(), nostr.Event{PubKey: requester}, ReviewRequest{
 		SessionID: "sess-1", RequestID: "req-1", PatchEventID: patch.ID.Hex(),
 	})
-	if rpcErr == nil || rpcErr.Code != contextvm.ErrorUnauthorized {
+	// A payment denial must surface as ErrorPaymentRequired with the
+	// retryable/reason payload — the same mapping the direct ContextVM review/order
+	// path uses — not a bare Unauthorized that hides that the request is payable.
+	if rpcErr == nil || rpcErr.Code != contextvm.ErrorPaymentRequired {
 		t.Fatalf("payment denial error = %+v", rpcErr)
+	}
+	var data struct {
+		Reason    string `json:"reason"`
+		Retryable bool   `json:"retryable"`
+	}
+	if err := json.Unmarshal(rpcErr.Data, &data); err != nil {
+		t.Fatalf("payment denial data: %v", err)
+	}
+	if data.Reason != "no_payment" {
+		t.Fatalf("payment denial reason = %q, want no_payment", data.Reason)
 	}
 	if task, queued := popReviewTask(orders); authorizer.calls != 1 || queued {
 		t.Fatalf("payment denial did not stop enqueue: calls=%d task=%+v queued=%v", authorizer.calls, task, queued)

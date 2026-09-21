@@ -18,9 +18,11 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/contextvm"
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/publisher"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 	"git.sharegap.net/cascadia/drydock/internal/revieworder"
 	"git.sharegap.net/cascadia/drydock/internal/reviewsession"
+	"git.sharegap.net/cascadia/drydock/internal/signing"
 	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 
@@ -37,17 +39,6 @@ const (
 	// fixTTL controls how long suggested fixes are retained server-side.
 	fixTTL = 15 * time.Minute
 )
-
-// Signer signs Nostr events for publishing responses.
-type Signer interface {
-	GetPublicKey(ctx context.Context) (nostr.PubKey, error)
-	SignEvent(ctx context.Context, evt *nostr.Event) error
-}
-
-// RelayPublisher publishes signed events to Nostr relays.
-type RelayPublisher interface {
-	Publish(ctx context.Context, relays []string, event nostr.Event) error
-}
 
 // PatchOrderer admits stored patch requests through the shared review service.
 type PatchOrderer interface {
@@ -70,8 +61,8 @@ type Handler struct {
 	ctxBuilder *contextbuilder.Builder
 	engine     *reviewengine.Engine
 	agenticSvc *agenticreview.Service
-	signer     Signer
-	publish    RelayPublisher
+	signer     signing.Signer
+	publish    publisher.RelayPublisher
 	logger     *slog.Logger
 	ourPubKey  string
 	sem        chan struct{}
@@ -110,8 +101,8 @@ func New(
 	store *db.Store,
 	ctxBuilder *contextbuilder.Builder,
 	engine *reviewengine.Engine,
-	signer Signer,
-	relayPub RelayPublisher,
+	signer signing.Signer,
+	relayPub publisher.RelayPublisher,
 	logger *slog.Logger,
 	opts ...func(*Handler),
 ) *Handler {
@@ -351,20 +342,10 @@ func (h *Handler) processPatchReviewRequest(ctx context.Context, event nostr.Eve
 		Invocation:      db.ReviewInvocationIDE,
 	})
 	if err != nil {
-		switch {
-		case errors.Is(err, revieworder.ErrInvalidTarget):
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: err.Error()}
-		case errors.Is(err, revieworder.ErrTargetNotFound):
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorNotFound, Message: err.Error()}
-		case errors.Is(err, revieworder.ErrSecurityCeiling),
-			errors.Is(err, revieworder.ErrForceDenied),
-			errors.Is(err, revieworder.ErrPaymentDenied):
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorUnauthorized, Message: err.Error()}
-		case errors.Is(err, revieworder.ErrOrderConflict):
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorConflict, Message: err.Error()}
-		default:
-			return ReviewResponse{}, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
-		}
+		// One mapping for one error set: reuse revieworder's canonical mapping so
+		// a rate limit or payment denial surfaces the same protocol code (and the
+		// same retryable/reason payload) here as on the direct ContextVM path.
+		return ReviewResponse{}, revieworder.RPCError(err)
 	}
 
 	summary := "Patch review queued for asynchronous processing."

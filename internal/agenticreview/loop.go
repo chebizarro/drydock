@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"git.sharegap.net/cascadia/drydock/internal/agenttools"
 	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
@@ -71,11 +72,41 @@ type LoopRequest struct {
 	Selection  *agenttools.Selection
 	Counter    contextbuilder.TokenCounter
 	Limits     LoopLimits
+
+	// TerminalTool is the tool whose successful call ends the loop. Defaults to
+	// selection.finalize (the discovery/selection loop).
+	TerminalTool string
+	// TerminalStop is the stop reason recorded when TerminalTool succeeds.
+	// Defaults to StopFinalized.
+	TerminalStop StopReason
+	// Finalize produces the loop's terminal artifact once TerminalTool succeeds.
+	// It reports an error when the terminal handler ran but produced nothing
+	// usable. Defaults to reading the Selection's frozen bundle.
+	Finalize func() (contextbuilder.ContextBundle, error)
+
+	// EmptyAssistantNudge, when non-empty, is appended once as a corrective user
+	// message the first time the assistant returns no tool calls, so the model is
+	// re-prompted with guidance instead of an identical request. When
+	// EmptyAssistantStop and EmptyAssistantErr are also set, a second consecutive
+	// tool-less turn stops the loop with them; otherwise the loop continues until
+	// a natural budget limit.
+	EmptyAssistantNudge string
+	EmptyAssistantStop  StopReason
+	EmptyAssistantErr   error
+
+	// OnMessage, when set, receives each assistant and tool message as it is
+	// produced (the reviewer's transcript sink). A returned error stops the loop
+	// as a transport failure.
+	OnMessage func(context.Context, ...reviewengine.CompletionMessage) error
+	// OnToolResult, when set, receives every successful non-terminal tool call and
+	// its result (the reviewer's evidence ledger).
+	OnToolResult func(reviewengine.ToolCall, agenttools.Result)
 }
 
 type LoopResult struct {
-	Bundle contextbuilder.ContextBundle
-	Trace  LoopTrace
+	Bundle      contextbuilder.ContextBundle
+	Trace       LoopTrace
+	ServedModel string
 }
 
 type LoopRunner struct {
@@ -86,15 +117,36 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 	if r == nil || r.Client == nil {
 		return LoopResult{}, fmt.Errorf("agentic review: completion client is required")
 	}
-	if request.Registry == nil || request.Scope == nil || request.Selection == nil {
-		return LoopResult{}, fmt.Errorf("agentic review: registry, scope, and selection are required")
+	if request.Registry == nil || request.Scope == nil {
+		return LoopResult{}, fmt.Errorf("agentic review: registry and scope are required")
 	}
 	if request.Counter == nil {
 		return LoopResult{}, contextbuilder.ErrTokenCounterRequired
 	}
 	limits := normalizeLoopLimits(request.Limits)
 	request.Scope.MaxResultBytes = limits.MaxToolResultBytes
-	request.Scope.Selection = request.Selection
+	if request.Selection != nil {
+		request.Scope.Selection = request.Selection
+	}
+
+	terminalTool := request.TerminalTool
+	if terminalTool == "" {
+		terminalTool = agenttools.ToolSelectionFinalize
+	}
+	terminalStop := request.TerminalStop
+	if terminalStop == "" {
+		terminalStop = StopFinalized
+	}
+	finalize := request.Finalize
+	if finalize == nil {
+		finalize = func() (contextbuilder.ContextBundle, error) {
+			bundle, ok := request.Selection.Bundle()
+			if !ok {
+				return contextbuilder.ContextBundle{}, fmt.Errorf("%w: finalize handler returned without a frozen bundle", ErrFinalizeMissing)
+			}
+			return bundle, nil
+		}
+	}
 
 	definitions := request.Registry.ListForScope(request.Scope)
 	request.Completion.Tools = make([]reviewengine.ToolSchema, 0, len(definitions))
@@ -106,36 +158,42 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 	}
 
 	trace := LoopTrace{}
+	servedModel := ""
+	emptyNudged := false
 	defer observeLoopMetrics(&trace, limits)
+	stop := func(reason StopReason, err error) (LoopResult, error) {
+		trace.StopReason = reason
+		return LoopResult{Trace: trace, ServedModel: servedModel}, err
+	}
+
 	for trace.Turns < limits.MaxTurns {
 		if err := ctx.Err(); err != nil {
-			trace.StopReason = StopCancelled
-			return LoopResult{Trace: trace}, err
+			return stop(StopCancelled, err)
 		}
 		preflight, err := serializedRequestTokens(request.Completion, request.Counter)
 		if err != nil {
-			trace.StopReason = StopContextExceeded
-			return LoopResult{Trace: trace}, err
+			return stop(StopContextExceeded, err)
 		}
 		if preflight > limits.MaxModelContext {
-			trace.StopReason = StopContextExceeded
-			return LoopResult{Trace: trace}, fmt.Errorf("%w: tokens=%d limit=%d", ErrModelContext, preflight, limits.MaxModelContext)
+			return stop(StopContextExceeded, fmt.Errorf("%w: tokens=%d limit=%d", ErrModelContext, preflight, limits.MaxModelContext))
 		}
 		if trace.CumulativeTokens+preflight > limits.MaxCumulativeTokens {
-			trace.StopReason = StopTokensExhausted
-			return LoopResult{Trace: trace}, ErrTokenLimit
+			return stop(StopTokensExhausted, ErrTokenLimit)
 		}
 
 		completion, err := r.Client.Complete(ctx, request.Completion)
 		trace.Turns++
 		if err != nil {
 			if isContextCancellation(ctx, err) {
-				trace.StopReason = StopCancelled
-			} else {
-				trace.StopReason = StopTransportError
+				return stop(StopCancelled, err)
 			}
-			return LoopResult{Trace: trace}, err
+			return stop(StopTransportError, err)
 		}
+		if model := strings.TrimSpace(completion.Model); model != "" {
+			servedModel = model
+		}
+		completion.Message.PromptTokens = completion.Usage.PromptTokens
+		completion.Message.CompletionTokens = completion.Usage.CompletionTokens
 		used := completion.Usage.TotalTokens
 		if used <= 0 {
 			used = preflight + request.Counter.Count(completion.Message.Content)
@@ -145,15 +203,33 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 		}
 		trace.CumulativeTokens += used
 		if trace.CumulativeTokens > limits.MaxCumulativeTokens {
-			trace.StopReason = StopTokensExhausted
-			return LoopResult{Trace: trace}, ErrTokenLimit
+			return stop(StopTokensExhausted, ErrTokenLimit)
 		}
 
 		request.Completion.Messages = append(request.Completion.Messages, completion.Message)
+		if request.OnMessage != nil {
+			if err := request.OnMessage(ctx, completion.Message); err != nil {
+				return stop(StopTransportError, err)
+			}
+		}
+
+		if len(completion.Message.ToolCalls) == 0 {
+			if request.EmptyAssistantNudge != "" && !emptyNudged {
+				emptyNudged = true
+				request.Completion.Messages = append(request.Completion.Messages, reviewengine.CompletionMessage{
+					Role: reviewengine.MessageRoleUser, Content: request.EmptyAssistantNudge,
+				})
+				continue
+			}
+			if emptyNudged && request.EmptyAssistantErr != nil {
+				return stop(request.EmptyAssistantStop, request.EmptyAssistantErr)
+			}
+			continue
+		}
+
 		for _, call := range completion.Message.ToolCalls {
 			if trace.ToolCalls >= limits.MaxToolCalls {
-				trace.StopReason = StopToolsExhausted
-				return LoopResult{Trace: trace}, ErrToolCallLimit
+				return stop(StopToolsExhausted, ErrToolCallLimit)
 			}
 			trace.ToolCalls++
 			trace.ToolCallIDs = append(trace.ToolCallIDs, call.ID)
@@ -162,34 +238,39 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 				Arguments: json.RawMessage(call.Function.Arguments), Scope: request.Scope,
 			})
 			if dispatchErr != nil && isContextCancellation(ctx, dispatchErr) {
-				trace.StopReason = StopCancelled
-				return LoopResult{Trace: trace}, dispatchErr
+				return stop(StopCancelled, dispatchErr)
 			}
 			if dispatchErr != nil {
 				toolResult = agenttools.Result{Content: dispatchErr.Error(), IsError: true}
 			}
+			if request.OnToolResult != nil && dispatchErr == nil && !toolResult.IsError && call.Function.Name != terminalTool {
+				request.OnToolResult(call, toolResult)
+			}
 			encoded, err := json.Marshal(toolResult)
 			if err != nil {
-				trace.StopReason = StopTransportError
-				return LoopResult{Trace: trace}, err
+				return stop(StopTransportError, err)
 			}
-			request.Completion.Messages = append(request.Completion.Messages, reviewengine.CompletionMessage{
+			toolMessage := reviewengine.CompletionMessage{
 				Role: reviewengine.MessageRoleTool, ToolCallID: call.ID,
 				Name: call.Function.Name, Content: string(encoded),
-			})
-			if call.Function.Name == agenttools.ToolSelectionFinalize && dispatchErr == nil && !toolResult.IsError {
-				bundle, ok := request.Selection.Bundle()
-				if !ok {
-					trace.StopReason = StopTransportError
-					return LoopResult{Trace: trace}, fmt.Errorf("%w: finalize handler returned without a frozen bundle", ErrFinalizeMissing)
+			}
+			request.Completion.Messages = append(request.Completion.Messages, toolMessage)
+			if request.OnMessage != nil {
+				if err := request.OnMessage(ctx, toolMessage); err != nil {
+					return stop(StopTransportError, err)
 				}
-				trace.StopReason = StopFinalized
-				return LoopResult{Bundle: bundle, Trace: trace}, nil
+			}
+			if call.Function.Name == terminalTool && dispatchErr == nil && !toolResult.IsError {
+				bundle, err := finalize()
+				if err != nil {
+					return stop(StopTransportError, err)
+				}
+				trace.StopReason = terminalStop
+				return LoopResult{Bundle: bundle, Trace: trace, ServedModel: servedModel}, nil
 			}
 		}
 	}
-	trace.StopReason = StopTurnsExhausted
-	return LoopResult{Trace: trace}, ErrTurnLimit
+	return stop(StopTurnsExhausted, ErrTurnLimit)
 }
 
 func isContextCancellation(ctx context.Context, err error) bool {

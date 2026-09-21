@@ -219,8 +219,8 @@ func TestMapBinaryReport(t *testing.T) {
 func TestCorroborateOnlyConclusiveMatchingStaticFindings(t *testing.T) {
 	t.Parallel()
 	findings := []reviewengine.Finding{
-		{Evidence: "[CWE-347] [NOSTR-V2] missing verification", Confidence: .55},
-		{Evidence: "[CWE-323] [NOSTR-V4] key reuse", Confidence: .7},
+		{RuleID: "NOSTR-V2", Evidence: "missing verification", Confidence: .55},
+		{RuleID: "NOSTR-V4", Evidence: "key reuse", Confidence: .7},
 	}
 	got := Corroborate(findings, []SecurityEvidence{
 		{RuleID: RuleRelaySignature, Status: StatusFail, Target: "wss://secret.example"},

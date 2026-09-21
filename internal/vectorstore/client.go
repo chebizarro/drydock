@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/circuitbreaker"
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
@@ -213,6 +214,23 @@ func (c *Client) Upsert(ctx context.Context, collection string, points []Point) 
 	return nil
 }
 
+// Match builds a Qdrant filter condition requiring payload key to equal value.
+// It is the single spelling of the {"key":k,"match":{"value":v}} shape that was
+// hand-written at every call site.
+func Match(key, value string) map[string]any {
+	return map[string]any{"key": key, "match": map[string]any{"value": value}}
+}
+
+// Filter wraps conditions in a Qdrant "must" (logical AND) filter, preserving
+// their order. It returns nil when there are no conditions, which Search, Count
+// and Scroll all treat as "no filter".
+func Filter(conditions ...map[string]any) map[string]any {
+	if len(conditions) == 0 {
+		return nil
+	}
+	return map[string]any{"must": conditions}
+}
+
 // Search performs a nearest-neighbor vector search and returns up to limit results.
 // An optional filter map is passed directly to Qdrant's filter field.
 func (c *Client) Search(ctx context.Context, collection string, vector []float32, limit int, filter map[string]any) ([]SearchResult, error) {
@@ -376,7 +394,7 @@ func (c *Client) doHTTP(ctx context.Context, method, path string, body any) ([]b
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 200))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, hashutil.TruncateForLog(string(respBody), 200))
 	}
 
 	return respBody, nil
@@ -420,11 +438,4 @@ func validateCollectionConfig(name string, info *CollectionInfo, wantSize int, w
 		return fmt.Errorf("collection %s distance mismatch: existing distance %q, configured distance %q; migrate or recreate the collection before indexing", name, info.Distance, wantDistance)
 	}
 	return nil
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

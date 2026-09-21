@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"git.sharegap.net/cascadia/drydock/internal/gitexec"
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 	"git.sharegap.net/cascadia/drydock/internal/symbols"
 
@@ -63,10 +64,10 @@ type patchDiffProvider struct{}
 func (patchDiffProvider) LayerName() string { return LayerPatchDiff }
 func (patchDiffProvider) Priority() int     { return 1 }
 func (patchDiffProvider) Build(_ context.Context, in BuildInput) (string, error) {
-	return AnalyzePatch(in)
+	return renderPatch(in)
 }
 
-// AnalyzePatch renders the authoritative patch layer using the deterministic
+// renderPatch renders the authoritative patch layer using the deterministic
 // provider's exact byte limits.
 func renderPatch(in BuildInput) (string, error) {
 	diff := strings.TrimSpace(in.PatchEventContent)
@@ -85,10 +86,10 @@ type fileContextProvider struct{}
 func (fileContextProvider) LayerName() string { return LayerFileContext }
 func (fileContextProvider) Priority() int     { return 2 }
 func (fileContextProvider) Build(_ context.Context, in BuildInput) (string, error) {
-	return AnalyzeModifiedFiles(in)
+	return analyzeModifiedFiles(in)
 }
 
-// AnalyzeModifiedFiles renders current contents for files referenced by a patch.
+// analyzeModifiedFiles renders current contents for files referenced by a patch.
 func analyzeModifiedFiles(in BuildInput) (string, error) {
 	if in.RepoPath == "" {
 		return "", nil
@@ -108,7 +109,7 @@ func analyzeModifiedFiles(in BuildInput) (string, error) {
 		if err != nil {
 			continue
 		}
-		if !isProbablyText(content) {
+		if !hashutil.IsProbablyText(content) {
 			continue
 		}
 		if out.Len() > 20*1024 {
@@ -134,10 +135,10 @@ type symbolsCallsitesProvider struct {
 func (p symbolsCallsitesProvider) LayerName() string { return LayerSymbolsCallsites }
 func (p symbolsCallsitesProvider) Priority() int     { return 3 }
 func (p symbolsCallsitesProvider) Build(ctx context.Context, in BuildInput) (string, error) {
-	return AnalyzeSymbols(ctx, in, p.lspClient, p.search)
+	return analyzeSymbolsContent(ctx, in, p.lspClient, p.search)
 }
 
-// AnalyzeSymbols extracts changed symbols and renders LSP- or search-backed
+// analyzeSymbolsContent extracts changed symbols and renders LSP- or search-backed
 // definitions and callsites.
 func analyzeSymbolsContent(ctx context.Context, in BuildInput, lspClient *lspbridge.Client, search *Searcher) (string, error) {
 	p := symbolsCallsitesProvider{lspClient: lspClient, search: search}
@@ -171,7 +172,7 @@ func analyzeSymbolsContent(ctx context.Context, in BuildInput, lspClient *lspbri
 	// If it is configured but unavailable/empty, surface that degraded status before
 	// falling back so callers can distinguish grep context from LSP-backed context.
 	if p.lspClient != nil {
-		lspResult := AnalyzeLSP(ctx, p.lspClient, in, syms)
+		lspResult := analyzeLSP(ctx, p.lspClient, in, syms)
 		if lspResult.Content != "" {
 			out.WriteString(lspResult.Content)
 			content := strings.TrimSpace(out.String())
@@ -412,10 +413,10 @@ type testsProvider struct {
 func (p testsProvider) LayerName() string { return LayerTests }
 func (p testsProvider) Priority() int     { return 4 }
 func (p testsProvider) Build(ctx context.Context, in BuildInput) (string, error) {
-	return AnalyzeTests(ctx, in, p.search)
+	return analyzeTestsContent(ctx, in, p.search)
 }
 
-// AnalyzeTests renders test references and stable coverage-gap markers for
+// analyzeTestsContent renders test references and stable coverage-gap markers for
 // symbols changed by the patch.
 func analyzeTestsContent(ctx context.Context, in BuildInput, search *Searcher) (string, error) {
 	p := testsProvider{search: search}
@@ -465,10 +466,10 @@ type importsExportsProvider struct{}
 func (importsExportsProvider) LayerName() string { return LayerImportsExports }
 func (importsExportsProvider) Priority() int     { return 5 }
 func (importsExportsProvider) Build(_ context.Context, in BuildInput) (string, error) {
-	return AnalyzeImportsExports(in)
+	return analyzeImportsExports(in)
 }
 
-// AnalyzeImportsExports renders import/export lines changed by the patch.
+// analyzeImportsExports renders import/export lines changed by the patch.
 func analyzeImportsExports(in BuildInput) (string, error) {
 	lines := extractImportExportLines(in.PatchEventContent)
 	if len(lines) == 0 {
@@ -482,10 +483,10 @@ type commitHistoryProvider struct{}
 func (commitHistoryProvider) LayerName() string { return LayerCommitHistory }
 func (commitHistoryProvider) Priority() int     { return 6 }
 func (commitHistoryProvider) Build(ctx context.Context, in BuildInput) (string, error) {
-	return AnalyzeHistory(ctx, in)
+	return analyzeHistoryContent(ctx, in)
 }
 
-// AnalyzeHistory renders recent commits affecting patch paths.
+// analyzeHistoryContent renders recent commits affecting patch paths.
 func analyzeHistoryContent(ctx context.Context, in BuildInput) (string, error) {
 	if in.RepoPath == "" {
 		return "", nil
@@ -519,10 +520,10 @@ type projectDocsProvider struct{}
 func (projectDocsProvider) LayerName() string { return LayerProjectDocs }
 func (projectDocsProvider) Priority() int     { return 7 }
 func (projectDocsProvider) Build(_ context.Context, in BuildInput) (string, error) {
-	return AnalyzeDocs(in)
+	return analyzeDocsContent(in)
 }
 
-// AnalyzeDocs renders repository and workspace guidance using deterministic
+// analyzeDocsContent renders repository and workspace guidance using deterministic
 // candidate ordering and byte limits.
 func analyzeDocsContent(in BuildInput) (string, error) {
 	if in.RepoPath == "" {
@@ -556,7 +557,7 @@ func analyzeDocsContent(in BuildInput) (string, error) {
 		if err != nil || len(data) == 0 {
 			continue
 		}
-		if !isProbablyText(data) {
+		if !hashutil.IsProbablyText(data) {
 			continue
 		}
 		if out.Len() > 15*1024 {
@@ -640,14 +641,4 @@ func isExcludedPath(path string) bool {
 		return true
 	}
 	return false
-}
-
-func isProbablyText(data []byte) bool {
-	if len(data) == 0 {
-		return true
-	}
-	if bytes.IndexByte(data, 0x00) >= 0 {
-		return false
-	}
-	return true
 }

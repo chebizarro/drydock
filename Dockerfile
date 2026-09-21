@@ -3,7 +3,6 @@ FROM golang:1.26-alpine AS builder
 WORKDIR /src
 RUN apk add --no-cache git ca-certificates build-base
 
-ARG TARGETARCH=amd64
 ARG BETTERLEAKS_VERSION=v1.7.4
 RUN CGO_ENABLED=0 GOBIN=/out \
     go install github.com/betterleaks/betterleaks@${BETTERLEAKS_VERSION}
@@ -12,8 +11,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build -o /out/drydock ./cmd/drydock && \
-    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build -o /out/drydock-eval ./cmd/drydock-eval
+RUN CGO_ENABLED=1 GOOS=linux go build -o /out/drydock ./cmd/drydock && \
+    CGO_ENABLED=1 GOOS=linux go build -o /out/drydock-eval ./cmd/drydock-eval
 
 FROM alpine:3.22
 

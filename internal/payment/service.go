@@ -214,6 +214,14 @@ func paymentPending() (AuthorizeResult, error) {
 
 // AuthorizePatch checks if a patch event is authorized for review based on
 // the repo's payment policy.
+// PatchAuthorizer gates a patch review according to the repository payment
+// policy. *Service is the production implementation; the pipeline and the
+// review-order service both consume it through this single interface rather than
+// re-declaring a byte-identical one each.
+type PatchAuthorizer interface {
+	AuthorizePatch(ctx context.Context, patchEvent nostr.Event, repoID string, policy repoconfig.PaymentsConfig) (AuthorizeResult, error)
+}
+
 func (s *Service) AuthorizePatch(
 	ctx context.Context,
 	patchEvent nostr.Event,

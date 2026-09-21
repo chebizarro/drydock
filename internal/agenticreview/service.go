@@ -623,7 +623,8 @@ func (s *Service) validatePrepared(prepared *PreparedReview) (*preparedState, er
 	state := prepared.state
 	if err := state.snapshot.Verify(); err != nil {
 		recordSnapshotCorruption(err)
-		return nil, fmt.Errorf("%w: %v", ErrInvalidPrepared, err)
+		// %w keeps workspacesnapshot.ErrHashMismatch reachable via errors.Is.
+		return nil, fmt.Errorf("%w: %w", ErrInvalidPrepared, err)
 	}
 	if err := state.envelope.VerifyMaterials(state.patch, state.bundle.Content); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidPrepared, err)

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 	"git.sharegap.net/cascadia/drydock/internal/symbols"
 )
@@ -155,7 +156,7 @@ func scanTaintFunctions(ctx context.Context, in BuildInput) (map[string]*taintFu
 			}
 			filesSeen++
 			data, err := os.ReadFile(path)
-			if err != nil || len(data) == 0 || len(data) > 512*1024 || !isProbablyText(data) {
+			if err != nil || len(data) == 0 || len(data) > 512*1024 || !hashutil.IsProbablyText(data) {
 				return nil
 			}
 			rel, err := filepath.Rel(in.RepoPath, path)

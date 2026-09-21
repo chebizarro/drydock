@@ -144,11 +144,15 @@ func IsTransient(err error) bool {
 	if err == nil {
 		return false
 	}
-	if httpErr, ok := err.(*LLMHTTPError); ok {
+	// errors.As, not a bare type assertion: once any layer wraps with %w a
+	// bare assertion misses and IsTransient falls to its transient default,
+	// retrying a wrapped 400 Bad Request three times with backoff.
+	var httpErr *LLMHTTPError
+	if errors.As(err, &httpErr) {
 		return httpErr.StatusCode == 429 || httpErr.StatusCode >= 500
 	}
 	// Context cancellation is not transient
-	if err == context.Canceled || err == context.DeadlineExceeded {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	// For non-HTTP errors (network timeouts, connection refused, DNS failures),
@@ -421,43 +425,10 @@ func NewRetryingClient(inner LLMClient, cfg RetryConfig, logger *slog.Logger) *R
 }
 
 func (c *RetryingClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatResult, error) {
-	var lastErr error
-	for attempt := 0; attempt < c.Config.MaxAttempts; attempt++ {
-		result, err := c.Inner.ChatCompletion(ctx, req)
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-
-		if !IsTransient(err) {
-			return ChatResult{}, err // non-transient: fail immediately
-		}
-
-		if attempt+1 >= c.Config.MaxAttempts {
-			break // no more attempts
-		}
-
-		// Exponential backoff: baseDelay * 2^attempt, capped at maxDelay
-		delay := time.Duration(float64(c.Config.BaseDelay) * math.Pow(2, float64(attempt)))
-		if delay > c.Config.MaxDelay {
-			delay = c.Config.MaxDelay
-		}
-
-		c.Logger.Warn("llm request failed (transient), retrying",
-			"attempt", attempt+1,
-			"max_attempts", c.Config.MaxAttempts,
-			"delay", delay.String(),
-			"model", req.Model,
-			"error", err,
-		)
-
-		select {
-		case <-ctx.Done():
-			return ChatResult{}, ctx.Err()
-		case <-time.After(delay):
-		}
-	}
-	return ChatResult{}, fmt.Errorf("llm request failed after %d attempts: %w", c.Config.MaxAttempts, lastErr)
+	return retryLLM(ctx, c.Config, c.Logger, req.Model, "llm request",
+		func(ctx context.Context) (ChatResult, error) {
+			return c.Inner.ChatCompletion(ctx, req)
+		})
 }
 
 func (c *RetryingClient) Complete(ctx context.Context, req CompletionRequest) (CompletionResult, error) {
@@ -465,38 +436,58 @@ func (c *RetryingClient) Complete(ctx context.Context, req CompletionRequest) (C
 	if !ok {
 		return CompletionResult{}, ErrCompletionUnsupported
 	}
+	return retryLLM(ctx, c.Config, c.Logger, req.Model, "llm completion",
+		func(ctx context.Context) (CompletionResult, error) {
+			return inner.Complete(ctx, req)
+		})
+}
+
+// retryLLM runs call with the shared transient-error retry policy: exponential
+// backoff capped at MaxDelay, immediate return on a non-transient error, and
+// ctx cancellation honoured between attempts. The logger is optional; a nil
+// logger is skipped rather than panicked on (the two hand-rolled copies this
+// replaced disagreed, so a nil Logger panicked on chat but not completion).
+func retryLLM[T any](
+	ctx context.Context,
+	cfg RetryConfig,
+	logger *slog.Logger,
+	model, opName string,
+	call func(context.Context) (T, error),
+) (T, error) {
+	var zero T
 	var lastErr error
-	for attempt := 0; attempt < c.Config.MaxAttempts; attempt++ {
-		result, err := inner.Complete(ctx, req)
+	for attempt := 0; attempt < cfg.MaxAttempts; attempt++ {
+		result, err := call(ctx)
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
 		if !IsTransient(err) {
-			return CompletionResult{}, err
+			return zero, err // non-transient: fail immediately
 		}
-		if attempt+1 >= c.Config.MaxAttempts {
-			break
+		if attempt+1 >= cfg.MaxAttempts {
+			break // no more attempts
 		}
 
-		delay := time.Duration(float64(c.Config.BaseDelay) * math.Pow(2, float64(attempt)))
-		if delay > c.Config.MaxDelay {
-			delay = c.Config.MaxDelay
+		// Exponential backoff: baseDelay * 2^attempt, capped at maxDelay.
+		delay := time.Duration(float64(cfg.BaseDelay) * math.Pow(2, float64(attempt)))
+		if delay > cfg.MaxDelay {
+			delay = cfg.MaxDelay
 		}
-		if c.Logger != nil {
-			c.Logger.Warn("llm completion failed (transient), retrying",
+		if logger != nil {
+			logger.Warn(opName+" failed (transient), retrying",
 				"attempt", attempt+1,
-				"max_attempts", c.Config.MaxAttempts,
+				"max_attempts", cfg.MaxAttempts,
 				"delay", delay.String(),
-				"model", req.Model,
+				"model", model,
 				"error", err,
 			)
 		}
 		select {
 		case <-ctx.Done():
-			return CompletionResult{}, ctx.Err()
+			return zero, ctx.Err()
 		case <-time.After(delay):
 		}
 	}
-	return CompletionResult{}, fmt.Errorf("llm completion failed after %d attempts: %w", c.Config.MaxAttempts, lastErr)
+	return zero, fmt.Errorf("%s failed after %d attempts: %w", opName, cfg.MaxAttempts, lastErr)
 }

@@ -20,7 +20,6 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/nostrscan"
 	"git.sharegap.net/cascadia/drydock/internal/publisher"
-	"git.sharegap.net/cascadia/drydock/internal/repoconfig"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 	"git.sharegap.net/cascadia/drydock/internal/reviewsession"
 	"git.sharegap.net/cascadia/drydock/internal/securityscan"
@@ -101,21 +100,141 @@ func TestBudgetForDepth(t *testing.T) {
 }
 
 func TestNostrAuditFindingsKeepRuleIDAndCWE(t *testing.T) {
-	cfg := repoconfig.Default().Security.Nostr
+	// Rule identity travels as fields, not Evidence prose (DRYDOCK-vrbe), and
+	// role gating lives in nostrscan (DRYDOCK-ams0): NOSTR-V6 is client-only.
 	roles := []nostrscan.Role{nostrscan.RoleRelay}
-	findings := auditNostrFindings([]securityscan.SecurityFinding{
-		{RuleID: "NOSTR-V2", File: "relay.go", Evidence: "ingest -> store", Category: "security"},
-		{RuleID: "NOSTR-V6", File: "relay.go", Evidence: "preview", Category: "security"},
-	}, []string{"relay.go"}, roles, cfg)
-	if len(findings) != 1 || findings[0].RuleID != "NOSTR-V2" {
-		t.Fatalf("role-gated findings = %#v", findings)
+	if nostrscan.RuleAppliesToRoles("NOSTR-V6", roles) {
+		t.Fatal("NOSTR-V6 should not apply to a relay role")
 	}
-	converted := scanFindings(findings)
-	if len(converted) != 1 || converted[0].Category != "security" || findingCWE(converted[0]) != "CWE-347" {
+	if !nostrscan.RuleAppliesToRoles("NOSTR-V2", roles) {
+		t.Fatal("NOSTR-V2 should apply to a relay role")
+	}
+	converted := securityscan.ReviewFindings([]securityscan.SecurityFinding{
+		{RuleID: "NOSTR-V2", File: "relay.go", Evidence: "ingest -> store", Category: "security", Severity: "high"},
+	})
+	if len(converted) != 1 {
 		t.Fatalf("converted findings = %#v", converted)
 	}
-	if converted[0].Evidence != "[CWE-347] [NOSTR-V2] ingest -> store" {
-		t.Fatalf("evidence = %q", converted[0].Evidence)
+	f := converted[0]
+	if f.Category != "security" || f.RuleID != "NOSTR-V2" || f.CWE != "CWE-347" {
+		t.Fatalf("finding identity not carried as fields: %#v", f)
+	}
+	if f.Evidence != "ingest -> store" {
+		t.Fatalf("evidence should be clean prose, got %q", f.Evidence)
+	}
+	if findingCWE(f) != "CWE-347" {
+		t.Fatalf("findingCWE = %q", findingCWE(f))
+	}
+}
+
+type fakeSCATools struct {
+	paths  map[string]string
+	output map[string][]byte
+}
+
+func (f fakeSCATools) LookPath(name string) (string, error) {
+	if p, ok := f.paths[name]; ok {
+		return p, nil
+	}
+	return "", errors.New("not found")
+}
+
+func (f fakeSCATools) Run(_ context.Context, name string, _ ...string) ([]byte, error) {
+	return f.output[name], nil
+}
+
+func TestRunSCAToolsEmitsFindingsFromSARIF(t *testing.T) {
+	// A single result whose path (locations[].artifactLocation.uri) and message
+	// live in the same object — exactly what the old any-walker could not
+	// assemble, so EnableSCA reported coverage it never had (DRYDOCK-rnmo).
+	sarif := []byte(`{"version":"2.1.0","runs":[{"tool":{"driver":{"rules":[{"id":"CVE-2024-0001","shortDescription":{"text":"vulnerable dependency"}}]}},"results":[{"ruleId":"CVE-2024-0001","level":"error","message":{"text":"go.mod pulls a vulnerable version of foo"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"go.mod"},"region":{"startLine":5}}}]}]}]}`)
+	tools := fakeSCATools{
+		paths:  map[string]string{"trivy": "trivy"},
+		output: map[string][]byte{"trivy": sarif},
+	}
+	engine := New(Config{}, Dependencies{Tools: tools}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	findings, err := engine.runSCATools(context.Background(), t.TempDir(), true)
+	if err != nil {
+		t.Fatalf("runSCATools: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("expected one SCA finding, got %#v", findings)
+	}
+	f := findings[0]
+	if f.File != "go.mod" || f.Line != 5 || f.Severity != "high" || f.RuleID != "CVE-2024-0001" {
+		t.Fatalf("finding = %#v", f)
+	}
+}
+
+// TestParseSARIFFindingsResolvesRealSeverity guards DRYDOCK against flattening
+// a CRITICAL SCA finding to "high": SARIF 2.1.0 has no level above "error", so
+// real severity must be read from properties (GitHub's security-severity CVSS
+// score, or a Severity token) and only fall back to the level mapping. It also
+// pins the SARIF-spec default level (absent -> "warning" -> medium, not low).
+func TestParseSARIFFindingsResolvesRealSeverity(t *testing.T) {
+	loc := `"locations":[{"physicalLocation":{"artifactLocation":{"uri":"go.mod"},"region":{"startLine":1}}}]`
+	for _, tc := range []struct {
+		name  string
+		sarif string
+		want  string
+	}{
+		{
+			name:  "rule security-severity CVSS critical beats level ceiling",
+			sarif: `{"runs":[{"tool":{"driver":{"rules":[{"id":"CVE-1","properties":{"security-severity":"9.8"}}]}},"results":[{"ruleId":"CVE-1","level":"error","message":{"text":"m"},` + loc + `}]}]}`,
+			want:  "critical",
+		},
+		{
+			name:  "result properties severity token",
+			sarif: `{"runs":[{"tool":{"driver":{"rules":[]}},"results":[{"ruleId":"CVE-2","level":"warning","message":{"text":"m"},"properties":{"severity":"CRITICAL"},` + loc + `}]}]}`,
+			want:  "critical",
+		},
+		{
+			name:  "absent level defaults to warning then medium",
+			sarif: `{"runs":[{"tool":{"driver":{"rules":[]}},"results":[{"ruleId":"CVE-3","message":{"text":"m"},` + loc + `}]}]}`,
+			want:  "medium",
+		},
+		{
+			name:  "error level without properties stays high",
+			sarif: `{"runs":[{"tool":{"driver":{"rules":[]}},"results":[{"ruleId":"CVE-4","level":"error","message":{"text":"m"},` + loc + `}]}]}`,
+			want:  "high",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			findings, err := parseSARIFFindings("trivy", []byte(tc.sarif))
+			if err != nil {
+				t.Fatalf("parseSARIFFindings: %v", err)
+			}
+			if len(findings) != 1 {
+				t.Fatalf("expected 1 finding, got %#v", findings)
+			}
+			if findings[0].Severity != tc.want {
+				t.Fatalf("severity = %q, want %q", findings[0].Severity, tc.want)
+			}
+		})
+	}
+}
+
+func TestAuditReviewInstructionsBoundsSurfacesToBudget(t *testing.T) {
+	units := []candidateUnit{{File: "a.go"}, {File: "b.go"}, {File: "c.go"}}
+	surfaces := surface.Result{Locations: []surface.Location{
+		{File: "a.go", Tag: "sql", Line: 1},
+		{File: "c.go", Tag: "sql", Line: 2},         // dropped: c.go is beyond the budget
+		{File: "unrelated.go", Tag: "sql", Line: 3}, // dropped: not a candidate unit
+	}}
+	instr := auditReviewInstructions(units, nil, surfaces, "", 2)
+	jsonPart := instr[strings.Index(instr, "{"):]
+	var payload struct {
+		CandidateFiles []string           `json:"candidate_files"`
+		Surfaces       []surface.Location `json:"security_surfaces"`
+	}
+	if err := json.Unmarshal([]byte(jsonPart), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if len(payload.CandidateFiles) != 2 {
+		t.Fatalf("candidate files = %v, want 2 (depth budget)", payload.CandidateFiles)
+	}
+	if len(payload.Surfaces) != 1 || payload.Surfaces[0].File != "a.go" {
+		t.Fatalf("surfaces = %#v, want only a.go (in budget, has a surface)", payload.Surfaces)
 	}
 }
 
@@ -193,7 +312,7 @@ func TestModelLocalizationFallback(t *testing.T) {
 		RepoMap: []codemap.RankedSymbol{{Path: "a.go", Name: "A"}, {Path: "b.go", Name: "B"}},
 	}
 	heuristic := []candidateUnit{{File: "a.go", Score: 100}}
-	deterministic := []reviewengine.Finding{{File: "a.go", Category: "security", Evidence: "[CWE-78] sink"}}
+	deterministic := []reviewengine.Finding{{File: "a.go", Category: "security", CWE: "CWE-78", Evidence: "sink"}}
 	tests := []struct {
 		name      string
 		strategy  string

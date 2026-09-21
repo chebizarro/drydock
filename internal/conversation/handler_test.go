@@ -251,7 +251,7 @@ func TestHandleReply_RateLimitAt3Turns(t *testing.T) {
 	// Pre-seed 3 conversation turns.
 	for i := 1; i <= MaxTurnsPerReview; i++ {
 		hex := padHex64(i)
-		_, err := store.InsertConversation(ctx, db.ConversationTurn{
+		_, err := store.BeginConversationTurn(ctx, db.ConversationTurn{
 			ReviewEventID: testReviewID,
 			ReplyEventID:  hex,
 			RepoID:        testRepoID,
@@ -260,7 +260,7 @@ func TestHandleReply_RateLimitAt3Turns(t *testing.T) {
 			ReplyContent:  "turn content",
 			TurnNumber:    i,
 			CreatedAt:     time.Now().Unix(),
-		})
+		}, MaxTurnsPerReview)
 		if err != nil {
 			t.Fatal(err)
 		}

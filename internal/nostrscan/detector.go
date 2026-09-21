@@ -14,12 +14,12 @@ import (
 	"strconv"
 	"strings"
 
+	"git.sharegap.net/cascadia/drydock/internal/codemap"
 	"git.sharegap.net/cascadia/drydock/internal/gitexec"
 )
 
 const (
 	DefaultMinConfidence = 0.60
-	cacheVersion         = 1
 	maxScanFileBytes     = 2 * 1024 * 1024
 	maxScanBytes         = 32 * 1024 * 1024
 )
@@ -79,7 +79,7 @@ func (d *Detector) Detect(ctx context.Context, repoPath, ref string) (NostrProfi
 		ref = "HEAD"
 	}
 
-	treeHash, err := gitOutput(ctx, repoPath, "rev-parse", ref+"^{tree}")
+	treeHash, err := gitexec.Output(ctx, repoPath, "rev-parse", ref+"^{tree}")
 	if err != nil {
 		return NostrProfile{}, fmt.Errorf("nostrscan: resolve tree for %s: %w", ref, err)
 	}
@@ -156,7 +156,7 @@ func readCache(path, treeHash string) (NostrProfile, bool) {
 		return NostrProfile{}, false
 	}
 	var entry cacheEntry
-	if json.Unmarshal(data, &entry) != nil || entry.Version != cacheVersion || entry.TreeHash != treeHash {
+	if json.Unmarshal(data, &entry) != nil || entry.Version != codemap.CacheVersion || entry.TreeHash != treeHash {
 		return NostrProfile{}, false
 	}
 	entry.Profile.IsNostr = false
@@ -165,50 +165,14 @@ func readCache(path, treeHash string) (NostrProfile, bool) {
 
 func writeCache(path, treeHash string, profile NostrProfile) error {
 	profile.IsNostr = false
-	data, err := json.Marshal(cacheEntry{Version: cacheVersion, TreeHash: treeHash, Profile: profile})
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
+	return codemap.WriteJSONAtomic(path, cacheEntry{Version: codemap.CacheVersion, TreeHash: treeHash, Profile: profile})
 }
 
 func (d *Detector) resolveCacheDir(ctx context.Context, repoPath string) (string, error) {
 	if d.cacheDir != "" {
 		return d.cacheDir, nil
 	}
-	gitDir, err := gitOutput(ctx, repoPath, "rev-parse", "--git-common-dir")
-	if err != nil {
-		return "", fmt.Errorf("nostrscan: resolve git directory: %w", err)
-	}
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(repoPath, gitDir)
-	}
-	return filepath.Join(filepath.Clean(gitDir), "drydock-codemap"), nil
+	return codemap.ResolveCacheDir(ctx, repoPath)
 }
 
 type treeFile struct {
@@ -613,12 +577,4 @@ func lineAt(data []byte, offset int) int {
 		offset = len(data)
 	}
 	return bytes.Count(data[:offset], []byte{'\n'}) + 1
-}
-
-func gitOutput(ctx context.Context, repoPath string, args ...string) (string, error) {
-	out, err := gitexec.Run(ctx, repoPath, args...)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out), nil
 }

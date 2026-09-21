@@ -136,15 +136,6 @@ func (s *Server) Serve(listener net.Listener) error {
 	return nil
 }
 
-// ListenAndServe starts the health check server on the given address.
-func (s *Server) ListenAndServe(addr string) error {
-	listener, err := s.Listen(addr)
-	if err != nil {
-		return err
-	}
-	return s.Serve(listener)
-}
-
 // RunHeartbeat maintains the internal service heartbeat independently of
 // workload arrivals. It blocks until ctx is cancelled.
 func (s *Server) RunHeartbeat(ctx context.Context, interval time.Duration) {

@@ -10,14 +10,10 @@ import (
 	"log/slog"
 	"strconv"
 
+	"git.sharegap.net/cascadia/drydock/internal/signing"
+
 	"fiatjaf.com/nostr"
 )
-
-// Signer signs outbound ContextVM events.
-type Signer interface {
-	GetPublicKey(ctx context.Context) (nostr.PubKey, error)
-	SignEvent(ctx context.Context, evt *nostr.Event) error
-}
 
 // Pool is the subset of nostr.Pool used by Transport.
 type Pool interface {
@@ -28,13 +24,13 @@ type Pool interface {
 // Transport publishes and subscribes ContextVM JSON-RPC messages over Nostr.
 type Transport struct {
 	pool        Pool
-	signer      Signer
+	signer      signing.Signer
 	readRelays  []string
 	writeRelays []string
 	logger      *slog.Logger
 }
 
-func NewTransport(pool Pool, signer Signer, readRelays, writeRelays []string, logger *slog.Logger) *Transport {
+func NewTransport(pool Pool, signer signing.Signer, readRelays, writeRelays []string, logger *slog.Logger) *Transport {
 	if logger == nil {
 		logger = slog.Default()
 	}

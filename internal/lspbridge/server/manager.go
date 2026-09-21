@@ -80,7 +80,7 @@ func NewManager(logger *slog.Logger, opts ...ManagerOption) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	options := managerOptions{commandConfigs: configuredLSPCommandConfigs()}
+	options := managerOptions{}
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -359,31 +359,6 @@ func (m *Manager) commandConfig(lang string) (lspbridge.LSPCommandConfig, error)
 	return cfg, nil
 }
 
-func configuredLSPCommandConfigs() map[string]lspbridge.LSPCommandConfig {
-	configs := make(map[string]lspbridge.LSPCommandConfig)
-	disabled := make(map[string]struct{})
-	for _, lang := range splitConfigList(os.Getenv("DRYDOCK_LSP_DISABLED_LANGUAGES")) {
-		disabled[lang] = struct{}{}
-	}
-	for _, lang := range lspbridge.SupportedLanguages() {
-		envKey := languageEnvKey(lang)
-		cfg := lspbridge.LSPCommandConfig{}
-		if _, ok := disabled[lang]; ok || truthy(os.Getenv("DRYDOCK_LSP_"+envKey+"_DISABLED")) {
-			cfg.Disabled = true
-		}
-		if command := strings.TrimSpace(os.Getenv("DRYDOCK_LSP_" + envKey + "_COMMAND")); command != "" {
-			cfg.Command = command
-		}
-		if argsEnv, ok := os.LookupEnv("DRYDOCK_LSP_" + envKey + "_ARGS"); ok {
-			cfg.Args = splitArgs(argsEnv)
-		}
-		if cfg.Disabled || cfg.Command != "" || cfg.Args != nil {
-			configs[lang] = normalizeCommandConfig(cfg)
-		}
-	}
-	return configs
-}
-
 func normalizeCommandConfig(cfg lspbridge.LSPCommandConfig) lspbridge.LSPCommandConfig {
 	cfg.Command = strings.TrimSpace(cfg.Command)
 	if cfg.Args != nil {
@@ -396,31 +371,4 @@ func normalizeCommandConfig(cfg lspbridge.LSPCommandConfig) lspbridge.LSPCommand
 		cfg.Args = args
 	}
 	return cfg
-}
-
-func splitArgs(value string) []string {
-	if strings.TrimSpace(value) == "" {
-		return []string{}
-	}
-	var args []string
-	for _, part := range strings.Split(value, ",") {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			args = append(args, trimmed)
-		}
-	}
-	return args
-}
-
-func languageEnvKey(lang string) string {
-	replacer := strings.NewReplacer("-", "_", ".", "_")
-	return strings.ToUpper(replacer.Replace(lang))
-}
-
-func truthy(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1", "t", "true", "y", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }

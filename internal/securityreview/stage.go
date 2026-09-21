@@ -187,28 +187,24 @@ func (s *Stage) detectNostr(ctx context.Context, repoPath string, cfg repoconfig
 }
 
 func activateNostr(ctx context.Context, bundle contextbuilder.ContextBundle, repoPath string, profile nostrscan.NostrProfile, cfg repoconfig.NostrConfig) (contextbuilder.ContextBundle, string, []reviewengine.Finding, error) {
-	roles := effectiveNostrRoles(profile.Roles, cfg)
-	rules := filterNostrRules(nostrscan.PresenceRulesForRoles(roles), cfg)
-	scanner := securityscan.NewWithRuleSets(rules, nostrscan.SurfaceRules())
-	diff := extractLayer(bundle.Content, contextbuilder.LayerPatchDiff)
-	scan, err := scanner.ScanFiles(ctx, repoPath, bundle.ChangedFiles, diff)
-	if err != nil {
-		return bundle, "", nil, fmt.Errorf("securityreview: nostr security scan: %w", err)
-	}
-	findings := filterNostrFindings(scan.Findings, roles, cfg)
-
+	var codeMap *codemap.Map
 	if cfg.AbsenceAnalysis {
-		codeMap, err := codemap.New().Build(ctx, repoPath, "HEAD")
+		built, err := codemap.New().Build(ctx, repoPath, "HEAD")
 		if err != nil {
 			return bundle, "", nil, fmt.Errorf("securityreview: build codemap for nostr absence analysis: %w", err)
 		}
-		allFiles := make([]string, 0, len(codeMap.Files))
-		for file := range codeMap.Files {
-			allFiles = append(allFiles, file)
-		}
-		surfaces := scanner.LocateSurface(ctx, repoPath, allFiles)
-		absence := nostrscan.AnalyzeAbsences(ctx, repoPath, codeMap, surfaces)
-		findings = append(findings, filterNostrFindings(absence.Findings, roles, cfg)...)
+		codeMap = built
+	}
+	scan, _, err := nostrscan.Activate(ctx, nostrscan.ActivateInput{
+		RepoPath: repoPath,
+		Files:    bundle.ChangedFiles,
+		Diff:     extractLayer(bundle.Content, contextbuilder.LayerPatchDiff),
+		CodeMap:  codeMap,
+		Profile:  profile,
+		Config:   cfg,
+	})
+	if err != nil {
+		return bundle, "", nil, err
 	}
 
 	preamble := ""
@@ -224,57 +220,7 @@ func activateNostr(ctx context.Context, bundle contextbuilder.ContextBundle, rep
 		bundle.Content = strings.TrimSpace(bundle.Content) + "\n\n## nostr-protocol\n" + contextLayer
 		bundle.LayersUsed = append(bundle.LayersUsed, "nostr-protocol")
 	}
-	return bundle, preamble, nostrReviewFindings(findings), nil
-}
-
-func effectiveNostrRoles(detected []nostrscan.Role, cfg repoconfig.NostrConfig) []nostrscan.Role {
-	detectedStrings := make([]string, 0, len(detected))
-	for _, role := range detected {
-		detectedStrings = append(detectedStrings, string(role))
-	}
-	configured := cfg.EffectiveRoles(detectedStrings)
-	roles := make([]nostrscan.Role, 0, len(configured))
-	for _, role := range configured {
-		roles = append(roles, nostrscan.Role(role))
-	}
-	return roles
-}
-
-func filterNostrRules(rules []securityscan.Rule, cfg repoconfig.NostrConfig) []securityscan.Rule {
-	out := make([]securityscan.Rule, 0, len(rules))
-	for _, rule := range rules {
-		if cfg.AllowsRule(rule.ID) {
-			out = append(out, rule)
-		}
-	}
-	return out
-}
-
-func filterNostrFindings(findings []securityscan.SecurityFinding, roles []nostrscan.Role, cfg repoconfig.NostrConfig) []securityscan.SecurityFinding {
-	out := make([]securityscan.SecurityFinding, 0, len(findings))
-	for _, finding := range findings {
-		if cfg.AllowsRule(finding.RuleID) && nostrscan.RuleAppliesToRoles(finding.RuleID, roles) {
-			out = append(out, finding)
-		}
-	}
-	return out
-}
-
-func nostrReviewFindings(findings []securityscan.SecurityFinding) []reviewengine.Finding {
-	out := make([]reviewengine.Finding, 0, len(findings))
-	for _, finding := range findings {
-		cwe := securityscan.SASTRuleCWE[finding.RuleID]
-		evidence := "[" + finding.RuleID + "] " + finding.Evidence
-		if cwe != "" {
-			evidence = "[" + cwe + "] " + evidence
-		}
-		out = append(out, reviewengine.Finding{
-			Severity: finding.Severity, Category: "security", File: finding.File, Line: finding.Line,
-			Evidence: evidence, Explanation: finding.Description, Suggestion: finding.Suggestion,
-			Confidence: finding.Confidence,
-		})
-	}
-	return out
+	return bundle, preamble, securityscan.ReviewFindings(scan.Findings), nil
 }
 
 // ExtractEvidence extracts security provider layers from the rendered bundle.

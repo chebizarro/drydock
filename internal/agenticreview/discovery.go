@@ -123,6 +123,10 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 		},
 		Registry: d.config.Registry, Scope: scope, Selection: selection,
 		Counter: d.config.Counter, Limits: d.config.Limits,
+		// Re-prompt once with guidance instead of re-sending an identical request
+		// when the model returns no tool call; a model that still fails to finalize
+		// then exhausts its turn budget and routes to the deterministic fallback.
+		EmptyAssistantNudge: discoveryCorrectiveNudge,
 	})
 	if loopErr == nil {
 		artifacts, err := selection.Artifacts()

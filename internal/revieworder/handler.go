@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -113,7 +112,7 @@ func (h *Handler) HandleReviewOrder(ctx context.Context, request contextvm.Reque
 			"patch_event_id", params.PatchEventID,
 			"error", err,
 		)
-		return nil, reviewOrderRPCError(err)
+		return nil, RPCError(err)
 	}
 	if eventRepository != "" && accepted.Receipt.RepositoryAddress != eventRepository {
 		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "a tag does not match resolved repository"}
@@ -135,41 +134,26 @@ func (h *Handler) HandleReviewOrder(ctx context.Context, request contextvm.Reque
 }
 
 func (h *Handler) validateEnvelope(request contextvm.Request, params ReviewOrderParams) (string, *contextvm.Error) {
-	if request.Event.ID == nostr.ZeroID || request.Sender == nostr.ZeroPK {
-		return "", &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: "authenticated request event and sender are required"}
-	}
-	recipients := tagValues(request.Event.Tags, "p")
-	if len(recipients) != 1 {
-		return "", &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "exactly one p tag is required"}
-	}
-	recipient, err := scope.ParsePubkey(recipients[0])
-	if err != nil || h.servicePubkey == "" || recipient.Hex() != h.servicePubkey {
+	// The Drydock service pubkey is required to bind the p tag; an unconfigured
+	// service cannot authenticate recipients and must reject.
+	if h.servicePubkey == "" {
 		return "", &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "p tag must address the Drydock service"}
 	}
-	methods := tagValues(request.Event.Tags, "method")
-	if len(methods) != 1 || methods[0] != MethodReviewOrder {
-		return "", &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "exactly one matching method tag is required"}
-	}
-	targets := tagValues(request.Event.Tags, "e")
-	if len(targets) != 1 || targets[0] != params.PatchEventID {
-		return "", &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "exactly one e tag matching patch_event_id is required"}
-	}
-	expirations := tagValues(request.Event.Tags, "expiration")
-	if len(expirations) != 1 {
-		return "", &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "exactly one expiration tag is required"}
-	}
-	expiresAt, err := strconv.ParseInt(expirations[0], 10, 64)
-	if err != nil {
-		return "", &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "expiration must be a Unix timestamp"}
-	}
-	now := h.now()
-	if expiresAt <= now.Unix() {
-		return "", &contextvm.Error{Code: contextvm.ErrorExpired, Message: "review order expired"}
-	}
-	if expiresAt > time.Unix(int64(request.Event.CreatedAt), 0).Add(maxOrderLifetime).Unix() {
-		return "", &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "expiration exceeds the 15 minute order lifetime"}
+	// Shared addressing + mandatory replay protection. Review orders trigger paid
+	// work, so expiration is required (ExpirationRequired) within the 15 minute
+	// order lifetime.
+	if rpcErr := contextvm.ValidateEnvelope(request, contextvm.EnvelopePolicy{
+		ServicePubkey:      h.servicePubkey,
+		Method:             MethodReviewOrder,
+		RelatedID:          params.PatchEventID,
+		ExpirationRequired: true,
+		MaxLifetime:        maxOrderLifetime,
+		Now:                h.now,
+	}); rpcErr != nil {
+		return "", rpcErr
 	}
 
+	// Per-method binding: an optional a tag pins the target repository.
 	addresses := tagValues(request.Event.Tags, "a")
 	if len(addresses) > 1 {
 		return "", &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "at most one a tag is allowed"}
@@ -190,7 +174,11 @@ func (h *Handler) validateEnvelope(request contextvm.Request, params ReviewOrder
 	return repository.Address, nil
 }
 
-func reviewOrderRPCError(err error) *contextvm.Error {
+// RPCError maps a SubmitOnDemand error to its canonical ContextVM protocol
+// error. It is the single mapping for the review-order error set so every
+// caller (ContextVM review/order and the IDE gateway) surfaces the same code
+// and, for payment denials, the same retryable/reason data payload.
+func RPCError(err error) *contextvm.Error {
 	switch {
 	case errors.Is(err, ErrInvalidTarget):
 		return &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: err.Error()}

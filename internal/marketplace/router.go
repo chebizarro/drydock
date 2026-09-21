@@ -13,15 +13,10 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/payment"
+	"git.sharegap.net/cascadia/drydock/internal/signing"
 
 	"fiatjaf.com/nostr"
 )
-
-// Signer signs Nostr events.
-type Signer interface {
-	GetPublicKey(ctx context.Context) (nostr.PubKey, error)
-	SignEvent(ctx context.Context, evt *nostr.Event) error
-}
 
 // PayoutExecutor settles and reconciles marketplace reviewer payouts.
 type PayoutExecutor interface {
@@ -46,7 +41,7 @@ type Router struct {
 	cfg                RouterConfig
 	registry           *Registry
 	store              *db.Store
-	signer             Signer
+	signer             signing.Signer
 	contextVMTransport ContextVMTransport
 	payoutExecutor     PayoutExecutor
 	logger             *slog.Logger
@@ -57,7 +52,7 @@ func NewRouter(
 	cfg RouterConfig,
 	registry *Registry,
 	store *db.Store,
-	signer Signer,
+	signer signing.Signer,
 	contextVMTransport ContextVMTransport,
 	payoutExecutor PayoutExecutor,
 	logger *slog.Logger,
@@ -328,18 +323,15 @@ func generateAssignmentID(patchEventID, reviewerPubkey string) string {
 	return fmt.Sprintf("%s-%s", patchPrefix, reviewerPrefix)
 }
 
-// HandleAcceptance processes a reviewer accepting an assignment.
-func (r *Router) HandleAcceptance(ctx context.Context, event nostr.Event) error {
-	var acceptance ReviewAcceptance
-	if err := json.Unmarshal([]byte(event.Content), &acceptance); err != nil {
-		return fmt.Errorf("parse acceptance: %w", err)
+// recordAcceptance persists an already-decoded acceptance. The reviewer, event
+// id, and timestamp are taken from the authenticated envelope, never from the
+// untrusted params body.
+func (r *Router) recordAcceptance(ctx context.Context, acceptance ReviewAcceptance, reviewerPubkey, acceptanceEventID string, createdAt int64) error {
+	if reviewerPubkey != "" {
+		acceptance.ReviewerPubkey = reviewerPubkey
 	}
-
-	if event.PubKey != nostr.ZeroPK {
-		acceptance.ReviewerPubkey = event.PubKey.Hex()
-	}
-	acceptance.CreatedAt = int64(event.CreatedAt)
-	acceptance.EventID = event.ID.Hex()
+	acceptance.CreatedAt = createdAt
+	acceptance.EventID = acceptanceEventID
 
 	if err := r.registry.RecordAcceptance(ctx, acceptance); err != nil {
 		return fmt.Errorf("record acceptance: %w", err)
@@ -439,18 +431,15 @@ func (r *Router) executePayout(ctx context.Context, rec db.MarketplacePayoutReco
 	return nil
 }
 
-// HandleRejection processes a reviewer rejecting an assignment.
-func (r *Router) HandleRejection(ctx context.Context, event nostr.Event) error {
-	var rejection ReviewRejection
-	if err := json.Unmarshal([]byte(event.Content), &rejection); err != nil {
-		return fmt.Errorf("parse rejection: %w", err)
+// recordRejection persists an already-decoded rejection. The reviewer, event
+// id, and timestamp are taken from the authenticated envelope, never from the
+// untrusted params body.
+func (r *Router) recordRejection(ctx context.Context, rejection ReviewRejection, reviewerPubkey, rejectionEventID string, createdAt int64) error {
+	if reviewerPubkey != "" {
+		rejection.ReviewerPubkey = reviewerPubkey
 	}
-
-	if event.PubKey != nostr.ZeroPK {
-		rejection.ReviewerPubkey = event.PubKey.Hex()
-	}
-	rejection.CreatedAt = int64(event.CreatedAt)
-	rejection.EventID = event.ID.Hex()
+	rejection.CreatedAt = createdAt
+	rejection.EventID = rejectionEventID
 
 	if err := r.registry.RecordRejection(ctx, rejection); err != nil {
 		return fmt.Errorf("record rejection: %w", err)

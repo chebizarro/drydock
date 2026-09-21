@@ -4,10 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/bluekeyes/go-gitdiff/gitdiff"
 
 	evaldata "git.sharegap.net/cascadia/drydock/internal/eval"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
@@ -93,12 +93,12 @@ func (r *scannerRunner) ReviewCase(ctx context.Context, in evaldata.RunCaseInput
 		return reviewengine.ReviewerOutput{}, err
 	}
 
-	// Whole-file scan of the reconstructed post-image, matching the call
-	// auditengine makes (ScanFiles(..., "")). We do not pass the diff: 29 of the
-	// 31 corpus patches have malformed hunk headers that go-gitdiff — and thus
-	// securityscan's own diff-aware line filter — reject (DRYDOCK-dfl3). An empty
-	// diff cannot fail to parse, so the returned error is always nil here.
-	scan, err := r.scanner.ScanFiles(ctx, dir, files, "")
+	// Diff-aware scan of the reconstructed post-image: passing the (now-valid,
+	// DRYDOCK-dfl3) patch restricts findings to the lines the patch adds — the
+	// same line filter the production secret/scan path applies — instead of a
+	// whole-file scan. An unparseable diff would surface as an error here rather
+	// than a silent empty added-line map.
+	scan, err := r.scanner.ScanFiles(ctx, dir, files, in.PatchDiff)
 	if err != nil {
 		return reviewengine.ReviewerOutput{}, err
 	}
@@ -119,85 +119,51 @@ func (r *scannerRunner) ReviewCase(ctx context.Context, in evaldata.RunCaseInput
 }
 
 // writePatchPostImage reconstructs the post-image of each file in a unified
-// diff and writes it under dir, returning the changed-file paths. Added and
-// context lines are placed at their hunk's post-image line number so scanner
-// findings carry line numbers comparable to the corpus's expected labels.
-//
-// This walks the diff directly rather than via go-gitdiff because 29 of the 31
-// corpus patches carry malformed hunk-header counts that go-gitdiff rejects
-// (DRYDOCK-dfl3 — the same defect that let an unparseable diff read as a clean
-// scan on the secret-reporting path). Only the @@ start offset and the
-// +/-/space line prefixes are trusted — never the header counts — so a wrong
-// count cannot break reconstruction. This workaround is deliberately confined
-// to the test corpus; once DRYDOCK-dfl3 repairs the headers at source, replace
-// it with gitdiff.Parse rather than carrying it forward.
+// diff via go-gitdiff — the pipeline's authoritative patch parser — and writes
+// it under dir, returning the changed-file paths. Added and context lines are
+// placed at their post-image line number so scanner findings carry line numbers
+// comparable to the corpus's expected labels. The corpus is valid unified diff
+// (DRYDOCK-dfl3 repaired the hunk-header counts), so no tolerant walk is needed.
 func writePatchPostImage(dir, diff string) ([]string, error) {
-	hunkHeader := regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)`)
-	fileLines := map[string]map[int]string{}
-	fileMax := map[string]int{}
-	var order []string
-
-	var current string
-	lineNum := 0
-	for _, raw := range strings.Split(diff, "\n") {
-		switch {
-		case strings.HasPrefix(raw, "+++ "):
-			name := strings.TrimPrefix(raw, "+++ ")
-			name = strings.TrimPrefix(name, "b/")
-			current = strings.TrimSpace(name)
-			if _, ok := fileLines[current]; !ok && current != "" && current != "/dev/null" {
-				fileLines[current] = map[int]string{}
-				order = append(order, current)
-			}
-		case strings.HasPrefix(raw, "--- "):
-			// old-file header; ignore.
-		case strings.HasPrefix(raw, "@@"):
-			if m := hunkHeader.FindStringSubmatch(raw); m != nil {
-				lineNum, _ = strconv.Atoi(m[1])
-			}
-		case strings.HasPrefix(raw, "+"):
-			if current != "" && current != "/dev/null" {
-				fileLines[current][lineNum] = raw[1:]
-				if lineNum > fileMax[current] {
-					fileMax[current] = lineNum
-				}
-			}
-			lineNum++
-		case strings.HasPrefix(raw, "-"):
-			// removed line: absent from the post-image.
-		case strings.HasPrefix(raw, "diff "), strings.HasPrefix(raw, "\\"):
-			// file separators / "\ No newline" markers.
-		default:
-			// context line (leading space or blank).
-			if current != "" && current != "/dev/null" {
-				text := raw
-				if strings.HasPrefix(raw, " ") {
-					text = raw[1:]
-				}
-				fileLines[current][lineNum] = text
-				if lineNum > fileMax[current] {
-					fileMax[current] = lineNum
-				}
-			}
-			lineNum++
-		}
+	files, _, err := gitdiff.Parse(strings.NewReader(diff))
+	if err != nil {
+		return nil, err
 	}
-
-	changed := make([]string, 0, len(order))
-	for _, name := range order {
+	var changed []string
+	for _, file := range files {
+		if file.NewName == "" || file.IsDelete {
+			continue
+		}
+		lineAt := map[int]string{}
+		maxLine := 0
+		for _, fragment := range file.TextFragments {
+			lineNum := int(fragment.NewPosition)
+			for _, line := range fragment.Lines {
+				switch line.Op {
+				case gitdiff.OpAdd, gitdiff.OpContext:
+					lineAt[lineNum] = strings.TrimSuffix(line.Line, "\n")
+					if lineNum > maxLine {
+						maxLine = lineNum
+					}
+					lineNum++
+				case gitdiff.OpDelete:
+					// Removed line: absent from the post-image.
+				}
+			}
+		}
 		var buf strings.Builder
-		for i := 1; i <= fileMax[name]; i++ {
-			buf.WriteString(fileLines[name][i])
+		for i := 1; i <= maxLine; i++ {
+			buf.WriteString(lineAt[i])
 			buf.WriteByte('\n')
 		}
-		target := filepath.Join(dir, filepath.FromSlash(name))
+		target := filepath.Join(dir, filepath.FromSlash(file.NewName))
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return nil, err
 		}
 		if err := os.WriteFile(target, []byte(buf.String()), 0o644); err != nil {
 			return nil, err
 		}
-		changed = append(changed, name)
+		changed = append(changed, file.NewName)
 	}
 	return changed, nil
 }

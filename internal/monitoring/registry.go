@@ -209,6 +209,14 @@ func (r *Registry) ApplyDeletion(ctx context.Context, event nostr.Event) (bool, 
 	return true, nil
 }
 
+// Membership is the live monitored-repository membership projection consumed by
+// the pipeline and the review-order service. *Registry is the production
+// implementation; both consumers share this interface rather than each
+// re-declaring a byte-identical one.
+type Membership interface {
+	Contains(repositoryAddress string) bool
+}
+
 func (r *Registry) Contains(repositoryAddress string) bool {
 	ref, err := scope.ParseRepositoryRef(repositoryAddress)
 	if err != nil {

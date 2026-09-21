@@ -671,24 +671,12 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 
 	// --- LLM endpoint checks (warnings only, as they may come online later) ---
-	llmEndpoints := map[string]struct {
-		baseURL string
-		apiKey  string
-	}{
-		"planner":           {baseURL: c.PlannerBaseURL, apiKey: c.EffectiveLLMAPIKey(c.PlannerAPIKey)},
-		"coder32b":          {baseURL: c.Coder32BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.Coder32BAPIKey)},
-		"70b":               {baseURL: c.LLM70BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.LLM70BAPIKey)},
-		"coder14b":          {baseURL: c.Coder14BBaseURL, apiKey: c.EffectiveLLMAPIKey(c.Coder14BAPIKey)},
-		"meta":              {baseURL: c.MetaBaseURL, apiKey: c.EffectiveLLMAPIKey(c.MetaAPIKey)},
-		"agentic-discovery": {baseURL: c.AgenticDiscoveryBaseURL, apiKey: c.EffectiveLLMAPIKey(c.AgenticDiscoveryAPIKey)},
-	}
-	for name, endpoint := range llmEndpoints {
-		baseURL := endpoint.baseURL
-		if baseURL == "" {
+	for _, e := range c.modelEndpoints() {
+		if e.baseURL == "" {
 			continue
 		}
-		if err := c.checkLLMEndpoint(ctx, baseURL, endpoint.apiKey); err != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("LLM endpoint %s (%s) not reachable: %v", name, baseURL, err))
+		if err := c.checkLLMEndpoint(ctx, e.baseURL, e.apiKey); err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("LLM endpoint %s (%s) not reachable: %v", e.name, e.baseURL, err))
 		}
 	}
 
@@ -785,6 +773,51 @@ func (c *Config) IsProduction() bool {
 	}
 }
 
+// modelEndpointSpec is the single source of truth for one LLM endpoint's
+// environment bindings and resolved values. Endpoint validation ranges over
+// modelEndpoints() so no endpoint can silently escape the production TLS and
+// API-key guards. required marks the core review models that must be
+// explicitly configured in production.
+type modelEndpointSpec struct {
+	name       string
+	baseURLEnv string
+	modelEnv   string
+	keyEnv     string
+	baseURL    string
+	model      string
+	apiKey     string
+	required   bool
+}
+
+// modelEndpoints enumerates every LLM endpoint the binary constructs in
+// cmd/drydock/main.go. The sec* endpoints carry the global DRYDOCK_LLM_API_KEY
+// (main.go passes EffectiveLLMAPIKey("")), so keyEnv points at the shared key.
+func (c *Config) modelEndpoints() []modelEndpointSpec {
+	return []modelEndpointSpec{
+		{name: "planner", baseURLEnv: "DRYDOCK_PLANNER_BASE_URL", modelEnv: "DRYDOCK_PLANNER_MODEL", keyEnv: "DRYDOCK_PLANNER_API_KEY", baseURL: c.PlannerBaseURL, model: c.PlannerModel, apiKey: c.EffectiveLLMAPIKey(c.PlannerAPIKey), required: true},
+		{name: "coder32b", baseURLEnv: "DRYDOCK_CODER32B_BASE_URL", modelEnv: "DRYDOCK_CODER32B_MODEL", keyEnv: "DRYDOCK_CODER32B_API_KEY", baseURL: c.Coder32BBaseURL, model: c.Coder32BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder32BAPIKey), required: true},
+		{name: "70b", baseURLEnv: "DRYDOCK_LLM70B_BASE_URL", modelEnv: "DRYDOCK_LLM70B_MODEL", keyEnv: "DRYDOCK_LLM70B_API_KEY", baseURL: c.LLM70BBaseURL, model: c.LLM70BModel, apiKey: c.EffectiveLLMAPIKey(c.LLM70BAPIKey), required: true},
+		{name: "coder14b", baseURLEnv: "DRYDOCK_CODER14B_BASE_URL", modelEnv: "DRYDOCK_CODER14B_MODEL", keyEnv: "DRYDOCK_CODER14B_API_KEY", baseURL: c.Coder14BBaseURL, model: c.Coder14BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder14BAPIKey), required: true},
+		{name: "meta", baseURLEnv: "DRYDOCK_META_BASE_URL", modelEnv: "DRYDOCK_META_MODEL", keyEnv: "DRYDOCK_META_API_KEY", baseURL: c.MetaBaseURL, model: c.MetaModel, apiKey: c.EffectiveLLMAPIKey(c.MetaAPIKey), required: true},
+		{name: "sec70b", baseURLEnv: "DRYDOCK_SEC70B_BASE_URL", modelEnv: "DRYDOCK_SEC70B_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.Sec70BBaseURL, model: c.Sec70BModel, apiKey: c.EffectiveLLMAPIKey("")},
+		{name: "secclassify", baseURLEnv: "DRYDOCK_SECCLASSIFY_BASE_URL", modelEnv: "DRYDOCK_SECCLASSIFY_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecClassifyBaseURL, model: c.SecClassifyModel, apiKey: c.EffectiveLLMAPIKey("")},
+		{name: "seclocalize", baseURLEnv: "DRYDOCK_SECLOCALIZE_BASE_URL", modelEnv: "DRYDOCK_SECLOCALIZE_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecLocalizeBaseURL, model: c.SecLocalizeModel, apiKey: c.EffectiveLLMAPIKey("")},
+		{name: "agentic-discovery", baseURLEnv: "DRYDOCK_AGENTIC_DISCOVERY_BASE_URL", modelEnv: "DRYDOCK_AGENTIC_DISCOVERY_MODEL", keyEnv: "DRYDOCK_AGENTIC_DISCOVERY_API_KEY", baseURL: c.AgenticDiscoveryBaseURL, model: c.AgenticDiscoveryModel, apiKey: c.EffectiveLLMAPIKey(c.AgenticDiscoveryAPIKey)},
+	}
+}
+
+// requireTLSEndpoint rejects loopback and non-HTTPS URLs for a configured
+// endpoint. Empty values are ignored so optional endpoints stay optional while
+// still being guarded the moment an operator points one at a plaintext URL.
+func (c *Config) requireTLSEndpoint(result *ValidationResult, key, rawURL string) {
+	if isLoopbackURL(rawURL) {
+		result.Errors = append(result.Errors, fmt.Sprintf("production mode must not use localhost/loopback URL for %s", key))
+	}
+	if strings.TrimSpace(rawURL) != "" && !isHTTPSURL(rawURL) {
+		result.Errors = append(result.Errors, fmt.Sprintf("production mode requires %s to use https://", key))
+	}
+}
+
 func (c *Config) validateProductionConfig(result *ValidationResult) {
 	if result == nil {
 		return
@@ -802,38 +835,21 @@ func (c *Config) validateProductionConfig(result *ValidationResult) {
 		}
 	}
 
-	c.requireExplicit(result, "DRYDOCK_PLANNER_BASE_URL", c.PlannerBaseURL)
-	c.requireExplicit(result, "DRYDOCK_PLANNER_MODEL", c.PlannerModel)
-	c.requireLLMAPIKey(result, "planner", "DRYDOCK_PLANNER_API_KEY", c.EffectiveLLMAPIKey(c.PlannerAPIKey))
-	c.requireExplicit(result, "DRYDOCK_CODER32B_BASE_URL", c.Coder32BBaseURL)
-	c.requireExplicit(result, "DRYDOCK_CODER32B_MODEL", c.Coder32BModel)
-	c.requireLLMAPIKey(result, "coder32b", "DRYDOCK_CODER32B_API_KEY", c.EffectiveLLMAPIKey(c.Coder32BAPIKey))
-	c.requireExplicit(result, "DRYDOCK_LLM70B_BASE_URL", c.LLM70BBaseURL)
-	c.requireExplicit(result, "DRYDOCK_LLM70B_MODEL", c.LLM70BModel)
-	c.requireLLMAPIKey(result, "70b", "DRYDOCK_LLM70B_API_KEY", c.EffectiveLLMAPIKey(c.LLM70BAPIKey))
-	c.requireExplicit(result, "DRYDOCK_CODER14B_BASE_URL", c.Coder14BBaseURL)
-	c.requireExplicit(result, "DRYDOCK_CODER14B_MODEL", c.Coder14BModel)
-	c.requireLLMAPIKey(result, "coder14b", "DRYDOCK_CODER14B_API_KEY", c.EffectiveLLMAPIKey(c.Coder14BAPIKey))
-	c.requireExplicit(result, "DRYDOCK_META_BASE_URL", c.MetaBaseURL)
-	c.requireExplicit(result, "DRYDOCK_META_MODEL", c.MetaModel)
-	c.requireLLMAPIKey(result, "meta", "DRYDOCK_META_API_KEY", c.EffectiveLLMAPIKey(c.MetaAPIKey))
-
-	for name, rawURL := range map[string]string{
-		"DRYDOCK_PLANNER_BASE_URL":  c.PlannerBaseURL,
-		"DRYDOCK_CODER32B_BASE_URL": c.Coder32BBaseURL,
-		"DRYDOCK_LLM70B_BASE_URL":   c.LLM70BBaseURL,
-		"DRYDOCK_CODER14B_BASE_URL": c.Coder14BBaseURL,
-		"DRYDOCK_META_BASE_URL":     c.MetaBaseURL,
-		"DRYDOCK_QDRANT_URL":        c.QdrantURL,
-		"DRYDOCK_EMBED_BASE_URL":    c.EmbedBaseURL,
-	} {
-		if isLoopbackURL(rawURL) {
-			result.Errors = append(result.Errors, fmt.Sprintf("production mode must not use localhost/loopback URL for %s", name))
+	// Every LLM endpoint is validated from one table so none can escape the
+	// production TLS/API-key guards. The core review models must be explicitly
+	// configured; the security and agentic-discovery endpoints are optional but
+	// are still TLS-checked when set, because main.go transmits the shared API
+	// key to whatever URL they carry.
+	for _, e := range c.modelEndpoints() {
+		if e.required {
+			c.requireExplicit(result, e.baseURLEnv, e.baseURL)
+			c.requireExplicit(result, e.modelEnv, e.model)
+			c.requireLLMAPIKey(result, e.name, e.keyEnv, e.apiKey)
 		}
-		if strings.TrimSpace(rawURL) != "" && !isHTTPSURL(rawURL) {
-			result.Errors = append(result.Errors, fmt.Sprintf("production mode requires %s to use https://", name))
-		}
+		c.requireTLSEndpoint(result, e.baseURLEnv, e.baseURL)
 	}
+	c.requireTLSEndpoint(result, "DRYDOCK_QDRANT_URL", c.QdrantURL)
+	c.requireTLSEndpoint(result, "DRYDOCK_EMBED_BASE_URL", c.EmbedBaseURL)
 
 	c.requireExplicit(result, "DRYDOCK_QDRANT_URL", c.QdrantURL)
 	c.requireExplicit(result, "DRYDOCK_QDRANT_API_KEY", c.QdrantAPIKey)

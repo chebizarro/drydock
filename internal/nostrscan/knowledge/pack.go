@@ -5,9 +5,13 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 )
+
+// cweList matches a single CWE id or a comma-separated list of them.
+var cweList = regexp.MustCompile(`^CWE-[1-9][0-9]*(?:, CWE-[1-9][0-9]*)*$`)
 
 //go:embed pack.v1.json
 var packData []byte
@@ -22,6 +26,9 @@ type Entry struct {
 type Vulnerability struct {
 	Entry
 	Adversary string `json:"adversary"`
+	// CWE is the versioned single source of truth for this rule's CWE
+	// hypotheses (comma-separated when a rule maps to several).
+	CWE string `json:"cwe"`
 }
 
 type Pack struct {
@@ -73,6 +80,22 @@ func VulnerabilitySource(id string) string {
 	return ""
 }
 
+// VulnerabilityCWE returns the CWE hypotheses for a NOSTR vulnerability. The
+// pack is the single source of NOSTR rule CWE identity: static scanning,
+// dynamic probing, and the SARIF output all read it, so they cannot drift.
+func VulnerabilityCWE(id string) string {
+	pack, err := Load()
+	if err != nil {
+		return ""
+	}
+	for _, vulnerability := range pack.Vulnerabilities {
+		if vulnerability.ID == id {
+			return vulnerability.CWE
+		}
+	}
+	return ""
+}
+
 // Context renders the corpus for the nostr-protocol contextbuilder layer.
 func Context() (string, error) {
 	pack, err := Load()
@@ -109,6 +132,9 @@ func validate(pack Pack) error {
 		}
 		if vulnerability.Adversary != "MU" && vulnerability.Adversary != "MS" {
 			return fmt.Errorf("entry %s has invalid adversary %q", vulnerability.ID, vulnerability.Adversary)
+		}
+		if !cweList.MatchString(vulnerability.CWE) {
+			return fmt.Errorf("entry %s has invalid cwe %q", vulnerability.ID, vulnerability.CWE)
 		}
 	}
 	return nil

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"git.sharegap.net/cascadia/drydock/internal/gitexec"
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 	"git.sharegap.net/cascadia/drydock/internal/symbols"
 )
@@ -74,7 +75,7 @@ func (b *Builder) Build(ctx context.Context, repoPath, ref string) (*Map, error)
 		return nil, fmt.Errorf("codemap: symbol extraction unavailable; rebuild with CGO_ENABLED=1")
 	}
 
-	treeHash, err := gitOutput(ctx, repoPath, "rev-parse", ref+"^{tree}")
+	treeHash, err := gitexec.Output(ctx, repoPath, "rev-parse", ref+"^{tree}")
 	if err != nil {
 		return nil, fmt.Errorf("codemap: resolve tree for %s: %w", ref, err)
 	}
@@ -99,7 +100,7 @@ func (b *Builder) Build(ctx context.Context, repoPath, ref string) (*Map, error)
 	defer extractor.Close()
 
 	result := &Map{
-		Version:          cacheVersion,
+		Version:          CacheVersion,
 		TreeHash:         treeHash,
 		Ref:              ref,
 		Files:            make(map[string]File),
@@ -164,7 +165,7 @@ func (b *Builder) Build(ctx context.Context, repoPath, ref string) (*Map, error)
 	}
 	result.RepoMap = rankSymbols(result)
 
-	if err := writeJSONAtomic(treePath, result); err != nil {
+	if err := WriteJSONAtomic(treePath, result); err != nil {
 		return nil, fmt.Errorf("codemap: write tree cache: %w", err)
 	}
 	return result, nil
@@ -215,7 +216,7 @@ func (b *Builder) loadBlob(
 	path := filepath.Join(cacheDir, "blobs", hash[:2], hash+".json")
 	var cached blobCache
 	if err := readJSON(path, &cached); err == nil &&
-		cached.Version == cacheVersion && cached.BlobHash == hash && cached.Language == lang {
+		cached.Version == CacheVersion && cached.BlobHash == hash && cached.Language == lang {
 		return cached, true, nil
 	}
 
@@ -223,9 +224,9 @@ func (b *Builder) loadBlob(
 	if err != nil {
 		return blobCache{}, false, err
 	}
-	if len(source) > maxSourceBytes || !probablyText(source) {
-		empty := blobCache{Version: cacheVersion, BlobHash: hash, Language: lang}
-		if err := writeJSONAtomic(path, empty); err != nil {
+	if len(source) > maxSourceBytes || !hashutil.IsProbablyText(source) {
+		empty := blobCache{Version: CacheVersion, BlobHash: hash, Language: lang}
+		if err := WriteJSONAtomic(path, empty); err != nil {
 			return blobCache{}, false, err
 		}
 		return empty, false, nil
@@ -236,13 +237,13 @@ func (b *Builder) loadBlob(
 		return blobCache{}, false, err
 	}
 	cached = blobCache{
-		Version:  cacheVersion,
+		Version:  CacheVersion,
 		BlobHash: hash,
 		Language: lang,
 		Symbols:  declarations,
 		Imports:  extractImports(lang, source),
 	}
-	if err := writeJSONAtomic(path, cached); err != nil {
+	if err := WriteJSONAtomic(path, cached); err != nil {
 		return blobCache{}, false, err
 	}
 	return cached, false, nil
@@ -252,7 +253,14 @@ func (b *Builder) resolveCacheDir(ctx context.Context, repoPath string) (string,
 	if b.cacheDir != "" {
 		return b.cacheDir, nil
 	}
-	gitDir, err := gitOutput(ctx, repoPath, "rev-parse", "--git-common-dir")
+	return ResolveCacheDir(ctx, repoPath)
+}
+
+// ResolveCacheDir returns the checkout's shared drydock-codemap directory inside
+// the common git dir. nostrscan caches its profiles alongside code maps here, so
+// this is the single source of the directory path both packages write into.
+func ResolveCacheDir(ctx context.Context, repoPath string) (string, error) {
+	gitDir, err := gitexec.Output(ctx, repoPath, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return "", fmt.Errorf("codemap: resolve git directory: %w", err)
 	}
@@ -267,7 +275,7 @@ func readTreeCache(path, treeHash string) (*Map, error) {
 	if err := readJSON(path, &cached); err != nil {
 		return nil, err
 	}
-	if cached.Version != cacheVersion || cached.TreeHash != treeHash {
+	if cached.Version != CacheVersion || cached.TreeHash != treeHash {
 		return nil, fmt.Errorf("stale cache")
 	}
 	return &cached, nil
@@ -281,7 +289,10 @@ func readJSON(path string, target any) error {
 	return json.Unmarshal(data, target)
 }
 
-func writeJSONAtomic(path string, value any) error {
+// WriteJSONAtomic marshals value to path via a temp file and rename so a
+// concurrent reader never observes a partial cache entry. It is exported so
+// nostrscan, which caches into the same directory, shares one writer.
+func WriteJSONAtomic(path string, value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -314,24 +325,8 @@ func writeJSONAtomic(path string, value any) error {
 	return os.Rename(tmpPath, path)
 }
 
-func gitOutput(ctx context.Context, repoPath string, args ...string) (string, error) {
-	out, err := gitexec.Run(ctx, repoPath, args...)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out), nil
-}
-
 func gitBlob(ctx context.Context, repoPath, hash string) ([]byte, error) {
 	return gitexec.RunBytes(ctx, repoPath, "cat-file", "blob", hash)
-}
-
-func probablyText(data []byte) bool {
-	check := data
-	if len(check) > 512 {
-		check = check[:512]
-	}
-	return !strings.ContainsRune(string(check), '\x00')
 }
 
 func sortMapSymbols(index map[string][]Symbol) {

@@ -557,7 +557,9 @@ func normalizeSubmissionPath(value string) (string, error) {
 
 func (r *Reviewer) validateExecutionBinding(request reviewengine.ReviewerExecutionRequest) error {
 	if err := r.config.Snapshot.Verify(); err != nil {
-		return fmt.Errorf("%w: verify snapshot: %v", ErrReviewerTargetMismatch, err)
+		// %w (not %v) so workspacesnapshot.ErrHashMismatch survives the wrap
+		// and errors.Is/recordSnapshotCorruption can still see the corruption.
+		return fmt.Errorf("%w: verify snapshot: %w", ErrReviewerTargetMismatch, err)
 	}
 	if !bytes.Equal(r.config.Snapshot.PatchContent(), []byte(request.PatchDiff)) {
 		return fmt.Errorf("%w: authoritative patch differs", ErrReviewerTargetMismatch)
@@ -631,14 +633,6 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 	scope.MaxResultBytes = r.config.Limits.MaxToolResultBytes
 	defer r.config.Registry.ClearScopeReplay(runID)
 
-	definitions := r.config.Registry.ListForScope(scope)
-	tools := make([]reviewengine.ToolSchema, 0, len(definitions))
-	for _, definition := range definitions {
-		tools = append(tools, reviewengine.ToolSchema{
-			Name: definition.Name, Description: definition.Description,
-			Parameters: append(json.RawMessage(nil), definition.InputSchema...),
-		})
-	}
 	baseMessages := []reviewengine.CompletionMessage{
 		{Role: reviewengine.MessageRoleSystem, Content: ReviewerSystemPrompt + "\n\nEngine-owned review policy:\n" + request.System},
 		{Role: reviewengine.MessageRoleUser, Content: request.User},
@@ -647,19 +641,9 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 	if strings.TrimSpace(request.Conversation.Message) != "" {
 		baseMessages = append(baseMessages, reviewengine.CompletionMessage{Role: reviewengine.MessageRoleUser, Content: request.Conversation.Message})
 	}
-	completionRequest := reviewengine.CompletionRequest{
-		BaseURL: request.Endpoint.BaseURL, APIKey: request.Endpoint.APIKey,
-		Model: request.Endpoint.Model, Temperature: request.Temperature,
-		Messages: baseMessages, Tools: tools,
-	}
 
-	limits := r.config.Limits
-	trace := LoopTrace{}
-	defer observeLoopMetrics(&trace, limits)
-	emptyNudged := false
-	servedModel := ""
 	var transcript []reviewengine.CompletionMessage
-	appendTranscript := func(messages ...reviewengine.CompletionMessage) error {
+	onMessage := func(ctx context.Context, messages ...reviewengine.CompletionMessage) error {
 		cloned := cloneReviewerMessages(messages)
 		if request.Conversation.Sink != nil {
 			if err := request.Conversation.Sink.AppendReviewerMessages(ctx, cloned); err != nil {
@@ -669,116 +653,48 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 		transcript = append(transcript, cloned...)
 		return nil
 	}
-	fail := func(reason StopReason, err error) (reviewengine.ReviewerExecutionResult, error) {
-		trace.StopReason = reason
-		return reviewengine.ReviewerExecutionResult{
-			Trace: reviewerTrace(trace, acceptedSubmission{}), ValidatedScope: requestScope,
-			Transcript: cloneReviewerMessages(transcript),
-		}, err
+
+	loopResult, loopErr := (&LoopRunner{Client: r.config.Client}).Run(ctx, LoopRequest{
+		Completion: reviewengine.CompletionRequest{
+			BaseURL: request.Endpoint.BaseURL, APIKey: request.Endpoint.APIKey,
+			Model: request.Endpoint.Model, Temperature: request.Temperature,
+			Messages: baseMessages,
+		},
+		Registry: r.config.Registry, Scope: scope, Counter: r.config.Counter,
+		Limits:       r.config.Limits,
+		TerminalTool: agenttools.ToolReviewSubmit,
+		TerminalStop: StopReviewSubmitted,
+		Finalize: func() (contextbuilder.ContextBundle, error) {
+			if _, ok := submitter.Accepted(); !ok {
+				return contextbuilder.ContextBundle{}, fmt.Errorf("%w: submit handler accepted without a review", ErrReviewSubmitMissing)
+			}
+			return contextbuilder.ContextBundle{}, nil
+		},
+		EmptyAssistantNudge: reviewerCorrectiveNudge,
+		EmptyAssistantStop:  StopEmptyAssistant,
+		EmptyAssistantErr:   ErrReviewerEmptyResponse,
+		OnMessage:           onMessage,
+		OnToolResult: func(call reviewengine.ToolCall, result agenttools.Result) {
+			ledger.Record(call, result)
+		},
+	})
+
+	accepted, _ := submitter.Accepted()
+	result := reviewengine.ReviewerExecutionResult{
+		Trace:          reviewerTrace(loopResult.Trace, accepted),
+		ValidatedScope: requestScope,
+		Transcript:     cloneReviewerMessages(transcript),
 	}
-
-	for trace.Turns < limits.MaxTurns {
-		if err := ctx.Err(); err != nil {
-			return fail(StopCancelled, err)
+	if loopErr != nil {
+		// The reviewer frames budget exhaustion as a missing review.submit.
+		if errors.Is(loopErr, ErrTurnLimit) || errors.Is(loopErr, ErrToolCallLimit) {
+			loopErr = fmt.Errorf("%w: %w", ErrReviewSubmitMissing, loopErr)
 		}
-		preflight, err := serializedRequestTokens(completionRequest, r.config.Counter)
-		if err != nil {
-			return fail(StopContextExceeded, err)
-		}
-		if preflight > limits.MaxModelContext {
-			return fail(StopContextExceeded, fmt.Errorf("%w: tokens=%d limit=%d", ErrModelContext, preflight, limits.MaxModelContext))
-		}
-		if trace.CumulativeTokens+preflight > limits.MaxCumulativeTokens {
-			return fail(StopTokensExhausted, ErrTokenLimit)
-		}
-
-		completion, err := r.config.Client.Complete(ctx, completionRequest)
-		trace.Turns++
-		if err != nil {
-			if isContextCancellation(ctx, err) {
-				return fail(StopCancelled, err)
-			}
-			return fail(StopTransportError, err)
-		}
-		if model := strings.TrimSpace(completion.Model); model != "" {
-			servedModel = model
-		}
-		completion.Message.PromptTokens = completion.Usage.PromptTokens
-		completion.Message.CompletionTokens = completion.Usage.CompletionTokens
-		used := completion.Usage.TotalTokens
-		if used <= 0 {
-			used = preflight + r.config.Counter.Count(completion.Message.Content)
-			for _, call := range completion.Message.ToolCalls {
-				used += r.config.Counter.Count(call.Function.Name)
-				used += r.config.Counter.Count(call.Function.Arguments)
-			}
-		}
-		trace.CumulativeTokens += used
-		if trace.CumulativeTokens > limits.MaxCumulativeTokens {
-			return fail(StopTokensExhausted, ErrTokenLimit)
-		}
-
-		completionRequest.Messages = append(completionRequest.Messages, completion.Message)
-		if err := appendTranscript(completion.Message); err != nil {
-			return fail(StopTransportError, err)
-		}
-		if len(completion.Message.ToolCalls) == 0 {
-			if emptyNudged {
-				return fail(StopEmptyAssistant, ErrReviewerEmptyResponse)
-			}
-			emptyNudged = true
-			completionRequest.Messages = append(completionRequest.Messages, reviewengine.CompletionMessage{
-				Role: reviewengine.MessageRoleUser, Content: reviewerCorrectiveNudge,
-			})
-			continue
-		}
-
-		for _, call := range completion.Message.ToolCalls {
-			if trace.ToolCalls >= limits.MaxToolCalls {
-				return fail(StopToolsExhausted, fmt.Errorf("%w: %w", ErrReviewSubmitMissing, ErrToolCallLimit))
-			}
-			trace.ToolCalls++
-			trace.ToolCallIDs = append(trace.ToolCallIDs, call.ID)
-			toolResult, dispatchErr := r.config.Registry.Dispatch(ctx, agenttools.Invocation{
-				ToolCallID: call.ID, Name: call.Function.Name,
-				Arguments: json.RawMessage(call.Function.Arguments), Scope: scope,
-			})
-			if dispatchErr != nil && isContextCancellation(ctx, dispatchErr) {
-				return fail(StopCancelled, dispatchErr)
-			}
-			if dispatchErr != nil {
-				toolResult = agenttools.Result{Content: dispatchErr.Error(), IsError: true}
-			}
-			if dispatchErr == nil && !toolResult.IsError && call.Function.Name != agenttools.ToolReviewSubmit {
-				ledger.Record(call, toolResult)
-			}
-			encoded, err := json.Marshal(toolResult)
-			if err != nil {
-				return fail(StopTransportError, err)
-			}
-			toolMessage := reviewengine.CompletionMessage{
-				Role: reviewengine.MessageRoleTool, ToolCallID: call.ID,
-				Name: call.Function.Name, Content: string(encoded),
-			}
-			completionRequest.Messages = append(completionRequest.Messages, toolMessage)
-			if err := appendTranscript(toolMessage); err != nil {
-				return fail(StopTransportError, err)
-			}
-			if call.Function.Name == agenttools.ToolReviewSubmit && dispatchErr == nil && !toolResult.IsError {
-				accepted, ok := submitter.Accepted()
-				if !ok {
-					return fail(StopTransportError, fmt.Errorf("%w: submit handler accepted without a review", ErrReviewSubmitMissing))
-				}
-				trace.StopReason = StopReviewSubmitted
-				return reviewengine.ReviewerExecutionResult{
-					Review: accepted.review, ServedModel: servedModel,
-					Trace: reviewerTrace(trace, accepted), ValidatedScope: requestScope,
-					Transcript: cloneReviewerMessages(transcript),
-				}, nil
-			}
-		}
+		return result, loopErr
 	}
-	return fail(StopTurnsExhausted, fmt.Errorf("%w: %w", ErrReviewSubmitMissing, ErrTurnLimit))
+	result.Review = accepted.review
+	result.ServedModel = loopResult.ServedModel
+	return result, nil
 }
 
 func reviewerTrace(trace LoopTrace, accepted acceptedSubmission) reviewengine.ReviewerTrace {

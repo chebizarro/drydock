@@ -687,6 +687,16 @@ func (m *Manager) CleanupReviewBranch(ctx context.Context, repoPath, branch stri
 }
 
 func (m *Manager) applySinglePatch(ctx context.Context, repoPath, patchContent string) error {
+	doneApply := metrics.TimerVec(metrics.GitOpDuration, "apply")
+	defer doneApply()
+	return m.runGitApply(ctx, repoPath, patchContent, "--3way", "--index")
+}
+
+// runGitApply pipes patch to `git apply <flags> -` in repoPath. It captures the
+// stdin write error so a failed or short pipe write cannot masquerade as a
+// patch that git rejected: a bare CombinedOutput would hide it, making git see
+// a truncated patch and exit non-zero.
+func (m *Manager) runGitApply(ctx context.Context, repoPath, patch string, flags ...string) error {
 	validatedPath, err := m.validateRepoPath(repoPath)
 	if err != nil {
 		return err
@@ -694,9 +704,9 @@ func (m *Manager) applySinglePatch(ctx context.Context, repoPath, patchContent s
 
 	applyCtx, cancel := context.WithTimeout(ctx, gitApplyTimeout)
 	defer cancel()
-	doneApply := metrics.TimerVec(metrics.GitOpDuration, "apply")
-	defer doneApply()
-	cmd := gitexec.Command(applyCtx, validatedPath, "apply", "--3way", "--index", "-")
+	args := append([]string{"apply"}, flags...)
+	args = append(args, "-")
+	cmd := gitexec.Command(applyCtx, validatedPath, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("open stdin: %w", err)
@@ -711,7 +721,7 @@ func (m *Manager) applySinglePatch(ctx context.Context, repoPath, patchContent s
 			return
 		default:
 		}
-		_, writeErr := io.WriteString(stdin, patchContent)
+		_, writeErr := io.WriteString(stdin, patch)
 		errCh <- writeErr
 	}()
 
@@ -1194,52 +1204,12 @@ func (m *Manager) commitSnapshot(ctx context.Context, repoPath string) error {
 
 // checkPatchApplies tests if a patch applies cleanly without modifying the tree.
 func (m *Manager) checkPatchApplies(ctx context.Context, repoPath, patch string) error {
-	validatedPath, err := m.validateRepoPath(repoPath)
-	if err != nil {
-		return err
-	}
-
-	applyCtx, cancel := context.WithTimeout(ctx, gitApplyTimeout)
-	defer cancel()
-	cmd := gitexec.Command(applyCtx, validatedPath, "apply", "--check", "-")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-	go func() {
-		defer stdin.Close()
-		io.WriteString(stdin, patch)
-	}()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return m.runGitApply(ctx, repoPath, patch, "--check")
 }
 
 // applyPatchContent applies a patch to the working tree.
 func (m *Manager) applyPatchContent(ctx context.Context, repoPath, patch string) error {
-	validatedPath, err := m.validateRepoPath(repoPath)
-	if err != nil {
-		return err
-	}
-
-	applyCtx, cancel := context.WithTimeout(ctx, gitApplyTimeout)
-	defer cancel()
-	cmd := gitexec.Command(applyCtx, validatedPath, "apply", "--index", "-")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-	go func() {
-		defer stdin.Close()
-		io.WriteString(stdin, patch)
-	}()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return m.runGitApply(ctx, repoPath, patch, "--index")
 }
 
 // normalizeSuggestedPatch ensures a LLM-generated diff hunk has proper

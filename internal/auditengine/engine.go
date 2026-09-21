@@ -108,11 +108,6 @@ type AuditPublisher interface {
 type ProgressReporter interface {
 	ReportAuditProgress(context.Context, int64, string) error
 }
-type ToolRunner interface {
-	LookPath(string) (string, error)
-	Run(context.Context, string, ...string) ([]byte, error)
-}
-
 type NostrProber interface {
 	Run(context.Context, nostrprobe.Config) ([]nostrprobe.SecurityEvidence, error)
 }
@@ -134,7 +129,7 @@ type Dependencies struct {
 	VerifierFactory VerifierFactory
 	Publisher       AuditPublisher
 	Progress        ProgressReporter
-	Tools           ToolRunner
+	Tools           nostrprobe.ToolRunner
 	Localizer       Localizer
 	NostrProber     NostrProber
 }
@@ -265,7 +260,7 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		return result, fmt.Errorf("prepare checkout: %w", err)
 	}
 	result.RepoPath = repoPath
-	result.Commit, err = gitOutput(ctx, repoPath, "rev-parse", "HEAD")
+	result.Commit, err = gitexec.Output(ctx, repoPath, "rev-parse", "HEAD")
 	if err != nil {
 		return result, fmt.Errorf("resolve audit commit: %w", err)
 	}
@@ -300,7 +295,7 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	}
 	result.ScannedFiles = scan.FilesScanned
 	result.Coverage = coverage
-	allDeterministic := scanFindings(scan.Findings)
+	allDeterministic := securityscan.ReviewFindings(scan.Findings)
 	scaFindings, scaErr := e.runSCATools(ctx, repoPath, req.EnableSCA)
 	if scaErr != nil {
 		return result, scaErr
@@ -319,32 +314,25 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		if scanErr != nil {
 			return result, fmt.Errorf("scan secrets with betterleaks: %w", scanErr)
 		}
-		allDeterministic = append(allDeterministic, scanFindings(secretScan.Findings)...)
+		allDeterministic = append(allDeterministic, securityscan.ReviewFindings(secretScan.Findings)...)
 		betterleaksRan = true
 	}
 
 	var nostrContext, nostrPreamble string
 	var probeEvidence []nostrprobe.SecurityEvidence
 	if nostrActive {
-		roles := auditNostrRoles(nostrProfile.Roles, req.Nostr)
-		rules := auditNostrRules(nostrscan.PresenceRulesForRoles(roles), req.Nostr)
-		nostrScanner := securityscan.NewWithRuleSets(rules, nostrscan.SurfaceRules())
-		nostrPresence, err := nostrScanner.ScanFiles(ctx, repoPath, files, "")
+		nostrScan, nostrSurfaces, err := nostrscan.Activate(ctx, nostrscan.ActivateInput{
+			RepoPath: repoPath, Files: files, CodeMap: codeMap, Profile: nostrProfile, Config: req.Nostr,
+		})
 		if err != nil {
-			return result, fmt.Errorf("nostr presence scan: %w", err)
+			return result, err
 		}
-		nostrSurfaces := nostrScanner.LocateSurface(ctx, repoPath, files)
-		coverage.ScanOperationsScanned += nostrPresence.FilesScanned + nostrSurfaces.FilesScanned
-		coverage.ScanOperationsSkipped += nostrPresence.FilesSkipped + nostrSurfaces.FilesSkipped
-		coverage.ScanOperationsErrored += nostrPresence.FilesErrored + nostrSurfaces.FilesErrored
+		coverage.ScanOperationsScanned += nostrScan.FilesScanned + nostrSurfaces.FilesScanned
+		coverage.ScanOperationsSkipped += nostrScan.FilesSkipped + nostrSurfaces.FilesSkipped
+		coverage.ScanOperationsErrored += nostrScan.FilesErrored + nostrSurfaces.FilesErrored
 		result.Coverage = coverage
 		surfaceResult.Locations = append(surfaceResult.Locations, nostrSurfaces.Locations...)
-		nostrFindings := auditNostrFindings(nostrPresence.Findings, files, roles, req.Nostr)
-		if req.Nostr.AbsenceAnalysis {
-			absence := nostrscan.AnalyzeAbsences(ctx, repoPath, codeMap, nostrSurfaces)
-			nostrFindings = append(nostrFindings, auditNostrFindings(absence.Findings, files, roles, req.Nostr)...)
-		}
-		allDeterministic = append(allDeterministic, scanFindings(nostrFindings)...)
+		allDeterministic = append(allDeterministic, securityscan.ReviewFindings(nostrScan.Findings)...)
 		if req.Nostr.KnowledgePack {
 			nostrContext, err = knowledge.Context()
 			if err != nil {
@@ -527,60 +515,6 @@ func codeMapFiles(m *codemap.Map, subtree string) []string {
 	slices.Sort(files)
 	return files
 }
-func scanFindings(findings []securityscan.SecurityFinding) []reviewengine.Finding {
-	out := make([]reviewengine.Finding, 0, len(findings))
-	for _, finding := range findings {
-		cwe, evidence := securityscan.SASTRuleCWE[finding.RuleID], finding.Evidence
-		if strings.HasPrefix(finding.RuleID, "NOSTR-") {
-			evidence = "[" + finding.RuleID + "] " + evidence
-		}
-		if cwe != "" {
-			evidence = "[" + cwe + "] " + evidence
-		}
-		out = append(out, reviewengine.Finding{Severity: finding.Severity, Category: "security", File: finding.File, Line: finding.Line, Evidence: evidence, Explanation: finding.Description, Suggestion: finding.Suggestion, Sensitive: finding.Sensitive, Confidence: finding.Confidence})
-	}
-	return out
-}
-func auditNostrRoles(detected []nostrscan.Role, cfg repoconfig.NostrConfig) []nostrscan.Role {
-	detectedStrings := make([]string, 0, len(detected))
-	for _, role := range detected {
-		detectedStrings = append(detectedStrings, string(role))
-	}
-	configured := cfg.EffectiveRoles(detectedStrings)
-	roles := make([]nostrscan.Role, 0, len(configured))
-	for _, role := range configured {
-		roles = append(roles, nostrscan.Role(role))
-	}
-	return roles
-}
-
-func auditNostrRules(rules []securityscan.Rule, cfg repoconfig.NostrConfig) []securityscan.Rule {
-	out := make([]securityscan.Rule, 0, len(rules))
-	for _, rule := range rules {
-		if cfg.AllowsRule(rule.ID) {
-			out = append(out, rule)
-		}
-	}
-	return out
-}
-
-func auditNostrFindings(findings []securityscan.SecurityFinding, files []string, roles []nostrscan.Role, cfg repoconfig.NostrConfig) []securityscan.SecurityFinding {
-	allowedFiles := make(map[string]struct{}, len(files))
-	for _, file := range files {
-		allowedFiles[file] = struct{}{}
-	}
-	out := make([]securityscan.SecurityFinding, 0, len(findings))
-	for _, finding := range findings {
-		if _, ok := allowedFiles[finding.File]; !ok {
-			continue
-		}
-		if cfg.AllowsRule(finding.RuleID) && nostrscan.RuleAppliesToRoles(finding.RuleID, roles) {
-			out = append(out, finding)
-		}
-	}
-	return out
-}
-
 func (e *Engine) localize(ctx context.Context, repoPath string, codeMap *codemap.Map, files []string, deterministic []reviewengine.Finding, surfaces surface.Result, sinceCommit string) []candidateUnit {
 	scores, allowed := make(map[string]int), make(map[string]struct{}, len(files))
 	for _, file := range files {
@@ -689,7 +623,7 @@ func recentFiles(ctx context.Context, repoPath, sinceCommit string) []string {
 	} else {
 		args = append(args, "-n", "50")
 	}
-	out, err := gitOutput(ctx, repoPath, args...)
+	out, err := gitexec.Output(ctx, repoPath, args...)
 	if err != nil {
 		return nil
 	}
@@ -745,7 +679,7 @@ func (e *Engine) reviewAgentically(ctx context.Context, req Request, repoPath, c
 	}
 	output, err := e.deps.AgenticReview.ReviewPrepared(ctx, prepared, agenticreview.ReviewOptions{
 		ReviewerRoute: reviewengine.RouteSec70B, ReviewerSystemPromptOverride: systemPrompt,
-		AdditionalInstructions: auditReviewInstructions(units, deterministic, surfaces, nostrContext),
+		AdditionalInstructions: auditReviewInstructions(units, deterministic, surfaces, nostrContext, budget.MaxUnits),
 		SkipWalkthrough:        true,
 	})
 	if err != nil {
@@ -758,15 +692,31 @@ func (e *Engine) reviewAgentically(ctx context.Context, req Request, repoPath, c
 	return findings, nil
 }
 
-func auditReviewInstructions(units []candidateUnit, findings []reviewengine.Finding, surfaces surface.Result, nostrContext string) string {
+func auditReviewInstructions(units []candidateUnit, findings []reviewengine.Finding, surfaces surface.Result, nostrContext string, maxUnits int) string {
 	payload := struct {
 		CandidateFiles []string               `json:"candidate_files"`
 		Findings       []reviewengine.Finding `json:"deterministic_findings"`
 		Surfaces       []surface.Location     `json:"security_surfaces"`
 		NostrContext   string                 `json:"nostr_context,omitempty"`
-	}{Findings: findings, Surfaces: surfaces.Locations, NostrContext: nostrContext}
+	}{Findings: findings, NostrContext: nostrContext}
+	// Bound the payload to the units that will actually be reviewed under the
+	// depth budget, and scope the surface locations to those files. The raw
+	// locator list is unbounded — SURFACE-SQL matches any line containing
+	// UPDATE/DELETE (including prose) and SURFACE-CRYPTO any verify(/sign( — so
+	// marshalling all of it into the reviewer prompt dwarfs the code context and
+	// makes the prompt shift with unrelated edits (DRYDOCK-0bst).
+	inScope := make(map[string]struct{}, len(units))
 	for _, unit := range units {
+		if maxUnits > 0 && len(payload.CandidateFiles) >= maxUnits {
+			break
+		}
 		payload.CandidateFiles = append(payload.CandidateFiles, unit.File)
+		inScope[unit.File] = struct{}{}
+	}
+	for _, location := range surfaces.Locations {
+		if _, ok := inScope[location.File]; ok {
+			payload.Surfaces = append(payload.Surfaces, location)
+		}
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -810,11 +760,15 @@ func (e *Engine) reviewUnits(ctx context.Context, units []candidateUnit, budget 
 					continue
 				}
 				for i := range verified {
-					if strings.Contains(strings.ToUpper(verified[i].Evidence), "NOSTR-") {
-						cwe := strings.ToUpper(strings.TrimSpace(verified[i].Category))
-						if strings.HasPrefix(cwe, "CWE-") && !strings.Contains(verified[i].Evidence, "["+cwe+"]") {
-							verified[i].Evidence = "[" + cwe + "] " + verified[i].Evidence
-						}
+					// The classifier reports the CWE in Category; capture it as
+					// a field so rule identity travels structurally instead of
+					// being re-encoded into Evidence prose. Restore the security
+					// category for NOSTR findings so their dedup identity is
+					// unchanged.
+					if cwe := strings.ToUpper(strings.TrimSpace(verified[i].Category)); strings.HasPrefix(cwe, "CWE-") {
+						verified[i].CWE = cwe
+					}
+					if strings.HasPrefix(verified[i].RuleID, "NOSTR-") {
 						verified[i].Category = "security"
 					}
 				}
@@ -867,16 +821,12 @@ func findingsForFile(findings []reviewengine.Finding, file string) []reviewengin
 	}
 	return out
 }
+
+// findingCWE returns the finding's CWE, carried as a structured field
+// (DRYDOCK-vrbe) rather than parsed back out of Evidence prose.
 func findingCWE(finding reviewengine.Finding) string {
-	category := strings.ToUpper(strings.TrimSpace(finding.Category))
-	if strings.HasPrefix(category, "CWE-") {
-		return category
-	}
-	evidence := strings.ToUpper(finding.Evidence)
-	if start := strings.Index(evidence, "[CWE-"); start >= 0 {
-		if end := strings.Index(evidence[start:], "]"); end > 0 {
-			return evidence[start+1 : start+end]
-		}
+	if cwe := strings.ToUpper(strings.TrimSpace(finding.CWE)); cwe != "" {
+		return cwe
 	}
 	return "CWE-000"
 }
@@ -902,21 +852,16 @@ func nearbyCode(repoPath string, finding reviewengine.Finding) string {
 	}
 	return strings.Join(lines[start:end], "\n")
 }
-func gitOutput(ctx context.Context, repoPath string, args ...string) (string, error) {
-	out, err := gitexec.Run(ctx, repoPath, args...)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out), nil
-}
-
 func (e *Engine) runSCATools(ctx context.Context, repoPath string, enabled bool) ([]reviewengine.Finding, error) {
 	var findings []reviewengine.Finding
 	if enabled {
+		// All three tools emit SARIF 2.1.0, whose fixed schema keeps the file
+		// path and the message in one result object — unlike their bespoke JSON,
+		// where they live in different objects (DRYDOCK-rnmo).
 		tools := []struct {
 			names []string
 			args  func(string) []string
-		}{{[]string{"trivy"}, func(repo string) []string { return []string{"fs", "--format", "json", repo} }}, {[]string{"grype"}, func(repo string) []string { return []string{"dir:" + repo, "-o", "json"} }}, {[]string{"osv-scanner", "osv"}, func(repo string) []string { return []string{"--format", "json", "-r", repo} }}}
+		}{{[]string{"trivy"}, func(repo string) []string { return []string{"fs", "--format", "sarif", repo} }}, {[]string{"grype"}, func(repo string) []string { return []string{"dir:" + repo, "-o", "sarif"} }}, {[]string{"osv-scanner", "osv"}, func(repo string) []string { return []string{"--format", "sarif", "-r", repo} }}}
 		for _, tool := range tools {
 			name, ok := e.availableTool(tool.names...)
 			if !ok {
@@ -928,7 +873,7 @@ func (e *Engine) runSCATools(ctx context.Context, repoPath string, enabled bool)
 				e.logger.Warn("optional security scanner failed", "tool", name, "error", err)
 				continue
 			}
-			parsed, parseErr := parseExternalFindings(name, out)
+			parsed, parseErr := parseSARIFFindings(name, out)
 			if parseErr != nil {
 				return nil, fmt.Errorf("parse %s findings: %w", name, parseErr)
 			}
@@ -945,63 +890,185 @@ func (e *Engine) availableTool(names ...string) (string, bool) {
 	}
 	return "", false
 }
-func parseExternalFindings(tool string, data []byte) ([]reviewengine.Finding, error) {
-	var value any
-	if json.Unmarshal(data, &value) != nil {
-		return nil, nil
+
+// sarifDocument is the minimal SARIF 2.1.0 shape emitted by trivy, grype, and
+// osv-scanner. Decoding it typed keeps each result's file path and message
+// together, instead of guessing field names across three schemas where they
+// live in different objects — the bug that made the old walker drop every
+// finding (DRYDOCK-rnmo).
+type sarifDocument struct {
+	Runs []struct {
+		Tool struct {
+			Driver struct {
+				Rules []struct {
+					ID               string `json:"id"`
+					ShortDescription struct {
+						Text string `json:"text"`
+					} `json:"shortDescription"`
+					FullDescription struct {
+						Text string `json:"text"`
+					} `json:"fullDescription"`
+					// GitHub convention carries real severity here: security-severity is
+					// a CVSS base score, and several scanners also emit a Severity token.
+					Properties struct {
+						SecuritySeverity string `json:"security-severity"`
+						Severity         string `json:"severity"`
+					} `json:"properties"`
+				} `json:"rules"`
+			} `json:"driver"`
+		} `json:"tool"`
+		Results []struct {
+			RuleID  string `json:"ruleId"`
+			Level   string `json:"level"`
+			Message struct {
+				Text string `json:"text"`
+			} `json:"message"`
+			Properties struct {
+				SecuritySeverity string `json:"security-severity"`
+				Severity         string `json:"severity"`
+			} `json:"properties"`
+			Locations []struct {
+				PhysicalLocation struct {
+					ArtifactLocation struct {
+						URI string `json:"uri"`
+					} `json:"artifactLocation"`
+					Region struct {
+						StartLine int `json:"startLine"`
+					} `json:"region"`
+				} `json:"physicalLocation"`
+			} `json:"locations"`
+		} `json:"results"`
+	} `json:"runs"`
+}
+
+func parseSARIFFindings(tool string, data []byte) ([]reviewengine.Finding, error) {
+	var doc sarifDocument
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("decode %s sarif: %w", tool, err)
 	}
 	var findings []reviewengine.Finding
-	walkJSON(value, func(item map[string]any) {
-		file := firstString(item, "Target", "file", "File", "path", "Path")
-		line := firstInt(item, "StartLine", "line", "Line")
-		message := firstString(item, "Description", "description", "message", "Message", "Title", "RuleID")
-		severity := strings.ToLower(firstString(item, "Severity", "severity"))
-		if severity == "" {
-			severity = "high"
+	for _, run := range doc.Runs {
+		descriptions := make(map[string]string, len(run.Tool.Driver.Rules))
+		ruleSeverities := make(map[string]string, len(run.Tool.Driver.Rules))
+		for _, rule := range run.Tool.Driver.Rules {
+			text := strings.TrimSpace(rule.ShortDescription.Text)
+			if text == "" {
+				text = strings.TrimSpace(rule.FullDescription.Text)
+			}
+			if text != "" {
+				descriptions[rule.ID] = text
+			}
+			if sev := severityFromProperties(rule.Properties.Severity, rule.Properties.SecuritySeverity); sev != "" {
+				ruleSeverities[rule.ID] = sev
+			}
 		}
-		if !reviewengine.IsValidSeverity(severity) {
-			severity = "medium"
+		for _, res := range run.Results {
+			message := strings.TrimSpace(res.Message.Text)
+			if message == "" {
+				message = descriptions[res.RuleID]
+			}
+			file, line := "", 0
+			for _, loc := range res.Locations {
+				if uri := strings.TrimSpace(loc.PhysicalLocation.ArtifactLocation.URI); uri != "" {
+					file = uri
+					if line = loc.PhysicalLocation.Region.StartLine; line <= 0 {
+						line = 1
+					}
+					break
+				}
+			}
+			if file == "" || message == "" {
+				continue
+			}
+			findings = append(findings, reviewengine.Finding{
+				Severity:    sarifResultSeverity(res.Properties.Severity, res.Properties.SecuritySeverity, ruleSeverities[res.RuleID], res.Level),
+				Category:    "security",
+				File:        filepath.ToSlash(file),
+				Line:        line,
+				Evidence:    "[" + tool + "] " + message,
+				Explanation: message,
+				RuleID:      strings.TrimSpace(res.RuleID),
+				Confidence:  .9,
+			})
 		}
-		if file == "" || message == "" {
-			return
-		}
-		if line <= 0 {
-			line = 1
-		}
-		findings = append(findings, reviewengine.Finding{Severity: severity, Category: "security", File: filepath.ToSlash(file), Line: line, Evidence: "[" + tool + "] " + message, Explanation: message, Confidence: .9})
-	})
+	}
 	return reviewengine.DeduplicateFindings(findings)
 }
-func walkJSON(value any, visit func(map[string]any)) {
-	switch typed := value.(type) {
-	case map[string]any:
-		visit(typed)
-		for _, child := range typed {
-			walkJSON(child, visit)
-		}
-	case []any:
-		for _, child := range typed {
-			walkJSON(child, visit)
-		}
+
+// sarifResultSeverity resolves a SARIF result to the drydock severity
+// vocabulary. Real severity lives in properties on modern scanner output, so
+// those win over the coarse SARIF level: a trivy/grype/osv-scanner CRITICAL
+// must not be flattened to "high" (the level ceiling) and lose P0. Precedence
+// is result properties, then the rule's properties, then the level mapping.
+func sarifResultSeverity(resultSeverity, resultSecuritySeverity, ruleSeverity, level string) string {
+	if sev := severityFromProperties(resultSeverity, resultSecuritySeverity); sev != "" {
+		return sev
+	}
+	if ruleSeverity != "" {
+		return ruleSeverity
+	}
+	return sarifSeverity(level)
+}
+
+// severityFromProperties reads real severity out of SARIF properties: a textual
+// Severity token (CRITICAL/HIGH/...) if present, otherwise the GitHub
+// security-severity CVSS base score. Returns "" when neither is usable so the
+// caller can fall back to the coarse level mapping.
+func severityFromProperties(token, securitySeverity string) string {
+	if sev := normalizeSeverityToken(token); sev != "" {
+		return sev
+	}
+	return cvssSeverity(securitySeverity)
+}
+
+// normalizeSeverityToken maps a textual severity token to the drydock
+// vocabulary, or "" if it is empty or unrecognized.
+func normalizeSeverityToken(token string) string {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "critical":
+		return "critical"
+	case "high":
+		return "high"
+	case "medium", "moderate":
+		return "medium"
+	case "low":
+		return "low"
+	default:
+		return ""
 	}
 }
-func firstString(item map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if value, ok := item[key].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
+
+// cvssSeverity maps a CVSS v3 base score (the GitHub security-severity
+// convention) to the drydock vocabulary using the standard qualitative bands,
+// or "" if the value is not a positive number.
+func cvssSeverity(securitySeverity string) string {
+	score, err := strconv.ParseFloat(strings.TrimSpace(securitySeverity), 64)
+	if err != nil {
+		return ""
 	}
-	return ""
+	switch {
+	case score >= 9.0:
+		return "critical"
+	case score >= 7.0:
+		return "high"
+	case score >= 4.0:
+		return "medium"
+	case score > 0:
+		return "low"
+	default:
+		return ""
+	}
 }
-func firstInt(item map[string]any, keys ...string) int {
-	for _, key := range keys {
-		switch value := item[key].(type) {
-		case float64:
-			return int(value)
-		case json.Number:
-			number, _ := strconv.Atoi(value.String())
-			return number
-		}
+
+// sarifSeverity maps a SARIF result level to the drydock severity vocabulary.
+// An absent level defaults to "warning" per the SARIF 2.1.0 spec, not "low".
+func sarifSeverity(level string) string {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "error":
+		return "high"
+	case "warning", "":
+		return "medium"
+	default:
+		return "low"
 	}
-	return 0
 }

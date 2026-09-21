@@ -40,15 +40,15 @@ The paper's seven vulnerabilities and their attack variants become Drydock's Nos
 
 | ID | [NP25] ref | Vulnerability | Impact | CWE |
 |---|---|---|---|---|
-| `NOSTR-V1` | Vuln. 1, §3 | **Lack of public-key authenticity.** The `pubkey` in a received event is never authenticated; a malicious relay substitutes its own keypair and re-signs. Signature verification *passes*. | Key-substitution forgery of any event (profile, contacts, DMs) | CWE-345, CWE-322 |
+| `NOSTR-V1` | Vuln. 1, §3 | **Lack of public-key authenticity.** The `pubkey` in a received event is never authenticated; a malicious relay substitutes its own keypair and re-signs. Signature verification *passes*. | Key-substitution forgery of any event (profile, contacts, DMs) | CWE-345 |
 | `NOSTR-V2` | Vuln. 2, §4.1 | **Missing signature verification** on received events. | Universal event forgery by any user | CWE-347 |
 | `NOSTR-V3` | Vuln. 3, §4.2 | **Unauthenticated encryption** — NIP-04 AES-CBC with no MAC. | CBC malleability → DM forgery; combines with V4/V6 for plaintext recovery | CWE-353, CWE-327 |
 | `NOSTR-V4` | Vuln. 4, §4.2 | **Lack of key separation** — the same ECDH shared secret serves NIP-04 and NIP-46 with no domain separation. | Known-plaintext oracle enabling universal DM forgery | CWE-323, CWE-1204 |
 | `NOSTR-V5` | Vuln. 5, §5 | **Domain-name / metadata leakage** from message handling. | Recipient IP + link disclosure to attacker-controlled hosts | CWE-200 |
 | `NOSTR-V6` | Vuln. 6, §5.1–5.3 | **Automatic link-preview generation on the recipient side** for encrypted DMs. | Plaintext recovery: URL non-domain part w.p. 1; whole message w. non-negligible probability | CWE-200, CWE-918 |
-| `NOSTR-V7` | Vuln. 7, §6 | **Inadequate cache search** — sender-provided `id` used as cache key instead of recomputing it. | Signature-verification bypass; forged profiles → redirected Bitcoin transfers | CWE-345, CWE-354 |
+| `NOSTR-V7` | Vuln. 7, §6 | **Inadequate cache search** — sender-provided `id` used as cache key instead of recomputing it. | Signature-verification bypass; forged profiles → redirected Bitcoin transfers | CWE-345 |
 | `NOSTR-R1` | App. E.2 | **Generic replay** — no dedup/`created_at` freshness on accepted events. | Replay of prior events as new | CWE-294 |
-| `NOSTR-R2` | App. E.3 | **Truncated replay** — CBC ciphertext truncation replayed as a valid DM. | Partial-message forgery | CWE-294, CWE-353 |
+| `NOSTR-R2` | App. E.3 | **Truncated replay** — CBC ciphertext truncation replayed as a valid DM. | Partial-message forgery | CWE-20 |
 
 Relay-side classes, drawn from `nostr-secprobe`'s active probe set, extend the taxonomy for relay implementations:
 

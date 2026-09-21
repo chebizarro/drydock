@@ -385,25 +385,6 @@ func TestLanguageBoost(t *testing.T) {
 	}
 }
 
-func TestDetectLanguage(t *testing.T) {
-	tests := []struct {
-		files []string
-		want  string
-	}{
-		{[]string{"main.go", "util.go", "test.py"}, "go"},
-		{[]string{"app.py", "models.py"}, "python"},
-		{[]string{"index.ts", "App.tsx"}, "typescript"},
-		{[]string{"data.csv", "config.yml"}, ""}, // no supported lang
-		{nil, ""},
-	}
-	for _, tt := range tests {
-		got := DetectLanguage(tt.files)
-		if got != tt.want {
-			t.Errorf("DetectLanguage(%v) = %q, want %q", tt.files, got, tt.want)
-		}
-	}
-}
-
 func TestFormatFewShot(t *testing.T) {
 	s := scoredResult{
 		content: `{"example":"data"}`,

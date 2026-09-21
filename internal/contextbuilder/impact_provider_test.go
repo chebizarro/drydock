@@ -149,19 +149,6 @@ func TestIsStructuralKind(t *testing.T) {
 	}
 }
 
-func TestNoisySymbolFiltering(t *testing.T) {
-	// init, main, run should be filtered out.
-	for _, name := range []string{"init", "main", "run", "new", "get", "set"} {
-		if !noisySymbols[strings.ToLower(name)] {
-			t.Errorf("%q should be in noisy symbols", name)
-		}
-	}
-	// "UserStore" should not be noisy.
-	if noisySymbols["userstore"] {
-		t.Error("UserStore should not be noisy")
-	}
-}
-
 func TestIsTestFile(t *testing.T) {
 	tests := []struct {
 		path string

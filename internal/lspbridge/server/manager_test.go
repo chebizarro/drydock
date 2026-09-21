@@ -44,21 +44,6 @@ func TestManagerCommandConfigDisable(t *testing.T) {
 	}
 }
 
-func TestConfiguredLSPCommandConfigsFromEnv(t *testing.T) {
-	t.Setenv("DRYDOCK_LSP_GO_COMMAND", "/custom/gopls")
-	t.Setenv("DRYDOCK_LSP_GO_ARGS", "serve,-remote=auto")
-	t.Setenv("DRYDOCK_LSP_RUST_DISABLED", "true")
-
-	configs := configuredLSPCommandConfigs()
-	goCfg := configs[lspbridge.LangGo]
-	if goCfg.Command != "/custom/gopls" || !reflect.DeepEqual(goCfg.Args, []string{"serve", "-remote=auto"}) {
-		t.Fatalf("unexpected Go config from env: %+v", goCfg)
-	}
-	if !configs[lspbridge.LangRust].Disabled {
-		t.Fatalf("expected Rust to be disabled from env, got %+v", configs[lspbridge.LangRust])
-	}
-}
-
 func TestManagerConcurrentGetOrStartStartsOneProcess(t *testing.T) {
 	repo := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "starts")

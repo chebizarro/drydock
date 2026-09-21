@@ -449,24 +449,20 @@ func (s *Store) GetAssignmentByID(ctx context.Context, id int) (*ReviewAssignmen
 
 // GetAssignmentByEventID retrieves an assignment by its Nostr event ID.
 func (s *Store) GetAssignmentByEventID(ctx context.Context, eventID string) (*ReviewAssignment, error) {
-	return s.getAssignmentByColumn(ctx, "assignment_event_id", eventID)
+	return s.getAssignment(ctx, "assignment_event_id", eventID)
 }
 
 // GetAssignmentByCompletionEventID retrieves an assignment by its published review event ID.
 // completion_event_id remains a fallback for rows created before migration v4.
 func (s *Store) GetAssignmentByCompletionEventID(ctx context.Context, eventID string) (*ReviewAssignment, error) {
-	assignment, err := s.getAssignmentByColumn(ctx, "review_event_id", eventID)
+	assignment, err := s.getAssignment(ctx, "review_event_id", eventID)
 	if err == nil {
 		return assignment, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	return s.getAssignmentByColumn(ctx, "completion_event_id", eventID)
-}
-
-func (s *Store) getAssignmentByColumn(ctx context.Context, column, eventID string) (*ReviewAssignment, error) {
-	return s.getAssignment(ctx, column, eventID)
+	return s.getAssignment(ctx, "completion_event_id", eventID)
 }
 
 func (s *Store) getAssignment(ctx context.Context, column string, value any) (*ReviewAssignment, error) {
@@ -505,32 +501,6 @@ func (s *Store) getAssignment(ctx context.Context, column string, value any) (*R
 		a.ReviewEventID = reviewEventID.String
 	}
 	return &a, nil
-}
-
-// UpdateAssignmentStatus updates the status of an assignment.
-func (s *Store) UpdateAssignmentStatus(ctx context.Context, id int, status string, eventID string) error {
-	now := time.Now().Unix()
-
-	var query string
-	var args []interface{}
-
-	switch status {
-	case "accepted":
-		query = `UPDATE review_assignments SET status = ?, acceptance_event_id = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, eventID, now, id}
-	case "completed":
-		query = `UPDATE review_assignments SET status = ?, completion_event_id = ?, review_event_id = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, eventID, eventID, now, id}
-	default:
-		query = `UPDATE review_assignments SET status = ?, updated_at = ? WHERE id = ?`
-		args = []interface{}{status, now, id}
-	}
-
-	_, err := s.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("update assignment status: %w", err)
-	}
-	return nil
 }
 
 // TransitionPendingAssignment atomically accepts or rejects a pending,

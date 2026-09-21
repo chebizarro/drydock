@@ -75,11 +75,7 @@ func (p *Provider) Build(ctx context.Context, in contextbuilder.BuildInput) (str
 	}
 
 	// Search for semantically similar code in the same repo.
-	filter := map[string]any{
-		"must": []map[string]any{
-			{"key": "repo_id", "match": map[string]any{"value": in.RepoID}},
-		},
-	}
+	filter := vectorstore.Filter(vectorstore.Match("repo_id", in.RepoID))
 
 	results, err := p.qdrant.Search(ctx, p.qdrant.CollectionNames().CodeChunks, vec, searchLimit, filter)
 	if err != nil {

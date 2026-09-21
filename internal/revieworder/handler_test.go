@@ -53,7 +53,7 @@ type orderFixture struct {
 	patch        nostr.Event
 }
 
-func newOrderFixture(t *testing.T, announcement bool, patchAddresses []string, loader RepositoryConfigLoader, authorizer PaymentAuthorizer, limit int) *orderFixture {
+func newOrderFixture(t *testing.T, announcement bool, patchAddresses []string, loader RepositoryConfigLoader, authorizer payment.PatchAuthorizer, limit int) *orderFixture {
 	t.Helper()
 	ctx := context.Background()
 	store := testStore(t, ctx, filepath.Join(t.TempDir(), "orders.db"))
@@ -133,6 +133,37 @@ func (f *orderFixture) request(t *testing.T, orderID string, params ReviewOrderP
 		Event: event, Sender: event.PubKey,
 		Msg: contextvm.Message{JSONRPC: "2.0", ID: orderID, Method: MethodReviewOrder, Params: raw},
 	})
+}
+
+func TestReviewOrderRequiresExpiration(t *testing.T) {
+	// Review orders trigger paid work, so replay protection is mandatory: an
+	// envelope with no expiration tag must be rejected.
+	f := newOrderFixture(t, true, []string{""}, nil, nil, 20)
+	params := ReviewOrderParams{PatchEventID: f.patch.ID.Hex()}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := nostr.Event{
+		Kind:      contextvm.KindContextVM,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"p", f.servicePK.Hex()},
+			{"method", MethodReviewOrder},
+			{"e", params.PatchEventID},
+		}, // no expiration tag
+		Content: string(raw),
+	}
+	if err := event.Sign(f.requesterKey); err != nil {
+		t.Fatal(err)
+	}
+	_, rpcErr := f.handler.HandleReviewOrder(f.ctx, contextvm.Request{
+		Event: event, Sender: event.PubKey,
+		Msg: contextvm.Message{JSONRPC: "2.0", ID: "no-expiry", Method: MethodReviewOrder, Params: raw},
+	})
+	if rpcErr == nil || rpcErr.Code != contextvm.ErrorInvalidParams {
+		t.Fatalf("order without expiration accepted: %+v", rpcErr)
+	}
 }
 
 func TestReviewOrderTargetCases(t *testing.T) {

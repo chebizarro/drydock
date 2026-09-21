@@ -2,6 +2,24 @@ package symbols
 
 import "testing"
 
+func TestPrimaryLanguage(t *testing.T) {
+	tests := []struct {
+		files []string
+		want  string
+	}{
+		{[]string{"main.go", "util.go", "test.py"}, "go"},
+		{[]string{"app.py", "models.py"}, "python"},
+		{[]string{"index.ts", "App.tsx"}, "typescript"},
+		{[]string{"data.csv", "config.yml"}, ""}, // no recognized language
+		{nil, ""},
+	}
+	for _, tt := range tests {
+		if got := PrimaryLanguage(tt.files); got != tt.want {
+			t.Errorf("PrimaryLanguage(%v) = %q, want %q", tt.files, got, tt.want)
+		}
+	}
+}
+
 func TestLangFromExtTable(t *testing.T) {
 	tests := []struct {
 		ext  string

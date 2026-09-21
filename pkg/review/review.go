@@ -293,7 +293,10 @@ func (e *Engine) Stream(ctx context.Context, req Request) (<-chan Event, error) 
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan Event)
+	// Buffered by one so the single terminal event is deposited even when the
+	// consumer is not yet parked on a receive; this keeps terminal delivery
+	// deterministic under cancellation without pinning the normalizer.
+	out := make(chan Event, 1)
 	go normalizeStream(ctx, providerName, model, internalEvents, out)
 	return out, nil
 }
@@ -389,6 +392,11 @@ func (a streamingCompletionAdapter) StreamCompletion(ctx context.Context, _ revi
 				mapped.Kind = reviewengine.CompletionStreamComplete
 				if event.Result != nil {
 					mapped.Result.Model = event.Result.Model
+					// Carry the terminal snapshot so a provider that returns
+					// its full text in Result.Content (the documented shape)
+					// instead of streaming deltas is not silently emptied.
+					mapped.Result.Message.Content = event.Result.Content
+					mapped.Result.Usage = toInternalUsage(event.Result.Usage)
 				}
 			case EventCancellation:
 				mapped.Kind = reviewengine.CompletionStreamCanceled
@@ -428,47 +436,87 @@ func normalizeStream(ctx context.Context, provider, requestedModel string, in <-
 	for {
 		select {
 		case <-ctx.Done():
-			emitTerminal(out, EventCancellation, StatusCanceled, content.String(), usage, model, mapError(provider, ctx.Err()))
+			emitTerminal(ctx, out, EventCancellation, StatusCanceled, content.String(), usage, model, mapError(provider, ctx.Err()))
 			return
 		case event, ok := <-in:
 			if !ok {
-				emitTerminal(out, EventCompletion, StatusCompleted, content.String(), usage, model, nil)
+				// A closed channel with a canceled context means the upstream
+				// unwound because of cancellation; report that deterministically
+				// rather than racing the ctx.Done() branch into a false success.
+				if err := ctx.Err(); err != nil {
+					emitTerminal(ctx, out, EventCancellation, StatusCanceled, content.String(), usage, model, mapError(provider, err))
+					return
+				}
+				emitTerminal(ctx, out, EventCompletion, StatusCompleted, content.String(), usage, model, nil)
 				return
 			}
 			switch event.Kind {
 			case reviewengine.CompletionStreamContentDelta:
 				content.WriteString(event.Delta)
-				out <- Event{Kind: EventContentDelta, Delta: event.Delta}
+				if !trySend(ctx, out, Event{Kind: EventContentDelta, Delta: event.Delta}) {
+					return
+				}
 			case reviewengine.CompletionStreamUsage:
 				usage = fromInternalUsage(event.Usage)
-				out <- Event{Kind: EventUsage, Usage: usage}
+				if !trySend(ctx, out, Event{Kind: EventUsage, Usage: usage}) {
+					return
+				}
 			case reviewengine.CompletionStreamOperation:
 				op := event.Operation
-				out <- Event{Kind: EventOperationStatus, Operation: &OperationStatus{ID: op.ID, Name: op.Name, Status: op.Status, Detail: op.Detail}}
+				if !trySend(ctx, out, Event{Kind: EventOperationStatus, Operation: &OperationStatus{ID: op.ID, Name: op.Name, Status: op.Status, Detail: op.Detail}}) {
+					return
+				}
 			case reviewengine.CompletionStreamComplete:
 				if event.Result.Model != "" {
 					model = event.Result.Model
 				}
-				emitTerminal(out, EventCompletion, StatusCompleted, content.String(), usage, model, nil)
+				finalContent := content.String()
+				if finalContent == "" && event.Result.Message.Content != "" {
+					finalContent = event.Result.Message.Content
+				}
+				if (usage == Usage{}) {
+					if u := fromInternalUsage(event.Result.Usage); (u != Usage{}) {
+						usage = u
+					}
+				}
+				emitTerminal(ctx, out, EventCompletion, StatusCompleted, finalContent, usage, model, nil)
 				return
 			case reviewengine.CompletionStreamCanceled:
 				err := event.Err
 				if err == nil {
 					err = context.Canceled
 				}
-				emitTerminal(out, EventCancellation, StatusCanceled, content.String(), usage, model, mapError(provider, err))
+				emitTerminal(ctx, out, EventCancellation, StatusCanceled, content.String(), usage, model, mapError(provider, err))
 				return
 			case reviewengine.CompletionStreamFailed:
-				emitTerminal(out, EventFailure, StatusFailed, content.String(), usage, model, mapError(provider, event.Err))
+				emitTerminal(ctx, out, EventFailure, StatusFailed, content.String(), usage, model, mapError(provider, event.Err))
 				return
 			}
 		}
 	}
 }
 
-func emitTerminal(out chan<- Event, kind EventKind, status TerminalStatus, content string, usage Usage, model string, failure *Error) {
+// trySend delivers ev, preferring delivery but never blocking once ctx is
+// canceled, so a consumer that cancels and stops draining cannot pin the
+// normalizer goroutine. The prior non-blocking attempt lets a buffered slot
+// absorb the send even when the consumer has not yet parked on a receive.
+func trySend(ctx context.Context, out chan<- Event, ev Event) bool {
+	select {
+	case out <- ev:
+		return true
+	default:
+	}
+	select {
+	case out <- ev:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func emitTerminal(ctx context.Context, out chan<- Event, kind EventKind, status TerminalStatus, content string, usage Usage, model string, failure *Error) {
 	result := &Result{Status: status, Content: content, Usage: usage, Model: model}
-	out <- Event{Kind: kind, Result: result, Error: failure}
+	trySend(ctx, out, Event{Kind: kind, Result: result, Error: failure})
 }
 
 func mapError(provider string, err error) *Error {

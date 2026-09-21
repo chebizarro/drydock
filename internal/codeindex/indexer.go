@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 	"git.sharegap.net/cascadia/drydock/internal/symbols"
 	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
@@ -307,7 +308,7 @@ func (idx *Indexer) indexFile(
 	if len(source) > maxFileBytes {
 		return fileIndexResult{}, nil
 	}
-	if !isProbablyText(source) {
+	if !hashutil.IsProbablyText(source) {
 		return fileIndexResult{}, nil
 	}
 
@@ -359,7 +360,7 @@ func (idx *Indexer) indexFile(
 				"end_line":       int(sym.EndLine) + 1,   // 1-based
 				"language":       lang,
 				"content":        content,
-				"content_hash":   contentHash(content),
+				"content_hash":   hashutil.SHA256Hex([]byte(content)),
 				"indexed_commit": commit,
 			},
 		})
@@ -418,12 +419,6 @@ func chunkPointID(repoID, filePath string, sym symbols.Symbol) string {
 	return fmt.Sprintf("%x", h[:16])
 }
 
-// contentHash returns the SHA-256 hex digest of content.
-func contentHash(content string) string {
-	h := sha256.Sum256([]byte(content))
-	return fmt.Sprintf("%x", h)
-}
-
 // repoMutex returns a per-repo mutex, creating one if needed.
 func (idx *Indexer) repoMutex(repoID string) *sync.Mutex {
 	v, _ := idx.repoLocks.LoadOrStore(repoID, &sync.Mutex{})
@@ -432,30 +427,20 @@ func (idx *Indexer) repoMutex(repoID string) *sync.Mutex {
 
 // countRepoPoints returns the number of code chunks for a repo in Qdrant.
 func (idx *Indexer) countRepoPoints(ctx context.Context, repoID string) (int64, error) {
-	return idx.qdrant.Count(ctx, idx.collection, map[string]any{
-		"must": []map[string]any{
-			{"key": "repo_id", "match": map[string]any{"value": repoID}},
-		},
-	})
+	return idx.qdrant.Count(ctx, idx.collection, vectorstore.Filter(vectorstore.Match("repo_id", repoID)))
 }
 
 // deleteRepoPoints removes all code chunks for a repo from Qdrant.
 func (idx *Indexer) deleteRepoPoints(ctx context.Context, repoID string) error {
-	return idx.scrollAndDelete(ctx, map[string]any{
-		"must": []map[string]any{
-			{"key": "repo_id", "match": map[string]any{"value": repoID}},
-		},
-	})
+	return idx.scrollAndDelete(ctx, vectorstore.Filter(vectorstore.Match("repo_id", repoID)))
 }
 
 // deleteFilePoints removes all code chunks for a specific file in a repo.
 func (idx *Indexer) deleteFilePoints(ctx context.Context, repoID, filePath string) error {
-	return idx.scrollAndDelete(ctx, map[string]any{
-		"must": []map[string]any{
-			{"key": "repo_id", "match": map[string]any{"value": repoID}},
-			{"key": "file_path", "match": map[string]any{"value": filePath}},
-		},
-	})
+	return idx.scrollAndDelete(ctx, vectorstore.Filter(
+		vectorstore.Match("repo_id", repoID),
+		vectorstore.Match("file_path", filePath),
+	))
 }
 
 // scrollAndDelete scrolls matching points and deletes them in batches.
@@ -647,18 +632,4 @@ func writeStateFileAtomic(path string, data []byte, perm os.FileMode) error {
 		_ = dirHandle.Close()
 	}
 	return nil
-}
-
-// isProbablyText returns true if data looks like text (no NUL bytes in first 512 bytes).
-func isProbablyText(data []byte) bool {
-	check := data
-	if len(check) > 512 {
-		check = check[:512]
-	}
-	for _, b := range check {
-		if b == 0 {
-			return false
-		}
-	}
-	return true
 }

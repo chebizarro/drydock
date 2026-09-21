@@ -73,6 +73,35 @@ func TestStreamCompletionHappyPath(t *testing.T) {
 	}
 }
 
+// A streaming provider may return its whole response in the terminal
+// Result.Content (the documented shape) instead of streaming deltas. The
+// round-trip previously dropped that content and emitted "".
+func TestStreamCompletionUsesTerminalResultContent(t *testing.T) {
+	provider := fakeProvider{stream: func(context.Context, ProviderRequest) (<-chan Event, error) {
+		events := make(chan Event, 1)
+		events <- Event{Kind: EventCompletion, Result: &Result{
+			Content: "full response text",
+			Usage:   Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+			Model:   "served-model",
+		}}
+		close(events)
+		return events, nil
+	}}
+	engine, _ := New(map[string]Provider{"stub": provider})
+	stream, err := engine.Stream(context.Background(), Request{Model: ModelSelection{Provider: "stub", Model: "m"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collect(stream)
+	terminal := events[len(events)-1]
+	if terminal.Kind != EventCompletion || terminal.Result == nil {
+		t.Fatalf("terminal = %#v", terminal)
+	}
+	if terminal.Result.Content != "full response text" || terminal.Result.Usage.TotalTokens != 15 || terminal.Result.Model != "served-model" {
+		t.Fatalf("result = %#v", terminal.Result)
+	}
+}
+
 func TestStreamFailurePreservesPartialContentAndUsage(t *testing.T) {
 	provider := fakeProvider{stream: func(context.Context, ProviderRequest) (<-chan Event, error) {
 		events := make(chan Event, 3)

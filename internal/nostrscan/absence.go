@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -20,6 +21,25 @@ import (
 const AbsenceConfidence = 0.79
 
 const maxAbsenceDepth = 24
+
+// Use-site verb lists for the four checks that reduce to "the identifier
+// contains one of these verbs" (DRYDOCK-ff2a). Named slices state that plainly
+// instead of a regex that advertises precision it does not have.
+var (
+	v2UseVerbs = []string{"store", "save", "persist", "render", "display", "trust", "accept", "process"}
+	v7UseVerbs = []string{"lookup", "find", "get", "contains", "cached", "cache", "dedup", "seen"}
+	r1UseVerbs = []string{"store", "save", "persist", "insert", "write"}
+	r2UseVerbs = []string{"decrypt"}
+)
+
+// nameHasUseVerb reports whether an extracted identifier contains any verb
+// (case-insensitive).
+func nameHasUseVerb(name string, verbs []string) bool {
+	lower := strings.ToLower(name)
+	return slices.ContainsFunc(verbs, func(v string) bool {
+		return strings.Contains(lower, v)
+	})
+}
 
 // AbsenceAnalyzer finds Nostr security checks missing from ingest-to-use paths.
 type AbsenceAnalyzer struct{}
@@ -74,11 +94,12 @@ var (
 	freshnessRE           = regexp.MustCompile(`(?i)(?:created_at|createdAt)[^\n]*(?:<|>|<=|>=|before|after|fresh|stale|monotonic)|(?:fresh|stale|monotonic)[^\n]*(?:created_at|createdAt)`)
 	lengthOrMACRE         = regexp.MustCompile(`(?i)(?:(?:(?:ciphertext|payload|content)\s*\.\s*(?:len|length)|len\s*\(\s*(?:ciphertext|payload|content)\s*\))\s*(?:%|<|>|==|!=)|blockSize|block_size|(?:verify|check)[A-Za-z0-9_]*(?:mac|hmac|tag|integrity)|(?:hmac|aead|poly1305|authenticate)[A-Za-z0-9_]*\s*\()`)
 
-	v2UseNameRE = regexp.MustCompile(`(?i)(?:store|save|persist|render|display|trust|accept|process)[A-Za-z0-9_]*(?:event|message|profile|contact|dm)?`)
-	v7UseNameRE = regexp.MustCompile(`(?i)(?:lookup|find|get|contains|cached|cache|dedup|seen)[A-Za-z0-9_]*(?:event|id|profile)?`)
+	// v1 keeps a regex because its suffixes are genuinely required (matchContact,
+	// attributeProfile, displaySender, …), not optional. The other four use-site
+	// checks were regexes ending in an OPTIONAL, unanchored group, so they only
+	// ever meant "the identifier contains one of these verbs" (DRYDOCK-ff2a);
+	// they are honest substring checks now (see v2UseVerbs et al.).
 	v1UseNameRE = regexp.MustCompile(`(?i)(?:match[A-Za-z0-9_]*contact|attribute[A-Za-z0-9_]*profile|display[A-Za-z0-9_]*sender|trust[A-Za-z0-9_]*(?:key|pubkey)|dm[A-Za-z0-9_]*sender)`)
-	r1UseNameRE = regexp.MustCompile(`(?i)(?:store|save|persist|insert|write)[A-Za-z0-9_]*(?:event|message|dm)?`)
-	r2UseNameRE = regexp.MustCompile(`(?i)(?:decrypt)[A-Za-z0-9_]*(?:dm|message|event|content)?`)
 
 	wireIDRE      = regexp.MustCompile(`(?i)(?:event|ev|evt)\s*(?:\.\s*id|\[\s*["']id["']\s*\])`)
 	pubkeyRE      = regexp.MustCompile(`(?i)(?:event|ev|evt)\s*(?:\.\s*pubkey|\[\s*["']pubkey["']\s*\])`)
@@ -165,7 +186,7 @@ func loadAbsenceNodes(repoPath string, codeMap *codemap.Map, surfaces surface.Re
 			case "nostr-preview-render-path":
 				node.v2Use = firstPositive(node.v2Use, location.Line)
 			case "nostr-encrypt-decrypt":
-				if r2UseNameRE.MatchString(node.symbol.Name) {
+				if nameHasUseVerb(node.symbol.Name, r2UseVerbs) {
 					node.r2Use = firstPositive(node.r2Use, location.Line)
 				}
 			}
@@ -185,19 +206,19 @@ func classifyAbsenceNode(node *absenceNode) {
 	node.freshness = freshnessRE.MatchString(body)
 	node.lengthOrMAC = lengthOrMACRE.MatchString(body)
 
-	if v2UseNameRE.MatchString(name) || persistenceRE.MatchString(body) {
+	if nameHasUseVerb(name, v2UseVerbs) || persistenceRE.MatchString(body) {
 		node.v2Use = int(node.symbol.StartLine)
 	}
-	if (v7UseNameRE.MatchString(name) || cacheLookupRE.MatchString(body)) && wireIDRE.MatchString(body) {
+	if (nameHasUseVerb(name, v7UseVerbs) || cacheLookupRE.MatchString(body)) && wireIDRE.MatchString(body) {
 		node.v7Use = int(node.symbol.StartLine)
 	}
 	if v1UseNameRE.MatchString(name) && pubkeyRE.MatchString(body) {
 		node.v1Use = int(node.symbol.StartLine)
 	}
-	if r1UseNameRE.MatchString(name) || persistenceRE.MatchString(body) {
+	if nameHasUseVerb(name, r1UseVerbs) || persistenceRE.MatchString(body) {
 		node.r1Use = int(node.symbol.StartLine)
 	}
-	if r2UseNameRE.MatchString(name) {
+	if nameHasUseVerb(name, r2UseVerbs) {
 		node.r2Use = int(node.symbol.StartLine)
 	}
 }

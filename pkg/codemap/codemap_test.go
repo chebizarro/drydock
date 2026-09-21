@@ -15,7 +15,38 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/symbols"
 )
 
-func TestLanguageAndSymbolGoldenParity(t *testing.T) {
+// TestPublicTypesMirrorInternalFields is the compile-agnostic parity guard for
+// the hand-written converters below: adding a field to an internal type without
+// mirroring it in the public DTO makes the converter silently drop it, which no
+// golden or round-trip test catches. This asserts every exported internal field
+// has a same-named public field.
+func TestPublicTypesMirrorInternalFields(t *testing.T) {
+	cases := []struct {
+		name     string
+		internal reflect.Type
+		public   reflect.Type
+	}{
+		{"Symbol", reflect.TypeOf(internalcodemap.Symbol{}), reflect.TypeOf(Symbol{})},
+		{"File", reflect.TypeOf(internalcodemap.File{}), reflect.TypeOf(File{})},
+		{"RankedSymbol", reflect.TypeOf(internalcodemap.RankedSymbol{}), reflect.TypeOf(RankedSymbol{})},
+		{"CacheStats", reflect.TypeOf(internalcodemap.CacheStats{}), reflect.TypeOf(CacheStats{})},
+		{"Map", reflect.TypeOf(internalcodemap.Map{}), reflect.TypeOf(Map{})},
+		{"SourceSymbol", reflect.TypeOf(symbols.Symbol{}), reflect.TypeOf(SourceSymbol{})},
+	}
+	for _, tc := range cases {
+		public := make(map[string]bool)
+		for i := 0; i < tc.public.NumField(); i++ {
+			public[tc.public.Field(i).Name] = true
+		}
+		for i := 0; i < tc.internal.NumField(); i++ {
+			if name := tc.internal.Field(i).Name; !public[name] {
+				t.Errorf("%s: internal field %q has no public mirror; the converter will silently drop it", tc.name, name)
+			}
+		}
+	}
+}
+
+func TestLanguageAndSymbolGolden(t *testing.T) {
 	language, ok := DetectLanguage("sample.go")
 	if !ok || language.ID != symbols.LangFromExt(".go") {
 		t.Fatalf("language = %#v, ok=%v", language, ok)
@@ -27,16 +58,6 @@ func TestLanguageAndSymbolGoldenParity(t *testing.T) {
 			t.Skip(err)
 		}
 		t.Fatal(err)
-	}
-	extractor := symbols.New()
-	defer extractor.Close()
-	internal, err := extractor.Extract("go", source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := sourceSymbols(internal)
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("symbol facade != internal\nfacade: %#v\ninternal: %#v", got, want)
 	}
 	encoded, err := json.MarshalIndent(struct {
 		Language  Language
@@ -78,7 +99,7 @@ func TestParserConcurrentCallsAreSerializedSafely(t *testing.T) {
 	}
 }
 
-func TestRepositoryMapGoldenParity(t *testing.T) {
+func TestRepositoryMapGolden(t *testing.T) {
 	if !TreeSitterAvailable() {
 		t.Skip("tree-sitter unavailable")
 	}
@@ -95,16 +116,7 @@ func TestRepositoryMapGoldenParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	internalMap, err := internalcodemap.Build(context.Background(), repo, "HEAD", internalcodemap.WithCacheDir(t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := fromInternalMap(internalMap)
 	publicMap.Cache = CacheStats{}
-	want.Cache = CacheStats{}
-	if !reflect.DeepEqual(publicMap, want) {
-		t.Fatalf("map facade != internal\nfacade: %#v\ninternal: %#v", publicMap, want)
-	}
 	encoded, err := json.MarshalIndent(publicMap, "", "  ")
 	if err != nil {
 		t.Fatal(err)

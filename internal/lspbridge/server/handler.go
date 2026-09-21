@@ -450,17 +450,11 @@ func (h *Handler) authorized(r *http.Request) bool {
 	return ok
 }
 
+// configuredAuthTokens indexes the tokens resolved by parseConfig, which is the
+// single authority for LSP bridge auth env vars (cmd/lsp-bridge/main.go). There
+// is deliberately no env fallback here: it was unreachable from the shipped
+// binary and parsed the same variables differently.
 func configuredAuthTokens(tokens []string) map[string]struct{} {
-	if len(tokens) == 0 {
-		for _, key := range []string{"LSP_BRIDGE_AUTH_TOKENS", "DRYDOCK_LSP_BRIDGE_TOKENS"} {
-			tokens = append(tokens, splitTokenList(os.Getenv(key))...)
-		}
-		for _, key := range []string{"LSP_BRIDGE_AUTH_TOKEN", "DRYDOCK_LSP_BRIDGE_TOKEN"} {
-			if single := strings.TrimSpace(os.Getenv(key)); single != "" {
-				tokens = append(tokens, single)
-			}
-		}
-	}
 	out := make(map[string]struct{}, len(tokens))
 	for _, token := range tokens {
 		if token = strings.TrimSpace(token); token != "" {
@@ -468,16 +462,6 @@ func configuredAuthTokens(tokens []string) map[string]struct{} {
 		}
 	}
 	return out
-}
-
-func splitTokenList(value string) []string {
-	var tokens []string
-	for _, token := range strings.Split(value, ",") {
-		if token = strings.TrimSpace(token); token != "" {
-			tokens = append(tokens, token)
-		}
-	}
-	return tokens
 }
 
 func configuredAllowedRoots(roots []string, logger *slog.Logger) []string {

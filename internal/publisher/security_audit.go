@@ -2,8 +2,6 @@ package publisher
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,8 +11,10 @@ import (
 	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 	"git.sharegap.net/cascadia/drydock/internal/nostrprobe"
 	"git.sharegap.net/cascadia/drydock/internal/scope"
+	"git.sharegap.net/cascadia/drydock/internal/signing"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip59"
@@ -28,7 +28,7 @@ const (
 // GiftWrapSigner is the signing and NIP-44 encryption surface required to
 // deliver private security-audit detail.
 type GiftWrapSigner interface {
-	Signer
+	signing.Signer
 	Encrypt(ctx context.Context, plaintext string, recipient nostr.PubKey) (string, error)
 }
 
@@ -168,7 +168,7 @@ func (s *Service) PublishSecurityAudit(ctx context.Context, in PublishSecurityAu
 	if err != nil {
 		return out, fmt.Errorf("generate SARIF: %w", err)
 	}
-	sarifHash := sha256Hex(sarif)
+	sarifHash := hashutil.SHA256Hex(sarif)
 	complete := in.Complete &&
 		in.Coverage.ScanOperationsSkipped == 0 &&
 		in.Coverage.ScanOperationsErrored == 0 &&
@@ -191,7 +191,7 @@ func (s *Service) PublishSecurityAudit(ctx context.Context, in PublishSecurityAu
 	if err != nil {
 		return out, fmt.Errorf("marshal security audit detail: %w", err)
 	}
-	reportDigest := sha256Hex(detailJSON)
+	reportDigest := hashutil.SHA256Hex(detailJSON)
 
 	counts := countAuditSeverities(in.Findings)
 	publicContent := SecurityAuditPublicContent{
@@ -547,9 +547,4 @@ func nonNilFindings(findings []SecurityAuditFinding) []SecurityAuditFinding {
 		return []SecurityAuditFinding{}
 	}
 	return findings
-}
-
-func sha256Hex(content []byte) string {
-	sum := sha256.Sum256(content)
-	return hex.EncodeToString(sum[:])
 }

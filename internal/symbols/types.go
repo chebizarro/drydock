@@ -1,6 +1,10 @@
 package symbols
 
-import "sort"
+import (
+	"path/filepath"
+	"sort"
+	"strings"
+)
 
 // SymbolKind classifies what kind of declaration a symbol is.
 type SymbolKind string
@@ -34,6 +38,33 @@ func LangFromExt(ext string) string {
 		return ""
 	}
 	return lang
+}
+
+// PrimaryLanguage returns the most common recognized language across files,
+// with first-seen order winning ties so the result is deterministic. Files with
+// an unrecognized extension are ignored; an empty result means none matched.
+func PrimaryLanguage(files []string) string {
+	counts := make(map[string]int)
+	var order []string // first-seen order for deterministic tie-breaking
+	for _, f := range files {
+		lang := LangFromExt(strings.ToLower(filepath.Ext(f)))
+		if lang == "" {
+			continue
+		}
+		if counts[lang] == 0 {
+			order = append(order, lang)
+		}
+		counts[lang]++
+	}
+	best := ""
+	bestCount := 0
+	for _, lang := range order {
+		if counts[lang] > bestCount {
+			best = lang
+			bestCount = counts[lang]
+		}
+	}
+	return best
 }
 
 // LanguageMetadata describes one recognized source language.

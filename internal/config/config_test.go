@@ -413,6 +413,62 @@ func TestValidateProductionRequiresAuthenticatedTLSEndpoints(t *testing.T) {
 	}
 }
 
+// The security and agentic-discovery endpoints previously escaped production
+// validation entirely, so an operator could point DRYDOCK_SEC70B_BASE_URL at a
+// plaintext or loopback host and the binary would transmit the shared
+// DRYDOCK_LLM_API_KEY there with no guard. Every LLM endpoint must now be
+// TLS-checked in production.
+func TestValidateProductionGuardsSecurityEndpointTLS(t *testing.T) {
+	cfg := Config{
+		Production:              true,
+		Sec70BBaseURL:           "http://sec70b.internal/v1",
+		SecClassifyBaseURL:      "http://secclassify.internal/v1",
+		SecLocalizeBaseURL:      "https://127.0.0.1/v1",
+		AgenticDiscoveryBaseURL: "http://discovery.internal/v1",
+	}
+	result := ValidationResult{}
+	cfg.validateProductionConfig(&result)
+
+	for _, want := range []string{
+		"DRYDOCK_SEC70B_BASE_URL to use https://",
+		"DRYDOCK_SECCLASSIFY_BASE_URL to use https://",
+		"loopback URL for DRYDOCK_SECLOCALIZE_BASE_URL",
+		"DRYDOCK_AGENTIC_DISCOVERY_BASE_URL to use https://",
+	} {
+		if !hasErrorContaining(result, want) {
+			t.Errorf("expected production validation error containing %q; got %#v", want, result.Errors)
+		}
+	}
+}
+
+// The optional security and agentic-discovery endpoints stay optional: when
+// unset, production validation must not fault them. This is the complement of
+// TestValidateProductionGuardsSecurityEndpointTLS — the guard fires on a
+// plaintext or loopback URL but never on an absent one, so operators who do not
+// run the security pathway are not forced to configure it.
+func TestValidateProductionAllowsEmptyOptionalSecurityEndpoints(t *testing.T) {
+	cfg := Config{
+		Production:              true,
+		Sec70BBaseURL:           "",
+		SecClassifyBaseURL:      "",
+		SecLocalizeBaseURL:      "",
+		AgenticDiscoveryBaseURL: "",
+	}
+	result := ValidationResult{}
+	cfg.validateProductionConfig(&result)
+
+	for _, unwanted := range []string{
+		"DRYDOCK_SEC70B_BASE_URL",
+		"DRYDOCK_SECCLASSIFY_BASE_URL",
+		"DRYDOCK_SECLOCALIZE_BASE_URL",
+		"DRYDOCK_AGENTIC_DISCOVERY_BASE_URL",
+	} {
+		if hasErrorContaining(result, unwanted) {
+			t.Errorf("empty optional endpoint %s must not produce a production validation error; got %#v", unwanted, result.Errors)
+		}
+	}
+}
+
 func TestFromEnv_DevModePermitsLocalhostDefaults(t *testing.T) {
 	clearConfigEnv(t)
 

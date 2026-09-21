@@ -110,6 +110,40 @@ func TestRunSurvivorIsClassifiedAsFinding(t *testing.T) {
 	}
 }
 
+// TestRunPreservesRuleIDThroughVerification pins the invariant the auditengine
+// NOSTR category restore depends on (DRYDOCK-vrbe): RuleID travels on the
+// finding struct, so a survivor keeps its rule_id after verification and
+// classification even though the classifier overwrites Category with a CWE. The
+// model never echoes rule_id, so identity must never depend on it doing so. A
+// future securityverify change that reconstructs the finding from the model
+// response instead of mutating the struct would break the restore, and this
+// test would catch it.
+func TestRunPreservesRuleIDThroughVerification(t *testing.T) {
+	fake := &testutil.FakeLLM{Responses: []string{
+		`{"refuted":false,"certain":true,"reason":"reachable"}`,
+		`{"cwe":"CWE-345","severity":"high","confidence":0.9,"remediation":"verify the event signature"}`,
+	}}
+	engine := New(&lockedFakeLLM{fake: fake}, DefaultConfig())
+	finding := candidate()
+	finding.RuleID = "NOSTR-V3" // non-absence rule keeps the vote count at 1
+
+	got, err := engine.Run(context.Background(), []reviewengine.Finding{finding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want 1 survivor", len(got))
+	}
+	if got[0].RuleID != "NOSTR-V3" {
+		t.Fatalf("RuleID not preserved through verification: got %q, want NOSTR-V3", got[0].RuleID)
+	}
+	// The classifier still overwrites Category with the CWE; the auditengine
+	// restore keys on the preserved RuleID, not on this field.
+	if got[0].Category != "CWE-345" {
+		t.Fatalf("classifier should set Category to CWE, got %q", got[0].Category)
+	}
+}
+
 func TestNostrAbsenceWrapperVerificationRefutesWithDedicatedLens(t *testing.T) {
 	fake := &testutil.FakeLLM{Responses: []string{
 		`{"refuted":true,"certain":true,"reason":"handler.go:17 calls verifyEvent before dispatch"}`,
@@ -143,6 +177,35 @@ func TestNostrAbsenceWrapperVerificationRefutesWithDedicatedLens(t *testing.T) {
 		}
 		if !strings.Contains(req.User, `"confidence":0.79`) {
 			t.Fatalf("absence confidence cap was not preserved into verification: %s", req.User)
+		}
+	}
+}
+
+func TestNostrAbsenceDetectedByRuleIDField(t *testing.T) {
+	fake := &testutil.FakeLLM{Responses: []string{
+		`{"refuted":true,"certain":true,"reason":"verified upstream"}`,
+		`{"refuted":true,"certain":true,"reason":"library guarantees verification"}`,
+	}}
+	engine := New(&lockedFakeLLM{fake: fake}, DefaultConfig())
+	finding := candidate()
+	// Production now carries rule identity as a field with clean evidence and a
+	// plain "security" category (DRYDOCK-vrbe); Nostr detection must not depend
+	// on the rule id appearing in prose.
+	finding.RuleID = "NOSTR-V2"
+	finding.Category = "security"
+	finding.Explanation = "A received Nostr event reaches a use site without signature verification."
+	finding.Evidence = "relay.go:10 ingest -> handler.go:42 store"
+	finding.Confidence = 0.79
+
+	if _, err := engine.Run(context.Background(), []reviewengine.Finding{finding}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.Requests) != AbsenceVerifyVotes {
+		t.Fatalf("got %d verifier calls, want absence default %d for a RuleID-only Nostr finding", len(fake.Requests), AbsenceVerifyVotes)
+	}
+	for _, req := range fake.Requests {
+		if !strings.Contains(req.System, "NIP-01") {
+			t.Fatalf("Nostr knowledge pack missing from verifier prompt; field-based detection failed")
 		}
 	}
 }

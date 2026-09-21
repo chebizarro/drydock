@@ -184,15 +184,6 @@ func TestDiscoverDocFiles_WorkspaceRoots(t *testing.T) {
 	}
 }
 
-func TestIsProbablyText(t *testing.T) {
-	if !isProbablyText([]byte("hello world")) {
-		t.Error("expected text")
-	}
-	if isProbablyText([]byte{0x00, 0x01, 0x02}) {
-		t.Error("expected binary")
-	}
-}
-
 func TestRun_Integration(t *testing.T) {
 	// Set up a fake embedding + Qdrant server.
 	var upsertedPoints int

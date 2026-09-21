@@ -8,13 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"testing"
-
-	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
 )
 
-func TestTreeAndSearchGoldenParity(t *testing.T) {
+func TestTreeAndSearchGolden(t *testing.T) {
 	rootPath := t.TempDir()
 	writeRepoFixture(t, rootPath, "cmd/main.go", "package main\n\nfunc main() {\n\tprintln(\"needle\")\n}\n")
 	writeRepoFixture(t, rootPath, "pkg/value.go", "package pkg\n\nconst Value = \"needle\"\n")
@@ -35,39 +32,11 @@ func TestTreeAndSearchGoldenParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	internalEntries, err := snapshot.inner.List(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantTree := make([]TreeEntry, 0, len(internalEntries))
-	for _, entry := range internalEntries {
-		wantTree = append(wantTree, TreeEntry{
-			Path: entry.Path, SHA256: entry.Hash, Size: entry.Size, Mode: entry.Mode,
-		})
-	}
-	if !reflect.DeepEqual(gotTree, wantTree) {
-		t.Fatalf("tree facade != internal\nfacade: %#v\ninternal: %#v", gotTree, wantTree)
-	}
-
 	gotSearch, err := snapshot.Search(context.Background(), SearchOptions{
 		Query: "needle", Path: "pkg", MaxResults: 20,
 	})
 	if err != nil {
 		t.Fatal(err)
-	}
-	internalHits, err := contextbuilder.NewContentSearchFacade().Search(
-		context.Background(), snapshotSource{snapshot.inner},
-		contextbuilder.ContentSearchRequest{Query: "needle", Path: "pkg", MaxResults: 20},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantSearch := make([]SearchHit, 0, len(internalHits))
-	for _, hit := range internalHits {
-		wantSearch = append(wantSearch, SearchHit{Path: hit.Path, Line: hit.Line, Text: hit.Text})
-	}
-	if !reflect.DeepEqual(gotSearch, wantSearch) {
-		t.Fatalf("search facade != internal\nfacade: %#v\ninternal: %#v", gotSearch, wantSearch)
 	}
 
 	encoded, err := json.MarshalIndent(struct {

@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan/knowledge"
 )
 
 type Status string
@@ -149,6 +151,10 @@ func authorizedTargets(targets, allow []string) ([]string, error) {
 	return out, nil
 }
 
+// cweForRule resolves a probe rule's CWE. The relay-only rule ids are probe
+// specific and stay here; the vulnerability ids (RuleClientPreview=NOSTR-V6,
+// RuleKeySeparation=NOSTR-V4) read the versioned knowledge pack so the dynamic
+// and static paths cannot disagree on a rule's CWE (DRYDOCK-45d5).
 func cweForRule(ruleID string) string {
 	switch ruleID {
 	case RuleRelaySignature:
@@ -161,11 +167,7 @@ func cweForRule(ruleID string) string {
 		return "CWE-20"
 	case RuleRelayRate:
 		return "CWE-770"
-	case RuleClientPreview:
-		return "CWE-200"
-	case RuleKeySeparation:
-		return "CWE-323"
 	default:
-		return ""
+		return knowledge.VulnerabilityCWE(ruleID)
 	}
 }

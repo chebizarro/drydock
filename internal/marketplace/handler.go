@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -257,13 +256,14 @@ func (h *Handler) authorizeAssignmentIntent(ctx context.Context, senderPubkey, p
 
 // handleContextVMAcceptance processes a ContextVM assignment acceptance intent.
 func (h *Handler) handleContextVMAcceptance(ctx context.Context, req contextvm.Request) (any, *contextvm.Error) {
-	if _, rpcErr := contextvm.ParamsAs[ReviewAcceptance](req); rpcErr != nil {
+	acceptance, rpcErr := contextvm.ParamsAs[ReviewAcceptance](req)
+	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	event := req.Event
-	event.Content = string(req.Msg.Params)
-	event.PubKey = req.Sender
-	if err := h.router.HandleAcceptance(ctx, event); err != nil {
+	if rpcErr := verifySignedIntent(req); rpcErr != nil {
+		return nil, rpcErr
+	}
+	if err := h.router.recordAcceptance(ctx, acceptance, req.Sender.Hex(), req.Event.ID.Hex(), int64(req.Event.CreatedAt)); err != nil {
 		h.logger.Error("failed to handle marketplace acceptance intent",
 			"event_id", req.Event.ID.Hex(),
 			"error", err,
@@ -282,9 +282,8 @@ func (h *Handler) handleContextVMCompletion(ctx context.Context, req contextvm.R
 	if completion.AssignmentID == "" || completion.ReviewEventID == "" {
 		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidParams, Message: "assignment_id and review_event_id are required"}
 	}
-	if req.Event.PubKey == nostr.ZeroPK || req.Sender != req.Event.PubKey ||
-		!req.Event.CheckID() || !req.Event.VerifySignature() {
-		return nil, &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: "completion event failed signature verification"}
+	if rpcErr := verifySignedIntent(req); rpcErr != nil {
+		return nil, rpcErr
 	}
 	if err := h.router.complete(ctx, completion, req.Sender.Hex(), req.Event.ID.Hex()); err != nil {
 		h.logger.Error("failed to handle marketplace completion intent",
@@ -296,13 +295,14 @@ func (h *Handler) handleContextVMCompletion(ctx context.Context, req contextvm.R
 
 // handleContextVMRejection processes a ContextVM assignment rejection intent.
 func (h *Handler) handleContextVMRejection(ctx context.Context, req contextvm.Request) (any, *contextvm.Error) {
-	if _, rpcErr := contextvm.ParamsAs[ReviewRejection](req); rpcErr != nil {
+	rejection, rpcErr := contextvm.ParamsAs[ReviewRejection](req)
+	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	event := req.Event
-	event.Content = string(req.Msg.Params)
-	event.PubKey = req.Sender
-	if err := h.router.HandleRejection(ctx, event); err != nil {
+	if rpcErr := verifySignedIntent(req); rpcErr != nil {
+		return nil, rpcErr
+	}
+	if err := h.router.recordRejection(ctx, rejection, req.Sender.Hex(), req.Event.ID.Hex(), int64(req.Event.CreatedAt)); err != nil {
 		h.logger.Error("failed to handle marketplace rejection intent",
 			"event_id", req.Event.ID.Hex(),
 			"error", err,
@@ -310,6 +310,19 @@ func (h *Handler) handleContextVMRejection(ctx context.Context, req contextvm.Re
 		return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: err.Error()}
 	}
 	return map[string]string{"status": "rejected"}, nil
+}
+
+// verifySignedIntent authenticates a signed ContextVM intent envelope. The
+// source event must be self-consistent, authored by the authenticated sender,
+// and carry a valid signature. Acceptance, rejection, and completion intents
+// all share this check so no signed money/authorization path is weaker than the
+// others.
+func verifySignedIntent(req contextvm.Request) *contextvm.Error {
+	if req.Event.PubKey == nostr.ZeroPK || req.Sender != req.Event.PubKey ||
+		!req.Event.CheckID() || !req.Event.VerifySignature() {
+		return &contextvm.Error{Code: contextvm.ErrorInvalidRequest, Message: "intent event failed signature verification"}
+	}
+	return nil
 }
 
 const (
@@ -414,45 +427,17 @@ func parseMarketplaceFeedbackParams(raw json.RawMessage) (MarketplaceFeedbackPar
 }
 
 func validateMarketplaceFeedbackEnvelope(req contextvm.Request, params MarketplaceFeedbackParams) error {
-	if req.Sender == nostr.ZeroPK || req.Event.ID == nostr.ZeroID {
-		return errors.New("authenticated sender and event id are required")
-	}
-	methods := feedbackTagValues(req.Event.Tags, "method")
-	if len(methods) != 1 || methods[0] != MethodFeedback {
-		return errors.New("method tag must match marketplace/feedback")
-	}
-	related := feedbackTagValues(req.Event.Tags, "e")
-	if len(related) != 1 || related[0] != params.ReviewEventID {
-		return errors.New("e tag must match review_event_id")
-	}
-	expirations := feedbackTagValues(req.Event.Tags, "expiration")
-	if len(expirations) > 1 {
-		return errors.New("at most one expiration tag is allowed")
-	}
-	if len(expirations) == 0 {
-		return nil
-	}
-	expiresAt, err := strconv.ParseInt(expirations[0], 10, 64)
-	if err != nil {
-		return errors.New("expiration must be a Unix timestamp")
-	}
-	now := time.Now().Unix()
-	if expiresAt <= now {
-		return errors.New("feedback notification expired")
-	}
-	createdAt := int64(req.Event.CreatedAt)
-	if createdAt <= 0 || expiresAt <= createdAt || expiresAt > createdAt+int64(feedbackNotificationMaxLifetime/time.Second) {
-		return errors.New("expiration exceeds the 15 minute feedback lifetime")
+	// Feedback is a low-stakes rating notification: it binds the reviewed event
+	// (e tag) and its own method, and its expiration is optional but bounded to
+	// the feedback lifetime when present. ExpirationRequired is deliberately
+	// false here — that single flag is the one intentional replay-protection
+	// difference from review/order, which requires it.
+	if rpcErr := contextvm.ValidateEnvelope(req, contextvm.EnvelopePolicy{
+		Method:      MethodFeedback,
+		RelatedID:   params.ReviewEventID,
+		MaxLifetime: feedbackNotificationMaxLifetime,
+	}); rpcErr != nil {
+		return errors.New(rpcErr.Message)
 	}
 	return nil
-}
-
-func feedbackTagValues(tags nostr.Tags, name string) []string {
-	var values []string
-	for _, tag := range tags {
-		if len(tag) >= 2 && tag[0] == name {
-			values = append(values, tag[1])
-		}
-	}
-	return values
 }

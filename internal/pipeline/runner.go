@@ -17,6 +17,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 	"git.sharegap.net/cascadia/drydock/internal/metareview"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/monitoring"
 	"git.sharegap.net/cascadia/drydock/internal/payment"
 	"git.sharegap.net/cascadia/drydock/internal/promptrefine"
 	"git.sharegap.net/cascadia/drydock/internal/publisher"
@@ -27,6 +28,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/scope"
 	"git.sharegap.net/cascadia/drydock/internal/securityreview"
 	"git.sharegap.net/cascadia/drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/symbols"
 	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 	"git.sharegap.net/cascadia/drydock/internal/tracing"
 	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
@@ -63,16 +65,6 @@ func retryablePaymentError(auth payment.AuthorizeResult) error {
 	return errors.New(payment.ReasonPaymentPending)
 }
 
-// MonitoringRegistry exposes the live reactive-review membership projection.
-type MonitoringRegistry interface {
-	Contains(repositoryAddress string) bool
-}
-
-// PaymentAuthorizer gates reviews according to the repository payment policy.
-type PaymentAuthorizer interface {
-	AuthorizePatch(ctx context.Context, patchEvent nostr.Event, repoID string, policy repoconfig.PaymentsConfig) (payment.AuthorizeResult, error)
-}
-
 // SecurityReviewStage runs the verified security lens over an assembled context bundle.
 type SecurityReviewStage interface {
 	Run(context.Context, contextbuilder.ContextBundle, string, repoconfig.SecurityConfig) securityreview.SecurityResult
@@ -97,8 +89,8 @@ type Runner struct {
 	secScanner              *securityscan.Scanner
 	betterleaksScanner      BetterleaksScanner
 	securityReviewer        SecurityReviewStage
-	paymentAuth             PaymentAuthorizer
-	monitoring              MonitoringRegistry
+	paymentAuth             payment.PatchAuthorizer
+	monitoring              monitoring.Membership
 	queue                   <-chan db.ReviewTask
 	workers                 int
 	logger                  *slog.Logger
@@ -182,14 +174,14 @@ func WithSecurityReviewer(stage SecurityReviewStage) func(*Runner) {
 }
 
 // WithPaymentAuthorizer enables per-repository payment gating before expensive review work.
-func WithPaymentAuthorizer(auth PaymentAuthorizer) func(*Runner) {
+func WithPaymentAuthorizer(auth payment.PatchAuthorizer) func(*Runner) {
 	return func(r *Runner) {
 		r.paymentAuth = auth
 	}
 }
 
 // WithMonitoringRegistry configures the live fail-closed reactive gate.
-func WithMonitoringRegistry(registry MonitoringRegistry) func(*Runner) {
+func WithMonitoringRegistry(registry monitoring.Membership) func(*Runner) {
 	return func(r *Runner) {
 		r.monitoring = registry
 	}
@@ -571,7 +563,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			fewShot, fewShotErr = r.fewShotRetriever.RetrieveFewShots(ctx, FewShotQuery{
 				PatchDiff: patchDiffContent,
 				Limit:     2,
-				Language:  DetectLanguage(changedFiles),
+				Language:  symbols.PrimaryLanguage(changedFiles),
 				RepoID:    task.RepoID,
 			})
 		} else {

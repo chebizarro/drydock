@@ -9,9 +9,9 @@ import (
 const validMetaReviewJSON = `{"missed_findings":[{"type":"correctness","description":"missed nil check","evidence":"foo dereferences bar","why_missed":"prompt_gap"}],"false_positives":[{"finding_index":0,"reason":"the reported issue is guarded"}],"reasoning_quality":0.8,"context_utilization":0.7,"prompt_gaps":["emphasize nil checks"],"suggested_few_shot":true}`
 
 func TestParseMetaReviewOutputForFindingsDefaultsMissingOptionalFields(t *testing.T) {
-	out, err := ParseMetaReviewOutputForFindings(`{"reasoning_quality":"0.8"}`, 1)
+	out, err := ParseMetaReviewOutputForFindings(`{"reasoning_quality":0.8}`, 1)
 	if err != nil {
-		t.Fatalf("near-miss output rejected: %v", err)
+		t.Fatalf("valid partial output rejected: %v", err)
 	}
 	if out.ReasoningQuality != 0.8 || out.MissedFindings == nil || out.FalsePositives == nil || out.PromptGaps == nil {
 		t.Fatalf("missing fields were not defaulted safely: %+v", out)
@@ -22,34 +22,25 @@ func TestParseMetaReviewOutputForFindingsDefaultsMissingOptionalFields(t *testin
 	}
 }
 
-func TestParseMetaReviewOutputForFindingsToleratesCorpusNearMisses(t *testing.T) {
-	raw := "```json\n" +
-		`{"missed_findings":[],"false_positives":{"finding_index":"0","reason":["guarded"]},` +
-		`"reasoning_quality":"0.8","context_utilization":["0.7"],"prompt_gaps":42,"suggested_few_shot":[true]}` +
-		"\n```"
-	out, err := ParseMetaReviewOutputForFindings(raw, 1)
-	if err != nil {
-		t.Fatalf("tolerant parse failed: %v", err)
+// TestParseMetaReviewOutputForFindingsRejectsWrongTypedScalars pins the strict
+// contract: wrong-typed output (scalar-for-array, string-for-number,
+// array-for-scalar) must be rejected, not silently coerced, so a model that
+// ignores the schema is not graded as if it complied. reviewengine's repair
+// loop re-prompts on these errors instead.
+func TestParseMetaReviewOutputForFindingsRejectsWrongTypedScalars(t *testing.T) {
+	cases := map[string]string{
+		"string for reasoning_quality":      `{"reasoning_quality":"0.8"}`,
+		"array for context_utilization":     `{"context_utilization":["0.7"]}`,
+		"scalar object for false_positives": `{"false_positives":{"finding_index":0,"reason":"x"}}`,
+		"number for prompt_gaps":            `{"prompt_gaps":42}`,
+		"array for suggested_few_shot":      `{"suggested_few_shot":[true]}`,
 	}
-	if out.ReasoningQuality != 0.8 || out.ContextUtilization != 0.7 {
-		t.Fatalf("numeric strings/arrays were not coerced: %+v", out)
-	}
-	if len(out.FalsePositives) != 1 || out.FalsePositives[0].FindingIndex != 0 || out.FalsePositives[0].Reason != "guarded" {
-		t.Fatalf("scalar object or nested scalar/array slip was not coerced: %+v", out.FalsePositives)
-	}
-	if len(out.PromptGaps) != 1 || out.PromptGaps[0] != "42" || !out.SuggestedFewShot {
-		t.Fatalf("prompt gap or boolean array was not coerced: %+v", out)
-	}
-}
-
-func TestParseMetaReviewOutputRepairsInvalidEscape(t *testing.T) {
-	raw := `{"missed_findings":[],"false_positives":[],"reasoning_quality":0.8,"context_utilization":0.7,"prompt_gaps":["check \q path"],"suggested_few_shot":false}`
-	out, err := ParseMetaReviewOutput(raw)
-	if err != nil {
-		t.Fatalf("invalid escape near-miss was not repaired: %v", err)
-	}
-	if len(out.PromptGaps) != 1 || out.PromptGaps[0] != `check \q path` {
-		t.Fatalf("unexpected repaired prompt gap: %#v", out.PromptGaps)
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseMetaReviewOutputForFindings(raw, 1); err == nil {
+				t.Fatalf("expected wrong-typed field to be rejected: %s", raw)
+			}
+		})
 	}
 }
 

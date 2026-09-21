@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/circuitbreaker"
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
@@ -101,7 +102,7 @@ func (c *Client) doEmbed(ctx context.Context, text string) ([]float32, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("embed: HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 200))
+		return nil, fmt.Errorf("embed: HTTP %d: %s", resp.StatusCode, hashutil.TruncateForLog(string(respBody), 200))
 	}
 
 	var result embeddingResponse
@@ -162,11 +163,4 @@ type embeddingResponse struct {
 type embeddingData struct {
 	Embedding []float32 `json:"embedding"`
 	Index     int       `json:"index"`
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

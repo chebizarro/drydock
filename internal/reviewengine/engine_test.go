@@ -3,6 +3,7 @@ package reviewengine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -196,8 +197,8 @@ func TestEngineTestCoverageGapsAddedToChecklist(t *testing.T) {
 }
 
 func TestEngineRepairsMalformedFencedReviewerJSON(t *testing.T) {
-	fake := &FakeLLMForTest{
-		Responses: []string{
+	fake := &fakeLLM{
+		responses: []string{
 			`{"change_type":"bugfix","risk_areas":[],"needed_context":[],"review_focus":"correctness","model_route":"coder32b"}`,
 			"```json\n{\"summary\":\"ok\" \"findings\":[],\"needs_more_context\":[]}\n```",
 			`{"summary":"ok after repair","findings":[],"needs_more_context":[]}`,
@@ -221,20 +222,20 @@ func TestEngineRepairsMalformedFencedReviewerJSON(t *testing.T) {
 	if out.Review.Summary != "ok after repair" {
 		t.Fatalf("expected repaired review summary, got %q", out.Review.Summary)
 	}
-	if len(fake.Requests) != 4 {
-		t.Fatalf("expected planner + reviewer + repair + walkthrough requests, got %d", len(fake.Requests))
+	if len(fake.requests) != 4 {
+		t.Fatalf("expected planner + reviewer + repair + walkthrough requests, got %d", len(fake.requests))
 	}
-	if !fake.Requests[1].JSONMode || !fake.Requests[2].JSONMode {
+	if !fake.requests[1].JSONMode || !fake.requests[2].JSONMode {
 		t.Fatal("expected reviewer and repair requests to use JSON mode")
 	}
-	if !strings.Contains(fake.Requests[2].System, "repair") {
-		t.Fatalf("expected repair prompt, got system prompt %q", fake.Requests[2].System)
+	if !strings.Contains(fake.requests[2].System, "repair") {
+		t.Fatalf("expected repair prompt, got system prompt %q", fake.requests[2].System)
 	}
 }
 
 func TestEngineWalkthroughFailureReflectedInStatus(t *testing.T) {
-	fake := &FakeLLMForTest{
-		Responses: []string{
+	fake := &fakeLLM{
+		responses: []string{
 			`{"change_type":"feature","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
 			`{"summary":"ok","findings":[],"needs_more_context":[]}`,
 			`{"walkthrough":`,
@@ -457,6 +458,11 @@ func TestIsTransient(t *testing.T) {
 		{"http 400", &LLMHTTPError{StatusCode: 400}, false},
 		{"http 401", &LLMHTTPError{StatusCode: 401}, false},
 		{"http 404", &LLMHTTPError{StatusCode: 404}, false},
+		// Wrapped errors must unwrap via errors.As/Is: a wrapped 400 must not
+		// fall through to the transient default and get retried.
+		{"wrapped http 400", fmt.Errorf("call llm: %w", &LLMHTTPError{StatusCode: 400}), false},
+		{"wrapped http 500", fmt.Errorf("call llm: %w", &LLMHTTPError{StatusCode: 500}), true},
+		{"wrapped canceled", fmt.Errorf("call llm: %w", context.Canceled), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

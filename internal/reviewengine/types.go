@@ -87,18 +87,23 @@ const (
 type Finding struct {
 	// Priority is canonical. Severity remains on the wire for compatibility
 	// with existing scanners, publishers, and stored review artifacts.
-	Priority      Priority `json:"priority,omitempty"`
-	Severity      string   `json:"severity"`
-	Category      string   `json:"category"`
-	File          string   `json:"file"`
-	Line          int      `json:"line"`
-	Evidence      string   `json:"evidence"`
-	Explanation   string   `json:"explanation"`
-	Suggestion    string   `json:"suggestion"`
-	SuggestedDiff string   `json:"suggested_diff,omitempty"`
-	SuggestedCode string   `json:"suggested_code,omitempty"`
-	Sensitive     bool     `json:"sensitive,omitempty"`
-	Confidence    float64  `json:"confidence"`
+	Priority Priority `json:"priority,omitempty"`
+	Severity string   `json:"severity"`
+	Category string   `json:"category"`
+	// RuleID and CWE carry deterministic rule identity as structured fields
+	// so it survives an LLM round-trip instead of being encoded in, and parsed
+	// back out of, Evidence prose.
+	RuleID        string  `json:"rule_id,omitempty"`
+	CWE           string  `json:"cwe,omitempty"`
+	File          string  `json:"file"`
+	Line          int     `json:"line"`
+	Evidence      string  `json:"evidence"`
+	Explanation   string  `json:"explanation"`
+	Suggestion    string  `json:"suggestion"`
+	SuggestedDiff string  `json:"suggested_diff,omitempty"`
+	SuggestedCode string  `json:"suggested_code,omitempty"`
+	Sensitive     bool    `json:"sensitive,omitempty"`
+	Confidence    float64 `json:"confidence"`
 }
 
 func ParsePlannerOutput(raw string) (PlannerOutput, error) {

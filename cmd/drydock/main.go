@@ -176,7 +176,7 @@ func main() {
 	}
 
 	// --- Signer (shared NIP-46 client, with local nsec for development only) ---
-	var signer publisher.Signer
+	var signer signing.Signer
 	if cfg.SignerBunkerURL != "" {
 		s, err := cascadiasignet.NewBunkerSigner(ctx, cfg.SignerBunkerURL, cfg.Relays...)
 		if err != nil {
@@ -724,7 +724,7 @@ func main() {
 
 	// --- Event handlers registered before subscribing ---
 	repositoryScope := scope.NewMatcher(cfg.RepoAllowlist, cfg.RepoOwnerAllowlist)
-	var reactiveRegistry revieworder.MonitoringRegistry
+	var reactiveRegistry monitoring.Membership
 	if monitoredRepos != nil {
 		reactiveRegistry = monitoredRepos
 	}

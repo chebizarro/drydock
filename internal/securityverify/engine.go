@@ -236,7 +236,9 @@ func isNostrAbsenceFinding(finding reviewengine.Finding) bool {
 }
 
 func nostrRuleID(finding reviewengine.Finding) string {
-	for _, field := range []string{finding.Category, finding.Explanation, finding.Evidence} {
+	// RuleID is the authoritative identity (DRYDOCK-vrbe); the remaining fields
+	// stay as a fallback for LLM findings that only name the rule in prose.
+	for _, field := range []string{finding.RuleID, finding.Category, finding.Explanation, finding.Evidence} {
 		if ruleID := nostrRulePattern.FindString(field); ruleID != "" {
 			return strings.ToUpper(ruleID)
 		}

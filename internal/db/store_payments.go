@@ -59,18 +59,20 @@ type SubscriptionRecord struct {
 }
 
 // GetReviewPayment retrieves a review payment record by patch event ID.
-func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (ReviewPaymentRecord, error) {
+// reviewPaymentColumns is the review_payments SELECT list, in scanReviewPayment's
+// Scan order. Every review_payments read shares it so the 24-column positional
+// alignment lives in exactly one place. Columns are unqualified and resolve
+// against a `review_payments` table whether or not the query aliases it.
+const reviewPaymentColumns = `patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
+	COALESCE(token_hash, ''), mint_url, token_amount_sats, expected_amount_sats,
+	settled_amount_sats, subscription_days, invoice_id, invoice_request, invoice_amount_msats,
+	invoice_expires_at, melt_quote_id, melt_quote_amount_sats,
+	melt_fee_reserve_sats, melt_state, reservation_attempt_id, reservation_expires_at,
+	created_at, updated_at`
+
+func scanReviewPayment(sc rowScanner) (ReviewPaymentRecord, error) {
 	var rec ReviewPaymentRecord
-	err := s.db.QueryRowContext(ctx, `
-		SELECT patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
-		       COALESCE(token_hash, ''), mint_url, token_amount_sats, expected_amount_sats,
-		       settled_amount_sats, subscription_days, invoice_id, invoice_request, invoice_amount_msats,
-		       invoice_expires_at, melt_quote_id, melt_quote_amount_sats,
-		       melt_fee_reserve_sats, melt_state, reservation_attempt_id, reservation_expires_at,
-		       created_at, updated_at
-		FROM review_payments
-		WHERE patch_event_id = ?
-	`, patchEventID).Scan(
+	err := sc.Scan(
 		&rec.PatchEventID, &rec.RepoID, &rec.AuthorPubkey, &rec.Status, &rec.AccessKind,
 		&rec.RequestedMode, &rec.TokenHash, &rec.MintURL, &rec.TokenAmountSats,
 		&rec.ExpectedAmountSats, &rec.SettledAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
@@ -78,6 +80,12 @@ func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (Revi
 		&rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats, &rec.MeltState,
 		&rec.ReservationAttemptID, &rec.ReservationExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
 	)
+	return rec, err
+}
+
+func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (ReviewPaymentRecord, error) {
+	rec, err := scanReviewPayment(s.db.QueryRowContext(ctx,
+		`SELECT `+reviewPaymentColumns+` FROM review_payments WHERE patch_event_id = ?`, patchEventID))
 	if err != nil {
 		return ReviewPaymentRecord{}, fmt.Errorf("get review payment: %w", err)
 	}
@@ -152,24 +160,8 @@ func (s *Store) UpsertPendingReviewPayment(ctx context.Context, rec ReviewPaymen
 
 // GetReviewPaymentByTokenHash retrieves a review payment record by reserved token hash.
 func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash string) (ReviewPaymentRecord, error) {
-	var rec ReviewPaymentRecord
-	err := s.db.QueryRowContext(ctx, `
-		SELECT patch_event_id, repo_id, author_pubkey, status, access_kind, requested_mode,
-		       COALESCE(token_hash, ''), mint_url, token_amount_sats, expected_amount_sats,
-		       settled_amount_sats, subscription_days, invoice_id, invoice_request, invoice_amount_msats,
-		       invoice_expires_at, melt_quote_id, melt_quote_amount_sats,
-		       melt_fee_reserve_sats, melt_state, reservation_attempt_id, reservation_expires_at,
-		       created_at, updated_at
-		FROM review_payments
-		WHERE token_hash = ?
-	`, tokenHash).Scan(
-		&rec.PatchEventID, &rec.RepoID, &rec.AuthorPubkey, &rec.Status, &rec.AccessKind,
-		&rec.RequestedMode, &rec.TokenHash, &rec.MintURL, &rec.TokenAmountSats,
-		&rec.ExpectedAmountSats, &rec.SettledAmountSats, &rec.SubscriptionDays, &rec.InvoiceID, &rec.InvoiceRequest,
-		&rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt, &rec.MeltQuoteID,
-		&rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats, &rec.MeltState,
-		&rec.ReservationAttemptID, &rec.ReservationExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
-	)
+	rec, err := scanReviewPayment(s.db.QueryRowContext(ctx,
+		`SELECT `+reviewPaymentColumns+` FROM review_payments WHERE token_hash = ?`, tokenHash))
 	if err != nil {
 		return ReviewPaymentRecord{}, fmt.Errorf("get review payment by token hash: %w", err)
 	}
@@ -249,12 +241,7 @@ func (s *Store) ListReviewPaymentRecoveryCandidates(ctx context.Context, afterPa
 		return nil, errors.New("payment recovery page size must be between 1 and 500")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT p.patch_event_id, p.repo_id, p.author_pubkey, p.status, p.access_kind, p.requested_mode,
-		       COALESCE(p.token_hash, ''), p.mint_url, p.token_amount_sats, p.expected_amount_sats,
-		       p.settled_amount_sats, p.subscription_days, p.invoice_id, p.invoice_request,
-		       p.invoice_amount_msats, p.invoice_expires_at, p.melt_quote_id,
-		       p.melt_quote_amount_sats, p.melt_fee_reserve_sats, p.melt_state,
-		       p.reservation_attempt_id, p.reservation_expires_at, p.created_at, p.updated_at
+		SELECT `+reviewPaymentColumns+`
 		FROM review_payments p
 		WHERE p.patch_event_id > ? AND (
 			(p.status IN ('pending', 'token_spent') AND p.melt_state IN ('submitted', 'unpaid', 'paid'))
@@ -275,16 +262,8 @@ func (s *Store) ListReviewPaymentRecoveryCandidates(ctx context.Context, afterPa
 
 	var records []ReviewPaymentRecord
 	for rows.Next() {
-		var rec ReviewPaymentRecord
-		if err := rows.Scan(
-			&rec.PatchEventID, &rec.RepoID, &rec.AuthorPubkey, &rec.Status, &rec.AccessKind,
-			&rec.RequestedMode, &rec.TokenHash, &rec.MintURL, &rec.TokenAmountSats,
-			&rec.ExpectedAmountSats, &rec.SettledAmountSats, &rec.SubscriptionDays,
-			&rec.InvoiceID, &rec.InvoiceRequest, &rec.InvoiceAmountMSats, &rec.InvoiceExpiresAt,
-			&rec.MeltQuoteID, &rec.MeltQuoteAmountSats, &rec.MeltFeeReserveSats,
-			&rec.MeltState, &rec.ReservationAttemptID, &rec.ReservationExpiresAt,
-			&rec.CreatedAt, &rec.UpdatedAt,
-		); err != nil {
+		rec, err := scanReviewPayment(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan payment recovery candidate: %w", err)
 		}
 		records = append(records, rec)

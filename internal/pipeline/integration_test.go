@@ -526,7 +526,7 @@ func TestIntegrationFullPipelineProcess(t *testing.T) {
 	}, store, testSigner{sk: signerKey}, relayPub, logger)
 
 	// 7. Real meta-review service (with fake LLM — won't trigger for this test)
-	metaLLM := &reviewengine.FakeLLMForTest{
+	metaLLM := &testutil.FakeLLM{
 		Responses: []string{
 			`{"missed_findings":[],"false_positives":[],"reasoning_quality":0.9,"context_utilization":0.8,"prompt_gaps":[],"suggested_few_shot":false}`,
 		},

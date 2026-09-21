@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 	"git.sharegap.net/cascadia/drydock/internal/nostrprobe"
 
 	"fiatjaf.com/nostr"
@@ -151,15 +152,15 @@ func TestPublishSecurityAuditEventsKeepDetailPrivate(t *testing.T) {
 	if detail.AuditID != auditID || detail.SARIFRef != securityAuditSARIFRef(auditID) || detail.Complete || detail.Coverage.ScanOperationsScanned != 8 {
 		t.Fatalf("private detail missing durable artifact reference or coverage: %#v", detail)
 	}
-	if got := sha256Hex([]byte(rumor.Content)); got != result.ReportDigest {
+	if got := hashutil.SHA256Hex([]byte(rumor.Content)); got != result.ReportDigest {
 		t.Fatalf("detail digest = %s, want %s", got, result.ReportDigest)
 	}
-	if got := sha256Hex(result.SARIF); got != result.SARIFSHA256 {
+	if got := hashutil.SHA256Hex(result.SARIF); got != result.SARIFSHA256 {
 		t.Fatalf("SARIF digest = %s, want %s", got, result.SARIFSHA256)
 	}
-	storedSARIF, storedHash, err := store.SecurityAuditSARIF(ctx, auditID)
+	storedSARIF, storedHash, err := store.SecurityAuditSARIFForRequester(ctx, auditID, "requester")
 	if err != nil {
-		t.Fatalf("SecurityAuditSARIF() error = %v", err)
+		t.Fatalf("SecurityAuditSARIFForRequester() error = %v", err)
 	}
 	if string(storedSARIF) != string(result.SARIF) || storedHash != result.SARIFSHA256 {
 		t.Fatal("durable SARIF does not match publication result")

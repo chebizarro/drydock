@@ -239,19 +239,13 @@ func TestIntegrationMarketplaceFeedbackNotification(t *testing.T) {
 		RepoID:            "repo-1",
 		ReviewerPubkey:    reviewer.pubkey().Hex(),
 		RequesterPubkey:   rater.pubkey().Hex(),
-		Status:            "accepted",
+		Status:            "completed",
 		AssignmentEventID: "feedback-assignment",
 		CompletionEventID: "review-complete-event",
+		ReviewEventID:     "review-complete-event",
 		ExpiresAt:         time.Now().Add(time.Hour).Unix(),
 	}); err != nil {
 		t.Fatalf("CreateAssignment feedback: %v", err)
-	}
-	assignment, err := store.GetAssignmentByEventID(ctx, "feedback-assignment")
-	if err != nil {
-		t.Fatalf("GetAssignmentByEventID feedback: %v", err)
-	}
-	if err := store.UpdateAssignmentStatus(ctx, assignment.ID, "completed", "review-complete-event"); err != nil {
-		t.Fatalf("UpdateAssignmentStatus completed: %v", err)
 	}
 
 	vmRouter := contextvm.NewRouter()

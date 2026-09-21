@@ -11,6 +11,7 @@ import (
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/monitoring"
 	"git.sharegap.net/cascadia/drydock/internal/payment"
 	"git.sharegap.net/cascadia/drydock/internal/ratelimit"
 	"git.sharegap.net/cascadia/drydock/internal/repoconfig"
@@ -48,19 +49,9 @@ func (e *PaymentDeniedError) Error() string {
 
 func (e *PaymentDeniedError) Unwrap() error { return ErrPaymentDenied }
 
-// MonitoringRegistry is the live monitored-repository membership projection.
-type MonitoringRegistry interface {
-	Contains(repositoryAddress string) bool
-}
-
 // RepositoryConfigLoader reads policy from the canonical repository base.
 type RepositoryConfigLoader interface {
 	LoadBaseRepoConfig(ctx context.Context, repoID string) ([]byte, error)
-}
-
-// PaymentAuthorizer applies the shared patch payment policy.
-type PaymentAuthorizer interface {
-	AuthorizePatch(ctx context.Context, patchEvent nostr.Event, repoID string, policy repoconfig.PaymentsConfig) (payment.AuthorizeResult, error)
 }
 
 type Config struct {
@@ -70,9 +61,9 @@ type Config struct {
 type Service struct {
 	store           *db.Store
 	securityCeiling scope.Matcher
-	monitoring      MonitoringRegistry
+	monitoring      monitoring.Membership
 	configLoader    RepositoryConfigLoader
-	paymentAuth     PaymentAuthorizer
+	paymentAuth     payment.PatchAuthorizer
 	rateLimiter     *ratelimit.Limiter
 	queue           chan db.ReviewTask
 	logger          *slog.Logger
@@ -114,9 +105,9 @@ func New(
 	cfg Config,
 	store *db.Store,
 	securityCeiling scope.Matcher,
-	monitoring MonitoringRegistry,
+	monitoring monitoring.Membership,
 	configLoader RepositoryConfigLoader,
-	paymentAuth PaymentAuthorizer,
+	paymentAuth payment.PatchAuthorizer,
 	logger *slog.Logger,
 ) *Service {
 	if logger == nil {

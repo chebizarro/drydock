@@ -198,11 +198,13 @@ func sameReviewOrder(a, b ReviewOrderReceipt) bool {
 		a.Force == b.Force
 }
 
-type reviewOrderScanner interface {
+// rowScanner is satisfied by both *sql.Row and *sql.Rows, letting one scan
+// helper serve single-row and iterating callers.
+type rowScanner interface {
 	Scan(...any) error
 }
 
-func scanReviewOrder(scanner reviewOrderScanner) (ReviewOrderReceipt, error) {
+func scanReviewOrder(scanner rowScanner) (ReviewOrderReceipt, error) {
 	var receipt ReviewOrderReceipt
 	var force int
 	err := scanner.Scan(

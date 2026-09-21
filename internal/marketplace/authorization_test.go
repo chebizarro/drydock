@@ -19,27 +19,30 @@ func TestRouterRejectsAcceptanceAndRejectionFromNonReviewer(t *testing.T) {
 
 	for _, tc := range []struct {
 		name   string
-		handle func(context.Context, *Router, string, nostr.SecretKey) error
+		method string
+		params func(assignmentID string) any
+		handle func(*Handler, context.Context, contextvm.Request) (any, *contextvm.Error)
 	}{
 		{
-			name: "acceptance",
-			handle: func(ctx context.Context, router *Router, assignmentID string, attackerSK nostr.SecretKey) error {
-				return router.HandleAcceptance(ctx, signedMarketplaceEvent(t, attackerSK, KindReviewAcceptance, ReviewAcceptance{AssignmentID: assignmentID}))
-			},
+			name:   "acceptance",
+			method: MethodAccept,
+			params: func(id string) any { return ReviewAcceptance{AssignmentID: id} },
+			handle: (*Handler).handleContextVMAcceptance,
 		},
 		{
-			name: "rejection",
-			handle: func(ctx context.Context, router *Router, assignmentID string, attackerSK nostr.SecretKey) error {
-				return router.HandleRejection(ctx, signedMarketplaceEvent(t, attackerSK, KindReviewRejection, ReviewRejection{AssignmentID: assignmentID, Reason: "malicious"}))
-			},
+			name:   "rejection",
+			method: MethodReject,
+			params: func(id string) any { return ReviewRejection{AssignmentID: id, Reason: "malicious"} },
+			handle: (*Handler).handleContextVMRejection,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := mustOpenStore(t, ctx)
 			registry := NewRegistry(store, slog.Default())
 			router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: testPubKey()}, nil, nil, slog.Default())
+			handler := NewHandler(registry, router, store, slog.Default())
 			reviewer := testPubKey().Hex()
-			attackerSK := nostr.Generate()
+			attacker := newIntegrationSigner()
 			assignmentID := "assign-non-reviewer-" + tc.name
 			seedAssignment(t, ctx, store, db.ReviewAssignment{
 				PatchEventID:      "patch-" + tc.name,
@@ -51,9 +54,14 @@ func TestRouterRejectsAcceptanceAndRejectionFromNonReviewer(t *testing.T) {
 				ExpiresAt:         time.Now().Add(time.Hour).Unix(),
 			})
 
-			err := tc.handle(ctx, router, assignmentID, attackerSK)
-			if err == nil || !strings.Contains(err.Error(), "unauthorized reviewer") {
-				t.Fatalf("expected unauthorized reviewer error, got %v", err)
+			// A genuinely signed intent from an attacker (not the assigned
+			// reviewer) travels the live ContextVM path: verifySignedIntent
+			// accepts the valid signature, and the registry must still reject
+			// the reviewer-identity mismatch. This is the path production runs.
+			req := contextVMRequest(t, attacker, tc.method, "intent-"+tc.name, tc.params(assignmentID), nil)
+			_, rpcErr := tc.handle(handler, ctx, req)
+			if rpcErr == nil || !strings.Contains(rpcErr.Message, "unauthorized reviewer") {
+				t.Fatalf("expected unauthorized reviewer error, got %v", rpcErr)
 			}
 			assignment, err := store.GetAssignmentByEventID(ctx, assignmentID)
 			if err != nil {
@@ -92,8 +100,9 @@ func TestRouterRejectsNonPendingOrExpiredAssignmentTransition(t *testing.T) {
 			store := mustOpenStore(t, ctx)
 			registry := NewRegistry(store, slog.Default())
 			router := NewRouter(RouterConfig{}, registry, store, &mockSigner{pubkey: testPubKey()}, nil, nil, slog.Default())
-			reviewerSK := nostr.Generate()
-			reviewer := nostr.GetPublicKey(reviewerSK).Hex()
+			handler := NewHandler(registry, router, store, slog.Default())
+			reviewerSigner := newIntegrationSigner()
+			reviewer := reviewerSigner.pubkey().Hex()
 			assignmentID := "assign-transition-" + strings.ReplaceAll(tc.name, " ", "-")
 			seedAssignment(t, ctx, store, db.ReviewAssignment{
 				PatchEventID:      "patch-transition-" + tc.name,
@@ -105,25 +114,33 @@ func TestRouterRejectsNonPendingOrExpiredAssignmentTransition(t *testing.T) {
 				ExpiresAt:         tc.expiresAt,
 			})
 
+			// Route each transition through the live ContextVM handler: a
+			// valid signature from the genuine reviewer passes
+			// verifySignedIntent, so the not-pending / expired guard must come
+			// from the registry on the path production actually runs.
 			for _, action := range []struct {
 				name   string
-				handle func(context.Context, nostr.Event) error
-				event  nostr.Event
+				method string
+				params any
+				handle func(*Handler, context.Context, contextvm.Request) (any, *contextvm.Error)
 			}{
 				{
 					name:   "acceptance",
-					handle: router.HandleAcceptance,
-					event:  signedMarketplaceEvent(t, reviewerSK, KindReviewAcceptance, ReviewAcceptance{AssignmentID: assignmentID}),
+					method: MethodAccept,
+					params: ReviewAcceptance{AssignmentID: assignmentID},
+					handle: (*Handler).handleContextVMAcceptance,
 				},
 				{
 					name:   "rejection",
-					handle: router.HandleRejection,
-					event:  signedMarketplaceEvent(t, reviewerSK, KindReviewRejection, ReviewRejection{AssignmentID: assignmentID, Reason: "too late"}),
+					method: MethodReject,
+					params: ReviewRejection{AssignmentID: assignmentID, Reason: "too late"},
+					handle: (*Handler).handleContextVMRejection,
 				},
 			} {
-				err := action.handle(ctx, action.event)
-				if err == nil || !strings.Contains(err.Error(), tc.wantSubstring) {
-					t.Fatalf("%s: expected %q error, got %v", action.name, tc.wantSubstring, err)
+				req := contextVMRequest(t, reviewerSigner, action.method, "intent-"+action.name+"-"+tc.name, action.params, nil)
+				_, rpcErr := action.handle(handler, ctx, req)
+				if rpcErr == nil || !strings.Contains(rpcErr.Message, tc.wantSubstring) {
+					t.Fatalf("%s: expected %q error, got %v", action.name, tc.wantSubstring, rpcErr)
 				}
 				assignment, err := store.GetAssignmentByEventID(ctx, assignmentID)
 				if err != nil {
@@ -303,6 +320,57 @@ func seedPatchEvent(t *testing.T, ctx context.Context, store *db.Store, authorSK
 		t.Fatalf("InsertPatchEvent: %v", err)
 	}
 	return event.ID.Hex()
+}
+
+// TestContextVMAcceptanceRejectsForgedEnvelope proves the acceptance intent
+// handler authenticates the signed envelope. The prior implementation forged an
+// event (mutating Content/PubKey after signing) and never verified it, so a
+// tampered envelope was recorded as a genuine acceptance. The completion path
+// already verified; this closes that asymmetry.
+func TestContextVMAcceptanceRejectsForgedEnvelope(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+	registry := NewRegistry(store, slog.Default())
+	router := NewRouter(RouterConfig{}, registry, store, nil, nil, nil, slog.Default())
+	handler := NewHandler(registry, router, store, slog.Default())
+	cv := contextvm.NewRouter()
+	if err := handler.RegisterContextVMMethods(cv); err != nil {
+		t.Fatalf("RegisterContextVMMethods: %v", err)
+	}
+	reviewer := newIntegrationSigner()
+
+	if err := store.CreateAssignment(ctx, db.ReviewAssignment{
+		PatchEventID:      "patch-forged",
+		RepoID:            "repo-1",
+		ReviewerPubkey:    reviewer.pubkey().Hex(),
+		RequesterPubkey:   testPubKey().Hex(),
+		Status:            "pending",
+		AssignmentEventID: "forged-assignment",
+		ExpiresAt:         time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatalf("CreateAssignment: %v", err)
+	}
+
+	req := contextVMRequest(t, reviewer, MethodAccept, "accept-forged",
+		ReviewAcceptance{AssignmentID: "forged-assignment", EstimatedTime: "2h"}, nil)
+	// Tamper the envelope after signing: mutating Content invalidates the event
+	// id and signature, exactly the forgery the old handler performed itself.
+	req.Event.Content = string(req.Msg.Params)
+
+	resp, err := cv.Handle(ctx, req)
+	if err != nil {
+		t.Fatalf("handle acceptance: %v", err)
+	}
+	if resp.Error == nil || resp.Error.Code != contextvm.ErrorInvalidRequest {
+		t.Fatalf("expected invalid-request rejection, got %+v", resp.Error)
+	}
+	assignment, err := store.GetAssignmentByEventID(ctx, "forged-assignment")
+	if err != nil {
+		t.Fatalf("GetAssignmentByEventID: %v", err)
+	}
+	if assignment.Status != "pending" {
+		t.Fatalf("forged acceptance changed status to %q, want pending", assignment.Status)
+	}
 }
 
 func signedMarketplaceEvent(t *testing.T, sk nostr.SecretKey, kind int, content any) nostr.Event {

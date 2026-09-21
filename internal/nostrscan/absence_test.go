@@ -13,6 +13,30 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/securityscan/surface"
 )
 
+func TestNameHasUseVerb(t *testing.T) {
+	// The four use-site checks are honest substring checks over a verb list
+	// (DRYDOCK-ff2a), not regexes advertising a precision they never had.
+	cases := []struct {
+		name  string
+		verbs []string
+		want  bool
+	}{
+		{"StoreEvent", v2UseVerbs, true},
+		{"renderProfile", v2UseVerbs, true},
+		{"computeHash", v2UseVerbs, false},
+		{"cacheLookup", v7UseVerbs, true},
+		{"validate", v7UseVerbs, false},
+		{"persistDM", r1UseVerbs, true},
+		{"decryptContent", r2UseVerbs, true},
+		{"encryptContent", r2UseVerbs, false},
+	}
+	for _, tc := range cases {
+		if got := nameHasUseVerb(tc.name, tc.verbs); got != tc.want {
+			t.Errorf("nameHasUseVerb(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestAbsenceV2WrapperDominatesUse(t *testing.T) {
 	result := analyzeAbsenceFixture(t, "v2", "fixed.go")
 	if findingByRule(result.Findings, "NOSTR-V2") != nil {

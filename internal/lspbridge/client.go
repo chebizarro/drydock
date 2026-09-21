@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 )
 
 // Client communicates with the LSP bridge service over HTTP.
@@ -60,7 +62,7 @@ func (c *Client) Analyze(ctx context.Context, req AnalyzeRequest) (*AnalyzeRespo
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("lspbridge: HTTP %d: %s", resp.StatusCode, truncateStr(string(respBody), 200))
+		return nil, fmt.Errorf("lspbridge: HTTP %d: %s", resp.StatusCode, hashutil.TruncateForLog(string(respBody), 200))
 	}
 
 	var result AnalyzeResponse
@@ -93,11 +95,4 @@ func (c *Client) authorize(req *http.Request) {
 	if c.apiToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiToken)
 	}
-}
-
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

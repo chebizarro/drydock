@@ -15,16 +15,15 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/signing"
 	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 
 	"fiatjaf.com/nostr"
 )
 
-type Signer interface {
-	GetPublicKey(ctx context.Context) (nostr.PubKey, error)
-	SignEvent(ctx context.Context, evt *nostr.Event) error
-}
-
+// RelayPublisher publishes signed events to Nostr relays. It is the single
+// canonical declaration; consumers import it rather than re-declaring an
+// identical interface.
 type RelayPublisher interface {
 	Publish(ctx context.Context, relays []string, event nostr.Event) error
 }
@@ -63,12 +62,12 @@ type PublishInput struct {
 type Service struct {
 	cfg     Config
 	store   *db.Store
-	signer  Signer
+	signer  signing.Signer
 	publish RelayPublisher
 	logger  *slog.Logger
 }
 
-func New(cfg Config, store *db.Store, signer Signer, relayPublisher RelayPublisher, logger *slog.Logger) *Service {
+func New(cfg Config, store *db.Store, signer signing.Signer, relayPublisher RelayPublisher, logger *slog.Logger) *Service {
 	if cfg.DetailSeverityFloor == "" {
 		cfg.DetailSeverityFloor = "high"
 	}

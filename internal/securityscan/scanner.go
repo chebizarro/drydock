@@ -178,6 +178,13 @@ func (s *Scanner) scanFile(_ context.Context, relPath, absPath string, addedLine
 					evidence = evidence[:200] + "..."
 				}
 
+				// A literal, unambiguous pattern gets full confidence (the zero
+				// default); hedged heuristic rules carry their own lower value
+				// so a guess is not published as a certainty.
+				confidence := rule.Confidence
+				if confidence == 0 {
+					confidence = 1.0
+				}
 				findings = append(findings, SecurityFinding{
 					RuleID:      rule.ID,
 					Severity:    rule.Severity,
@@ -188,7 +195,7 @@ func (s *Scanner) scanFile(_ context.Context, relPath, absPath string, addedLine
 					Evidence:    evidence,
 					Description: rule.Description,
 					Suggestion:  rule.Suggestion,
-					Confidence:  1.0, // deterministic rules have full confidence
+					Confidence:  confidence,
 				})
 			}
 		}

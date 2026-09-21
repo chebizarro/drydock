@@ -3,7 +3,17 @@
 // reliable pattern matching that catches well-known issues LLMs may miss.
 package securityscan
 
-import "regexp"
+import (
+	"regexp"
+
+	"git.sharegap.net/cascadia/drydock/internal/nostrscan/knowledge"
+)
+
+// HeuristicRuleConfidence is assigned to rules whose own descriptions are
+// hedged ("Possible…", "may enable…"). Like nostrscan.AbsenceConfidence it is
+// intentionally below the review gating threshold so a heuristic guess is not
+// mistaken downstream for a literal, high-certainty match.
+const HeuristicRuleConfidence = 0.5
 
 // SurfaceRules returns locator rules that identify security-relevant code.
 // These rules provide context only and must never be reported as findings.
@@ -72,6 +82,10 @@ type Rule struct {
 	Suggestion     string             // recommended fix
 	Classification RuleClassification // finding (default) or surface locator
 	SurfaceTag     string             // security-surface tag for locator rules
+	// Confidence is the certainty a match represents a real finding. Zero is
+	// treated as 1.0 (a literal, unambiguous pattern); hedged heuristic rules
+	// set it explicitly below the gating threshold.
+	Confidence float64
 }
 
 // appliesToFile returns true if the rule applies to the given file path.
@@ -94,32 +108,35 @@ func hasExtension(path, ext string) bool {
 	return path[len(path)-len(ext):] == ext
 }
 
-// SASTRuleCWE maps each deterministic finding rule to its CWE hypotheses.
+// SASTRuleCWE maps each builtin SAST finding rule to its CWE hypotheses.
+// NOSTR rule CWEs are NOT duplicated here: they live in the knowledge pack
+// (the single source of NOSTR rule identity). Use RuleCWE to resolve any rule.
 var SASTRuleCWE = map[string]string{
-	"SEC-001":  "CWE-798",
-	"SEC-002":  "CWE-798",
-	"SEC-003":  "CWE-321",
-	"SEC-010":  "CWE-89",
-	"SEC-011":  "CWE-89",
-	"SEC-020":  "CWE-78",
-	"SEC-021":  "CWE-78",
-	"SEC-030":  "CWE-22",
-	"SEC-040":  "CWE-328",
-	"SEC-041":  "CWE-328",
-	"SEC-042":  "CWE-327",
-	"SEC-050":  "CWE-79",
-	"SEC-060":  "CWE-918",
-	"SEC-070":  "CWE-295",
-	"SEC-080":  "CWE-502",
-	"NOSTR-V1": "CWE-345",
-	"NOSTR-V2": "CWE-347",
-	"NOSTR-V3": "CWE-353, CWE-327",
-	"NOSTR-V4": "CWE-323, CWE-1204",
-	"NOSTR-V5": "CWE-200",
-	"NOSTR-V6": "CWE-200, CWE-918",
-	"NOSTR-V7": "CWE-345",
-	"NOSTR-R1": "CWE-294",
-	"NOSTR-R2": "CWE-20",
+	"SEC-001": "CWE-798",
+	"SEC-002": "CWE-798",
+	"SEC-003": "CWE-321",
+	"SEC-010": "CWE-89",
+	"SEC-011": "CWE-89",
+	"SEC-020": "CWE-78",
+	"SEC-021": "CWE-78",
+	"SEC-030": "CWE-22",
+	"SEC-040": "CWE-328",
+	"SEC-041": "CWE-328",
+	"SEC-042": "CWE-327",
+	"SEC-050": "CWE-79",
+	"SEC-060": "CWE-918",
+	"SEC-070": "CWE-295",
+	"SEC-080": "CWE-502",
+}
+
+// RuleCWE resolves the CWE hypotheses for any deterministic rule id, whether
+// builtin SAST (SASTRuleCWE) or NOSTR (the versioned knowledge pack). It is the
+// one place that answers "what CWE does this rule carry".
+func RuleCWE(ruleID string) string {
+	if cwe, ok := SASTRuleCWE[ruleID]; ok {
+		return cwe
+	}
+	return knowledge.VulnerabilityCWE(ruleID)
 }
 
 // BuiltinRules returns the curated set of security scanning rules.
@@ -160,6 +177,7 @@ func BuiltinRules() []Rule {
 			Description: "Possible SQL injection via string concatenation or formatting. Use parameterized queries.",
 			Languages:   []string{".go"},
 			Suggestion:  "Use parameterized queries (?, $1) instead of string interpolation.",
+			Confidence:  HeuristicRuleConfidence,
 		},
 		{
 			ID:          "SEC-011",
@@ -169,6 +187,7 @@ func BuiltinRules() []Rule {
 			Description: "Possible SQL injection via string formatting. Use parameterized queries.",
 			Languages:   []string{".py"},
 			Suggestion:  "Use parameterized queries with placeholders instead of f-strings or % formatting.",
+			Confidence:  HeuristicRuleConfidence,
 		},
 
 		// --- Command Injection ---
@@ -200,6 +219,7 @@ func BuiltinRules() []Rule {
 			Description: "File path constructed with string concatenation. Unsanitized user input may enable path traversal (../).",
 			Languages:   []string{".go"},
 			Suggestion:  "Validate paths with filepath.Clean and ensure they don't escape the intended directory.",
+			Confidence:  HeuristicRuleConfidence,
 		},
 
 		// --- Insecure Crypto ---
@@ -249,6 +269,7 @@ func BuiltinRules() []Rule {
 			Category:    "security",
 			Description: "HTTP request URL constructed from dynamic input. This may enable server-side request forgery (SSRF) if the URL is user-controlled.",
 			Suggestion:  "Validate and allowlist target URLs. Block requests to internal/private IP ranges.",
+			Confidence:  HeuristicRuleConfidence,
 		},
 
 		// --- Insecure TLS ---

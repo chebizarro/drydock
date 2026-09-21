@@ -10,7 +10,7 @@ cp .env.example .env
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DRYDOCK_MODE` | `listener` \\| `eval` | `listener` | Docker entrypoint routing: `listener` runs `cmd/drydock`, `eval` runs `cmd/drydock-eval`. Not parsed by the Go binaries themselves — only used by `scripts/entrypoint.sh`. |
+| `DRYDOCK_MODE` | `listener` \\| `eval` \\| `drift-guard` | `listener` | Deployment mode. `scripts/entrypoint.sh` routes `eval` to `cmd/drydock-eval`; `listener` and `drift-guard` both exec `cmd/drydock`, which also reads `DRYDOCK_MODE` itself (`main.go`) and switches into the drift-guard subcommands (`export`/`flag`/`list`) when it is `drift-guard`. |
 | `DRYDOCK_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` | Structured JSON log level. `debug` is verbose and includes raw LLM responses. |
 
 ## Database & Storage

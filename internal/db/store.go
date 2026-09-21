@@ -742,15 +742,13 @@ func (s *Store) applySchemaMigration(ctx context.Context, migration schemaMigrat
 }
 
 // hasColumn checks whether a table has a specific column.
-func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
-	return hasColumn(ctx, s.db, table, column)
-}
-
-type columnQuerier interface {
+// rowsQuerier is the read subset of *sql.DB / *sql.Tx shared by helpers that run
+// a query against either a store-wide connection or an in-flight transaction.
+type rowsQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func hasColumn(ctx context.Context, q columnQuerier, table, column string) (bool, error) {
+func hasColumn(ctx context.Context, q rowsQuerier, table, column string) (bool, error) {
 	quotedTable, err := quoteSQLiteIdent(table)
 	if err != nil {
 		return false, err
@@ -1174,7 +1172,7 @@ func (s *Store) UpsertRootStatus(ctx context.Context, event nostr.Event) error {
 		}
 	}
 
-	allowed, err := s.isStatusAuthorAllowed(ctx, rootID, repoID, event.PubKey)
+	allowed, err := s.CanStatusAuthor(ctx, rootID, repoID, event.PubKey)
 	if err != nil {
 		return err
 	}
@@ -1208,7 +1206,9 @@ func (s *Store) UpsertRootStatus(ctx context.Context, event nostr.Event) error {
 	return nil
 }
 
-func (s *Store) isStatusAuthorAllowed(ctx context.Context, rootID, repoID string, author nostr.PubKey) (bool, error) {
+// CanStatusAuthor reports whether author is authorized to publish NIP-34 status
+// events for the given root event in the given repository.
+func (s *Store) CanStatusAuthor(ctx context.Context, rootID, repoID string, author nostr.PubKey) (bool, error) {
 	if strings.TrimSpace(rootID) == "" {
 		return false, nil
 	}
@@ -1407,26 +1407,6 @@ func (s *Store) MarkReviewFailureNoticeDelivered(ctx context.Context, patchEvent
 	}
 	if affected == 0 {
 		return errors.New("review failure notice reservation not found")
-	}
-	return nil
-}
-
-func (s *Store) UpsertThreadCache(ctx context.Context, rootID, eventID string, now int64) error {
-	_, err := s.db.ExecContext(
-		ctx,
-		`INSERT INTO thread_cache(root_id, event_ids, updated_at)
-		 VALUES (?, ?, ?)
-		 ON CONFLICT(root_id) DO UPDATE SET
-		    event_ids=thread_cache.event_ids || CASE
-		      WHEN instr(',' || thread_cache.event_ids || ',', ',' || excluded.event_ids || ',') > 0 THEN ''
-		      WHEN thread_cache.event_ids = '' THEN excluded.event_ids
-		      ELSE ',' || excluded.event_ids
-		    END,
-		    updated_at=excluded.updated_at`,
-		rootID, eventID, now,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert thread cache: %w", err)
 	}
 	return nil
 }
@@ -1645,13 +1625,6 @@ func (s *Store) GetRootStatus(ctx context.Context, rootID, repoID string) (kind 
 	return kind, eventID, createdAt, true, nil
 }
 
-// CanStatusAuthor checks whether the given pubkey is authorized to publish
-// NIP-34 status events for the given root event in the given repository.
-// This is a public wrapper around the existing isStatusAuthorAllowed logic.
-func (s *Store) CanStatusAuthor(ctx context.Context, rootID, repoID string, author nostr.PubKey) (bool, error) {
-	return s.isStatusAuthorAllowed(ctx, rootID, repoID, author)
-}
-
 // RecordReviewNote attaches an observable best-effort sub-stage outcome to an
 // existing review without changing its pipeline status.
 func (s *Store) RecordReviewNote(ctx context.Context, patchEventID, repoID, note string) error {
@@ -1800,21 +1773,6 @@ func (s *Store) SetReviewEventID(ctx context.Context, patchEventID, repoID, revi
 		if exists == 0 {
 			return ErrReviewNotFound
 		}
-	}
-	return nil
-}
-
-// ClearReviewEventID removes a provisional review event ID that was set before
-// publishing but for which the actual relay publish failed. This allows the
-// next retry to generate and publish a new event rather than incorrectly
-// assuming the prior event was already published.
-func (s *Store) ClearReviewEventID(ctx context.Context, patchEventID, repoID string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE review_log SET review_event_id=NULL WHERE patch_event_id=? AND repo_id=? AND status != 'published'`,
-		patchEventID, repoID,
-	)
-	if err != nil {
-		return fmt.Errorf("clear review event id: %w", err)
 	}
 	return nil
 }
@@ -2912,17 +2870,9 @@ func (s *Store) BeginConversationTurn(ctx context.Context, turn ConversationTurn
 		turn.ReplyEventID,
 	).Scan(&existingTurn, &existingStatus)
 	if err == nil {
-		// Row exists.
-		if existingStatus == "published" {
-			return existingTurn, nil // already done — idempotent
-		}
-		if existingStatus == "failed" || existingStatus == "pending" {
-			// Allow retry — return the existing turn number.
-			if err := tx.Commit(); err != nil {
-				return 0, fmt.Errorf("commit conversation retry: %w", err)
-			}
-			return existingTurn, nil
-		}
+		// The reply was already recorded (duplicate delivery or retry). Return its
+		// existing turn number idempotently regardless of status; the read-only
+		// transaction is discarded by the deferred Rollback either way.
 		return existingTurn, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -2960,35 +2910,6 @@ func (s *Store) BeginConversationTurn(ctx context.Context, turn ConversationTurn
 		return 0, fmt.Errorf("commit conversation: %w", err)
 	}
 	return nextTurn, nil
-}
-
-// CountConversationTurns returns the number of conversation turns for a review event.
-func (s *Store) CountConversationTurns(ctx context.Context, reviewEventID string) (int, error) {
-	var n int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM conversations WHERE review_event_id=?`,
-		reviewEventID,
-	).Scan(&n)
-	if err != nil {
-		return 0, fmt.Errorf("count conversation turns: %w", err)
-	}
-	return n, nil
-}
-
-// InsertConversation records a new conversation turn. Returns the auto-generated row ID.
-// Prefer BeginConversationTurn for rate-limited atomic inserts.
-func (s *Store) InsertConversation(ctx context.Context, turn ConversationTurn) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO conversations(review_event_id, reply_event_id, response_event_id, repo_id, patch_event_id,
-			reply_author, reply_content, response_content, turn_number, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
-		turn.ReviewEventID, turn.ReplyEventID, turn.ResponseEventID, turn.RepoID, turn.PatchEventID,
-		turn.ReplyAuthor, turn.ReplyContent, turn.ResponseContent, turn.TurnNumber, turn.CreatedAt,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("insert conversation: %w", err)
-	}
-	return res.LastInsertId()
 }
 
 // SetConversationResponse updates the response event ID, content, and status after publishing.

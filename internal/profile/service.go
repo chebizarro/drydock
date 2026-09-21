@@ -30,20 +30,14 @@ import (
 	"strings"
 	"time"
 
+	"git.sharegap.net/cascadia/drydock/internal/publisher"
+	"git.sharegap.net/cascadia/drydock/internal/signing"
+
 	"fiatjaf.com/nostr"
 )
 
 // blossomAuthKind is the Blossom authorization event kind (BUD-01).
 const blossomAuthKind = nostr.Kind(24242)
-
-type Signer interface {
-	GetPublicKey(ctx context.Context) (nostr.PubKey, error)
-	SignEvent(ctx context.Context, evt *nostr.Event) error
-}
-
-type RelayPublisher interface {
-	Publish(ctx context.Context, relays []string, event nostr.Event) error
-}
 
 // Fetcher retrieves events from relays until EOSE. *nostr.Pool satisfies it.
 type Fetcher interface {
@@ -71,14 +65,14 @@ type Config struct {
 
 type Service struct {
 	cfg      Config
-	signer   Signer
+	signer   signing.Signer
 	fetcher  Fetcher
-	relayPub RelayPublisher
+	relayPub publisher.RelayPublisher
 	http     *http.Client
 	logger   *slog.Logger
 }
 
-func New(cfg Config, signer Signer, fetcher Fetcher, relayPub RelayPublisher, logger *slog.Logger) *Service {
+func New(cfg Config, signer signing.Signer, fetcher Fetcher, relayPub publisher.RelayPublisher, logger *slog.Logger) *Service {
 	return &Service{
 		cfg:      cfg,
 		signer:   signer,

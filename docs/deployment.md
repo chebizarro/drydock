@@ -204,16 +204,6 @@ DRYDOCK_QDRANT_URL=http://qdrant:6333
 
 Any OpenAI-compatible `/embeddings` endpoint works (e.g., vLLM, TEI, OpenAI API).
 
-## Lemmy Deployment
-
-For the Lemmy deployment target (192.168.40.110), use the `.env.lemmy` file:
-
-```bash
-cp .env.lemmy .env
-# Review and adjust settings for your environment
-docker compose up --build -d
-```
-
 ## Production Hardening Checklist
 
 - [ ] **Signing**: Use the shared NIP-46 Signet path, not local nsec

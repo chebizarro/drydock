@@ -2,7 +2,6 @@ package nostrprobe
 
 import (
 	"fmt"
-	"strings"
 
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
@@ -22,7 +21,7 @@ func Corroborate(findings []reviewengine.Finding, evidence []SecurityEvidence) [
 	out := append([]reviewengine.Finding(nil), findings...)
 	for i := range out {
 		for staticRule, items := range confirmed {
-			if !strings.Contains(out[i].Evidence, "["+staticRule+"]") {
+			if out[i].RuleID != staticRule {
 				continue
 			}
 			out[i].Confidence = 1

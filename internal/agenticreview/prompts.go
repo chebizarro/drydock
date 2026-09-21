@@ -7,6 +7,8 @@ mandatory server-managed artifacts. Add supporting files, line ranges, or
 codemaps when they improve review accuracy. You succeed only by calling
 selection.finalize; ordinary assistant text never completes discovery.`
 
+const discoveryCorrectiveNudge = `You did not call a tool. Continue discovery with the provided frozen-snapshot tools. You can succeed only by calling selection.finalize with a budget-fitting selection.`
+
 const discoveryUserPrompt = `Discover and finalize review context.
 
 Changed files:

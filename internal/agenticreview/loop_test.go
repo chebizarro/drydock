@@ -105,6 +105,64 @@ func TestLoopExecutesToolsSequentiallyAndStopsOnlyOnFinalize(t *testing.T) {
 	}
 }
 
+func TestLoopPopulatesPerMessageTokenCountsAndServedModel(t *testing.T) {
+	patch := testPatch()
+	snapshot := discoverySnapshot(t, patch, map[string]string{
+		"changed.go": "new\n",
+		"extra.txt":  "optional context\n",
+	})
+	selection, err := agenttools.NewSelection(agenttools.SelectionConfig{
+		Snapshot: snapshot, ChangedFiles: []string{"changed.go"},
+		Counter: testCounter{}, TokenBudget: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(id, name, arguments string) reviewengine.ToolCall {
+		return reviewengine.ToolCall{ID: id, Type: "function", Function: reviewengine.ToolCallFunction{Name: name, Arguments: arguments}}
+	}
+	client := &scriptedClient{results: []reviewengine.CompletionResult{
+		{
+			Model:   "served-x",
+			Message: reviewengine.CompletionMessage{Role: reviewengine.MessageRoleAssistant, ToolCalls: []reviewengine.ToolCall{call("add", agenttools.ToolSelectionAdd, `{"artifacts":[{"kind":"file","path":"extra.txt"}]}`)}},
+			Usage:   reviewengine.CompletionUsage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10},
+		},
+		{
+			Model:   "served-x",
+			Message: reviewengine.CompletionMessage{Role: reviewengine.MessageRoleAssistant, ToolCalls: []reviewengine.ToolCall{call("final", agenttools.ToolSelectionFinalize, `{}`)}},
+			Usage:   reviewengine.CompletionUsage{TotalTokens: 1},
+		},
+	}}
+	scope := agenttools.NewScope("token-counts", snapshot, agenttools.RoleContextDiscovery)
+	result, err := (&LoopRunner{Client: client}).Run(context.Background(), LoopRequest{
+		Completion: reviewengine.CompletionRequest{
+			Messages: []reviewengine.CompletionMessage{{Role: reviewengine.MessageRoleUser, Content: "discover"}},
+		},
+		Registry: agenttools.NewRegistry(), Scope: scope, Selection: selection, Counter: testCounter{},
+		Limits: LoopLimits{MaxTurns: 3, MaxToolCalls: 4, MaxCumulativeTokens: 100_000, MaxModelContext: 100_000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ServedModel != "served-x" {
+		t.Fatalf("served model = %q, want served-x", result.ServedModel)
+	}
+	// The first assistant message is re-sent to the model on the second turn; it
+	// must carry the persistence token counts the provider reported.
+	var found bool
+	for _, message := range client.requests[1].Messages {
+		if message.Role == reviewengine.MessageRoleAssistant && len(message.ToolCalls) > 0 && message.ToolCalls[0].ID == "add" {
+			found = true
+			if message.PromptTokens != 7 || message.CompletionTokens != 3 {
+				t.Fatalf("assistant message token counts = %d/%d, want 7/3", message.PromptTokens, message.CompletionTokens)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("first assistant message was not re-sent: %#v", client.requests[1].Messages)
+	}
+}
+
 func TestLoopPreflightsModelContextBeforeCallingClient(t *testing.T) {
 	patch := testPatch()
 	snapshot := discoverySnapshot(t, patch, map[string]string{"changed.go": "new"})

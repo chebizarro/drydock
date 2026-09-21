@@ -96,55 +96,33 @@ func compactedTurnResult(turn Turn) (string, error) {
 	if len(turn.Result) == 0 || !json.Valid(turn.Result) {
 		return "", fmt.Errorf("%w: turn %d has no valid terminal result", ErrInvalidTranscript, turn.TurnNo)
 	}
-	var root any
-	if err := json.Unmarshal(turn.Result, &root); err != nil {
+	// turn.Result is always json.Marshal(reviewengine.RunOutput); the summary and
+	// findings live at the fixed path .Review.summary / .Review.findings. Decode
+	// that shape directly so reconstruction is deterministic. Findings stay as
+	// raw bytes to preserve the persisted representation verbatim.
+	var out struct {
+		Review struct {
+			Summary  string          `json:"summary"`
+			Findings json.RawMessage `json:"findings"`
+		}
+	}
+	if err := json.Unmarshal(turn.Result, &out); err != nil {
 		return "", err
 	}
-	summary, findings := findSummaryAndFindings(root)
+	findings := out.Review.Findings
+	if len(findings) == 0 {
+		findings = json.RawMessage(`[]`)
+	}
 	payload := struct {
 		TurnNo   int             `json:"turn_no"`
 		Summary  string          `json:"summary"`
 		Findings json.RawMessage `json:"findings"`
 	}{
-		TurnNo: turn.TurnNo, Summary: summary, Findings: findings,
-	}
-	if len(payload.Findings) == 0 {
-		payload.Findings = json.RawMessage(`[]`)
+		TurnNo: turn.TurnNo, Summary: out.Review.Summary, Findings: findings,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
 	return "Prior review result: " + string(encoded), nil
-}
-
-func findSummaryAndFindings(value any) (string, json.RawMessage) {
-	objects := []any{value}
-	for len(objects) > 0 {
-		current := objects[0]
-		objects = objects[1:]
-		object, ok := current.(map[string]any)
-		if !ok {
-			continue
-		}
-		var summary string
-		var findings any
-		for key, child := range object {
-			switch key {
-			case "summary", "Summary":
-				summary, _ = child.(string)
-			case "findings", "Findings":
-				findings = child
-			default:
-				if nested, ok := child.(map[string]any); ok {
-					objects = append(objects, nested)
-				}
-			}
-		}
-		if summary != "" || findings != nil {
-			encoded, _ := json.Marshal(findings)
-			return summary, encoded
-		}
-	}
-	return "", json.RawMessage(`[]`)
 }

@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/hashutil"
 	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
@@ -145,7 +146,7 @@ func (ing *Ingester) Run(ctx context.Context, cfg Config) (int, error) {
 		if len(data) > maxFileSize {
 			data = data[:maxFileSize]
 		}
-		if !isProbablyText(data) {
+		if !hashutil.IsProbablyText(data) {
 			continue
 		}
 
@@ -239,7 +240,7 @@ func ChunkDocument(repoID, filePath, content string) []Chunk {
 		FilePath:     filePath,
 		SectionTitle: filepath.Base(filePath),
 		Content:      content,
-		ContentHash:  contentHash(content),
+		ContentHash:  hashutil.SHA256Hex([]byte(content)),
 	}}
 }
 
@@ -253,7 +254,7 @@ func chunkMarkdown(repoID, filePath, content string) []Chunk {
 		if title, ok := isHeading(line); ok {
 			if current != nil && strings.TrimSpace(current.Content) != "" {
 				current.Content = strings.TrimSpace(current.Content)
-				current.ContentHash = contentHash(current.Content)
+				current.ContentHash = hashutil.SHA256Hex([]byte(current.Content))
 				chunks = append(chunks, *current)
 			}
 			current = &Chunk{
@@ -283,7 +284,7 @@ func chunkMarkdown(repoID, filePath, content string) []Chunk {
 
 	if current != nil && strings.TrimSpace(current.Content) != "" {
 		current.Content = strings.TrimSpace(current.Content)
-		current.ContentHash = contentHash(current.Content)
+		current.ContentHash = hashutil.SHA256Hex([]byte(current.Content))
 		chunks = append(chunks, *current)
 	}
 
@@ -373,11 +374,7 @@ func (ing *Ingester) fetchExistingHashes(ctx context.Context, repoID string) (ma
 	hashes := make(map[string]string)
 	var offset *string
 
-	filter := map[string]any{
-		"must": []map[string]any{
-			{"key": "repo_id", "match": map[string]any{"value": repoID}},
-		},
-	}
+	filter := vectorstore.Filter(vectorstore.Match("repo_id", repoID))
 
 	for {
 		points, next, err := ing.qdrant.Scroll(ctx, ing.qdrant.CollectionNames().ProjectDocs, 100, offset, filter)
@@ -410,24 +407,4 @@ func isHeading(line string) (string, bool) {
 func chunkID(c Chunk) string {
 	h := sha256.Sum256([]byte(c.RepoID + "::" + c.FilePath + "::" + c.SectionTitle))
 	return fmt.Sprintf("%x", h[:16])
-}
-
-// contentHash returns the SHA-256 hex digest of content.
-func contentHash(content string) string {
-	h := sha256.Sum256([]byte(content))
-	return fmt.Sprintf("%x", h)
-}
-
-// isProbablyText returns true if data looks like text (no NUL bytes in first 512 bytes).
-func isProbablyText(data []byte) bool {
-	check := data
-	if len(check) > 512 {
-		check = check[:512]
-	}
-	for _, b := range check {
-		if b == 0 {
-			return false
-		}
-	}
-	return true
 }

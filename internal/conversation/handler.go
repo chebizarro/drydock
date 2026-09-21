@@ -19,7 +19,9 @@ import (
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/publisher"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/signing"
 
 	"fiatjaf.com/nostr"
 )
@@ -29,17 +31,6 @@ const MaxTurnsPerReview = 3
 
 // maxConcurrent is the maximum number of concurrent conversation LLM calls.
 const maxConcurrent = 4
-
-// Signer signs Nostr events for publishing responses.
-type Signer interface {
-	GetPublicKey(ctx context.Context) (nostr.PubKey, error)
-	SignEvent(ctx context.Context, evt *nostr.Event) error
-}
-
-// RelayPublisher publishes signed events to Nostr relays.
-type RelayPublisher interface {
-	Publish(ctx context.Context, relays []string, event nostr.Event) error
-}
 
 // Config holds conversation handler configuration.
 type Config struct {
@@ -58,15 +49,15 @@ type Handler struct {
 	cfg       Config
 	store     *db.Store
 	client    reviewengine.LLMClient
-	signer    Signer
-	publish   RelayPublisher
+	signer    signing.Signer
+	publish   publisher.RelayPublisher
 	logger    *slog.Logger
 	ourPubKey string        // cached hex pubkey, resolved once at construction
 	sem       chan struct{} // bounded concurrency semaphore
 }
 
 // New creates a new conversation Handler.
-func New(cfg Config, store *db.Store, client reviewengine.LLMClient, signer Signer, relayPub RelayPublisher, logger *slog.Logger) *Handler {
+func New(cfg Config, store *db.Store, client reviewengine.LLMClient, signer signing.Signer, relayPub publisher.RelayPublisher, logger *slog.Logger) *Handler {
 	if cfg.Temperature == 0 {
 		cfg.Temperature = 0.3
 	}
@@ -165,8 +156,7 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 	// 4. Load original review content for context.
 	reviewContent, err := h.loadReviewContent(ctx, reviewEventID)
 	if err != nil {
-		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
-		return fmt.Errorf("load review content: %w", err)
+		return h.failTurn(ctx, replyEvent.ID.Hex(), fmt.Errorf("load review content: %w", err))
 	}
 
 	// 5. Load patch diff for additional context.
@@ -175,8 +165,7 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 	// 6. Load conversation history (prior turns only).
 	history, err := h.store.GetConversationHistory(ctx, reviewEventID)
 	if err != nil {
-		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
-		return fmt.Errorf("get conversation history: %w", err)
+		return h.failTurn(ctx, replyEvent.ID.Hex(), fmt.Errorf("get conversation history: %w", err))
 	}
 
 	// 7. Build turn pairs from history (exclude the current turn we just inserted).
@@ -205,16 +194,14 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 	})
 	if err != nil {
 		metrics.ConversationErrors.Inc()
-		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
-		return fmt.Errorf("conversation LLM call: %w", err)
+		return h.failTurn(ctx, replyEvent.ID.Hex(), fmt.Errorf("conversation LLM call: %w", err))
 	}
 	responseText := strings.TrimSpace(llmRes.Content)
 
 	// 9. Build and publish the response event (kind 1111 / NIP-22 comment).
 	relays, err := h.resolveRelays(ctx, patchEventID, repoID, relayURL)
 	if err != nil {
-		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
-		return fmt.Errorf("resolve relays: %w", err)
+		return h.failTurn(ctx, replyEvent.ID.Hex(), fmt.Errorf("resolve relays: %w", err))
 	}
 
 	expiresAt := strconv.FormatInt(time.Now().Add(h.cfg.ResponseTTL).Unix(), 10)
@@ -227,8 +214,7 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 	}
 	if err := h.signer.SignEvent(ctx, &responseEvent); err != nil {
 		metrics.ConversationErrors.Inc()
-		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
-		return fmt.Errorf("sign conversation response: %w", err)
+		return h.failTurn(ctx, replyEvent.ID.Hex(), fmt.Errorf("sign conversation response: %w", err))
 	}
 
 	// Persist the signed response in pending state before making it observable.
@@ -238,27 +224,21 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 	)
 	if err != nil {
 		metrics.ConversationErrors.Inc()
-		if markErr := h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex()); markErr != nil {
-			return errors.Join(fmt.Errorf("stage conversation response: %w", err), fmt.Errorf("mark conversation retryable: %w", markErr))
-		}
-		return fmt.Errorf("stage conversation response: %w", err)
+		return h.failTurn(ctx, replyEvent.ID.Hex(), fmt.Errorf("stage conversation response: %w", err))
 	}
 	staged, err := stageResult.RowsAffected()
 	if err != nil {
 		metrics.ConversationErrors.Inc()
-		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
-		return fmt.Errorf("confirm staged conversation response: %w", err)
+		return h.failTurn(ctx, replyEvent.ID.Hex(), fmt.Errorf("confirm staged conversation response: %w", err))
 	}
 	if staged != 1 {
 		metrics.ConversationErrors.Inc()
-		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
-		return fmt.Errorf("stage conversation response: reply %s not found", replyEvent.ID.Hex())
+		return h.failTurn(ctx, replyEvent.ID.Hex(), fmt.Errorf("stage conversation response: reply %s not found", replyEvent.ID.Hex()))
 	}
 
 	if err := h.publish.Publish(ctx, relays, responseEvent); err != nil {
 		metrics.ConversationErrors.Inc()
-		h.store.MarkConversationFailed(ctx, replyEvent.ID.Hex())
-		return fmt.Errorf("publish conversation response: %w", err)
+		return h.failTurn(ctx, replyEvent.ID.Hex(), fmt.Errorf("publish conversation response: %w", err))
 	}
 
 	// 10. Mark the durably staged response as published.
@@ -276,6 +256,17 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 	)
 
 	return nil
+}
+
+// failTurn marks the conversation turn as failed so the retry sweep can later
+// reclaim it, joining any mark error into the returned error rather than
+// discarding it. A dropped mark leaves the turn in a non-terminal state
+// forever, invisible to the sweep.
+func (h *Handler) failTurn(ctx context.Context, replyEventID string, cause error) error {
+	if markErr := h.store.MarkConversationFailed(ctx, replyEventID); markErr != nil {
+		return errors.Join(cause, fmt.Errorf("mark conversation retryable: %w", markErr))
+	}
+	return cause
 }
 
 // IsReplyToUs checks whether an event is a reply addressed to our pubkey.

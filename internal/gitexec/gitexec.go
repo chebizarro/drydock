@@ -48,6 +48,16 @@ func Run(ctx context.Context, repo string, args ...string) (string, error) {
 	return string(out), err
 }
 
+// Output is Run with surrounding whitespace trimmed, the common shape for
+// single-line git queries such as rev-parse.
+func Output(ctx context.Context, repo string, args ...string) (string, error) {
+	out, err := Run(ctx, repo, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // WaitError renders the standard failure error for a finished git command. For a
 // non-zero exit it reports stderr (from stderr when captured separately, else
 // from the ExitError) while keeping the underlying error recoverable via

@@ -184,7 +184,7 @@ func TestMigrateAddsReviewLogColumnsFromOldSnapshot(t *testing.T) {
 	}
 
 	for _, column := range []string{"status_event_id", "status_event_kind", "status_published_at", "force"} {
-		exists, err := store.hasColumn(ctx, "review_log", column)
+		exists, err := hasColumn(ctx, store.DB(), "review_log", column)
 		if err != nil {
 			t.Fatalf("hasColumn(%s): %v", column, err)
 		}
@@ -459,7 +459,7 @@ func TestHasColumnPropagatesQueryErrors(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
-	if _, err := store.hasColumn(ctx, "review_log", "status_event_id"); err == nil {
+	if _, err := hasColumn(ctx, store.DB(), "review_log", "status_event_id"); err == nil {
 		t.Fatal("expected hasColumn to return query error after database close")
 	}
 }

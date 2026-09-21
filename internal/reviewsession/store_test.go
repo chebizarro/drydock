@@ -62,7 +62,7 @@ func TestStoreReserveTurnCASAndRequestReplay(t *testing.T) {
 	store, _, now := newTestStore(t)
 	createSession(t, store, *now)
 	if err := store.CompleteTurn(context.Background(), "0123456789abcdef0123456789abcdef", "start",
-		json.RawMessage(`{"Review":{"Summary":"initial","Findings":[]}}`)); err != nil {
+		json.RawMessage(`{"Review":{"summary":"initial","findings":[]}}`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -105,7 +105,7 @@ func TestStoreReserveTurnCASAndRequestReplay(t *testing.T) {
 	}
 	active := loaded.Session.ActiveRequest
 	if err := store.CompleteTurn(context.Background(), params.ChatID, active,
-		json.RawMessage(`{"Review":{"Summary":"done","Findings":[]}}`)); err != nil {
+		json.RawMessage(`{"Review":{"summary":"done","findings":[]}}`)); err != nil {
 		t.Fatal(err)
 	}
 	replayParams := params
@@ -136,7 +136,7 @@ func TestStorePersistsOrderedMessagesAndExpiresBeforeDereference(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.CompleteTurn(context.Background(), chatID, "start",
-		json.RawMessage(`{"Review":{"Summary":"ok","Findings":[]}}`)); err != nil {
+		json.RawMessage(`{"Review":{"summary":"ok","findings":[]}}`)); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := store.LoadForContinuation(context.Background(), chatID)
@@ -170,9 +170,9 @@ func TestCompactHistoryKeepsNewestTurnRawAndCompactsOlderResults(t *testing.T) {
 	loaded := Loaded{
 		Turns: []Turn{
 			{TurnNo: 0, RequestText: "first question", Status: TurnComplete,
-				Result: json.RawMessage(`{"Review":{"Summary":"first summary","Findings":[{"File":"a.go"}]}}`)},
+				Result: json.RawMessage(`{"Review":{"summary":"first summary","findings":[{"file":"a.go"}]}}`)},
 			{TurnNo: 1, RequestText: "second question", Status: TurnComplete,
-				Result: json.RawMessage(`{"Review":{"Summary":"second summary","Findings":[]}}`)},
+				Result: json.RawMessage(`{"Review":{"summary":"second summary","findings":[]}}`)},
 		},
 		Messages: []Message{
 			{TurnNo: 0, Seq: 0, Role: reviewengine.MessageRoleUser, Content: "first question"},
@@ -189,16 +189,46 @@ func TestCompactHistoryKeepsNewestTurnRawAndCompactsOlderResults(t *testing.T) {
 		history[3].Content != "newest raw" {
 		t.Fatalf("compacted history = %+v", history)
 	}
-	again, err := CompactHistory(loaded, byteCounter{}, 350)
+	if _, err := CompactHistory(loaded, byteCounter{}, 10); !errors.Is(err, ErrHistoryTooLarge) {
+		t.Fatalf("tiny budget error = %v", err)
+	}
+}
+
+// TestCompactedTurnResultDecodesMarshaledRunOutput exercises the exact shape
+// production writes — json.Marshal(reviewengine.RunOutput) — which the old
+// capitalised fixtures never covered.
+func TestCompactedTurnResultDecodesMarshaledRunOutput(t *testing.T) {
+	raw, err := json.Marshal(reviewengine.RunOutput{
+		Review: reviewengine.ReviewerOutput{
+			Summary:  "real summary",
+			Findings: []reviewengine.Finding{{File: "a.go", Severity: "high"}},
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	left, _ := json.Marshal(history)
-	right, _ := json.Marshal(again)
-	if string(left) != string(right) {
-		t.Fatalf("compaction is not deterministic")
+	got, err := compactedTurnResult(Turn{TurnNo: 1, Result: raw})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := CompactHistory(loaded, byteCounter{}, 10); !errors.Is(err, ErrHistoryTooLarge) {
-		t.Fatalf("tiny budget error = %v", err)
+	if !strings.Contains(got, `"summary":"real summary"`) || !strings.Contains(got, `"file":"a.go"`) {
+		t.Fatalf("compacted result = %s", got)
+	}
+}
+
+// TestCompactedTurnResultReadsFixedReviewPath proves summary/findings are read
+// from the fixed .Review path and never from a sibling object that happens to
+// carry the same keys. The pre-fix BFS chose between them by randomized Go map
+// iteration, so this failed nondeterministically.
+func TestCompactedTurnResultReadsFixedReviewPath(t *testing.T) {
+	result := json.RawMessage(`{"Planner":{"summary":"WRONG","findings":[{"file":"wrong.go"}]},"Review":{"summary":"RIGHT","findings":[]}}`)
+	for i := 0; i < 100; i++ {
+		got, err := compactedTurnResult(Turn{TurnNo: 3, Result: result})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(got, `"summary":"RIGHT"`) || strings.Contains(got, "WRONG") {
+			t.Fatalf("compacted result read the wrong object: %s", got)
+		}
 	}
 }

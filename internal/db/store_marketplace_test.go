@@ -374,7 +374,7 @@ func TestRecordFeedbackConcurrentDuplicateIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestUpdateAssignmentStatus(t *testing.T) {
+func TestTransitionPendingAssignmentAccept(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
 
@@ -390,9 +390,10 @@ func TestUpdateAssignmentStatus(t *testing.T) {
 
 	got, _ := store.GetAssignmentByEventID(ctx, "evt-1")
 
-	// Accept the assignment
-	if err := store.UpdateAssignmentStatus(ctx, got.ID, "accepted", "accept-evt-1"); err != nil {
-		t.Fatalf("UpdateAssignmentStatus: %v", err)
+	// Accept the assignment via the guarded (CAS) production transition.
+	now := time.Now().Unix()
+	if err := store.TransitionPendingAssignment(ctx, got.ID, "reviewer-1", "accepted", "accept-evt-1", now); err != nil {
+		t.Fatalf("TransitionPendingAssignment: %v", err)
 	}
 
 	got, _ = store.GetAssignmentByID(ctx, got.ID)

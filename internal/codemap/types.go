@@ -3,7 +3,10 @@ package codemap
 
 import "git.sharegap.net/cascadia/drydock/internal/symbols"
 
-const cacheVersion = 1
+// CacheVersion is the schema version stamped on every on-disk cache entry in the
+// shared drydock-codemap directory. nostrscan writes into the same directory and
+// shares this constant so a schema bump invalidates both packages' entries.
+const CacheVersion = 1
 
 // Symbol is a repository symbol declaration. Lines are one-based.
 type Symbol struct {

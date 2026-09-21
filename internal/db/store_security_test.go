@@ -114,9 +114,9 @@ func TestSecurityAuditPublicationSetPersistsCoverageAndSARIF(t *testing.T) {
 		t.Fatalf("reservation was replaced: %+v", reused)
 	}
 
-	gotSARIF, gotHash, err := store.SecurityAuditSARIF(ctx, auditID)
+	gotSARIF, gotHash, err := store.SecurityAuditSARIFForRequester(ctx, auditID, "requester")
 	if err != nil {
-		t.Fatalf("SecurityAuditSARIF: %v", err)
+		t.Fatalf("SecurityAuditSARIFForRequester: %v", err)
 	}
 	if !bytes.Equal(gotSARIF, sarif) || gotHash != sarifHash {
 		t.Fatalf("SARIF = %q hash=%q", gotSARIF, gotHash)

@@ -135,7 +135,7 @@ func (s *Store) CreateSecurityAudit(ctx context.Context, repoID, ref, depth, req
 
 // StartSecurityAudit performs the pending -> running transition.
 func (s *Store) StartSecurityAudit(ctx context.Context, id int64) error {
-	return s.transitionSecurityAudit(ctx, id, "pending", "running", "", "")
+	return s.transitionSecurityAudit(ctx, id, "pending", "running")
 }
 
 // UpdateSecurityAuditCoverage persists the latest known audit coverage.
@@ -196,16 +196,13 @@ func (s *Store) PublishSecurityAudit(ctx context.Context, id int64, reportEventI
 
 // FailSecurityAudit performs the running -> failed transition.
 func (s *Store) FailSecurityAudit(ctx context.Context, id int64) error {
-	return s.transitionSecurityAudit(ctx, id, "running", "failed", "", "")
+	return s.transitionSecurityAudit(ctx, id, "running", "failed")
 }
 
-func (s *Store) transitionSecurityAudit(ctx context.Context, id int64, from, to, reportEventID, sarifHash string) error {
+func (s *Store) transitionSecurityAudit(ctx context.Context, id int64, from, to string) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE security_audits
-		SET state=?, report_event_id=CASE WHEN ?='' THEN report_event_id ELSE ? END,
-		sarif_hash=CASE WHEN ?='' THEN sarif_hash ELSE ? END, updated_at=?
-		WHERE id=? AND state=?`,
-		to, reportEventID, reportEventID, sarifHash, sarifHash, time.Now().Unix(), id, from)
+		`UPDATE security_audits SET state=?, updated_at=? WHERE id=? AND state=?`,
+		to, time.Now().Unix(), id, from)
 	if err != nil {
 		return fmt.Errorf("transition security audit %d %s->%s: %w", id, from, to, err)
 	}
@@ -337,11 +334,7 @@ func completePublicationTypes(publications []SecurityAuditPublication) bool {
 	return len(found) == 3
 }
 
-type securityAuditPublicationQuerier interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}
-
-func loadSecurityAuditPublications(ctx context.Context, q securityAuditPublicationQuerier, auditID int64) ([]SecurityAuditPublication, error) {
+func loadSecurityAuditPublications(ctx context.Context, q rowsQuerier, auditID int64) ([]SecurityAuditPublication, error) {
 	rows, err := q.QueryContext(ctx, `SELECT event_type, raw_event_json, relays_json, delivered_at
 		FROM security_audit_publication_outbox WHERE audit_id=?
 		ORDER BY CASE event_type WHEN 'report' THEN 1 WHEN 'detail' THEN 2 ELSE 3 END`, auditID)
@@ -479,11 +472,6 @@ func (s *Store) CompleteSecurityAuditPublication(ctx context.Context, auditID in
 		return fmt.Errorf("commit security audit %d publication completion: %w", auditID, err)
 	}
 	return nil
-}
-
-// SecurityAuditSARIF returns the durable SARIF bytes and their digest.
-func (s *Store) SecurityAuditSARIF(ctx context.Context, auditID int64) ([]byte, string, error) {
-	return s.securityAuditSARIF(ctx, auditID, "")
 }
 
 // SecurityAuditSARIFForRequester returns SARIF only when the requester matches

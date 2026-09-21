@@ -47,7 +47,7 @@ func TestContextVMFoundationMigrationFromLegacyReviewLog(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 	for _, column := range []string{"invocation", "requester_pubkey", "order_id"} {
-		exists, err := store.hasColumn(ctx, "review_log", column)
+		exists, err := hasColumn(ctx, store.DB(), "review_log", column)
 		if err != nil || !exists {
 			t.Fatalf("review_log.%s: exists=%v err=%v", column, exists, err)
 		}

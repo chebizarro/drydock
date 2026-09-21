@@ -2,7 +2,6 @@ package marketplace
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"sync"
 	"testing"
@@ -166,25 +165,16 @@ func TestRouter_HandleRejection_TriggersReassignment(t *testing.T) {
 		t.Fatalf("CreateAssignment failed: %v", err)
 	}
 
-	// Simulate reviewer1 rejecting
+	// Simulate reviewer1 rejecting. recordRejection is the shared production
+	// path the ContextVM handler invokes after verifySignedIntent, so exercising
+	// it keeps the reassignment coverage on the live code the daemon runs.
 	rejection := ReviewRejection{
 		AssignmentID:   "assign-r1",
 		ReviewerPubkey: reviewer1Pubkey,
 		Reason:         "too busy",
 	}
-	rejectionJSON, _ := json.Marshal(rejection)
-
-	rejectionEvent := nostr.Event{
-		Kind:      nostr.Kind(25910),
-		Content:   string(rejectionJSON),
-		PubKey:    nostr.PubKey{}, // Will be overwritten
-		CreatedAt: nostr.Now(),
-	}
-
-	// Handle the rejection
-	err := router.HandleRejection(ctx, rejectionEvent)
-	if err != nil {
-		t.Fatalf("HandleRejection failed: %v", err)
+	if err := router.recordRejection(ctx, rejection, reviewer1Pubkey, "reject-assign-r1", time.Now().Unix()); err != nil {
+		t.Fatalf("recordRejection failed: %v", err)
 	}
 
 	// Check that a new assignment was published via ContextVM
@@ -248,24 +238,14 @@ func TestRouter_HandleRejection_NoAlternatives(t *testing.T) {
 	}
 	store.CreateAssignment(ctx, assignment)
 
-	// Simulate rejection
+	// Simulate rejection via the shared production path.
 	rejection := ReviewRejection{
 		AssignmentID:   "assign-only",
 		ReviewerPubkey: reviewer1Pubkey,
 		Reason:         "no time",
 	}
-	rejectionJSON, _ := json.Marshal(rejection)
-
-	rejectionEvent := nostr.Event{
-		Kind:      nostr.Kind(25910),
-		Content:   string(rejectionJSON),
-		CreatedAt: nostr.Now(),
-	}
-
-	// Handle the rejection - should not error, but no reassignment
-	err := router.HandleRejection(ctx, rejectionEvent)
-	if err != nil {
-		t.Fatalf("HandleRejection failed: %v", err)
+	if err := router.recordRejection(ctx, rejection, reviewer1Pubkey, "reject-assign-only", time.Now().Unix()); err != nil {
+		t.Fatalf("recordRejection failed: %v", err)
 	}
 
 	// No new assignment should be published (no alternatives)

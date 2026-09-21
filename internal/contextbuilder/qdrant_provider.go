@@ -88,11 +88,7 @@ func (p *QdrantProvider) Build(ctx context.Context, in BuildInput) (string, erro
 	// Query project_docs always, filtered by repo_id when available.
 	var docsFilter map[string]any
 	if in.RepoID != "" {
-		docsFilter = map[string]any{
-			"must": []map[string]any{
-				{"key": "repo_id", "match": map[string]any{"value": in.RepoID}},
-			},
-		}
+		docsFilter = vectorstore.Filter(vectorstore.Match("repo_id", in.RepoID))
 	}
 	results, err := p.qdrant.Search(ctx, collections.ProjectDocs, vec, limit, docsFilter)
 	if err != nil {

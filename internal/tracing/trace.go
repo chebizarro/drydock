@@ -44,14 +44,6 @@ func fallbackTraceID() string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// WithTrace creates a new context with trace data.
-func WithTrace(ctx context.Context, traceID string) context.Context {
-	return context.WithValue(ctx, ctxKey{}, &TraceData{
-		TraceID:   traceID,
-		StartTime: time.Now(),
-	})
-}
-
 // WithTraceData creates a new context with full trace data.
 func WithTraceData(ctx context.Context, data TraceData) context.Context {
 	if data.TraceID == "" {
@@ -70,38 +62,6 @@ func FromContext(ctx context.Context) *TraceData {
 		return v.(*TraceData)
 	}
 	return nil
-}
-
-// TraceID returns the trace ID from context, or empty string if not present.
-func TraceID(ctx context.Context) string {
-	if td := FromContext(ctx); td != nil {
-		return td.TraceID
-	}
-	return ""
-}
-
-// SetEventID sets the event ID in the trace data.
-// Returns a new context with updated trace data.
-func SetEventID(ctx context.Context, eventID string) context.Context {
-	td := FromContext(ctx)
-	if td == nil {
-		return WithTraceData(ctx, TraceData{EventID: eventID})
-	}
-	newTD := *td
-	newTD.EventID = eventID
-	return context.WithValue(ctx, ctxKey{}, &newTD)
-}
-
-// SetRepoID sets the repo ID in the trace data.
-// Returns a new context with updated trace data.
-func SetRepoID(ctx context.Context, repoID string) context.Context {
-	td := FromContext(ctx)
-	if td == nil {
-		return WithTraceData(ctx, TraceData{RepoID: repoID})
-	}
-	newTD := *td
-	newTD.RepoID = repoID
-	return context.WithValue(ctx, ctxKey{}, &newTD)
 }
 
 // Elapsed returns the time elapsed since the trace started.
@@ -136,56 +96,6 @@ func Logger(ctx context.Context, base *slog.Logger) *slog.Logger {
 	return base.With(attrs...)
 }
 
-// Span represents a timed operation within a trace.
-type Span struct {
-	Name      string
-	StartTime time.Time
-	logger    *slog.Logger
-	ctx       context.Context
-}
-
-// StartSpan begins a new timed span for an operation.
-func StartSpan(ctx context.Context, logger *slog.Logger, name string) *Span {
-	return &Span{
-		Name:      name,
-		StartTime: time.Now(),
-		logger:    Logger(ctx, logger),
-		ctx:       ctx,
-	}
-}
-
-// End completes the span and logs the duration.
-func (s *Span) End() time.Duration {
-	duration := time.Since(s.StartTime)
-	s.logger.Debug("span completed",
-		"span", s.Name,
-		"duration_ms", duration.Milliseconds(),
-	)
-	return duration
-}
-
-// EndWithStatus completes the span with a status.
-func (s *Span) EndWithStatus(status string) time.Duration {
-	duration := time.Since(s.StartTime)
-	s.logger.Info("span completed",
-		"span", s.Name,
-		"status", status,
-		"duration_ms", duration.Milliseconds(),
-	)
-	return duration
-}
-
-// EndWithError completes the span with an error.
-func (s *Span) EndWithError(err error) time.Duration {
-	duration := time.Since(s.StartTime)
-	s.logger.Error("span failed",
-		"span", s.Name,
-		"error", err,
-		"duration_ms", duration.Milliseconds(),
-	)
-	return duration
-}
-
 // PipelineStages are the standard pipeline stages for timing.
 const (
 	StageRepoPrepare      = "repo_prepare"
@@ -195,7 +105,6 @@ const (
 	StageLLMReview        = "llm_review"
 	StageSecurityScan     = "security_scan"
 	StagePublish          = "publish"
-	StageMetaReview       = "meta_review"
 	StageStatusPublish    = "status_publish"
 )
 
@@ -203,7 +112,6 @@ const (
 type PipelineTimer struct {
 	stages map[string]time.Duration
 	logger *slog.Logger
-	ctx    context.Context
 }
 
 // NewPipelineTimer creates a new pipeline timer.
@@ -211,7 +119,6 @@ func NewPipelineTimer(ctx context.Context, logger *slog.Logger) *PipelineTimer {
 	return &PipelineTimer{
 		stages: make(map[string]time.Duration),
 		logger: Logger(ctx, logger),
-		ctx:    ctx,
 	}
 }
 
@@ -248,13 +155,4 @@ func (pt *PipelineTimer) Summary() {
 	attrs = append(attrs, "total_ms", total.Milliseconds())
 
 	pt.logger.Info("pipeline timing summary", attrs...)
-}
-
-// Durations returns a copy of the stage durations.
-func (pt *PipelineTimer) Durations() map[string]time.Duration {
-	result := make(map[string]time.Duration, len(pt.stages))
-	for k, v := range pt.stages {
-		result[k] = v
-	}
-	return result
 }

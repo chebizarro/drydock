@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
+	"git.sharegap.net/cascadia/drydock/internal/signing"
 
 	"fiatjaf.com/nostr"
 )
@@ -28,14 +29,14 @@ type AuditInput struct {
 
 // AuditPublisher emits signed kind-4903 audit events via the configured signer.
 type AuditPublisher struct {
-	signer  Signer
+	signer  signing.Signer
 	publish RelayPublisher
 	relays  []string
 	logger  *slog.Logger
 	now     func() time.Time
 }
 
-func NewAuditPublisher(signer Signer, relayPublisher RelayPublisher, relays []string, logger *slog.Logger) *AuditPublisher {
+func NewAuditPublisher(signer signing.Signer, relayPublisher RelayPublisher, relays []string, logger *slog.Logger) *AuditPublisher {
 	if signer == nil || relayPublisher == nil || len(relays) == 0 {
 		return nil
 	}
@@ -117,7 +118,7 @@ func (p *AuditPublisher) Publish(ctx context.Context, in AuditInput) error {
 // non-audit, non-auth event it signs. Audit events are signed by the underlying
 // signer directly to avoid recursive audit emission.
 type AuditedSigner struct {
-	base       Signer
+	base       signing.Signer
 	audit      *AuditPublisher
 	log        *slog.Logger
 	failClosed bool
@@ -130,11 +131,11 @@ type AuditedSignerOptions struct {
 	FailClosed bool
 }
 
-func NewAuditedSigner(base Signer, audit *AuditPublisher, logger *slog.Logger) Signer {
+func NewAuditedSigner(base signing.Signer, audit *AuditPublisher, logger *slog.Logger) signing.Signer {
 	return NewAuditedSignerWithOptions(base, audit, logger, AuditedSignerOptions{})
 }
 
-func NewAuditedSignerWithOptions(base Signer, audit *AuditPublisher, logger *slog.Logger, opts AuditedSignerOptions) Signer {
+func NewAuditedSignerWithOptions(base signing.Signer, audit *AuditPublisher, logger *slog.Logger, opts AuditedSignerOptions) signing.Signer {
 	if base == nil || audit == nil {
 		return base
 	}

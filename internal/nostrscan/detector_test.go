@@ -11,6 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"git.sharegap.net/cascadia/drydock/internal/codemap"
+	"git.sharegap.net/cascadia/drydock/internal/gitexec"
 )
 
 func TestDetectorProfilesGolden(t *testing.T) {
@@ -214,6 +217,44 @@ func containsRole(roles []Role, want Role) bool {
 		}
 	}
 	return false
+}
+
+// TestCacheSharesCodemapDirAndVersion locks nostrscan's on-disk cache to
+// codemap's shared directory and version constant. Both packages write into the
+// same drydock-codemap directory; before they shared codemap.CacheVersion each
+// carried its own cacheVersion = 1, so bumping codemap's version to invalidate a
+// schema change would silently leave nostrscan reading stale entries.
+func TestCacheSharesCodemapDirAndVersion(t *testing.T) {
+	repo := fixtureRepo(t, "client")
+	ctx := context.Background()
+
+	dir, err := codemap.ResolveCacheDir(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Detect(ctx, repo, "HEAD",
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))); err != nil {
+		t.Fatal(err)
+	}
+
+	treeHash, err := gitexec.Output(ctx, repo, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachePath := filepath.Join(dir, "nostr", "profiles", treeHash+".json")
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("profile cache not written under codemap cache dir %s: %v", dir, err)
+	}
+	var entry struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.Version != codemap.CacheVersion {
+		t.Fatalf("nostr cache version %d != codemap.CacheVersion %d; a codemap schema bump would not invalidate nostr entries in the shared dir", entry.Version, codemap.CacheVersion)
+	}
 }
 
 func fixtureRepo(t *testing.T, name string) string {

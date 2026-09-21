@@ -50,6 +50,55 @@ func TestBuiltinRulesHaveCWEMappings(t *testing.T) {
 	}
 }
 
+func TestHedgedRulesCarryReducedConfidence(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "q.go", "package q\n\nfunc f(id int) string { return fmt.Sprintf(\"SELECT * FROM t WHERE id = %d\", id) }\n")
+	scanner := New()
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"q.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
+	var got *SecurityFinding
+	for i := range result.Findings {
+		if result.Findings[i].RuleID == "SEC-010" {
+			got = &result.Findings[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("SEC-010 did not match a hedged SQL-injection line")
+	}
+	// SEC-010's own description says "Possible SQL injection"; it must not be
+	// published with a literal-match certainty (DRYDOCK-uth5).
+	if got.Confidence != HeuristicRuleConfidence {
+		t.Fatalf("SEC-010 confidence = %v, want %v", got.Confidence, HeuristicRuleConfidence)
+	}
+}
+
+func TestMergeScannerFindings_HeuristicDoesNotUpgradeSeverity(t *testing.T) {
+	scanFindings := []SecurityFinding{{
+		RuleID: "SEC-010", Severity: "high", Category: "security",
+		File: "a.go", Line: 10, Confidence: HeuristicRuleConfidence,
+	}}
+	llmFindings := []reviewengine.Finding{{
+		Severity: "medium", Category: "security", File: "a.go", Line: 10, Confidence: 0.7,
+	}}
+	merged, err := MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
+	if len(merged) != 1 {
+		t.Fatalf("merged = %#v", merged)
+	}
+	// A hedged heuristic match must not raise the LLM finding's severity or
+	// boost its confidence (DRYDOCK-uth5); it only tags the evidence.
+	if merged[0].Severity != "medium" {
+		t.Fatalf("heuristic scanner finding upgraded severity to %q, want medium", merged[0].Severity)
+	}
+	if merged[0].Confidence > 0.7 {
+		t.Fatalf("heuristic scanner finding boosted confidence to %v", merged[0].Confidence)
+	}
+}
+
 func TestScanDetectsHardcodedAPIKey(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "config.go", `package config
@@ -554,6 +603,67 @@ func TestMergeScannerFindings_SensitiveMatchCanonicalizesSpan(t *testing.T) {
 	}
 	if got.SuggestedDiff != "" || got.SuggestedCode != "" {
 		t.Error("sensitive merged finding should clear suggested diff and code")
+	}
+}
+
+// TestMergeScannerFindings_SensitiveConfidenceGate locks the DRYDOCK-uth5
+// corroboration gate onto the sensitive merge branch: a hedged heuristic secret
+// rule (confidence in (0, 0.8)) still replaces the LLM text with canonical
+// scanner text but must not raise severity or boost confidence, while a literal
+// (1.0) or legacy zero-confidence scanner finding still upgrades — the
+// corroboration that must not be silently disabled. The hedged case fails
+// against the pre-fix code, which upgraded unconditionally.
+func TestMergeScannerFindings_SensitiveConfidenceGate(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		confidence   float64
+		wantSeverity string
+		wantBoost    bool
+	}{
+		{name: "hedged heuristic does not upgrade", confidence: HeuristicRuleConfidence, wantSeverity: "high", wantBoost: false},
+		{name: "literal upgrades", confidence: 1.0, wantSeverity: "critical", wantBoost: true},
+		{name: "legacy zero-confidence upgrades", confidence: 0, wantSeverity: "critical", wantBoost: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scanFindings := []SecurityFinding{{
+				RuleID:      "SECRET-001",
+				Severity:    "critical",
+				Category:    "security",
+				File:        "config.go",
+				Line:        10,
+				Evidence:    "secret detected (redacted)",
+				Description: "A credential is present in source.",
+				Suggestion:  "Remove the credential and rotate it.",
+				Confidence:  tc.confidence,
+				Sensitive:   true,
+			}}
+			llmFindings := []reviewengine.Finding{{
+				Severity:   "high",
+				Category:   "security",
+				File:       "config.go",
+				Line:       10,
+				Evidence:   "raw LLM evidence",
+				Confidence: 0.7,
+			}}
+			merged, err := MergeScannerFindings(scanFindings, llmFindings)
+			if err != nil {
+				t.Fatalf("MergeScannerFindings error: %v", err)
+			}
+			if len(merged) != 1 {
+				t.Fatalf("expected 1 merged finding, got %d", len(merged))
+			}
+			got := merged[0]
+			if got.Severity != tc.wantSeverity {
+				t.Errorf("severity = %q, want %q", got.Severity, tc.wantSeverity)
+			}
+			if boosted := got.Confidence > 0.7; boosted != tc.wantBoost {
+				t.Errorf("confidence boosted = %v (value %v), want boosted = %v", boosted, got.Confidence, tc.wantBoost)
+			}
+			// Canonical text replacement happens regardless of the gate.
+			if !got.Sensitive || got.Evidence != scanFindings[0].Evidence {
+				t.Errorf("sensitive finding must canonicalize text regardless of gate: %+v", got)
+			}
+		})
 	}
 }
 

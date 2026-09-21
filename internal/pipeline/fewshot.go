@@ -5,14 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/embedding"
-	"git.sharegap.net/cascadia/drydock/internal/symbols"
 	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
@@ -198,24 +196,12 @@ func (r *QdrantFewShotRetriever) RetrieveFewShots(ctx context.Context, query Few
 func buildFewShotFilter(query FewShotQuery) map[string]any {
 	var must []map[string]any
 	if repoID := strings.TrimSpace(query.RepoID); repoID != "" {
-		must = append(must, qdrantMatchValue("repo_id", repoID))
+		must = append(must, vectorstore.Match("repo_id", repoID))
 	}
 	if language := strings.TrimSpace(query.Language); language != "" {
-		must = append(must, qdrantMatchValue("language", language))
+		must = append(must, vectorstore.Match("language", language))
 	}
-	if len(must) == 0 {
-		return nil
-	}
-	return map[string]any{"must": must}
-}
-
-func qdrantMatchValue(key string, value string) map[string]any {
-	return map[string]any{
-		"key": key,
-		"match": map[string]any{
-			"value": value,
-		},
-	}
+	return vectorstore.Filter(must...)
 }
 
 func (r *QdrantFewShotRetriever) fallback(ctx context.Context, limit int) ([]string, error) {
@@ -297,35 +283,4 @@ func formatFewShot(s scoredResult) string {
 		header = "[" + strings.Join(parts, " | ") + "]\n"
 	}
 	return header + s.content
-}
-
-// DetectLanguage returns the primary language from a list of changed file paths
-// by counting file extensions. On ties, the first-seen language wins for
-// determinism. Returns empty string if no supported language is detected.
-func DetectLanguage(changedFiles []string) string {
-	counts := make(map[string]int)
-	var order []string // first-seen order for deterministic tie-breaking
-	for _, f := range changedFiles {
-		ext := strings.ToLower(filepath.Ext(f))
-		lang := symbols.LangFromExt(ext)
-		if lang != "" {
-			if counts[lang] == 0 {
-				order = append(order, lang)
-			}
-			counts[lang]++
-		}
-	}
-	if len(counts) == 0 {
-		return ""
-	}
-	// Return the most common language; first-seen wins on ties.
-	best := ""
-	bestCount := 0
-	for _, lang := range order {
-		if counts[lang] > bestCount {
-			best = lang
-			bestCount = counts[lang]
-		}
-	}
-	return best
 }

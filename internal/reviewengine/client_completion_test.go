@@ -117,6 +117,33 @@ func TestRetryingClientCompleteRetriesTransientErrors(t *testing.T) {
 	}
 }
 
+type chatSequenceClient struct {
+	errs  []error
+	calls int
+}
+
+func (f *chatSequenceClient) ChatCompletion(context.Context, ChatRequest) (ChatResult, error) {
+	f.calls++
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		return ChatResult{}, err
+	}
+	return ChatResult{Content: "ok"}, nil
+}
+
+func TestRetryingClientChatNilLoggerDoesNotPanic(t *testing.T) {
+	inner := &chatSequenceClient{errs: []error{&LLMHTTPError{StatusCode: 503}}}
+	// A nil logger must be tolerated: before the two retry loops were unified the
+	// chat path logged unguarded and panicked on the first transient failure,
+	// while the byte-identical completion path guarded the log and survived.
+	client := NewRetryingClient(inner, RetryConfig{MaxAttempts: 2, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}, nil)
+	result, err := client.ChatCompletion(context.Background(), ChatRequest{Model: "m"})
+	if err != nil || result.Content != "ok" || inner.calls != 2 {
+		t.Fatalf("result=%+v calls=%d err=%v", result, inner.calls, err)
+	}
+}
+
 func TestCircuitBreakingClientCompleteUsesEndpointBreaker(t *testing.T) {
 	inner := &completionSequenceClient{errs: []error{errors.New("offline")}}
 	client := NewCircuitBreakingClient(inner, circuitbreaker.Config{
