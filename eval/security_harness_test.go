@@ -2,36 +2,36 @@ package eval
 
 import (
 	"context"
-	"encoding/json"
-	"io"
-	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	evaldata "git.sharegap.net/cascadia/drydock/internal/eval"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
-	"git.sharegap.net/cascadia/drydock/internal/securityverify"
-	"git.sharegap.net/cascadia/drydock/internal/testutil"
+	"git.sharegap.net/cascadia/drydock/internal/securityscan"
 )
 
-const prLensCIBudget = 5 * time.Second
-
-type securityMetrics struct {
-	TruePositives     int
-	FalsePositives    int
-	FalseNegatives    int
-	Precision         float64
-	Recall            float64
-	FalsePositiveRate float64
-	Latency           time.Duration
-}
-
-func TestSecurityPipelineVerifyImprovesFalsePositiveRate(t *testing.T) {
+// TestSecurityScannerHeldoutMetrics runs the production deterministic scanner
+// (securityscan.New) over the held-out patch corpus and scores its findings
+// with the canonical eval.Harness metric definition — the same code path the
+// monthly eval uses. There is no scripted model and no answer-key synthesis:
+// the numbers move if a rule regresses.
+//
+// The deterministic scanner only covers regex-detectable vulnerability classes
+// (hardcoded secrets, SQL/command injection, weak hashes, disabled TLS
+// verification, …). Semantic issues in the corpus (SSRF, path traversal, XSS,
+// missing authorization) are out of its reach by design and count as honest
+// false negatives — hence the modest recall floor below. The precision floor is
+// the load-bearing gate: the scanner must not flag the clean fixtures.
+func TestSecurityScannerHeldoutMetrics(t *testing.T) {
 	dataset, err := evaldata.LoadDataset("heldout-sample.json")
 	if err != nil {
 		t.Fatalf("load security eval dataset: %v", err)
 	}
+
 	cases := labeledSecurityCases(dataset.Cases)
 	positiveCases, cleanCases := 0, 0
 	for _, c := range cases {
@@ -45,61 +45,166 @@ func TestSecurityPipelineVerifyImprovesFalsePositiveRate(t *testing.T) {
 		t.Fatalf("dataset must contain vulnerability and clean-code labels: positives=%d clean=%d", positiveCases, cleanCases)
 	}
 
-	withoutVerify := runSecurityEval(t, cases, false)
-	withVerify := runSecurityEval(t, cases, true)
+	harness := evaldata.Harness{
+		Runner:        &scannerRunner{scanner: securityscan.New()},
+		LineTolerance: evaldata.DefaultLineTolerance,
+	}
+	metrics, err := harness.RunMonthly(context.Background(), evaldata.Dataset{
+		ID:    "heldout-security-scanner",
+		Cases: securityDataset(cases),
+	})
+	if err != nil {
+		t.Fatalf("run security scanner eval: %v", err)
+	}
 
-	t.Logf("security eval without securityverify: precision=%.3f recall=%.3f false-positive-rate=%.3f (tp=%d fp=%d fn=%d)",
-		withoutVerify.Precision, withoutVerify.Recall, withoutVerify.FalsePositiveRate,
-		withoutVerify.TruePositives, withoutVerify.FalsePositives, withoutVerify.FalseNegatives)
-	t.Logf("security eval with securityverify: precision=%.3f recall=%.3f false-positive-rate=%.3f latency=%s (tp=%d fp=%d fn=%d)",
-		withVerify.Precision, withVerify.Recall, withVerify.FalsePositiveRate, withVerify.Latency,
-		withVerify.TruePositives, withVerify.FalsePositives, withVerify.FalseNegatives)
+	precision := 1 - metrics.FalsePositiveRate
+	t.Logf("deterministic security scanner: precision=%.3f recall=%.3f false-positive-rate=%.3f (tp=%d fp=%d fn=%d over %d cases)",
+		precision, metrics.Recall, metrics.FalsePositiveRate,
+		metrics.TruePositives, metrics.FalsePositives, metrics.FalseNegatives, metrics.TotalCases)
 
-	if withoutVerify.FalsePositiveRate == 0 {
-		t.Fatal("unverified fixture must include false positives")
+	if metrics.TruePositives == 0 {
+		t.Fatal("deterministic scanner detected none of the labeled vulnerabilities")
 	}
-	if withVerify.FalsePositiveRate >= withoutVerify.FalsePositiveRate {
-		t.Fatalf("securityverify did not cut false-positive rate: without=%.3f with=%.3f",
-			withoutVerify.FalsePositiveRate, withVerify.FalsePositiveRate)
+	if metrics.Recall < 0.25 {
+		t.Fatalf("deterministic scanner recall %.3f fell below the regex-coverage floor 0.25", metrics.Recall)
 	}
-	if withVerify.Recall < withoutVerify.Recall {
-		t.Fatalf("securityverify dropped true-positive recall: without=%.3f with=%.3f",
-			withoutVerify.Recall, withVerify.Recall)
-	}
-	if withVerify.Precision <= withoutVerify.Precision {
-		t.Fatalf("securityverify did not improve precision: without=%.3f with=%.3f",
-			withoutVerify.Precision, withVerify.Precision)
-	}
-	if withVerify.Latency > prLensCIBudget {
-		t.Fatalf("verified PR-lens latency %s exceeds CI budget %s", withVerify.Latency, prLensCIBudget)
+	if precision < 0.75 {
+		t.Fatalf("deterministic scanner precision %.3f fell below floor 0.75 (fp=%d)", precision, metrics.FalsePositives)
 	}
 }
 
-func runSecurityEval(t *testing.T, cases []evaldata.PatchCase, withVerify bool) securityMetrics {
-	t.Helper()
-	ctx := context.Background()
-	started := time.Now()
-	var total securityMetrics
-	for _, c := range cases {
-		expected := securityExpected(c)
-		predicted := reviewerCandidates(t, ctx, c, expected)
-		if withVerify {
-			predicted = verifiedCandidates(t, ctx, predicted, expected)
+// scannerRunner adapts securityscan.Scanner to the eval.ReviewRunner interface
+// so the harness scores real scanner findings. It materializes each patch's
+// post-image on disk (the scanner reads files, diff-filtered to added lines)
+// and returns the scanner's findings verbatim.
+type scannerRunner struct {
+	scanner *securityscan.Scanner
+}
+
+func (r *scannerRunner) ReviewCase(ctx context.Context, in evaldata.RunCaseInput) (reviewengine.ReviewerOutput, error) {
+	dir, err := os.MkdirTemp("", "secscan-eval")
+	if err != nil {
+		return reviewengine.ReviewerOutput{}, err
+	}
+	defer os.RemoveAll(dir)
+
+	files, err := writePatchPostImage(dir, in.PatchDiff)
+	if err != nil {
+		return reviewengine.ReviewerOutput{}, err
+	}
+
+	// Whole-file scan of the reconstructed post-image, matching the call
+	// auditengine makes (ScanFiles(..., "")). We do not pass the diff: 29 of the
+	// 31 corpus patches have malformed hunk headers that go-gitdiff — and thus
+	// securityscan's own diff-aware line filter — reject (DRYDOCK-dfl3). An empty
+	// diff cannot fail to parse, so the returned error is always nil here.
+	scan, err := r.scanner.ScanFiles(ctx, dir, files, "")
+	if err != nil {
+		return reviewengine.ReviewerOutput{}, err
+	}
+	out := reviewengine.ReviewerOutput{Summary: "deterministic security scan"}
+	for _, f := range scan.Findings {
+		out.Findings = append(out.Findings, reviewengine.Finding{
+			Severity:    f.Severity,
+			Category:    f.Category,
+			File:        f.File,
+			Line:        f.Line,
+			Evidence:    f.Evidence,
+			Explanation: f.Description,
+			Suggestion:  f.Suggestion,
+			Confidence:  f.Confidence,
+		})
+	}
+	return out, nil
+}
+
+// writePatchPostImage reconstructs the post-image of each file in a unified
+// diff and writes it under dir, returning the changed-file paths. Added and
+// context lines are placed at their hunk's post-image line number so scanner
+// findings carry line numbers comparable to the corpus's expected labels.
+//
+// This walks the diff directly rather than via go-gitdiff because 29 of the 31
+// corpus patches carry malformed hunk-header counts that go-gitdiff rejects
+// (DRYDOCK-dfl3 — the same defect that let an unparseable diff read as a clean
+// scan on the secret-reporting path). Only the @@ start offset and the
+// +/-/space line prefixes are trusted — never the header counts — so a wrong
+// count cannot break reconstruction. This workaround is deliberately confined
+// to the test corpus; once DRYDOCK-dfl3 repairs the headers at source, replace
+// it with gitdiff.Parse rather than carrying it forward.
+func writePatchPostImage(dir, diff string) ([]string, error) {
+	hunkHeader := regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)`)
+	fileLines := map[string]map[int]string{}
+	fileMax := map[string]int{}
+	var order []string
+
+	var current string
+	lineNum := 0
+	for _, raw := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(raw, "+++ "):
+			name := strings.TrimPrefix(raw, "+++ ")
+			name = strings.TrimPrefix(name, "b/")
+			current = strings.TrimSpace(name)
+			if _, ok := fileLines[current]; !ok && current != "" && current != "/dev/null" {
+				fileLines[current] = map[int]string{}
+				order = append(order, current)
+			}
+		case strings.HasPrefix(raw, "--- "):
+			// old-file header; ignore.
+		case strings.HasPrefix(raw, "@@"):
+			if m := hunkHeader.FindStringSubmatch(raw); m != nil {
+				lineNum, _ = strconv.Atoi(m[1])
+			}
+		case strings.HasPrefix(raw, "+"):
+			if current != "" && current != "/dev/null" {
+				fileLines[current][lineNum] = raw[1:]
+				if lineNum > fileMax[current] {
+					fileMax[current] = lineNum
+				}
+			}
+			lineNum++
+		case strings.HasPrefix(raw, "-"):
+			// removed line: absent from the post-image.
+		case strings.HasPrefix(raw, "diff "), strings.HasPrefix(raw, "\\"):
+			// file separators / "\ No newline" markers.
+		default:
+			// context line (leading space or blank).
+			if current != "" && current != "/dev/null" {
+				text := raw
+				if strings.HasPrefix(raw, " ") {
+					text = raw[1:]
+				}
+				fileLines[current][lineNum] = text
+				if lineNum > fileMax[current] {
+					fileMax[current] = lineNum
+				}
+			}
+			lineNum++
 		}
-		tp, fp, fn := confusionCounts(expected, predicted)
-		total.TruePositives += tp
-		total.FalsePositives += fp
-		total.FalseNegatives += fn
 	}
-	total.Precision = metricRatio(total.TruePositives, total.TruePositives+total.FalsePositives)
-	total.Recall = metricRatio(total.TruePositives, total.TruePositives+total.FalseNegatives)
-	// Match the existing eval harness definition: the fraction of predicted
-	// findings that are false positives.
-	total.FalsePositiveRate = metricRatio(total.FalsePositives, total.TruePositives+total.FalsePositives)
-	total.Latency = time.Since(started)
-	return total
+
+	changed := make([]string, 0, len(order))
+	for _, name := range order {
+		var buf strings.Builder
+		for i := 1; i <= fileMax[name]; i++ {
+			buf.WriteString(fileLines[name][i])
+			buf.WriteByte('\n')
+		}
+		target := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(target, []byte(buf.String()), 0o644); err != nil {
+			return nil, err
+		}
+		changed = append(changed, name)
+	}
+	return changed, nil
 }
 
+// labeledSecurityCases keeps the security-relevant slice of the corpus: cases
+// that carry a security label plus the clean-code cases (no expected findings),
+// which measure the scanner's false-positive behaviour.
 func labeledSecurityCases(cases []evaldata.PatchCase) []evaldata.PatchCase {
 	selected := make([]evaldata.PatchCase, 0, len(cases))
 	for _, c := range cases {
@@ -110,6 +215,18 @@ func labeledSecurityCases(cases []evaldata.PatchCase) []evaldata.PatchCase {
 	return selected
 }
 
+// securityDataset drops non-security expected labels so the security-lens
+// metrics are scored only against security findings (the scanner emits nothing
+// else). Clean cases are preserved unchanged.
+func securityDataset(cases []evaldata.PatchCase) []evaldata.PatchCase {
+	out := make([]evaldata.PatchCase, 0, len(cases))
+	for _, c := range cases {
+		c.ExpectedFindings = securityExpected(c)
+		out = append(out, c)
+	}
+	return out
+}
+
 func securityExpected(c evaldata.PatchCase) []evaldata.ExpectedFinding {
 	var expected []evaldata.ExpectedFinding
 	for _, finding := range c.ExpectedFindings {
@@ -118,122 +235,4 @@ func securityExpected(c evaldata.PatchCase) []evaldata.ExpectedFinding {
 		}
 	}
 	return expected
-}
-
-func reviewerCandidates(t *testing.T, ctx context.Context, c evaldata.PatchCase, expected []evaldata.ExpectedFinding) []reviewengine.Finding {
-	t.Helper()
-	findings := make([]reviewengine.Finding, 0, max(1, len(expected)))
-	for _, finding := range expected {
-		findings = append(findings, reviewengine.Finding{
-			Severity: finding.Severity, Category: "security", File: finding.File, Line: finding.Line,
-			Evidence:    "attacker-controlled input reaches a sensitive sink",
-			Explanation: "reachable security vulnerability", Suggestion: "apply the relevant security control",
-			Confidence: 0.9,
-		})
-	}
-	if len(expected) == 0 {
-		findings = append(findings, reviewengine.Finding{
-			Severity: "medium", Category: "security", File: c.ChangedFiles[0], Line: 1,
-			Evidence: "security-sensitive code changed", Explanation: "possible vulnerability",
-			Suggestion: "review the change", Confidence: 0.75,
-		})
-	}
-
-	reviewJSON, err := json.Marshal(reviewengine.ReviewerOutput{
-		Summary: "deterministic security review", Findings: findings,
-	})
-	if err != nil {
-		t.Fatalf("marshal reviewer fixture for %s: %v", c.CaseID, err)
-	}
-	fake := &testutil.FakeLLM{Responses: []string{
-		`{"change_type":"security","risk_areas":["security"],"needed_context":[],"review_focus":"security","model_route":"sec70b"}`,
-		string(reviewJSON),
-	}}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	engine := reviewengine.New(reviewengine.Config{
-		Planner: reviewengine.ModelEndpoint{BaseURL: "fake://planner", Model: "planner"},
-		Sec70B:  reviewengine.ModelEndpoint{BaseURL: "fake://security", Model: "sec70b"},
-	}, fake, logger)
-	out, err := engine.Run(ctx, reviewengine.RunInput{
-		ContextBundle:   c.ContextBundle + "\n\n## patch\n" + c.PatchDiff,
-		ChangedFiles:    c.ChangedFiles,
-		ReviewerRoute:   reviewengine.RouteSec70B,
-		SkipWalkthrough: true,
-	})
-	if err != nil {
-		t.Fatalf("review case %s: %v", c.CaseID, err)
-	}
-	return out.Review.Findings
-}
-
-func verifiedCandidates(t *testing.T, ctx context.Context, candidates []reviewengine.Finding, expected []evaldata.ExpectedFinding) []reviewengine.Finding {
-	t.Helper()
-	responses := make([]string, 0, len(candidates)*2)
-	for _, candidate := range candidates {
-		if matchesAny(expected, candidate) {
-			responses = append(responses,
-				`{"refuted":false,"certain":true,"reason":"reachable and exploitable"}`,
-				`{"cwe":"CWE-20","severity":"high","confidence":0.95,"remediation":"validate and constrain untrusted input"}`,
-			)
-		} else {
-			responses = append(responses,
-				`{"refuted":true,"certain":true,"reason":"the reported path is already mitigated"}`,
-			)
-		}
-	}
-	fake := &testutil.FakeLLM{Responses: responses}
-	cfg := securityverify.Config{
-		VerifyVotes:      1,
-		VerifyEndpoint:   reviewengine.ModelEndpoint{BaseURL: "fake://verify", Model: "securityverify"},
-		ClassifyEndpoint: reviewengine.ModelEndpoint{BaseURL: "fake://classify", Model: "securityclassify"},
-	}
-	verified, err := securityverify.New(fake, cfg).Run(ctx, candidates)
-	if err != nil {
-		t.Fatalf("verify candidates: %v", err)
-	}
-	for i := range verified {
-		verified[i].Category = "security"
-	}
-	return verified
-}
-
-func confusionCounts(expected []evaldata.ExpectedFinding, predicted []reviewengine.Finding) (tp, fp, fn int) {
-	matched := make([]bool, len(expected))
-	for _, candidate := range predicted {
-		match := -1
-		for i, want := range expected {
-			if !matched[i] && want.File == candidate.File && want.Line == candidate.Line {
-				match = i
-				break
-			}
-		}
-		if match < 0 {
-			fp++
-			continue
-		}
-		matched[match] = true
-		tp++
-	}
-	for _, ok := range matched {
-		if !ok {
-			fn++
-		}
-	}
-	return tp, fp, fn
-}
-
-func matchesAny(expected []evaldata.ExpectedFinding, candidate reviewengine.Finding) bool {
-	for _, want := range expected {
-		if want.File == candidate.File && want.Line == candidate.Line {
-			return true
-		}
-	}
-	return false
-}
-
-func metricRatio(numerator, denominator int) float64 {
-	if denominator == 0 {
-		return 0
-	}
-	return float64(numerator) / float64(denominator)
 }

@@ -57,7 +57,7 @@ func (s *SQLStore) Create(ctx context.Context, p CreateParams) (Reservation, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Reservation{}, err
+		return Reservation{}, fmt.Errorf("review session: begin create transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -73,7 +73,7 @@ func (s *SQLStore) Create(ctx context.Context, p CreateParams) (Reservation, err
 	var kind, storage, manifest, diff string
 	if err := tx.QueryRowContext(ctx, `SELECT kind, storage_path, manifest_sha256, diff_sha256
 		FROM review_snapshots WHERE snapshot_id=?`, p.Snapshot.ID).Scan(&kind, &storage, &manifest, &diff); err != nil {
-		return Reservation{}, err
+		return Reservation{}, mapNotFound(err)
 	}
 	if kind != p.Snapshot.Kind || storage != p.Snapshot.StoragePath || manifest != p.Snapshot.ManifestHash || diff != p.Snapshot.DiffHash {
 		return Reservation{}, fmt.Errorf("review session: snapshot binding mismatch")
@@ -116,10 +116,10 @@ func (s *SQLStore) Create(ctx context.Context, p CreateParams) (Reservation, err
 	if _, err := tx.ExecContext(ctx, `UPDATE review_snapshots
 		SET ref_count=ref_count+1, expires_at=MAX(expires_at, ?), updated_at=? WHERE snapshot_id=?`,
 		p.ExpiresAt.Unix(), now.Unix(), p.Snapshot.ID); err != nil {
-		return Reservation{}, err
+		return Reservation{}, fmt.Errorf("review session: increment snapshot ref count: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return Reservation{}, err
+		return Reservation{}, fmt.Errorf("review session: commit create transaction: %w", err)
 	}
 	loaded, err := s.LoadForContinuation(ctx, p.ChatID)
 	if err != nil {
@@ -136,7 +136,7 @@ func (s *SQLStore) ReserveTurn(ctx context.Context, p ReserveTurnParams) (Reserv
 	now := s.now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Reservation{}, err
+		return Reservation{}, fmt.Errorf("review session: begin reserve turn transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -165,13 +165,13 @@ func (s *SQLStore) ReserveTurn(ctx context.Context, p ReserveTurnParams) (Reserv
 			return Reservation{}, ErrRequestInProgress
 		}
 		if err := tx.Commit(); err != nil {
-			return Reservation{}, err
+			return Reservation{}, fmt.Errorf("review session: commit replay reservation: %w", err)
 		}
 		session.Version = max(session.Version, existing.TurnNo)
 		return Reservation{Session: session, Turn: existing, Replay: true}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return Reservation{}, err
+		return Reservation{}, fmt.Errorf("review session: load existing turn: %w", err)
 	}
 	if session.State == StateExpired || !now.Before(session.ExpiresAt) {
 		return Reservation{}, ErrExpired
@@ -197,7 +197,7 @@ func (s *SQLStore) ReserveTurn(ctx context.Context, p ReserveTurnParams) (Reserv
 		VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?)`,
 		p.ChatID, turnNo, p.RequestID, hash, p.RequestText, p.ExpectedVersion, now.Unix())
 	if err != nil {
-		return Reservation{}, err
+		return Reservation{}, fmt.Errorf("review session: insert reserved turn: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE review_sessions
 		SET version=?, active_request_id=?, lease_id=?, expires_at=MAX(expires_at, ?), updated_at=?
@@ -205,7 +205,7 @@ func (s *SQLStore) ReserveTurn(ctx context.Context, p ReserveTurnParams) (Reserv
 		turnNo, p.RequestID, p.LeaseID, p.ExpiresAt.Unix(), now.Unix(),
 		p.ChatID, p.ExpectedVersion)
 	if err != nil {
-		return Reservation{}, err
+		return Reservation{}, fmt.Errorf("review session: reserve session turn: %w", err)
 	}
 	affected, _ := result.RowsAffected()
 	if affected != 1 {
@@ -219,10 +219,10 @@ func (s *SQLStore) ReserveTurn(ctx context.Context, p ReserveTurnParams) (Reserv
 	if _, err := tx.ExecContext(ctx, `UPDATE review_snapshots
 		SET expires_at=MAX(expires_at, ?), updated_at=? WHERE snapshot_id=?`,
 		p.ExpiresAt.Unix(), now.Unix(), session.Snapshot.ID); err != nil {
-		return Reservation{}, err
+		return Reservation{}, fmt.Errorf("review session: extend snapshot expiry: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return Reservation{}, err
+		return Reservation{}, fmt.Errorf("review session: commit reserve turn transaction: %w", err)
 	}
 	session.Version = turnNo
 	session.ActiveRequest = p.RequestID
@@ -239,7 +239,7 @@ func (s *SQLStore) AppendMessages(ctx context.Context, chatID, requestID string,
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("review session: begin append messages transaction: %w", err)
 	}
 	defer tx.Rollback()
 	var turnNo int
@@ -261,7 +261,7 @@ func (s *SQLStore) AppendMessages(ctx context.Context, chatID, requestID string,
 	var next int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq)+1, 0) FROM review_session_messages
 		WHERE chat_id=? AND turn_no=?`, chatID, turnNo).Scan(&next); err != nil {
-		return err
+		return mapNotFound(err)
 	}
 	now := s.now().UTC()
 	for i, message := range messages {
@@ -272,7 +272,10 @@ func (s *SQLStore) AppendMessages(ctx context.Context, chatID, requestID string,
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("review session: commit append messages transaction: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLStore) CompleteTurn(ctx context.Context, chatID, requestID string, result json.RawMessage) error {
@@ -294,7 +297,7 @@ func (s *SQLStore) finishTurn(ctx context.Context, chatID, requestID string, sta
 	now := s.now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("review session: begin finish turn transaction: %w", err)
 	}
 	defer tx.Rollback()
 	var turnNo int
@@ -305,7 +308,10 @@ func (s *SQLStore) finishTurn(ctx context.Context, chatID, requestID string, sta
 	}
 	if current != TurnReserved {
 		if current == status {
-			return tx.Commit()
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("review session: commit idempotent turn finish: %w", err)
+			}
+			return nil
 		}
 		return ErrInvalidTranscript
 	}
@@ -313,7 +319,7 @@ func (s *SQLStore) finishTurn(ctx context.Context, chatID, requestID string, sta
 		WHERE chat_id=? AND request_id=? AND status='reserved'`,
 		status, string(result), errorText, now.Unix(), chatID, requestID)
 	if err != nil {
-		return err
+		return fmt.Errorf("review session: update turn status: %w", err)
 	}
 	affected, _ := update.RowsAffected()
 	if affected != 1 {
@@ -327,7 +333,7 @@ func (s *SQLStore) finishTurn(ctx context.Context, chatID, requestID string, sta
 		WHERE chat_id=? AND active_request_id=? AND version=?`,
 		nextState, now.Unix(), chatID, requestID, turnNo)
 	if err != nil {
-		return err
+		return fmt.Errorf("review session: update session after turn: %w", err)
 	}
 	affected, _ = update.RowsAffected()
 	if affected != 1 {
@@ -336,14 +342,17 @@ func (s *SQLStore) finishTurn(ctx context.Context, chatID, requestID string, sta
 	if turnNo == 0 && status == TurnFailed {
 		var snapshotID string
 		if err := tx.QueryRowContext(ctx, `SELECT snapshot_id FROM review_sessions WHERE chat_id=?`, chatID).Scan(&snapshotID); err != nil {
-			return err
+			return mapNotFound(err)
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE review_snapshots SET ref_count=ref_count-1, updated_at=?
 			WHERE snapshot_id=? AND ref_count>0`, now.Unix(), snapshotID); err != nil {
-			return err
+			return fmt.Errorf("review session: decrement snapshot ref count: %w", err)
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("review session: commit finish turn transaction: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLStore) LoadForContinuation(ctx context.Context, chatID string) (Loaded, error) {
@@ -355,7 +364,7 @@ func (s *SQLStore) LoadForContinuation(ctx context.Context, chatID string) (Load
 	rows, err := s.db.QueryContext(ctx, `SELECT ordinal, kind, path, start_line, end_line, content_sha256, mandatory
 		FROM review_session_artifacts WHERE chat_id=? ORDER BY ordinal`, chatID)
 	if err != nil {
-		return Loaded{}, err
+		return Loaded{}, fmt.Errorf("review session: query session artifacts: %w", err)
 	}
 	for rows.Next() {
 		var artifact Artifact
@@ -363,19 +372,19 @@ func (s *SQLStore) LoadForContinuation(ctx context.Context, chatID string) (Load
 		if err := rows.Scan(&artifact.Ordinal, &artifact.Kind, &artifact.Path, &artifact.StartLine,
 			&artifact.EndLine, &artifact.Hash, &mandatory); err != nil {
 			rows.Close()
-			return Loaded{}, err
+			return Loaded{}, fmt.Errorf("review session: scan session artifact: %w", err)
 		}
 		artifact.Mandatory = mandatory != 0
 		loaded.Artifacts = append(loaded.Artifacts, artifact)
 	}
 	if err := rows.Close(); err != nil {
-		return Loaded{}, err
+		return Loaded{}, fmt.Errorf("review session: close session artifacts: %w", err)
 	}
 	rows, err = s.db.QueryContext(ctx, `SELECT turn_no, request_id, request_sha256, request_text,
 		expected_version, status, result_json, error_text, created_at, completed_at
 		FROM review_session_turns WHERE chat_id=? ORDER BY turn_no`, chatID)
 	if err != nil {
-		return Loaded{}, err
+		return Loaded{}, fmt.Errorf("review session: query session turns: %w", err)
 	}
 	for rows.Next() {
 		var turn Turn
@@ -384,7 +393,7 @@ func (s *SQLStore) LoadForContinuation(ctx context.Context, chatID string) (Load
 		if err := rows.Scan(&turn.TurnNo, &turn.RequestID, &turn.RequestHash, &turn.RequestText,
 			&turn.ExpectedVersion, &turn.Status, &resultText, &turn.Error, &created, &completed); err != nil {
 			rows.Close()
-			return Loaded{}, err
+			return Loaded{}, fmt.Errorf("review session: scan session turn: %w", err)
 		}
 		turn.Result = json.RawMessage(resultText)
 		turn.CreatedAt = time.Unix(created, 0).UTC()
@@ -394,13 +403,13 @@ func (s *SQLStore) LoadForContinuation(ctx context.Context, chatID string) (Load
 		loaded.Turns = append(loaded.Turns, turn)
 	}
 	if err := rows.Close(); err != nil {
-		return Loaded{}, err
+		return Loaded{}, fmt.Errorf("review session: close session turns: %w", err)
 	}
 	rows, err = s.db.QueryContext(ctx, `SELECT turn_no, seq, role, name, tool_call_id, content,
 		tool_calls_json, prompt_tokens, completion_tokens
 		FROM review_session_messages WHERE chat_id=? ORDER BY turn_no, seq`, chatID)
 	if err != nil {
-		return Loaded{}, err
+		return Loaded{}, fmt.Errorf("review session: query session messages: %w", err)
 	}
 	for rows.Next() {
 		var message Message
@@ -409,7 +418,7 @@ func (s *SQLStore) LoadForContinuation(ctx context.Context, chatID string) (Load
 			&message.ToolCallID, &message.Content, &toolCalls, &message.PromptTokens,
 			&message.CompletionTokens); err != nil {
 			rows.Close()
-			return Loaded{}, err
+			return Loaded{}, fmt.Errorf("review session: scan session message: %w", err)
 		}
 		if err := json.Unmarshal([]byte(toolCalls), &message.ToolCalls); err != nil {
 			rows.Close()
@@ -418,7 +427,7 @@ func (s *SQLStore) LoadForContinuation(ctx context.Context, chatID string) (Load
 		loaded.Messages = append(loaded.Messages, message)
 	}
 	if err := rows.Close(); err != nil {
-		return Loaded{}, err
+		return Loaded{}, fmt.Errorf("review session: close session messages: %w", err)
 	}
 	return loaded, nil
 }
@@ -427,7 +436,7 @@ func (s *SQLStore) Expire(ctx context.Context, chatID string) (string, error) {
 	now := s.now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("review session: begin expire transaction: %w", err)
 	}
 	defer tx.Rollback()
 	var state State
@@ -437,18 +446,21 @@ func (s *SQLStore) Expire(ctx context.Context, chatID string) (string, error) {
 		return "", mapNotFound(err)
 	}
 	if state == StateExpired {
-		return leaseID, tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return "", fmt.Errorf("review session: commit idempotent expire: %w", err)
+		}
+		return leaseID, nil
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE review_sessions SET state='expired', active_request_id='', updated_at=?
 		WHERE chat_id=?`, now.Unix(), chatID); err != nil {
-		return "", err
+		return "", fmt.Errorf("review session: expire session: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE review_snapshots SET ref_count=ref_count-1, updated_at=?
 		WHERE snapshot_id=? AND ref_count>0`, now.Unix(), snapshotID); err != nil {
-		return "", err
+		return "", fmt.Errorf("review session: release snapshot on expire: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return "", err
+		return "", fmt.Errorf("review session: commit expire transaction: %w", err)
 	}
 	return leaseID, nil
 }
@@ -470,19 +482,19 @@ func (s *SQLStore) MarkBroken(ctx context.Context, chatID string, cause error) e
 func (s *SQLStore) ListActive(ctx context.Context) ([]Session, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT chat_id FROM review_sessions WHERE state='active' ORDER BY chat_id`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("review session: query active sessions: %w", err)
 	}
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return nil, err
+			return nil, fmt.Errorf("review session: scan active session id: %w", err)
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("review session: close active sessions: %w", err)
 	}
 	sessions := make([]Session, 0, len(ids))
 	for _, id := range ids {
@@ -502,7 +514,7 @@ func (s *SQLStore) BindLease(ctx context.Context, chatID, leaseID string) error 
 	result, err := s.db.ExecContext(ctx, `UPDATE review_sessions SET lease_id=?, updated_at=?
 		WHERE chat_id=? AND state='active'`, leaseID, s.now().UTC().Unix(), chatID)
 	if err != nil {
-		return err
+		return fmt.Errorf("review session: bind session lease: %w", err)
 	}
 	affected, _ := result.RowsAffected()
 	if affected != 1 {
@@ -550,7 +562,7 @@ func insertMessage(ctx context.Context, tx *sql.Tx, chatID string, turnNo, seq i
 	}
 	toolCalls, err := json.Marshal(message.ToolCalls)
 	if err != nil {
-		return err
+		return fmt.Errorf("review session: encode tool calls: %w", err)
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO review_session_messages
 		(chat_id, turn_no, seq, role, name, tool_call_id, content, tool_calls_json,

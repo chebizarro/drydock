@@ -426,41 +426,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 
 	// 1d. Authorize payment-gated repositories before documentation/code indexing, context building, or LLM calls.
 	if repoCfg.Payments.Enabled {
-		if r.paymentAuth == nil {
-			return fmt.Errorf("payment_blocked:payment_service_not_configured")
-		}
-		paymentAuthorized := false
-		for attempt := 0; attempt < 3; attempt++ {
-			auth, err := r.paymentAuth.AuthorizePatch(ctx, patchEvent, task.RepoID, repoCfg.Payments)
-			if err != nil {
-				return fmt.Errorf("authorize payment: %w", err)
-			}
-			if auth.Allowed {
-				log.Info("review payment authorized",
-					"patch_event_id", task.PatchEventID,
-					"repo_id", task.RepoID,
-					"access_kind", auth.AccessKind)
-				paymentAuthorized = true
-				break
-			}
-			if pendingErr := retryablePaymentError(auth); pendingErr != nil {
-				// The worker records this canonical reason as an ordinary failed
-				// review, so the durable retry sweep can pick it up.
-				return pendingErr
-			}
-			advanced, err := r.store.MarkReviewPaymentBlocked(ctx, task.PatchEventID, task.RepoID, auth.Reason, auth.ZapReceiptCursor)
-			if err != nil {
-				return fmt.Errorf("persist payment block: %w", err)
-			}
-			if !advanced {
-				return fmt.Errorf("%w: %s", errPaymentBlockPersisted, auth.Reason)
-			}
-			log.Info("zap receipt arrived during payment authorization; retrying",
-				"patch_event_id", task.PatchEventID,
-				"repo_id", task.RepoID)
-		}
-		if !paymentAuthorized {
-			return errors.New("payment receipt churn")
+		if err := r.authorizePayment(ctx, task, patchEvent, repoCfg.Payments, log); err != nil {
+			return err
 		}
 	}
 
@@ -546,49 +513,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	var prepared *agenticreview.PreparedReview
 	releasePrepared := func() {}
 	if err := timer.Time(tracing.StageContextBuild, func() error {
-		if repoCfg.Context.TokenBudget < 0 {
-			return fmt.Errorf("invalid negative context token budget")
-		}
-		if bundle.Content != "" {
-			return nil // pipeline-owned exclusion-only decision; no model call
-		}
-		if r.agenticReviewFallback {
-			built, buildErr := r.ctxBuilder.Build(ctx, buildInput)
-			if buildErr != nil {
-				return buildErr
-			}
-			if r.agenticSvc != nil {
-				bundle, buildErr = r.agenticSvc.GateDeterministicBundle(built)
-			} else {
-				// Compatibility-only construction used by legacy embedders still
-				// receives an exact serialized-package gate; production always uses
-				// the service-owned authoritative counter above.
-				bundle, buildErr = agenttools.GateBundle(built, r.ctxBuilder.Counter, built.TokenBudget, agenttools.DefaultTokenHeadroom)
-			}
-			return buildErr
-		}
-		if r.agenticSvc == nil {
-			return fmt.Errorf("agentic review service is required unless the explicit rollout fallback is enabled")
-		}
-		var prepareErr error
-		prepared, prepareErr = r.agenticSvc.Prepare(ctx, agenticreview.PrepareInput{
-			Mode: reviewsession.ModePatch,
-			Snapshot: agenticreview.SnapshotSpec{
-				Kind: workspacesnapshot.KindPinnedGit, RepoPath: prep.RepoPath,
-				Ref: prep.ExpectedCommit, PatchRef: task.PatchEventID, Allowlist: analysis.ChangedFiles,
-			},
-			Patch: authoritativePatch, BuildInput: buildInput,
-			Target: agenticreview.TargetInput{
-				RepoID: task.RepoID, RootID: patchRec.RootID, PatchEventID: task.PatchEventID,
-				CanonicalRemoteIdentity: prep.CanonicalRemoteIdentity, BaseCommit: prep.BaseCommit,
-				TipCommit: prep.TipCommit, PreparedDiffSHA256: targetidentity.SHA256(authoritativePatch),
-			},
-		})
-		if prepareErr == nil {
-			bundle = prepared.Bundle()
-			bundle.ExcludedFiles = append([]string(nil), analysis.ExcludedFiles...)
-		}
-		return prepareErr
+		var buildErr error
+		bundle, prepared, buildErr = r.buildReviewContext(ctx, bundle, buildInput, analysis, repoCfg, prep, task, patchRec, authoritativePatch)
+		return buildErr
 	}); err != nil {
 		return fmt.Errorf("prepare agentic context: %w", err)
 	}
@@ -624,32 +551,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	// 5. Extract changed files from the context bundle (used for few-shot, engine, etc.).
 	changedFiles := bundle.ChangedFiles
 	if len(changedFiles) == 0 && len(bundle.ExcludedFiles) > 0 {
-		// All changed files were excluded by repo policy — skip LLM call and
+		// All changed files were excluded by repo policy — skip the LLM call and
 		// publish an explicit policy-skip review instead of failing.
-		if err := r.requireReactiveMonitoring(ctx, task, "pre_publication"); err != nil {
-			return err
-		}
-		reviewEventID, pubErr := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
-			PatchEventID:         task.PatchEventID,
-			RepoID:               task.RepoID,
-			Summary:              "This patch only modifies files excluded by repository review policy, so no automated review was run.",
-			Model:                "policy",
-			ContextHash:          ctxHash,
-			TargetEnvelope:       targetEnvelope,
-			ContextLayersUsed:    bundle.LayersUsed,
-			ContextLayersDropped: bundle.LayersDropped,
-			ExcludedFiles:        bundle.ExcludedFiles,
-			BaseCommit:           prep.BaseCommit,
-			TipCommit:            prep.TipCommit,
-			DiffSHA256:           prep.DiffSHA256,
-		})
-		if pubErr != nil {
-			return fmt.Errorf("publish exclusion-only review: %w", pubErr)
-		}
-		r.logger.Info("skipped LLM review (all files excluded by repo policy)",
-			"patch_event_id", task.PatchEventID, "review_event_id", reviewEventID,
-			"excluded_files", len(bundle.ExcludedFiles))
-		return nil
+		return r.publishExclusionOnlyReview(ctx, task, prep, bundle, targetEnvelope, ctxHash)
 	}
 	if len(changedFiles) == 0 {
 		// Fail closed: with no deterministic changed-file set, the reviewer
@@ -702,36 +606,8 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	var result reviewengine.RunOutput
 	if err := timer.Time(tracing.StageLLMReview, func() error {
 		var reviewErr error
-		if r.agenticReviewFallback {
-			if repoCfg.Ensemble.Enabled {
-				ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
-				result, reviewErr = r.engine.RunEnsemble(ctx, runInput, ensembleCfg)
-			} else {
-				result, reviewErr = r.engine.Run(ctx, runInput)
-			}
-		} else {
-			if prepared == nil {
-				return fmt.Errorf("agentic review preparation is missing")
-			}
-			options := agenticreview.ReviewOptions{
-				ReviewerSystemPromptOverride: promptOverride,
-				AdditionalInstructions:       repoCfg.PromptInstructions(), FewShot: fewShot,
-				SkipWalkthrough: !repoCfg.WalkthroughEnabled(),
-			}
-			if repoCfg.Ensemble.Enabled {
-				ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
-				options.Ensemble = &ensembleCfg
-			}
-			result, reviewErr = r.agenticSvc.ReviewPrepared(ctx, prepared, options)
-		}
-		if reviewErr != nil {
-			return fmt.Errorf("review engine: %w", reviewErr)
-		}
-		if repoCfg.Ensemble.Enabled {
-			log.Info("ensemble review completed",
-				"models", len(repoCfg.Ensemble.Models), "findings", len(result.Review.Findings))
-		}
-		return nil
+		result, reviewErr = r.runReview(ctx, runInput, prepared, repoCfg, log)
+		return reviewErr
 	}); err != nil {
 		return err
 	}
@@ -764,7 +640,10 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 			if err := r.repoSvc.AssertPreparedReview(ctx, prep); err != nil {
 				return fmt.Errorf("verify checkout before security scan: %w", err)
 			}
-			scanResult := r.secScanner.ScanFiles(ctx, prep.RepoPath, changedFiles, patchDiffContent)
+			scanResult, scanErr := r.secScanner.ScanFiles(ctx, prep.RepoPath, changedFiles, patchDiffContent)
+			if scanErr != nil {
+				return fmt.Errorf("security scan: %w", scanErr)
+			}
 			scanFindings = append(scanFindings, scanResult.Findings...)
 			if len(scanResult.Findings) > 0 {
 				metrics.SecurityScanFindings.Add(int64(len(scanResult.Findings)))
@@ -780,7 +659,10 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 
 	// 7b. Deduplicate scanner findings with LLM findings, then apply review policy.
 	llmFindings := append(result.Review.Findings, verifiedSecurityFindings...)
-	mergedFindings := securityscan.DeduplicateFindings(scanFindings, llmFindings)
+	mergedFindings, err := securityscan.MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		return fmt.Errorf("merge scanner findings: %w", err)
+	}
 	mergedReview := result.Review
 	mergedReview.Findings = mergedFindings
 	filteredReview := applyReviewPolicy(mergedReview, repoCfg)
@@ -915,6 +797,175 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	}
 
 	return nil
+}
+
+// authorizePayment gates payment-enabled repositories before any expensive
+// review work. It retries up to three times while a newly arrived zap receipt
+// advances the cursor mid-authorization, and persists a durable payment block —
+// the side effect the durable retry sweep depends on — when a denial is terminal.
+func (r *Runner) authorizePayment(ctx context.Context, task db.ReviewTask, patchEvent nostr.Event, payments repoconfig.PaymentsConfig, log *slog.Logger) error {
+	if r.paymentAuth == nil {
+		return fmt.Errorf("payment_blocked:payment_service_not_configured")
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		auth, err := r.paymentAuth.AuthorizePatch(ctx, patchEvent, task.RepoID, payments)
+		if err != nil {
+			return fmt.Errorf("authorize payment: %w", err)
+		}
+		if auth.Allowed {
+			log.Info("review payment authorized",
+				"patch_event_id", task.PatchEventID,
+				"repo_id", task.RepoID,
+				"access_kind", auth.AccessKind)
+			return nil
+		}
+		if pendingErr := retryablePaymentError(auth); pendingErr != nil {
+			// The worker records this canonical reason as an ordinary failed
+			// review, so the durable retry sweep can pick it up.
+			return pendingErr
+		}
+		advanced, err := r.store.MarkReviewPaymentBlocked(ctx, task.PatchEventID, task.RepoID, auth.Reason, auth.ZapReceiptCursor)
+		if err != nil {
+			return fmt.Errorf("persist payment block: %w", err)
+		}
+		if !advanced {
+			return fmt.Errorf("%w: %s", errPaymentBlockPersisted, auth.Reason)
+		}
+		log.Info("zap receipt arrived during payment authorization; retrying",
+			"patch_event_id", task.PatchEventID,
+			"repo_id", task.RepoID)
+	}
+	return errors.New("payment receipt churn")
+}
+
+// buildReviewContext assembles the review context bundle using either the
+// deterministic Builder path (agenticReviewFallback) or the agentic
+// service-owned Prepare path. When the caller has already decided the review is
+// exclusion-only (bundle.Content is set), it is a no-op. On the agentic path it
+// returns a non-nil PreparedReview whose lease the caller is responsible for
+// releasing.
+func (r *Runner) buildReviewContext(
+	ctx context.Context,
+	bundle contextbuilder.ContextBundle,
+	buildInput contextbuilder.BuildInput,
+	analysis contextbuilder.PatchAnalysisResult,
+	repoCfg repoconfig.RepoConfig,
+	prep repo.PrepareResult,
+	task db.ReviewTask,
+	patchRec db.PatchEventRecord,
+	authoritativePatch string,
+) (contextbuilder.ContextBundle, *agenticreview.PreparedReview, error) {
+	if repoCfg.Context.TokenBudget < 0 {
+		return bundle, nil, fmt.Errorf("invalid negative context token budget")
+	}
+	if bundle.Content != "" {
+		return bundle, nil, nil // pipeline-owned exclusion-only decision; no model call
+	}
+	if r.agenticReviewFallback {
+		built, buildErr := r.ctxBuilder.Build(ctx, buildInput)
+		if buildErr != nil {
+			return bundle, nil, buildErr
+		}
+		if r.agenticSvc != nil {
+			bundle, buildErr = r.agenticSvc.GateDeterministicBundle(built)
+		} else {
+			// Compatibility-only construction used by legacy embedders still
+			// receives an exact serialized-package gate; production always uses
+			// the service-owned authoritative counter above.
+			bundle, buildErr = agenttools.GateBundle(built, r.ctxBuilder.Counter, built.TokenBudget, agenttools.DefaultTokenHeadroom)
+		}
+		return bundle, nil, buildErr
+	}
+	if r.agenticSvc == nil {
+		return bundle, nil, fmt.Errorf("agentic review service is required unless the explicit rollout fallback is enabled")
+	}
+	prepared, prepareErr := r.agenticSvc.Prepare(ctx, agenticreview.PrepareInput{
+		Mode: reviewsession.ModePatch,
+		Snapshot: agenticreview.SnapshotSpec{
+			Kind: workspacesnapshot.KindPinnedGit, RepoPath: prep.RepoPath,
+			Ref: prep.ExpectedCommit, PatchRef: task.PatchEventID, Allowlist: analysis.ChangedFiles,
+		},
+		Patch: authoritativePatch, BuildInput: buildInput,
+		Target: agenticreview.TargetInput{
+			RepoID: task.RepoID, RootID: patchRec.RootID, PatchEventID: task.PatchEventID,
+			CanonicalRemoteIdentity: prep.CanonicalRemoteIdentity, BaseCommit: prep.BaseCommit,
+			TipCommit: prep.TipCommit, PreparedDiffSHA256: targetidentity.SHA256(authoritativePatch),
+		},
+	})
+	if prepareErr != nil {
+		return bundle, nil, prepareErr
+	}
+	bundle = prepared.Bundle()
+	bundle.ExcludedFiles = append([]string(nil), analysis.ExcludedFiles...)
+	return bundle, prepared, nil
+}
+
+// publishExclusionOnlyReview publishes an explicit policy-skip review for a
+// patch whose changed files were all excluded by repository review policy,
+// after re-checking the reactive-monitoring gate. No LLM call is made.
+func (r *Runner) publishExclusionOnlyReview(ctx context.Context, task db.ReviewTask, prep repo.PrepareResult, bundle contextbuilder.ContextBundle, targetEnvelope targetidentity.Envelope, ctxHash string) error {
+	if err := r.requireReactiveMonitoring(ctx, task, "pre_publication"); err != nil {
+		return err
+	}
+	reviewEventID, pubErr := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
+		PatchEventID:         task.PatchEventID,
+		RepoID:               task.RepoID,
+		Summary:              "This patch only modifies files excluded by repository review policy, so no automated review was run.",
+		Model:                "policy",
+		ContextHash:          ctxHash,
+		TargetEnvelope:       targetEnvelope,
+		ContextLayersUsed:    bundle.LayersUsed,
+		ContextLayersDropped: bundle.LayersDropped,
+		ExcludedFiles:        bundle.ExcludedFiles,
+		BaseCommit:           prep.BaseCommit,
+		TipCommit:            prep.TipCommit,
+		DiffSHA256:           prep.DiffSHA256,
+	})
+	if pubErr != nil {
+		return fmt.Errorf("publish exclusion-only review: %w", pubErr)
+	}
+	r.logger.Info("skipped LLM review (all files excluded by repo policy)",
+		"patch_event_id", task.PatchEventID, "review_event_id", reviewEventID,
+		"excluded_files", len(bundle.ExcludedFiles))
+	return nil
+}
+
+// runReview executes the LLM review using either the deterministic engine
+// (agenticReviewFallback) or the agentic service over a prepared review,
+// honoring the repository ensemble configuration in both paths.
+func (r *Runner) runReview(ctx context.Context, runInput reviewengine.RunInput, prepared *agenticreview.PreparedReview, repoCfg repoconfig.RepoConfig, log *slog.Logger) (reviewengine.RunOutput, error) {
+	var result reviewengine.RunOutput
+	var reviewErr error
+	if r.agenticReviewFallback {
+		if repoCfg.Ensemble.Enabled {
+			ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
+			result, reviewErr = r.engine.RunEnsemble(ctx, runInput, ensembleCfg)
+		} else {
+			result, reviewErr = r.engine.Run(ctx, runInput)
+		}
+	} else {
+		if prepared == nil {
+			return result, fmt.Errorf("agentic review preparation is missing")
+		}
+		options := agenticreview.ReviewOptions{
+			ReviewerSystemPromptOverride: runInput.ReviewerSystemPromptOverride,
+			AdditionalInstructions:       repoCfg.PromptInstructions(), FewShot: runInput.FewShot,
+			SkipWalkthrough: !repoCfg.WalkthroughEnabled(),
+		}
+		if repoCfg.Ensemble.Enabled {
+			ensembleCfg := repoCfg.Ensemble.ToReviewEngineEnsembleConfig()
+			options.Ensemble = &ensembleCfg
+		}
+		result, reviewErr = r.agenticSvc.ReviewPrepared(ctx, prepared, options)
+	}
+	if reviewErr != nil {
+		return result, fmt.Errorf("review engine: %w", reviewErr)
+	}
+	if repoCfg.Ensemble.Enabled {
+		log.Info("ensemble review completed",
+			"models", len(repoCfg.Ensemble.Models), "findings", len(result.Review.Findings))
+	}
+	return result, nil
 }
 
 func patchDiffForReview(patchEventID string, kind int, eventContent, preparedDiff string) (string, error) {

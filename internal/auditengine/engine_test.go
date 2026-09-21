@@ -285,8 +285,8 @@ func (m fixedAuditCodeMap) Build(context.Context, string, string) (*codemap.Map,
 
 type coverageErrorScanner struct{}
 
-func (coverageErrorScanner) ScanFiles(context.Context, string, []string, string) securityscan.ScanResult {
-	return securityscan.ScanResult{FilesScanned: 2, FilesSkipped: 1, FilesErrored: 1}
+func (coverageErrorScanner) ScanFiles(context.Context, string, []string, string) (securityscan.ScanResult, error) {
+	return securityscan.ScanResult{FilesScanned: 2, FilesSkipped: 1, FilesErrored: 1}, nil
 }
 func (coverageErrorScanner) LocateSurface(context.Context, string, []string) surface.Result {
 	return surface.Result{FilesScanned: 3, FilesSkipped: 2, FilesErrored: 2}
@@ -502,8 +502,8 @@ func (p *recordingAuditPublisher) PublishSecurityAudit(_ context.Context, input 
 
 type emptyAuditScanner struct{}
 
-func (emptyAuditScanner) ScanFiles(_ context.Context, _ string, files []string, _ string) securityscan.ScanResult {
-	return securityscan.ScanResult{FilesScanned: len(files)}
+func (emptyAuditScanner) ScanFiles(_ context.Context, _ string, files []string, _ string) (securityscan.ScanResult, error) {
+	return securityscan.ScanResult{FilesScanned: len(files)}, nil
 }
 
 func (emptyAuditScanner) LocateSurface(_ context.Context, _ string, files []string) surface.Result {

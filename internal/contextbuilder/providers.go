@@ -5,12 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 
+	"git.sharegap.net/cascadia/drydock/internal/gitexec"
 	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 	"git.sharegap.net/cascadia/drydock/internal/symbols"
 
@@ -506,13 +506,12 @@ func analyzeHistoryContent(ctx context.Context, in BuildInput) (string, error) {
 		return "", nil
 	}
 
-	args := []string{"-C", in.RepoPath, "log", "--oneline", "-n", "10", "--"}
-	args = append(args, paths...)
-	out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput()
+	args := append([]string{"log", "--oneline", "-n", "10", "--"}, paths...)
+	out, err := runGit(ctx, in.RepoPath, args...)
 	if err != nil {
-		return "", &LayerWarning{Err: fmt.Errorf("git history: %w: %s", err, strings.TrimSpace(string(out)))}
+		return "", &LayerWarning{Err: fmt.Errorf("git history: %w", err)}
 	}
-	return strings.TrimSpace(string(out)), nil
+	return out, nil
 }
 
 type projectDocsProvider struct{}
@@ -617,12 +616,11 @@ func extractImportExportLines(diff string) []string {
 }
 
 func runGit(ctx context.Context, repoPath string, args ...string) (string, error) {
-	full := append([]string{"-C", repoPath}, args...)
-	out, err := exec.CommandContext(ctx, "git", full...).CombinedOutput()
+	out, err := gitexec.Run(ctx, repoPath, args...)
 	if err != nil {
-		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out), nil
 }
 
 func isExcludedPath(path string) bool {

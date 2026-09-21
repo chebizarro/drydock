@@ -86,7 +86,10 @@ func TestMergeFindings_Deduplication(t *testing.T) {
 		ConsensusBoost: 0.10,
 	}
 
-	merged := mergeFindings(reviews, cfg, logger)
+	merged, err := mergeFindings(reviews, cfg, logger)
+	if err != nil {
+		t.Fatalf("mergeFindings error: %v", err)
+	}
 
 	if len(merged) != 1 {
 		t.Errorf("expected 1 merged finding, got %d", len(merged))
@@ -119,7 +122,10 @@ func TestMergeFindings_ConsensusBoost(t *testing.T) {
 		ConsensusBoost: 0.10,
 	}
 
-	merged := mergeFindings(reviews, cfg, logger)
+	merged, err := mergeFindings(reviews, cfg, logger)
+	if err != nil {
+		t.Fatalf("mergeFindings error: %v", err)
+	}
 
 	if len(merged) != 1 {
 		t.Errorf("expected 1 merged finding, got %d", len(merged))
@@ -151,7 +157,10 @@ func TestMergeFindings_RequireConsensus(t *testing.T) {
 		RequireConsensus: true,
 	}
 
-	merged := mergeFindings(reviews, cfg, logger)
+	merged, err := mergeFindings(reviews, cfg, logger)
+	if err != nil {
+		t.Fatalf("mergeFindings error: %v", err)
+	}
 
 	// Only the security finding should remain (reported by both)
 	if len(merged) != 1 {
@@ -179,7 +188,10 @@ func TestMergeFindings_UniqueFindings(t *testing.T) {
 		RequireConsensus: false,
 	}
 
-	merged := mergeFindings(reviews, cfg, logger)
+	merged, err := mergeFindings(reviews, cfg, logger)
+	if err != nil {
+		t.Fatalf("mergeFindings error: %v", err)
+	}
 
 	// Both unique findings should be preserved
 	if len(merged) != 2 {
@@ -200,7 +212,10 @@ func TestMergeFindings_SortOrder(t *testing.T) {
 
 	cfg := EnsembleConfig{}
 
-	merged := mergeFindings(reviews, cfg, logger)
+	merged, err := mergeFindings(reviews, cfg, logger)
+	if err != nil {
+		t.Fatalf("mergeFindings error: %v", err)
+	}
 
 	// Should be sorted: high > medium > low
 	if len(merged) != 3 {
@@ -237,13 +252,113 @@ func TestMergeFindings_ConfidenceCap(t *testing.T) {
 		ConsensusBoost: 0.20, // Would be 0.95 + 0.40 = 1.35
 	}
 
-	merged := mergeFindings(reviews, cfg, logger)
+	merged, err := mergeFindings(reviews, cfg, logger)
+	if err != nil {
+		t.Fatalf("mergeFindings error: %v", err)
+	}
 
 	if merged[0].Confidence > 1.0 {
 		t.Errorf("confidence should be capped at 1.0, got %f", merged[0].Confidence)
 	}
 	if merged[0].Confidence != 1.0 {
 		t.Errorf("expected confidence 1.0 (capped), got %f", merged[0].Confidence)
+	}
+}
+
+// TestSameFindingLocus pins the shared finding-identity predicate directly.
+// It restores the coverage lost when TestFindingKey was deleted alongside the
+// old (line/5)*5 bucket key.
+func TestSameFindingLocus(t *testing.T) {
+	base := Finding{File: "a.go", Category: "security", Line: 10}
+	cases := []struct {
+		name string
+		other Finding
+		same bool
+	}{
+		{"exact", Finding{File: "a.go", Category: "security", Line: 10}, true},
+		{"within +2", Finding{File: "a.go", Category: "security", Line: 12}, true},
+		{"within -2", Finding{File: "a.go", Category: "security", Line: 8}, true},
+		{"beyond +2", Finding{File: "a.go", Category: "security", Line: 13}, false},
+		{"beyond -2", Finding{File: "a.go", Category: "security", Line: 7}, false},
+		{"case-insensitive file/category", Finding{File: "A.GO", Category: "Security", Line: 10}, true},
+		{"different file", Finding{File: "b.go", Category: "security", Line: 10}, false},
+		{"different category", Finding{File: "a.go", Category: "style", Line: 10}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SameFindingLocus(base, tc.other); got != tc.same {
+				t.Errorf("SameFindingLocus(%v, %v) = %v, want %v", base, tc.other, got, tc.same)
+			}
+			// Identity must be symmetric.
+			if got := SameFindingLocus(tc.other, base); got != tc.same {
+				t.Errorf("SameFindingLocus reversed(%v, %v) = %v, want %v", tc.other, base, got, tc.same)
+			}
+		})
+	}
+}
+
+// TestMergeFindings_StableAnchorNoChaining is the worked example from the
+// clustering-identity fix: three findings in the same file+category at lines
+// 1/3/5 with confidences 0.5/0.9/0.7. With a stable per-cluster anchor they
+// form two clusters ({1,3} and {5}), matching the old exact-bucket behaviour.
+// The buggy version moved the anchor to the higher-confidence representative
+// (line 3) mid-pass, so line 5 fell within ±2 of it and everything chained into
+// a single cluster spanning lines 1-5. Whether two findings cluster must not
+// depend on what joined the cluster earlier or on confidence ordering.
+func TestMergeFindings_StableAnchorNoChaining(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	reviews := []modelResult{
+		{Route: RouteCoder32B, Review: ReviewerOutput{Summary: "1", Findings: []Finding{
+			{Severity: "medium", Category: "correctness", File: "a.go", Line: 1, Evidence: "line 1", Confidence: 0.50},
+			{Severity: "medium", Category: "correctness", File: "a.go", Line: 3, Evidence: "line 3", Confidence: 0.90},
+			{Severity: "medium", Category: "correctness", File: "a.go", Line: 5, Evidence: "line 5", Confidence: 0.70},
+		}}},
+	}
+
+	merged, err := mergeFindings(reviews, EnsembleConfig{ConsensusBoost: 0.10}, logger)
+	if err != nil {
+		t.Fatalf("mergeFindings error: %v", err)
+	}
+
+	if len(merged) != 2 {
+		t.Fatalf("expected 2 clusters ({1,3} and {5}), got %d: %+v", len(merged), merged)
+	}
+	lines := map[int]bool{}
+	for _, f := range merged {
+		lines[f.Line] = true
+	}
+	// The {1,3} cluster keeps the higher-confidence line-3 finding as its
+	// representative; the {5} cluster stands alone.
+	if !lines[3] || !lines[5] {
+		t.Fatalf("expected representatives at lines 3 and 5, got lines %v", lines)
+	}
+	if lines[1] {
+		t.Errorf("line 1 should have merged into the line-3 cluster, not survive on its own")
+	}
+}
+
+// TestMergeFindings_ConsensusNotSatisfiedBySingleRoute pins that consensus
+// counts *distinct* routes. Two nearby findings from one model cluster
+// together, but that single route must not satisfy RequireConsensus. The buggy
+// version appended the route per finding, so len(Models) == 2 passed the check.
+func TestMergeFindings_ConsensusNotSatisfiedBySingleRoute(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	reviews := []modelResult{
+		{Route: RouteCoder32B, Review: ReviewerOutput{Summary: "1", Findings: []Finding{
+			{Severity: "high", Category: "security", File: "a.go", Line: 5, Evidence: "first", Confidence: 0.90},
+			{Severity: "high", Category: "security", File: "a.go", Line: 6, Evidence: "second", Confidence: 0.85},
+		}}},
+	}
+
+	merged, err := mergeFindings(reviews, EnsembleConfig{ConsensusBoost: 0.10, RequireConsensus: true}, logger)
+	if err != nil {
+		t.Fatalf("mergeFindings error: %v", err)
+	}
+
+	if len(merged) != 0 {
+		t.Fatalf("expected 0 findings (single route cannot satisfy consensus), got %d: %+v", len(merged), merged)
 	}
 }
 
@@ -258,19 +373,6 @@ func TestCollectNeedsMoreContext(t *testing.T) {
 	// Should deduplicate
 	if len(result) != 3 {
 		t.Errorf("expected 3 unique context requests, got %d: %v", len(result), result)
-	}
-}
-
-func TestFindingKey(t *testing.T) {
-	f1 := Finding{File: "Main.go", Line: 10, Category: "SECURITY"}
-	f2 := Finding{File: "main.go", Line: 10, Category: "security"}
-
-	k1 := findingKey(f1)
-	k2 := findingKey(f2)
-
-	// Keys should match (case-insensitive)
-	if k1 != k2 {
-		t.Errorf("keys should match: %s vs %s", k1, k2)
 	}
 }
 

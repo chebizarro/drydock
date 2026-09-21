@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+
+	"github.com/bluekeyes/go-gitdiff/gitdiff"
 )
 
 const LayerSecurityScan = "security-scan"
@@ -35,12 +37,20 @@ func (p *Provider) Build(ctx context.Context, in contextbuilder.BuildInput) (str
 	}
 
 	// Extract changed files from the patch.
-	changedFiles := extractChangedFiles(in.PatchEventContent)
+	changedFiles, err := extractChangedFiles(in.PatchEventContent)
+	if err != nil {
+		// An unparseable diff must surface as a degraded layer, never as a
+		// silently empty (apparently clean) scan.
+		return "", &contextbuilder.LayerWarning{Err: fmt.Errorf("security scan: %w", err)}
+	}
 	if len(changedFiles) == 0 {
 		return "", nil
 	}
 
-	result := p.scanner.ScanFiles(ctx, in.RepoPath, changedFiles, in.PatchEventContent)
+	result, err := p.scanner.ScanFiles(ctx, in.RepoPath, changedFiles, in.PatchEventContent)
+	if err != nil {
+		return "", &contextbuilder.LayerWarning{Err: err}
+	}
 	if len(result.Findings) == 0 && result.FilesSkipped == 0 && result.FilesErrored == 0 {
 		return "", nil
 	}
@@ -68,18 +78,23 @@ func (p *Provider) Build(ctx context.Context, in contextbuilder.BuildInput) (str
 	return b.String(), nil
 }
 
-// extractChangedFiles extracts file paths from a unified diff.
-func extractChangedFiles(diff string) []string {
+// extractChangedFiles extracts post-image file paths from a unified diff using
+// go-gitdiff, matching the authoritative patch analysis in contextbuilder. A
+// non-empty diff that cannot be parsed returns an error rather than an empty
+// list, so an unparseable diff is never mistaken for "no files changed".
+func extractChangedFiles(diff string) ([]string, error) {
+	parsed, _, err := gitdiff.Parse(strings.NewReader(diff))
+	if err != nil {
+		return nil, fmt.Errorf("parse diff: %w", err)
+	}
 	var files []string
 	seen := make(map[string]bool)
-	for _, line := range strings.Split(diff, "\n") {
-		if strings.HasPrefix(line, "+++ b/") {
-			path := strings.TrimPrefix(line, "+++ b/")
-			if !seen[path] {
-				seen[path] = true
-				files = append(files, path)
-			}
+	for _, file := range parsed {
+		if file.NewName == "" || seen[file.NewName] {
+			continue
 		}
+		seen[file.NewName] = true
+		files = append(files, file.NewName)
 	}
-	return files
+	return files, nil
 }

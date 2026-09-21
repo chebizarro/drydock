@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"git.sharegap.net/cascadia/drydock/internal/securityscan/surface"
+
+	"github.com/bluekeyes/go-gitdiff/gitdiff"
 )
 
 // SecurityFinding represents a single security issue found by the scanner.
@@ -60,10 +62,15 @@ func NewWithRuleSets(rules, surfaceRules []Rule) *Scanner {
 
 // ScanFiles runs all applicable rules against the changed files in repoPath.
 // Only lines added in the diff (prefixed with "+") are scanned when diffContent
-// is provided, to avoid flagging pre-existing issues.
-func (s *Scanner) ScanFiles(ctx context.Context, repoPath string, changedFiles []string, diffContent string) ScanResult {
+// is provided, to avoid flagging pre-existing issues. If a diff is supplied but
+// cannot be parsed, ScanFiles returns an error rather than an empty result, so
+// an unparseable diff can never be mistaken for a clean scan.
+func (s *Scanner) ScanFiles(ctx context.Context, repoPath string, changedFiles []string, diffContent string) (ScanResult, error) {
 	// Parse the diff to extract added lines per file.
-	addedLines := ParseDiffAddedLines(diffContent)
+	addedLines, err := ParseDiffAddedLines(diffContent)
+	if err != nil {
+		return ScanResult{}, fmt.Errorf("scan files: %w", err)
+	}
 	hasDiff := diffContent != ""
 
 	result := ScanResult{
@@ -73,7 +80,7 @@ func (s *Scanner) ScanFiles(ctx context.Context, repoPath string, changedFiles [
 	for _, relPath := range changedFiles {
 		select {
 		case <-ctx.Done():
-			return result
+			return result, nil
 		default:
 		}
 
@@ -107,7 +114,7 @@ func (s *Scanner) ScanFiles(ctx context.Context, repoPath string, changedFiles [
 		result.FilesScanned++
 	}
 
-	return result
+	return result, nil
 }
 
 // LocateSurface finds security-relevant locations in the selected files.
@@ -237,71 +244,47 @@ func (s *Scanner) scanSurfaceFile(ctx context.Context, relPath, absPath string) 
 }
 
 // ParseDiffAddedLines extracts a map of file → {lineNumber: true} for all lines
-// added in the diff (lines starting with "+", excluding the "+++ b/" header).
-// The result can be reused by scanners that need to restrict findings to patch additions.
-func ParseDiffAddedLines(diffContent string) map[string]map[int]bool {
+// added in the diff, keyed by the post-image file name. Parsing goes through
+// go-gitdiff — the same parser contextbuilder uses for the authoritative patch
+// analysis — so securityscan agrees with the rest of the pipeline on which
+// lines a patch adds. A non-empty diff that cannot be parsed is returned as an
+// error, never as an empty map: callers scope their scan to added lines, so a
+// silent empty result would turn an unparseable diff into a false "clean scan".
+// The result can be reused by scanners that need to restrict findings to patch
+// additions.
+func ParseDiffAddedLines(diffContent string) (map[string]map[int]bool, error) {
 	result := make(map[string]map[int]bool)
 	if diffContent == "" {
-		return result
+		return result, nil
 	}
 
-	var currentFile string
-	var newLineNum int
+	files, _, err := gitdiff.Parse(strings.NewReader(diffContent))
+	if err != nil {
+		return nil, fmt.Errorf("parse diff: %w", err)
+	}
 
-	for _, line := range strings.Split(diffContent, "\n") {
-		if strings.HasPrefix(line, "+++ b/") {
-			currentFile = strings.TrimPrefix(line, "+++ b/")
-			continue
+	for _, file := range files {
+		if file.NewName == "" {
+			continue // pure deletion or unnamed: no added lines
 		}
-		if strings.HasPrefix(line, "--- ") {
-			continue
-		}
-		if strings.HasPrefix(line, "@@ ") {
-			// Parse hunk header: @@ -old,count +new,count @@
-			newLineNum = parseHunkNewStart(line)
-			continue
-		}
-		if currentFile == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "+") {
-			if result[currentFile] == nil {
-				result[currentFile] = make(map[int]bool)
+		for _, fragment := range file.TextFragments {
+			lineNum := fragment.NewPosition
+			for _, line := range fragment.Lines {
+				switch line.Op {
+				case gitdiff.OpAdd:
+					if result[file.NewName] == nil {
+						result[file.NewName] = make(map[int]bool)
+					}
+					result[file.NewName][int(lineNum)] = true
+					lineNum++
+				case gitdiff.OpContext:
+					lineNum++
+				case gitdiff.OpDelete:
+					// Removed line — does not exist in the post-image.
+				}
 			}
-			result[currentFile][newLineNum] = true
-			newLineNum++
-		} else if strings.HasPrefix(line, "-") {
-			// Removed line — don't advance new line counter.
-			continue
-		} else {
-			// Context line — advance new line counter.
-			newLineNum++
 		}
 	}
 
-	return result
-}
-
-// parseHunkNewStart extracts the new file start line from a hunk header.
-// Format: @@ -old,count +new,count @@
-func parseHunkNewStart(line string) int {
-	// Find "+N" after the first space.
-	plusIdx := strings.Index(line, "+")
-	if plusIdx < 0 {
-		return 1
-	}
-	rest := line[plusIdx+1:]
-	// Read digits until comma or space.
-	var num int
-	for _, c := range rest {
-		if c >= '0' && c <= '9' {
-			num = num*10 + int(c-'0')
-		} else {
-			break
-		}
-	}
-	if num == 0 {
-		return 1
-	}
-	return num
+	return result, nil
 }

@@ -82,6 +82,24 @@ func (s *recordingBetterleaksScanner) Scan(_ context.Context, req betterleaks.Sc
 	return s.result, s.err
 }
 
+type stubPaymentAuthorizer struct {
+	calls   int
+	results []payment.AuthorizeResult
+	err     error
+}
+
+func (s *stubPaymentAuthorizer) AuthorizePatch(_ context.Context, _ nostr.Event, _ string, _ repoconfig.PaymentsConfig) (payment.AuthorizeResult, error) {
+	s.calls++
+	if s.err != nil {
+		return payment.AuthorizeResult{}, s.err
+	}
+	idx := s.calls - 1
+	if idx >= len(s.results) {
+		idx = len(s.results) - 1
+	}
+	return s.results[idx], nil
+}
+
 func sensitiveScannerFinding() securityscan.SecurityFinding {
 	return securityscan.SecurityFinding{
 		RuleID: "test-secret", Severity: "high", Category: "security",
@@ -342,6 +360,87 @@ func TestCheckReviewStatusForceBypassesDraftAndClosed(t *testing.T) {
 		if err := runner.checkReviewStatus(ctx, normal, rootID, []string{"open"}); err == nil || !strings.HasPrefix(err.Error(), "status_skipped:") {
 			t.Fatalf("ordinary status %d error = %v, want status_skipped", kind, err)
 		}
+	}
+}
+
+func TestAuthorizePaymentPersistsTerminalBlockAndStopsRetrying(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedPatchForPipeline(t, ctx, store)
+
+	auth := &stubPaymentAuthorizer{results: []payment.AuthorizeResult{
+		{Allowed: false, Reason: "no_payment"},
+	}}
+	runner := &Runner{store: store, paymentAuth: auth, logger: testLogger()}
+
+	err := runner.authorizePayment(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}, nostr.Event{}, repoconfig.Default().Payments, testLogger())
+	if !errors.Is(err, errPaymentBlockPersisted) {
+		t.Fatalf("authorizePayment error = %v, want wrapped errPaymentBlockPersisted", err)
+	}
+	// A terminal denial that persists (advanced == false) must break the loop
+	// immediately rather than re-authorizing three times.
+	if auth.calls != 1 {
+		t.Fatalf("authorize attempts = %d, want 1", auth.calls)
+	}
+
+	// The durable block is the side effect the retry sweep depends on.
+	status, err := store.GetReviewStatus(ctx, patchID, repoID)
+	if err != nil {
+		t.Fatalf("get review status: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("review status = %q, want failed", status)
+	}
+	note, err := store.GetReviewNote(ctx, patchID, repoID)
+	if err != nil {
+		t.Fatalf("get review note: %v", err)
+	}
+	if !strings.Contains(note, "payment_blocked:no_payment") {
+		t.Fatalf("failure reason = %q, want payment_blocked:no_payment", note)
+	}
+}
+
+func TestAuthorizePaymentAllowedIsClean(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedPatchForPipeline(t, ctx, store)
+
+	auth := &stubPaymentAuthorizer{results: []payment.AuthorizeResult{{Allowed: true, AccessKind: "free_tier"}}}
+	runner := &Runner{store: store, paymentAuth: auth, logger: testLogger()}
+
+	if err := runner.authorizePayment(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}, nostr.Event{}, repoconfig.Default().Payments, testLogger()); err != nil {
+		t.Fatalf("authorizePayment on allowed payment = %v, want nil", err)
+	}
+	if auth.calls != 1 {
+		t.Fatalf("authorize attempts = %d, want 1", auth.calls)
+	}
+	// An authorized review must not be marked failed.
+	status, err := store.GetReviewStatus(ctx, patchID, repoID)
+	if err != nil {
+		t.Fatalf("get review status: %v", err)
+	}
+	if status != "reviewing" {
+		t.Fatalf("review status = %q, want reviewing (unchanged)", status)
+	}
+}
+
+func TestAuthorizePaymentPendingUsesRequeuePath(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedPatchForPipeline(t, ctx, store)
+
+	auth := &stubPaymentAuthorizer{results: []payment.AuthorizeResult{
+		{Allowed: false, Reason: payment.ReasonPaymentPending, Retryable: true},
+	}}
+	runner := &Runner{store: store, paymentAuth: auth, logger: testLogger()}
+
+	err := runner.authorizePayment(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}, nostr.Event{}, repoconfig.Default().Payments, testLogger())
+	if err == nil || err.Error() != payment.ReasonPaymentPending || errors.Is(err, errPaymentBlockPersisted) {
+		t.Fatalf("authorizePayment pending error = %v, want ordinary %q requeue path", err, payment.ReasonPaymentPending)
+	}
+	// The pending path must not persist a terminal block.
+	if status, err := store.GetReviewStatus(ctx, patchID, repoID); err != nil || status != "reviewing" {
+		t.Fatalf("pending payment left status %q err=%v, want reviewing", status, err)
 	}
 }
 

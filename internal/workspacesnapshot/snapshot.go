@@ -12,13 +12,15 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"git.sharegap.net/cascadia/drydock/internal/gitexec"
+	"git.sharegap.net/cascadia/drydock/internal/safepath"
 )
 
 type Kind string
@@ -29,9 +31,9 @@ const (
 )
 
 var (
-	ErrInvalidPath     = errors.New("workspace snapshot: invalid path")
-	ErrOutsideScope    = errors.New("workspace snapshot: path outside snapshot scope")
-	ErrSymlink         = errors.New("workspace snapshot: symlinks are not allowed")
+	ErrInvalidPath     = safepath.ErrInvalidPath
+	ErrOutsideScope    = safepath.ErrOutsideScope
+	ErrSymlink         = safepath.ErrSymlink
 	ErrHashMismatch    = errors.New("workspace snapshot: artifact hash mismatch")
 	ErrNotFound        = errors.New("workspace snapshot: not found")
 	ErrExpired         = errors.New("workspace snapshot: expired")
@@ -186,7 +188,7 @@ func (m *Manager) CreatePinned(ctx context.Context, opts PinnedGitOptions) (_ *S
 	if ref == "" {
 		return nil, fmt.Errorf("workspace snapshot: git ref is required")
 	}
-	commit, err := runGit(ctx, repoRoot, "rev-parse", "--verify", ref+"^{commit}")
+	commit, err := gitexec.Run(ctx, repoRoot, "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil {
 		return nil, fmt.Errorf("workspace snapshot: pin ref: %w", err)
 	}
@@ -204,13 +206,13 @@ func (m *Manager) CreatePinned(ctx context.Context, opts PinnedGitOptions) (_ *S
 		return nil, fmt.Errorf("workspace snapshot: create descriptor root: %w", err)
 	}
 	refName := "refs/drydock/snapshots/" + id
-	if _, err := runGit(ctx, repoRoot, "update-ref", refName, commit); err != nil {
+	if _, err := gitexec.Run(ctx, repoRoot, "update-ref", refName, commit); err != nil {
 		return nil, fmt.Errorf("workspace snapshot: create lease ref: %w", err)
 	}
 	committed := false
 	defer func() {
 		if !committed {
-			_, _ = runGit(context.Background(), repoRoot, "update-ref", "-d", refName)
+			_, _ = gitexec.Run(context.Background(), repoRoot, "update-ref", "-d", refName)
 			_ = os.RemoveAll(snapshotRoot)
 		}
 	}()
@@ -366,7 +368,7 @@ func (m *Manager) Restore(ctx context.Context, storagePath, expectedID, expected
 	}
 	entries := make(map[string]ManifestEntry, len(descriptor.Entries))
 	for _, entry := range descriptor.Entries {
-		path, err := normalizePath(entry.Path, false)
+		path, err := safepath.Normalize(entry.Path, false)
 		if err != nil || path != entry.Path || entry.Hash == "" {
 			return nil, ErrHashMismatch
 		}
@@ -397,7 +399,7 @@ func (m *Manager) Restore(ctx context.Context, storagePath, expectedID, expected
 		if descriptor.RepoRoot == "" || descriptor.RefName == "" {
 			return nil, ErrHashMismatch
 		}
-		resolved, err := runGit(ctx, descriptor.RepoRoot, "rev-parse", "--verify", descriptor.RefName+"^{commit}")
+		resolved, err := gitexec.Run(ctx, descriptor.RepoRoot, "rev-parse", "--verify", descriptor.RefName+"^{commit}")
 		if err != nil || strings.TrimSpace(resolved) != descriptor.Commit {
 			return nil, ErrHashMismatch
 		}
@@ -500,7 +502,7 @@ func (m *Manager) GC(ctx context.Context) ([]string, error) {
 		}
 		switch s.immutableKind {
 		case KindPinnedGit:
-			if _, err := runGit(ctx, s.repoRoot, "update-ref", "-d", s.refName); err != nil {
+			if _, err := gitexec.Run(ctx, s.repoRoot, "update-ref", "-d", s.refName); err != nil {
 				return removed, fmt.Errorf("workspace snapshot: delete lease ref: %w", err)
 			}
 			if err := os.RemoveAll(s.storagePath); err != nil {
@@ -528,7 +530,7 @@ func (m *Manager) hasActiveLeaseLocked(snapshotID string, now time.Time) bool {
 }
 
 func (s *Snapshot) ReadFile(ctx context.Context, path string) ([]byte, error) {
-	normalized, err := normalizePath(path, false)
+	normalized, err := safepath.Normalize(path, false)
 	if err != nil {
 		return nil, err
 	}
@@ -541,7 +543,7 @@ func (s *Snapshot) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	}
 	switch s.immutableKind {
 	case KindPinnedGit:
-		out, err := runGitBytes(ctx, s.repoRoot, "show", s.immutableCommit+":"+normalized)
+		out, err := gitexec.RunBytes(ctx, s.repoRoot, "show", s.immutableCommit+":"+normalized)
 		if err != nil {
 			return nil, fmt.Errorf("workspace snapshot: read pinned file: %w", err)
 		}
@@ -571,7 +573,7 @@ func (s *Snapshot) Resolve(path string) (string, error) {
 	if s.immutableKind != KindMutableCopy {
 		return "", ErrNotMaterialized
 	}
-	normalized, err := normalizePath(path, false)
+	normalized, err := safepath.Normalize(path, false)
 	if err != nil {
 		return "", err
 	}
@@ -586,7 +588,7 @@ func (s *Snapshot) Resolve(path string) (string, error) {
 	if !insideRoot(s.filesRoot, resolved) {
 		return "", ErrOutsideScope
 	}
-	if err := rejectSymlinkComponents(s.filesRoot, resolved); err != nil {
+	if err := safepath.RejectSymlinkComponents(s.filesRoot, resolved); err != nil {
 		return "", err
 	}
 	data, err := os.ReadFile(resolved)
@@ -600,7 +602,7 @@ func (s *Snapshot) Resolve(path string) (string, error) {
 }
 
 func (s *Snapshot) List(prefix string) ([]ManifestEntry, error) {
-	normalized, err := normalizePath(prefix, true)
+	normalized, err := safepath.Normalize(prefix, true)
 	if err != nil {
 		return nil, err
 	}
@@ -700,7 +702,7 @@ func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, err
 	path := ""
 	if strings.TrimSpace(req.Path) != "" {
 		var err error
-		path, err = normalizePath(req.Path, false)
+		path, err = safepath.Normalize(req.Path, false)
 		if err != nil {
 			return nil, err
 		}
@@ -718,7 +720,7 @@ func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, err
 		if path != "" {
 			return s.ReadFile(ctx, path)
 		}
-		return runGitBytes(ctx, s.repoRoot, "show", "--no-ext-diff", "--no-textconv", "--stat", "--oneline", s.immutableCommit)
+		return gitexec.RunBytes(ctx, s.repoRoot, "show", "--no-ext-diff", "--no-textconv", "--stat", "--oneline", s.immutableCommit)
 	case "log":
 		limit := req.Limit
 		if limit <= 0 {
@@ -737,7 +739,7 @@ func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, err
 				}
 			}
 		}
-		return runGitBytes(ctx, s.repoRoot, args...)
+		return gitexec.RunBytes(ctx, s.repoRoot, args...)
 	case "blame":
 		if path == "" {
 			return nil, fmt.Errorf("workspace snapshot: blame path is required")
@@ -751,7 +753,7 @@ func (s *Snapshot) GitRead(ctx context.Context, req GitReadRequest) ([]byte, err
 			args = append(args, "-L", fmt.Sprintf("%d,%d", req.StartLine, end))
 		}
 		args = append(args, s.immutableCommit, "--", path)
-		return runGitBytes(ctx, s.repoRoot, args...)
+		return gitexec.RunBytes(ctx, s.repoRoot, args...)
 	default:
 		return nil, fmt.Errorf("workspace snapshot: unsupported git action %q", req.Action)
 	}
@@ -779,7 +781,7 @@ func normalizeAllowlist(paths []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(paths))
 	var out []string
 	for _, path := range paths {
-		normalized, err := normalizePath(path, true)
+		normalized, err := safepath.Normalize(path, true)
 		if err != nil {
 			return nil, err
 		}
@@ -798,29 +800,6 @@ func normalizeAllowlist(paths []string) ([]string, error) {
 		collapsed = append(collapsed, candidate)
 	}
 	return collapsed, nil
-}
-
-func normalizePath(path string, allowDot bool) (string, error) {
-	path = strings.TrimSpace(strings.ReplaceAll(path, "\\", "/"))
-	windowsAbsolute := len(path) >= 3 &&
-		((path[0] >= 'a' && path[0] <= 'z') || (path[0] >= 'A' && path[0] <= 'Z')) &&
-		path[1] == ':' && path[2] == '/'
-	if path == "" || strings.ContainsRune(path, 0) || windowsAbsolute || filepath.IsAbs(path) || filepath.VolumeName(path) != "" {
-		return "", ErrInvalidPath
-	}
-	for _, part := range strings.Split(path, "/") {
-		if part == ".." {
-			return "", ErrInvalidPath
-		}
-	}
-	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
-	if clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
-		return "", ErrInvalidPath
-	}
-	if clean == "." && !allowDot {
-		return "", ErrInvalidPath
-	}
-	return clean, nil
 }
 
 func pathAllowed(path string, allowlist []string) bool {
@@ -940,7 +919,7 @@ func gitManifest(ctx context.Context, repoRoot, commit string, allowlist []strin
 			args = append(args, allowed)
 		}
 	}
-	out, err := runGitBytes(ctx, repoRoot, args...)
+	out, err := gitexec.RunBytes(ctx, repoRoot, args...)
 	if err != nil {
 		return nil, fmt.Errorf("workspace snapshot: read git tree: %w", err)
 	}
@@ -957,7 +936,7 @@ func gitManifest(ctx context.Context, repoRoot, commit string, allowlist []strin
 		if len(fields) != 3 {
 			return nil, fmt.Errorf("workspace snapshot: malformed git tree metadata")
 		}
-		path, err := normalizePath(string(pathBytes), false)
+		path, err := safepath.Normalize(string(pathBytes), false)
 		if err != nil {
 			return nil, err
 		}
@@ -970,7 +949,7 @@ func gitManifest(ctx context.Context, repoRoot, commit string, allowlist []strin
 		if fields[1] != "blob" {
 			continue
 		}
-		data, err := runGitBytes(ctx, repoRoot, "show", commit+":"+path)
+		data, err := gitexec.RunBytes(ctx, repoRoot, "show", commit+":"+path)
 		if err != nil {
 			return nil, err
 		}
@@ -981,25 +960,6 @@ func gitManifest(ctx context.Context, repoRoot, commit string, allowlist []strin
 		return nil, fmt.Errorf("workspace snapshot: allowlist matched no files")
 	}
 	return entries, nil
-}
-
-func rejectSymlinkComponents(root, target string) error {
-	rel, err := filepath.Rel(root, target)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return ErrOutsideScope
-	}
-	current := root
-	for _, part := range strings.Split(rel, string(filepath.Separator)) {
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%w: %s", ErrSymlink, rel)
-		}
-	}
-	return nil
 }
 
 func insideRoot(root, candidate string) bool {
@@ -1112,24 +1072,4 @@ func newID() (string, error) {
 		return "", fmt.Errorf("workspace snapshot: generate ID: %w", err)
 	}
 	return hex.EncodeToString(raw[:]), nil
-}
-
-func runGit(ctx context.Context, repo string, args ...string) (string, error) {
-	out, err := runGitBytes(ctx, repo, args...)
-	return string(out), err
-}
-
-func runGitBytes(ctx context.Context, repo string, args ...string) ([]byte, error) {
-	full := append([]string{"-C", repo}, args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
-	out, err := cmd.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return nil, fmt.Errorf("git %s: %s", strings.Join(args, " "), strings.TrimSpace(string(exitErr.Stderr)))
-		}
-		return nil, err
-	}
-	return out, nil
 }

@@ -23,6 +23,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/codemap"
 	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
 	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/gitexec"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/nostrprobe"
 	"git.sharegap.net/cascadia/drydock/internal/nostrscan"
@@ -79,7 +80,7 @@ type CodeMapBuilder interface {
 	Build(context.Context, string, string) (*codemap.Map, error)
 }
 type Scanner interface {
-	ScanFiles(context.Context, string, []string, string) securityscan.ScanResult
+	ScanFiles(context.Context, string, []string, string) (securityscan.ScanResult, error)
 	LocateSurface(context.Context, string, []string) surface.Result
 }
 type AgenticReviewer interface {
@@ -287,7 +288,10 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	files := codeMapFiles(codeMap, req.Subtree)
 
 	e.progress(ctx, auditID, "deterministic-sweep")
-	scan := e.deps.Scanner.ScanFiles(ctx, repoPath, files, "")
+	scan, err := e.deps.Scanner.ScanFiles(ctx, repoPath, files, "")
+	if err != nil {
+		return result, fmt.Errorf("deterministic security scan: %w", err)
+	}
 	surfaceResult := e.deps.Scanner.LocateSurface(ctx, repoPath, files)
 	coverage := db.SecurityAuditCoverage{
 		ScanOperationsScanned: scan.FilesScanned + surfaceResult.FilesScanned,
@@ -297,7 +301,11 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	result.ScannedFiles = scan.FilesScanned
 	result.Coverage = coverage
 	allDeterministic := scanFindings(scan.Findings)
-	allDeterministic = append(allDeterministic, e.runSCATools(ctx, repoPath, req.EnableSCA)...)
+	scaFindings, scaErr := e.runSCATools(ctx, repoPath, req.EnableSCA)
+	if scaErr != nil {
+		return result, scaErr
+	}
+	allDeterministic = append(allDeterministic, scaFindings...)
 	betterleaksRan := false
 	if req.EnableSecrets {
 		if e.deps.SecretScanner == nil {
@@ -321,7 +329,10 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		roles := auditNostrRoles(nostrProfile.Roles, req.Nostr)
 		rules := auditNostrRules(nostrscan.PresenceRulesForRoles(roles), req.Nostr)
 		nostrScanner := securityscan.NewWithRuleSets(rules, nostrscan.SurfaceRules())
-		nostrPresence := nostrScanner.ScanFiles(ctx, repoPath, files, "")
+		nostrPresence, err := nostrScanner.ScanFiles(ctx, repoPath, files, "")
+		if err != nil {
+			return result, fmt.Errorf("nostr presence scan: %w", err)
+		}
 		nostrSurfaces := nostrScanner.LocateSurface(ctx, repoPath, files)
 		coverage.ScanOperationsScanned += nostrPresence.FilesScanned + nostrSurfaces.FilesScanned
 		coverage.ScanOperationsSkipped += nostrPresence.FilesSkipped + nostrSurfaces.FilesSkipped
@@ -406,7 +417,10 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 		return result, err
 	}
 	result.ReviewedUnits = len(units)
-	verified = reviewengine.DeduplicateFindings(verified)
+	verified, err = reviewengine.DeduplicateFindings(verified)
+	if err != nil {
+		return result, fmt.Errorf("deduplicate audit findings: %w", err)
+	}
 	verified = nostrprobe.Corroborate(verified, probeEvidence)
 	result.Findings = verified
 	for _, finding := range verified {
@@ -785,7 +799,12 @@ func (e *Engine) reviewUnits(ctx context.Context, units []candidateUnit, budget 
 				if !budget.ModelReview {
 					candidates = filterSeverity(candidates, budget.MinSeverity)
 				}
-				verified, err := verifier.Run(ctx, reviewengine.DeduplicateFindings(candidates))
+				deduped, dedupeErr := reviewengine.DeduplicateFindings(candidates)
+				if dedupeErr != nil {
+					results <- unitResult{err: fmt.Errorf("deduplicate %s: %w", unit.File, dedupeErr)}
+					continue
+				}
+				verified, err := verifier.Run(ctx, deduped)
 				if err != nil {
 					results <- unitResult{err: fmt.Errorf("verify %s: %w", unit.File, err)}
 					continue
@@ -884,14 +903,14 @@ func nearbyCode(repoPath string, finding reviewengine.Finding) string {
 	return strings.Join(lines[start:end], "\n")
 }
 func gitOutput(ctx context.Context, repoPath string, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, "git", append([]string{"-C", repoPath}, args...)...).CombinedOutput()
+	out, err := gitexec.Run(ctx, repoPath, args...)
 	if err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out), nil
 }
 
-func (e *Engine) runSCATools(ctx context.Context, repoPath string, enabled bool) []reviewengine.Finding {
+func (e *Engine) runSCATools(ctx context.Context, repoPath string, enabled bool) ([]reviewengine.Finding, error) {
 	var findings []reviewengine.Finding
 	if enabled {
 		tools := []struct {
@@ -909,10 +928,14 @@ func (e *Engine) runSCATools(ctx context.Context, repoPath string, enabled bool)
 				e.logger.Warn("optional security scanner failed", "tool", name, "error", err)
 				continue
 			}
-			findings = append(findings, parseExternalFindings(name, out)...)
+			parsed, parseErr := parseExternalFindings(name, out)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse %s findings: %w", name, parseErr)
+			}
+			findings = append(findings, parsed...)
 		}
 	}
-	return findings
+	return findings, nil
 }
 func (e *Engine) availableTool(names ...string) (string, bool) {
 	for _, name := range names {
@@ -922,10 +945,10 @@ func (e *Engine) availableTool(names ...string) (string, bool) {
 	}
 	return "", false
 }
-func parseExternalFindings(tool string, data []byte) []reviewengine.Finding {
+func parseExternalFindings(tool string, data []byte) ([]reviewengine.Finding, error) {
 	var value any
 	if json.Unmarshal(data, &value) != nil {
-		return nil
+		return nil, nil
 	}
 	var findings []reviewengine.Finding
 	walkJSON(value, func(item map[string]any) {

@@ -79,7 +79,7 @@ func (s *Store) GetReviewPayment(ctx context.Context, patchEventID string) (Revi
 		&rec.ReservationAttemptID, &rec.ReservationExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
-		return ReviewPaymentRecord{}, err
+		return ReviewPaymentRecord{}, fmt.Errorf("get review payment: %w", err)
 	}
 	return rec, nil
 }
@@ -138,7 +138,7 @@ func (s *Store) UpsertPendingReviewPayment(ctx context.Context, rec ReviewPaymen
 		if isSQLiteUniqueConstraint(err) {
 			return ErrTokenHashAlreadyReserved
 		}
-		return err
+		return fmt.Errorf("upsert pending review payment: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -171,7 +171,7 @@ func (s *Store) GetReviewPaymentByTokenHash(ctx context.Context, tokenHash strin
 		&rec.ReservationAttemptID, &rec.ReservationExpiresAt, &rec.CreatedAt, &rec.UpdatedAt,
 	)
 	if err != nil {
-		return ReviewPaymentRecord{}, err
+		return ReviewPaymentRecord{}, fmt.Errorf("get review payment by token hash: %w", err)
 	}
 	return rec, nil
 }
@@ -185,7 +185,10 @@ func (s *Store) DeleteUnsubmittedReviewPayment(ctx context.Context, patchEventID
 		WHERE patch_event_id = ? AND token_hash = ? AND reservation_attempt_id = ?
 		  AND status = 'pending' AND melt_state = ''
 	`, patchEventID, tokenHash, attemptID)
-	return err
+	if err != nil {
+		return fmt.Errorf("delete unsubmitted review payment: %w", err)
+	}
+	return nil
 }
 
 // DeleteExpiredUnsubmittedReviewPayment releases one expired attempt. The
@@ -197,10 +200,13 @@ func (s *Store) DeleteExpiredUnsubmittedReviewPayment(ctx context.Context, patch
 		  AND status = 'pending' AND melt_state = '' AND reservation_expires_at <= ?
 	`, patchEventID, tokenHash, attemptID, now)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("delete expired unsubmitted review payment: %w", err)
 	}
 	rows, err := result.RowsAffected()
-	return rows == 1, err
+	if err != nil {
+		return false, fmt.Errorf("read delete expired unsubmitted review payment result: %w", err)
+	}
+	return rows == 1, nil
 }
 
 // DeleteExpiredUnsubmittedReviewPayments releases crashed pre-submission
@@ -211,9 +217,13 @@ func (s *Store) DeleteExpiredUnsubmittedReviewPayments(ctx context.Context, now 
 		WHERE status = 'pending' AND melt_state = '' AND reservation_expires_at <= ?
 	`, now)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("delete expired unsubmitted review payments: %w", err)
 	}
-	return result.RowsAffected()
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read delete expired unsubmitted review payments result: %w", err)
+	}
+	return affected, nil
 }
 
 // DeleteProvablyUnsubmittedMelt releases a submitted-intent record only when
@@ -225,7 +235,10 @@ func (s *Store) DeleteProvablyUnsubmittedMelt(ctx context.Context, patchEventID,
 		WHERE patch_event_id = ? AND token_hash = ? AND reservation_attempt_id = ? AND melt_quote_id = ?
 		AND status = 'pending' AND melt_state = 'submitted'
 	`, patchEventID, tokenHash, attemptID, quoteID)
-	return err
+	if err != nil {
+		return fmt.Errorf("delete provably unsubmitted melt: %w", err)
+	}
+	return nil
 }
 
 // ListReviewPaymentRecoveryCandidates returns a deterministic page of durable
@@ -288,7 +301,7 @@ func (s *Store) ListReviewPaymentRecoveryCandidates(ctx context.Context, afterPa
 func (s *Store) RequeueReviewAfterPayment(ctx context.Context, patchEventID string) (ReviewTask, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return ReviewTask{}, false, err
+		return ReviewTask{}, false, fmt.Errorf("begin requeue review transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -310,11 +323,11 @@ func (s *Store) RequeueReviewAfterPayment(ctx context.Context, patchEventID stri
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return ReviewTask{}, false, err
+		return ReviewTask{}, false, fmt.Errorf("read requeue review rows affected: %w", err)
 	}
 	if affected == 0 {
 		if err := tx.Commit(); err != nil {
-			return ReviewTask{}, false, err
+			return ReviewTask{}, false, fmt.Errorf("commit requeue review after payment: %w", err)
 		}
 		return ReviewTask{}, false, nil
 	}
@@ -330,7 +343,7 @@ func (s *Store) RequeueReviewAfterPayment(ctx context.Context, patchEventID stri
 		return ReviewTask{}, false, fmt.Errorf("read requeued payment review: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return ReviewTask{}, false, err
+		return ReviewTask{}, false, fmt.Errorf("commit requeue review after payment: %w", err)
 	}
 	return task, true, nil
 }
@@ -352,7 +365,7 @@ func (s *Store) MarkReviewPaymentMeltSubmitted(ctx context.Context, patchEventID
 		  AND (reservation_expires_at = 0 OR reservation_expires_at > ?)
 	`, quoteID, quoteAmount, feeReserve, now, patchEventID, tokenHash, attemptID, now)
 	if err != nil {
-		return err
+		return fmt.Errorf("mark review payment melt submitted: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -371,7 +384,10 @@ func (s *Store) MarkReviewPaymentMeltUnpaid(ctx context.Context, patchEventID st
 		UPDATE review_payments SET melt_state = 'unpaid', updated_at = ?
 		WHERE patch_event_id = ? AND status = 'pending' AND melt_state = 'submitted'
 	`, time.Now().Unix(), patchEventID)
-	return err
+	if err != nil {
+		return fmt.Errorf("mark review payment melt unpaid: %w", err)
+	}
+	return nil
 }
 
 // MarkReviewPaymentFailed durably records a definitive settlement failure.
@@ -386,18 +402,18 @@ func (s *Store) MarkReviewPaymentFailed(ctx context.Context, patchEventID string
 		)
 	`, time.Now().Unix(), patchEventID)
 	if err != nil {
-		return err
+		return fmt.Errorf("mark review payment failed: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return fmt.Errorf("read mark review payment failed result: %w", err)
 	}
 	if affected == 1 {
 		return nil
 	}
 	var meltState string
 	if err := s.db.QueryRowContext(ctx, `SELECT melt_state FROM review_payments WHERE patch_event_id=?`, patchEventID).Scan(&meltState); err != nil {
-		return err
+		return fmt.Errorf("load review payment melt state: %w", err)
 	}
 	if meltState == "failed" {
 		return nil
@@ -415,7 +431,7 @@ func (s *Store) MarkReviewPaymentTokenSpent(ctx context.Context, patchEventID st
 		WHERE patch_event_id = ? AND status = 'pending' AND melt_state IN ('submitted', 'unpaid')
 	`, now, patchEventID)
 	if err != nil {
-		return err
+		return fmt.Errorf("mark review payment token spent: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -426,7 +442,7 @@ func (s *Store) MarkReviewPaymentTokenSpent(ctx context.Context, patchEventID st
 	}
 	var status, meltState string
 	if err := s.db.QueryRowContext(ctx, `SELECT status, melt_state FROM review_payments WHERE patch_event_id = ?`, patchEventID).Scan(&status, &meltState); err != nil {
-		return err
+		return fmt.Errorf("load review payment state: %w", err)
 	}
 	if (status == "token_spent" || status == "authorized") && meltState == "paid" {
 		return nil
@@ -444,7 +460,7 @@ func (s *Store) MarkReviewPaymentAuthorized(ctx context.Context, patchEventID, a
 		WHERE patch_event_id = ? AND status = 'token_spent'
 	`, accessKind, now, patchEventID)
 	if err != nil {
-		return err
+		return fmt.Errorf("mark review payment authorized: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -500,7 +516,10 @@ func (s *Store) UpsertSubscription(ctx context.Context, authorPubkey, repoID, so
 	`, authorPubkey, repoID, sourcePatchEventID, sourceTokenHash,
 		paidAmountSats, now+extendSecs, now, now,
 		now, extendSecs, now)
-	return err
+	if err != nil {
+		return fmt.Errorf("upsert subscription: %w", err)
+	}
+	return nil
 }
 
 // FinalizePaidReview atomically creates/extends a subscription (when requested)
@@ -509,7 +528,7 @@ func (s *Store) UpsertSubscription(ctx context.Context, authorPubkey, repoID, so
 func (s *Store) FinalizePaidReview(ctx context.Context, patchEventID, tokenHash string) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("begin finalize paid review transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -525,7 +544,7 @@ func (s *Store) FinalizePaidReview(ctx context.Context, patchEventID, tokenHash 
 		&author, &repoID, &expectedAmount, &settledAmount, &subscriptionDays, &meltState,
 		&invoiceAmountMSats, &quoteAmount)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("load review payment for finalize: %w", err)
 	}
 	if storedToken == "" || storedToken != tokenHash {
 		return "", errors.New("payment token identity mismatch")
@@ -582,7 +601,7 @@ func (s *Store) FinalizePaidReview(ctx context.Context, patchEventID, tokenHash 
 		WHERE patch_event_id = ? AND token_hash = ? AND status = 'token_spent' AND melt_state = 'paid'
 	`, accessKind, time.Now().Unix(), patchEventID, tokenHash)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("authorize paid review: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -592,7 +611,7 @@ func (s *Store) FinalizePaidReview(ctx context.Context, patchEventID, tokenHash 
 		return "", fmt.Errorf("conditional payment authorization affected %d rows", rows)
 	}
 	if err := tx.Commit(); err != nil {
-		return "", err
+		return "", fmt.Errorf("commit finalize paid review: %w", err)
 	}
 	return accessKind, nil
 }
@@ -602,7 +621,7 @@ func (s *Store) FinalizePaidReview(ctx context.Context, patchEventID, tokenHash 
 func (s *Store) TryAuthorizeFreeReview(ctx context.Context, patchEventID, repoID, authorPubkey string, dailyLimit int, usageDay string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("begin free review transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -642,7 +661,7 @@ func (s *Store) TryAuthorizeFreeReview(ctx context.Context, patchEventID, repoID
 			updated_at = ?
 	`, authorPubkey, repoID, usageDay, now, now)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("increment free review usage: %w", err)
 	}
 
 	// Insert authorized payment record
@@ -658,11 +677,11 @@ func (s *Store) TryAuthorizeFreeReview(ctx context.Context, patchEventID, repoID
 			updated_at = ?
 	`, patchEventID, repoID, authorPubkey, now, now, now)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("insert free review payment: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return false, err
+		return false, fmt.Errorf("commit free review authorization: %w", err)
 	}
 	return true, nil
 }
@@ -679,7 +698,10 @@ func (s *Store) AuthorizeReviewFromSubscription(ctx context.Context, patchEventI
 		) VALUES (?, ?, ?, 'authorized', 'subscription', 'review', NULL, '', 0, '', '', 0, ?, ?)
 		ON CONFLICT(patch_event_id) DO NOTHING
 	`, patchEventID, repoID, authorPubkey, now, now)
-	return err
+	if err != nil {
+		return fmt.Errorf("authorize review from subscription: %w", err)
+	}
+	return nil
 }
 
 // IsTokenHashUsed checks if a token hash has already been used for payment.
@@ -740,7 +762,7 @@ func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignm
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return MarketplacePayoutRecord{}, false, err
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("begin complete assignment transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -791,11 +813,11 @@ func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignm
 			WHERE id = ? AND reviewer_pubkey = ? AND status = 'accepted'
 		`, completionEventID, reviewEventID, now, assignmentID, reviewerPubkey)
 		if err != nil {
-			return MarketplacePayoutRecord{}, false, err
+			return MarketplacePayoutRecord{}, false, fmt.Errorf("update completion assignment: %w", err)
 		}
 		rows, err := result.RowsAffected()
 		if err != nil {
-			return MarketplacePayoutRecord{}, false, err
+			return MarketplacePayoutRecord{}, false, fmt.Errorf("read completion transition result: %w", err)
 		}
 		if rows != 1 {
 			return MarketplacePayoutRecord{}, false, fmt.Errorf("completion transition affected %d rows", rows)
@@ -807,7 +829,7 @@ func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignm
 
 	if priceSats <= 0 {
 		if err := tx.Commit(); err != nil {
-			return MarketplacePayoutRecord{}, false, err
+			return MarketplacePayoutRecord{}, false, fmt.Errorf("commit completed assignment: %w", err)
 		}
 		return MarketplacePayoutRecord{}, false, nil
 	}
@@ -837,7 +859,7 @@ func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignm
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return MarketplacePayoutRecord{}, false, err
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("read payout allocation result: %w", err)
 	}
 	if inserted == 1 {
 		if _, err := tx.ExecContext(ctx, `
@@ -860,7 +882,7 @@ func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignm
 	}
 	rec.CompletionEventID, rec.ReviewEventID = completionEventID, reviewEventID
 	if err := tx.Commit(); err != nil {
-		return MarketplacePayoutRecord{}, false, err
+		return MarketplacePayoutRecord{}, false, fmt.Errorf("commit completed assignment payout: %w", err)
 	}
 	return rec, true, nil
 }
@@ -876,7 +898,10 @@ func getMarketplacePayoutTx(ctx context.Context, q interface {
 	`, assignmentID).Scan(&rec.AssignmentID, &rec.IdempotencyKey, &rec.AmountSats, &rec.Destination,
 		&rec.Status, &rec.PaymentHash, &rec.Preimage, &rec.FailureReason, &rec.SubmittedAt,
 		&rec.SettledAt, &rec.CreatedAt, &rec.UpdatedAt)
-	return rec, err
+	if err != nil {
+		return MarketplacePayoutRecord{}, fmt.Errorf("get marketplace payout: %w", err)
+	}
+	return rec, nil
 }
 
 // GetMarketplacePayout returns the payout for an assignment.
@@ -890,16 +915,19 @@ func (s *Store) GetMarketplacePayout(ctx context.Context, assignmentID int) (Mar
 func (s *Store) MarkMarketplacePayoutSubmitted(ctx context.Context, assignmentID int, now int64) (claimed bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("begin payout submission transaction: %w", err)
 	}
 	defer tx.Rollback()
 	var status string
 	if err := tx.QueryRowContext(ctx, "SELECT status FROM marketplace_payouts WHERE assignment_id=?", assignmentID).Scan(&status); err != nil {
-		return false, err
+		return false, fmt.Errorf("load payout status: %w", err)
 	}
 	if status != "pending" {
 		if status == "submitted" || status == "settled" || status == "failed" {
-			return false, tx.Commit()
+			if err := tx.Commit(); err != nil {
+				return false, fmt.Errorf("commit payout submission: %w", err)
+			}
+			return false, nil
 		}
 		return false, fmt.Errorf("payout %d has invalid state %s", assignmentID, status)
 	}
@@ -908,7 +936,7 @@ func (s *Store) MarkMarketplacePayoutSubmitted(ctx context.Context, assignmentID
 		WHERE assignment_id=? AND status='pending'
 	`, now, now, assignmentID)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("update payout submission: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil || rows != 1 {
@@ -922,7 +950,7 @@ func (s *Store) MarkMarketplacePayoutSubmitted(ctx context.Context, assignmentID
 		return false, fmt.Errorf("audit payout submission: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return false, err
+		return false, fmt.Errorf("commit payout submission: %w", err)
 	}
 	return true, nil
 }
@@ -953,18 +981,21 @@ func (s *Store) MarkMarketplacePayoutSettled(ctx context.Context, assignmentID i
 func (s *Store) transitionMarketplacePayout(ctx context.Context, assignmentID int, from, to, paymentHash, detail string, now, settledAt int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin payout transition transaction: %w", err)
 	}
 	defer tx.Rollback()
 	var status, storedHash, storedPreimage string
 	if err := tx.QueryRowContext(ctx, `
 		SELECT status, payment_hash, preimage FROM marketplace_payouts WHERE assignment_id = ?
 	`, assignmentID).Scan(&status, &storedHash, &storedPreimage); err != nil {
-		return err
+		return fmt.Errorf("load payout for transition: %w", err)
 	}
 	if status == to {
 		if to != "settled" || (storedHash == paymentHash && storedPreimage == detail) {
-			return tx.Commit()
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit payout transition: %w", err)
+			}
+			return nil
 		}
 		return errors.New("payout already settled with different evidence")
 	}
@@ -994,7 +1025,7 @@ func (s *Store) transitionMarketplacePayout(ctx context.Context, assignmentID in
 		return fmt.Errorf("unsupported payout state %q", to)
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("execute payout transition: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -1022,7 +1053,10 @@ func (s *Store) transitionMarketplacePayout(ctx context.Context, assignmentID in
 	`, assignmentID, from, to, paymentHash, detail, now); err != nil {
 		return fmt.Errorf("audit payout transition: %w", err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit payout transition: %w", err)
+	}
+	return nil
 }
 
 // ListMarketplacePayoutAudit returns the immutable transition history.
@@ -1033,7 +1067,7 @@ func (s *Store) ListMarketplacePayoutAudit(ctx context.Context, assignmentID int
 		FROM marketplace_payout_audit WHERE assignment_id = ? ORDER BY id
 	`, assignmentID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query payout audit: %w", err)
 	}
 	defer rows.Close()
 	var out []MarketplacePayoutAuditRecord
@@ -1041,11 +1075,14 @@ func (s *Store) ListMarketplacePayoutAudit(ctx context.Context, assignmentID int
 		var rec MarketplacePayoutAuditRecord
 		if err := rows.Scan(&rec.ID, &rec.AssignmentID, &rec.FromStatus, &rec.ToStatus,
 			&rec.CompletionEventID, &rec.PaymentHash, &rec.Detail, &rec.CreatedAt); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan payout audit record: %w", err)
 		}
 		out = append(out, rec)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate payout audit records: %w", err)
+	}
+	return out, nil
 }
 
 // isSQLiteUniqueConstraint reports whether err is a uniqueness violation, using

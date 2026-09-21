@@ -68,12 +68,15 @@ func TestSurfaceRulesDoNotProduceFindings(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "main.go", "package main\nfunc main() { exec.Command(\"worker\") }\n")
 
-	result := NewWithRules(SurfaceRules()).ScanFiles(
+	result, err := NewWithRules(SurfaceRules()).ScanFiles(
 		context.Background(),
 		dir,
 		[]string{"main.go"},
 		"",
 	)
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 	if len(result.Findings) != 0 {
 		t.Fatalf("surface locator produced %d finding(s)", len(result.Findings))
 	}

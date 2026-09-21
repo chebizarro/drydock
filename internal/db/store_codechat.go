@@ -105,11 +105,11 @@ func (s *Store) SetCodeChatResponse(ctx context.Context, eventID, response strin
 		response, eventID,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("update codechat response: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return fmt.Errorf("read codechat response update result: %w", err)
 	}
 	if affected != 1 {
 		return fmt.Errorf("stage codechat response: event %s not found", eventID)
@@ -124,11 +124,11 @@ func (s *Store) MarkCodeChatPublished(ctx context.Context, eventID string) error
 		eventID,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("update codechat published status: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return fmt.Errorf("read codechat published update result: %w", err)
 	}
 	if affected != 1 {
 		return fmt.Errorf("mark codechat published: event %s not found", eventID)
@@ -142,7 +142,10 @@ func (s *Store) MarkCodeChatFailed(ctx context.Context, eventID string) error {
 		`UPDATE codechat_turns SET status = 'failed' WHERE event_id = ?`,
 		eventID,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("mark codechat failed: %w", err)
+	}
+	return nil
 }
 
 // GetCodeChatHistory returns the recent chat turns for a user and repo.
@@ -156,7 +159,7 @@ func (s *Store) GetCodeChatHistory(ctx context.Context, senderPubKey, repoID str
 		senderPubKey, repoID, limit,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query codechat history: %w", err)
 	}
 	defer rows.Close()
 
@@ -164,7 +167,7 @@ func (s *Store) GetCodeChatHistory(ctx context.Context, senderPubKey, repoID str
 	for rows.Next() {
 		var t CodeChatTurn
 		if err := rows.Scan(&t.ID, &t.SenderPubKey, &t.EventID, &t.RepoID, &t.Question, &t.Response, &t.Status, &t.CreatedAt); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan codechat turn: %w", err)
 		}
 		turns = append(turns, t)
 	}
@@ -174,7 +177,10 @@ func (s *Store) GetCodeChatHistory(ctx context.Context, senderPubKey, repoID str
 		turns[i], turns[j] = turns[j], turns[i]
 	}
 
-	return turns, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate codechat history: %w", err)
+	}
+	return turns, nil
 }
 
 // GetLastCodeChatRepo returns the most recent repo a user chatted about.
@@ -190,5 +196,8 @@ func (s *Store) GetLastCodeChatRepo(ctx context.Context, senderPubKey string) (s
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
-	return repoID, err
+	if err != nil {
+		return "", fmt.Errorf("get last codechat repo: %w", err)
+	}
+	return repoID, nil
 }

@@ -151,7 +151,12 @@ func (s *Stage) Run(ctx context.Context, bundle contextbuilder.ContextBundle, re
 		VerifyEndpoint:   s.verifyEndpoint,
 		ClassifyEndpoint: s.classifyEndpoint,
 	}
-	verified, err := securityverify.New(s.client, verifyCfg).Run(ctx, reviewengine.DeduplicateFindings(candidates))
+	deduped, err := reviewengine.DeduplicateFindings(candidates)
+	if err != nil {
+		result.Error = fmt.Errorf("deduplicate security findings: %w", err)
+		return result
+	}
+	verified, err := securityverify.New(s.client, verifyCfg).Run(ctx, deduped)
 	if err != nil {
 		result.Error = fmt.Errorf("security verify: %w", err)
 		return result
@@ -186,7 +191,10 @@ func activateNostr(ctx context.Context, bundle contextbuilder.ContextBundle, rep
 	rules := filterNostrRules(nostrscan.PresenceRulesForRoles(roles), cfg)
 	scanner := securityscan.NewWithRuleSets(rules, nostrscan.SurfaceRules())
 	diff := extractLayer(bundle.Content, contextbuilder.LayerPatchDiff)
-	scan := scanner.ScanFiles(ctx, repoPath, bundle.ChangedFiles, diff)
+	scan, err := scanner.ScanFiles(ctx, repoPath, bundle.ChangedFiles, diff)
+	if err != nil {
+		return bundle, "", nil, fmt.Errorf("securityreview: nostr security scan: %w", err)
+	}
 	findings := filterNostrFindings(scan.Findings, roles, cfg)
 
 	if cfg.AbsenceAnalysis {

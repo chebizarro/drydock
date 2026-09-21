@@ -4,27 +4,31 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
-// DeduplicateFindings merges scanner findings with LLM findings. Non-sensitive
-// findings merge with one same-category finding on a nearby line. Sensitive
-// findings merge with every finding overlapping their expanded line span and
-// replace LLM-provided text with canonical scanner text. Unmatched scanner
-// findings are converted to reviewengine.Finding and prepended.
-func DeduplicateFindings(scanFindings []SecurityFinding, llmFindings []reviewengine.Finding) []reviewengine.Finding {
+// MergeScannerFindings merges deterministic scanner findings into the LLM
+// findings and returns one normalized set. Finding identity is decided by the shared
+// reviewengine.SameFindingLocus predicate; the merge policy on top of it is
+// this package's own:
+//   - A non-sensitive scanner finding that shares an LLM finding's identity
+//     keeps the LLM finding as the representative, upgrades its severity to the
+//     scanner's when higher, applies a corroboration confidence boost, and
+//     tags the evidence with the SAST rule ID.
+//   - A sensitive scanner finding merges with every LLM finding overlapping its
+//     expanded [Line-3, EndLine+3] span and replaces the LLM-provided text with
+//     canonical scanner text.
+//   - Unmatched scanner findings are converted to reviewengine.Finding and
+//     prepended.
+//
+// The LLM finding stays the representative deliberately: scanner findings carry
+// a flat Confidence 1.0 (DRYDOCK-uth5) even for hedged rules, so "highest
+// confidence wins" would replace richer LLM explanations with terse rule text.
+func MergeScannerFindings(scanFindings []SecurityFinding, llmFindings []reviewengine.Finding) ([]reviewengine.Finding, error) {
 	if len(scanFindings) == 0 {
-		return llmFindings
+		// Still normalize: the returned set is published, and callers rely on
+		// canonical priorities being populated regardless of which path produced it.
+		return reviewengine.NormalizeFindings(llmFindings)
 	}
 
-	// Build a lookup index for LLM findings by file.
-	type fileLineKey struct {
-		file string
-		line int
-	}
-	llmIdx := make(map[fileLineKey]int, len(llmFindings))
-	for i, f := range llmFindings {
-		llmIdx[fileLineKey{f.File, f.Line}] = i
-	}
-
-	boosted := make(map[int]bool) // indices of LLM findings that were boosted
+	boosted := make(map[int]bool) // LLM findings already merged with a scanner finding
 	var unmatched []SecurityFinding
 
 	for _, sf := range scanFindings {
@@ -49,30 +53,26 @@ func DeduplicateFindings(scanFindings []SecurityFinding, llmFindings []revieweng
 			continue
 		}
 
-		// Check exact match first, then nearby lines (±3).
-		// Only merge when the LLM finding is also in the "security" category.
-		for delta := 0; delta <= 3; delta++ {
-			for _, d := range []int{delta, -delta} {
-				key := fileLineKey{sf.File, sf.Line + d}
-				if idx, ok := llmIdx[key]; ok && !boosted[idx] && llmFindings[idx].Category == sf.Category {
-					// Boost the LLM finding's confidence.
-					if llmFindings[idx].Confidence < 0.95 {
-						llmFindings[idx].Confidence = min(llmFindings[idx].Confidence+0.15, 1.0)
-					}
-					// Upgrade severity if scanner found a higher severity.
-					if reviewengine.IsAtOrAboveSeverity(sf.Severity, llmFindings[idx].Severity) {
-						llmFindings[idx].Severity = sf.Severity
-					}
-					// Append scanner evidence as additional context.
-					llmFindings[idx].Evidence += " [SAST: " + sf.RuleID + "]"
-					boosted[idx] = true
-					matched = true
-					break
-				}
+		// Non-sensitive: fold the scanner's signal into the first LLM finding
+		// that shares the finding's identity. The LLM finding stays the base.
+		candidate := reviewengine.Finding{File: sf.File, Category: sf.Category, Line: sf.Line}
+		for idx := range llmFindings {
+			if boosted[idx] || !reviewengine.SameFindingLocus(candidate, llmFindings[idx]) {
+				continue
 			}
-			if matched {
-				break
+			// Corroboration boost: two independent methods agree.
+			if llmFindings[idx].Confidence < 0.95 {
+				llmFindings[idx].Confidence = min(llmFindings[idx].Confidence+0.15, 1.0)
 			}
+			// Upgrade severity if the scanner found a higher one.
+			if reviewengine.IsAtOrAboveSeverity(sf.Severity, llmFindings[idx].Severity) {
+				llmFindings[idx].Severity = sf.Severity
+			}
+			// Append scanner evidence as additional context.
+			llmFindings[idx].Evidence += " [SAST: " + sf.RuleID + "]"
+			boosted[idx] = true
+			matched = true
+			break
 		}
 		if !matched {
 			unmatched = append(unmatched, sf)
@@ -99,10 +99,7 @@ func DeduplicateFindings(scanFindings []SecurityFinding, llmFindings []revieweng
 		})
 	}
 	result = append(result, llmFindings...)
-	if normalized, err := reviewengine.NormalizeFindings(result); err == nil {
-		return normalized
-	}
-	return result
+	return reviewengine.NormalizeFindings(result)
 }
 
 func mergeSensitiveFinding(llmFinding *reviewengine.Finding, scannerFinding SecurityFinding) {

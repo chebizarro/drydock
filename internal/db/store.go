@@ -569,7 +569,10 @@ CREATE INDEX idx_review_payments_author_repo
 			_, err := tx.ExecContext(ctx, `UPDATE review_payments
 				SET reservation_expires_at = updated_at
 				WHERE status = 'pending' AND melt_state = '' AND reservation_expires_at = 0`)
-			return err
+			if err != nil {
+				return fmt.Errorf("release legacy payment reservations: %w", err)
+			}
+			return nil
 		},
 	},
 	{
@@ -717,7 +720,10 @@ func (s *Store) applySchemaMigration(ctx context.Context, migration schemaMigrat
 		return fmt.Errorf("check schema migration %d: %w", migration.version, err)
 	}
 	if applied > 0 {
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit schema migration %d: %w", migration.version, err)
+		}
+		return nil
 	}
 
 	if err := migration.apply(ctx, tx); err != nil {
@@ -751,7 +757,7 @@ func hasColumn(ctx context.Context, q columnQuerier, table, column string) (bool
 	}
 	rows, err := q.QueryContext(ctx, "PRAGMA table_info("+quotedTable+")")
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("query table info: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -761,14 +767,14 @@ func hasColumn(ctx context.Context, q columnQuerier, table, column string) (bool
 		var dfltValue *string
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk); err != nil {
-			return false, err
+			return false, fmt.Errorf("scan table info: %w", err)
 		}
 		if name == column {
 			return true, nil
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return false, err
+		return false, fmt.Errorf("iterate table info: %w", err)
 	}
 	return false, nil
 }
@@ -2023,7 +2029,10 @@ func (s *Store) GetRecentFewShots(ctx context.Context, limit int) ([]string, err
 		}
 		results = append(results, content)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate few shot rows: %w", err)
+	}
+	return results, nil
 }
 
 func (s *Store) PruneFewShotToCap(ctx context.Context, cap int) error {
@@ -2549,7 +2558,10 @@ func (s *Store) FetchUnconsumedPromptGaps(ctx context.Context, limit int) ([]Pro
 		}
 		gaps = append(gaps, g)
 	}
-	return gaps, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate prompt gap rows: %w", err)
+	}
+	return gaps, nil
 }
 
 // MarkPromptGapsConsumed sets consumed=1 for the given gap IDs.
@@ -2666,7 +2678,10 @@ func (s *Store) ActivatePromptVersion(ctx context.Context, id int64) error {
 		return fmt.Errorf("activate prompt version: %w", err)
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit prompt version activation: %w", err)
+	}
+	return nil
 }
 
 // RollbackPromptVersion marks a version as rolled_back and re-activates its parent.
@@ -2701,7 +2716,10 @@ func (s *Store) RollbackPromptVersion(ctx context.Context, id int64) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit prompt version rollback: %w", err)
+	}
+	return nil
 }
 
 // SetPromptVersionEvalScore records the evaluation score for a prompt version.
@@ -2757,7 +2775,10 @@ func (s *Store) SampleRecentMetaReviews(ctx context.Context, n int) ([]MetaRevie
 		}
 		samples = append(samples, s)
 	}
-	return samples, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate meta review samples: %w", err)
+	}
+	return samples, nil
 }
 
 // InsertDriftFlag marks a meta-review as exhibiting convention drift.
@@ -2793,7 +2814,10 @@ func (s *Store) GetDriftFlaggedExamples(ctx context.Context, limit int) ([]Drift
 		}
 		flags = append(flags, f)
 	}
-	return flags, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate drift flags: %w", err)
+	}
+	return flags, nil
 }
 
 // GetDriftFlaggedResponses returns response JSON and notes for flagged reviews,
@@ -2828,7 +2852,10 @@ func (s *Store) GetDriftFlaggedResponses(ctx context.Context, limit int) ([]stru
 		}
 		results = append(results, r)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate drift flagged responses: %w", err)
+	}
+	return results, nil
 }
 
 // GetLatestEvalRecall returns the recall from the most recent eval run, or 0 if none.
@@ -3014,7 +3041,10 @@ func (s *Store) GetConversationHistory(ctx context.Context, reviewEventID string
 		}
 		turns = append(turns, t)
 	}
-	return turns, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate conversation turns: %w", err)
+	}
+	return turns, nil
 }
 
 // FindReviewForReply looks up which review event a reply is targeting.

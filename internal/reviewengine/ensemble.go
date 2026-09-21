@@ -164,7 +164,10 @@ func (e *Engine) RunEnsembleWithExecutors(ctx context.Context, in RunInput, cfg 
 		return RunOutput{}, fmt.Errorf("all %d ensemble reviewer(s) failed: %s", len(models), joinErrors(errs))
 	}
 
-	merged := mergeFindings(reviews, cfg, e.logger)
+	merged, err := mergeFindings(reviews, cfg, e.logger)
+	if err != nil {
+		return RunOutput{}, fmt.Errorf("merge ensemble findings: %w", err)
+	}
 	if scope == FindingScopePatch {
 		merged, err = filterFindingsToChangedFiles(merged, in.ChangedFiles, in.TargetEnvelope,
 			in.PatchDiff, in.ContextBundle, e.logger, "ensemble")
@@ -245,47 +248,99 @@ func joinErrors(errs []error) string {
 	return strings.Join(parts, "; ")
 }
 
-// findingKey generates a deduplication key for a finding.
-// Findings are considered the same if they target the same file, line, and category.
-func findingKey(f Finding) string {
-	normalizedLine := (f.Line / 5) * 5
-	return fmt.Sprintf("%s:%d:%s", strings.ToLower(f.File), normalizedLine, strings.ToLower(f.Category))
+// SameFindingLocus reports whether two findings describe the same defect:
+// same file and category (case-insensitive), within two lines. This is the
+// single definition of finding identity, shared by mergeFindings,
+// DeduplicateFindings, and securityscan.MergeScannerFindings.
+func SameFindingLocus(a, b Finding) bool {
+	if !strings.EqualFold(a.File, b.File) || !strings.EqualFold(a.Category, b.Category) {
+		return false
+	}
+	delta := a.Line - b.Line
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= 2
 }
 
 // mergedFinding tracks a finding across multiple models.
 type mergedFinding struct {
-	Finding  Finding
+	// Anchor is the first finding seen in the cluster. Membership is decided
+	// against it and it never changes, so whether two findings cluster cannot
+	// depend on join order or which finding happened to have higher confidence.
+	Anchor Finding
+	// Finding is the representative used for explanatory fields; a
+	// higher-confidence member may replace it, but that never widens the
+	// clustering window because identity is anchored, not representative-based.
+	Finding Finding
+	// Models holds the distinct routes that contributed to the cluster.
 	Models   []ModelRoute
 	Priority Priority
 }
 
-// mergeFindings combines findings from multiple models, deduplicates by
-// (file, line, category), and applies consensus scoring.
-func mergeFindings(reviews []modelResult, cfg EnsembleConfig, logger *slog.Logger) []Finding {
+// mergeFindings combines findings from multiple models, clusters them by the
+// shared (file, category, ±2 line) window, and applies consensus scoring.
+// Cluster identity is anchored to the first finding seen (stable), while the
+// highest-confidence finding becomes the representative used for explanatory
+// fields. Every distinct contributing route is tracked so consensus boost and
+// RequireConsensus reflect how many models actually agreed.
+func mergeFindings(reviews []modelResult, cfg EnsembleConfig, logger *slog.Logger) ([]Finding, error) {
 	if len(reviews) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	// Group findings by key
-	byKey := make(map[string]*mergedFinding)
-
+	// Flatten every finding tagged with its originating route, then sort so the
+	// window clustering is deterministic (same ordering DeduplicateFindings uses).
+	type routedFinding struct {
+		finding Finding
+		route   ModelRoute
+	}
+	var flat []routedFinding
 	for _, r := range reviews {
 		for _, f := range r.Review.Findings {
-			key := findingKey(f)
-			if existing, ok := byKey[key]; ok {
-				// Finding already reported by another model — boost confidence.
-				existing.Models = append(existing.Models, r.Route)
-				existing.Priority = higherCanonicalPriority(existing.Priority, canonicalFindingPriority(f))
-				// Keep the higher-confidence representative for explanatory fields,
-				// but never let confidence downgrade the cluster's priority.
-				if f.Confidence > existing.Finding.Confidence {
-					existing.Finding = f
-				}
-			} else {
-				byKey[key] = &mergedFinding{
-					Finding: f, Models: []ModelRoute{r.Route}, Priority: canonicalFindingPriority(f),
-				}
+			flat = append(flat, routedFinding{finding: f, route: r.Route})
+		}
+	}
+	sort.SliceStable(flat, func(i, j int) bool {
+		fi, fj := flat[i].finding, flat[j].finding
+		if !strings.EqualFold(fi.File, fj.File) {
+			return strings.ToLower(fi.File) < strings.ToLower(fj.File)
+		}
+		if !strings.EqualFold(fi.Category, fj.Category) {
+			return strings.ToLower(fi.Category) < strings.ToLower(fj.Category)
+		}
+		return fi.Line < fj.Line
+	})
+
+	var clusters []*mergedFinding
+	for _, rf := range flat {
+		var cluster *mergedFinding
+		for i := len(clusters) - 1; i >= 0; i-- {
+			// Compare against the stable anchor, never the representative, so the
+			// ±2 window cannot drift as higher-confidence findings replace the
+			// representative and chain otherwise-separate clusters together.
+			if SameFindingLocus(clusters[i].Anchor, rf.finding) {
+				cluster = clusters[i]
+				break
 			}
+		}
+		if cluster == nil {
+			clusters = append(clusters, &mergedFinding{
+				Anchor: rf.finding, Finding: rf.finding,
+				Models: []ModelRoute{rf.route}, Priority: canonicalFindingPriority(rf.finding),
+			})
+			continue
+		}
+		// Count each route once: consensus means multiple *distinct* models
+		// agreed, not one model reporting two nearby findings.
+		if !containsRoute(cluster.Models, rf.route) {
+			cluster.Models = append(cluster.Models, rf.route)
+		}
+		cluster.Priority = higherCanonicalPriority(cluster.Priority, canonicalFindingPriority(rf.finding))
+		// Keep the higher-confidence representative for explanatory fields,
+		// but never let confidence downgrade the cluster's priority.
+		if rf.finding.Confidence > cluster.Finding.Confidence {
+			cluster.Finding = rf.finding
 		}
 	}
 
@@ -296,7 +351,7 @@ func mergeFindings(reviews []modelResult, cfg EnsembleConfig, logger *slog.Logge
 		consensusBoost = 0.10
 	}
 
-	for _, mf := range byKey {
+	for _, mf := range clusters {
 		// Skip if consensus required but only one model reported
 		if cfg.RequireConsensus && len(mf.Models) < 2 {
 			logger.Debug("finding dropped: no consensus",
@@ -354,16 +409,13 @@ func mergeFindings(reviews []modelResult, cfg EnsembleConfig, logger *slog.Logge
 		}
 		return result[i].Line < result[j].Line
 	})
-	if normalized, err := NormalizeFindings(result); err == nil {
-		return normalized
-	}
-	return result
+	return NormalizeFindings(result)
 }
 
 // DeduplicateFindings merges findings in the same file and category whose
 // locations are within two lines. The highest-confidence representative is
 // retained and the result uses the ensemble severity/confidence ordering.
-func DeduplicateFindings(findings []Finding) []Finding {
+func DeduplicateFindings(findings []Finding) ([]Finding, error) {
 	ordered := append([]Finding(nil), findings...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		if strings.ToLower(ordered[i].File) != strings.ToLower(ordered[j].File) {
@@ -380,10 +432,7 @@ func DeduplicateFindings(findings []Finding) []Finding {
 		merged := false
 		for i := len(result) - 1; i >= 0; i-- {
 			existing := result[i]
-			if !strings.EqualFold(existing.File, finding.File) || !strings.EqualFold(existing.Category, finding.Category) {
-				continue
-			}
-			if existing.Line-finding.Line > 2 || finding.Line-existing.Line > 2 {
+			if !SameFindingLocus(existing, finding) {
 				continue
 			}
 			priority := higherCanonicalPriority(canonicalFindingPriority(existing), canonicalFindingPriority(finding))
@@ -417,10 +466,16 @@ func DeduplicateFindings(findings []Finding) []Finding {
 		}
 		return result[i].Line < result[j].Line
 	})
-	if normalized, err := NormalizeFindings(result); err == nil {
-		return normalized
+	return NormalizeFindings(result)
+}
+
+func containsRoute(routes []ModelRoute, route ModelRoute) bool {
+	for _, r := range routes {
+		if r == route {
+			return true
+		}
 	}
-	return result
+	return false
 }
 
 func canonicalFindingPriority(f Finding) Priority {

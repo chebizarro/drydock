@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"git.sharegap.net/cascadia/drydock/internal/gitexec"
 	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 	"git.sharegap.net/cascadia/drydock/internal/symbols"
 )
@@ -176,8 +176,7 @@ type treeEntry struct {
 }
 
 func listTree(ctx context.Context, repoPath, ref string) ([]treeEntry, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "ls-tree", "-r", "-z", ref)
-	out, err := cmd.Output()
+	out, err := gitexec.RunBytes(ctx, repoPath, "ls-tree", "-r", "-z", ref)
 	if err != nil {
 		return nil, err
 	}
@@ -316,21 +315,15 @@ func writeJSONAtomic(path string, value any) error {
 }
 
 func gitOutput(ctx context.Context, repoPath string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repoPath}, args...)...)
-	out, err := cmd.CombinedOutput()
+	out, err := gitexec.Run(ctx, repoPath, args...)
 	if err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out), nil
 }
 
 func gitBlob(ctx context.Context, repoPath, hash string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "cat-file", "blob", hash)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
+	return gitexec.RunBytes(ctx, repoPath, "cat-file", "blob", hash)
 }
 
 func probablyText(data []byte) bool {

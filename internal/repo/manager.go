@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"git.sharegap.net/cascadia/drydock/internal/gitexec"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 
@@ -220,7 +221,8 @@ func (m *Manager) ensureRepoAtPath(ctx context.Context, repoPath, repoID string,
 	if err != nil {
 		return "", err
 	}
-	if out, err := exec.CommandContext(cloneCtx, "git", "clone", cloneURL, validatedPath).CombinedOutput(); err != nil {
+	cloneCmd := gitexec.Harden(exec.CommandContext(cloneCtx, "git", "clone", cloneURL, validatedPath))
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git clone %s: %w: %s", cloneURL, err, strings.TrimSpace(string(out)))
 	}
 	m.touchAccess(repoPath)
@@ -694,7 +696,7 @@ func (m *Manager) applySinglePatch(ctx context.Context, repoPath, patchContent s
 	defer cancel()
 	doneApply := metrics.TimerVec(metrics.GitOpDuration, "apply")
 	defer doneApply()
-	cmd := exec.CommandContext(applyCtx, "git", "-C", validatedPath, "apply", "--3way", "--index", "-")
+	cmd := gitexec.Command(applyCtx, validatedPath, "apply", "--3way", "--index", "-")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("open stdin: %w", err)
@@ -729,31 +731,11 @@ func (m *Manager) runGit(ctx context.Context, repoPath string, args ...string) (
 	if err != nil {
 		return "", err
 	}
-	fullArgs := append([]string{"-C", validatedPath}, args...)
-	out, err := exec.CommandContext(ctx, "git", fullArgs...).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// runGitStdout runs a git command and returns stdout only, preserving the
-// output verbatim. Use this for commands whose output is content (e.g. diff)
-// rather than a short value, so stderr warnings never contaminate it.
-func (m *Manager) runGitStdout(ctx context.Context, repoPath string, args ...string) (string, error) {
-	validatedPath, err := m.validateRepoPath(repoPath)
+	out, err := gitexec.RunBytes(ctx, validatedPath, args...)
 	if err != nil {
 		return "", err
 	}
-	fullArgs := append([]string{"-C", validatedPath}, args...)
-	cmd := exec.CommandContext(ctx, "git", fullArgs...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
-	}
-	return stdout.String(), nil
+	return strings.TrimSpace(string(out)), nil
 }
 
 // runGitNULCountLimited streams NUL-delimited stdout and terminates Git as
@@ -763,8 +745,7 @@ func (m *Manager) runGitNULCountLimited(ctx context.Context, repoPath string, li
 	if err != nil {
 		return 0, false, err
 	}
-	fullArgs := append([]string{"-C", validatedPath}, args...)
-	cmd := exec.CommandContext(ctx, "git", fullArgs...)
+	cmd := gitexec.Command(ctx, validatedPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return 0, false, err
@@ -782,8 +763,7 @@ func (m *Manager) runGitNULCountLimited(ctx context.Context, repoPath string, li
 		if n > 0 {
 			count += bytes.Count(buf[:n], []byte{0})
 			if count > limit {
-				_ = cmd.Process.Kill()
-				_ = cmd.Wait()
+				killAndWait(cmd)
 				return count, true, nil
 			}
 		}
@@ -791,13 +771,12 @@ func (m *Manager) runGitNULCountLimited(ctx context.Context, repoPath string, li
 			break
 		}
 		if readErr != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
+			killAndWait(cmd)
 			return 0, false, readErr
 		}
 	}
 	if err := cmd.Wait(); err != nil {
-		return 0, false, fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return 0, false, gitexec.WaitError(args, err, stderr.Bytes())
 	}
 	return count, false, nil
 }
@@ -809,8 +788,7 @@ func (m *Manager) runGitStdoutLimited(ctx context.Context, repoPath string, limi
 	if err != nil {
 		return "", false, err
 	}
-	fullArgs := append([]string{"-C", validatedPath}, args...)
-	cmd := exec.CommandContext(ctx, "git", fullArgs...)
+	cmd := gitexec.Command(ctx, validatedPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", false, err
@@ -822,19 +800,24 @@ func (m *Manager) runGitStdoutLimited(ctx context.Context, repoPath string, limi
 	}
 	data, readErr := io.ReadAll(io.LimitReader(stdout, limit+1))
 	if readErr != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		killAndWait(cmd)
 		return "", false, readErr
 	}
 	if int64(len(data)) > limit {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		killAndWait(cmd)
 		return "", true, nil
 	}
 	if err := cmd.Wait(); err != nil {
-		return "", false, fmt.Errorf("git %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return "", false, gitexec.WaitError(args, err, stderr.Bytes())
 	}
 	return string(data), false, nil
+}
+
+// killAndWait terminates a running git subprocess and reaps it, discarding the
+// errors that arise from killing a process we are abandoning on purpose.
+func killAndWait(cmd *exec.Cmd) {
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
 }
 
 func (m *Manager) repoPath(repoID string) string {
@@ -1218,7 +1201,7 @@ func (m *Manager) checkPatchApplies(ctx context.Context, repoPath, patch string)
 
 	applyCtx, cancel := context.WithTimeout(ctx, gitApplyTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(applyCtx, "git", "-C", validatedPath, "apply", "--check", "-")
+	cmd := gitexec.Command(applyCtx, validatedPath, "apply", "--check", "-")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -1243,7 +1226,7 @@ func (m *Manager) applyPatchContent(ctx context.Context, repoPath, patch string)
 
 	applyCtx, cancel := context.WithTimeout(ctx, gitApplyTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(applyCtx, "git", "-C", validatedPath, "apply", "--index", "-")
+	cmd := gitexec.Command(applyCtx, validatedPath, "apply", "--index", "-")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err

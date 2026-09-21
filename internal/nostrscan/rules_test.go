@@ -29,12 +29,18 @@ func TestPresenceRulesVulnerableAndFixedFixtures(t *testing.T) {
 			vulnerable := filepath.Join("testdata", "rules", tt.name, "vulnerable.ts")
 			fixed := filepath.Join("testdata", "rules", tt.name, "fixed.ts")
 
-			vulnerableResult := scanner.ScanFiles(context.Background(), ".", []string{vulnerable}, "")
+			vulnerableResult, err := scanner.ScanFiles(context.Background(), ".", []string{vulnerable}, "")
+			if err != nil {
+				t.Fatalf("scan vulnerable fixture: %v", err)
+			}
 			if !hasFinding(vulnerableResult.Findings, tt.ruleID) {
 				t.Fatalf("%s did not flag vulnerable fixture; findings: %#v", tt.ruleID, vulnerableResult.Findings)
 			}
 
-			fixedResult := scanner.ScanFiles(context.Background(), ".", []string{fixed}, "")
+			fixedResult, err := scanner.ScanFiles(context.Background(), ".", []string{fixed}, "")
+			if err != nil {
+				t.Fatalf("scan fixed fixture: %v", err)
+			}
 			if hasFinding(fixedResult.Findings, tt.ruleID) {
 				t.Fatalf("%s flagged fixed fixture; findings: %#v", tt.ruleID, fixedResult.Findings)
 			}

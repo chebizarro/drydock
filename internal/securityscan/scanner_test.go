@@ -57,7 +57,10 @@ func TestScanDetectsHardcodedAPIKey(t *testing.T) {
 const apiKey = "sk-1234567890abcdef1234567890abcdef"
 `)
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"config.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"config.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	if len(result.Findings) == 0 {
 		t.Fatal("expected at least one finding for hardcoded API key")
@@ -98,7 +101,10 @@ func TestScanDetectsHardcodedPassword(t *testing.T) {
 var password = "super_secret_password123"
 `)
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"db.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"db.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	foundSEC002 := false
 	for _, f := range result.Findings {
@@ -118,7 +124,10 @@ func TestScanDetectsPrivateKey(t *testing.T) {
 var key = "-----BEGIN RSA PRIVATE KEY-----"
 `)
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"certs.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"certs.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	foundSEC003 := false
 	for _, f := range result.Findings {
@@ -140,7 +149,10 @@ func getUser(name string) {
 }
 `)
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"query.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"query.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	foundSEC010 := false
 	for _, f := range result.Findings {
@@ -160,7 +172,10 @@ func TestScanDetectsInsecureTLS(t *testing.T) {
 var cfg = &tls.Config{InsecureSkipVerify: true}
 `)
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"http.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"http.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	foundSEC070 := false
 	for _, f := range result.Findings {
@@ -180,7 +195,10 @@ func TestScanDetectsWeakHash(t *testing.T) {
 h := md5.New()
 `)
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"hash.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"hash.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	foundSEC040 := false
 	for _, f := range result.Findings {
@@ -202,7 +220,10 @@ func main() {
 }
 `)
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"safe.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"safe.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	if len(result.Findings) != 0 {
 		t.Errorf("expected 0 findings for clean file, got %d", len(result.Findings))
@@ -224,7 +245,10 @@ import "os"
 os.system("ls")
 `)
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"test.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"test.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	for _, f := range result.Findings {
 		if f.RuleID == "SEC-021" {
@@ -257,7 +281,10 @@ const newKey = "api_key: 1234567890abcdef1234567890"
 `
 
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"config.go"}, diff)
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"config.go"}, diff)
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	// Should only flag line 10 (added), not line 5 (pre-existing).
 	for _, f := range result.Findings {
@@ -271,7 +298,10 @@ func TestScanDeletedFileNoError(t *testing.T) {
 	dir := t.TempDir()
 	// File doesn't exist — scanner should gracefully skip.
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"nonexistent.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"nonexistent.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	if len(result.Findings) != 0 {
 		t.Error("should produce no findings for nonexistent file")
@@ -291,7 +321,10 @@ func TestScanRecordsOpenErrors(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "not-a-directory", "content")
 
-	result := New().ScanFiles(context.Background(), dir, []string{"not-a-directory/file.go"}, "")
+	result, err := New().ScanFiles(context.Background(), dir, []string{"not-a-directory/file.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	if result.FilesScanned != 0 || result.FilesSkipped != 0 || result.FilesErrored != 1 {
 		t.Fatalf("unexpected counts: scanned=%d skipped=%d errored=%d", result.FilesScanned, result.FilesSkipped, result.FilesErrored)
@@ -302,7 +335,10 @@ func TestScanRecordsScannerErrors(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "oversized.go", strings.Repeat("a", 1024*1024+1))
 
-	result := New().ScanFiles(context.Background(), dir, []string{"oversized.go"}, "")
+	result, err := New().ScanFiles(context.Background(), dir, []string{"oversized.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	if result.FilesScanned != 0 || result.FilesSkipped != 0 || result.FilesErrored != 1 {
 		t.Fatalf("unexpected counts: scanned=%d skipped=%d errored=%d", result.FilesScanned, result.FilesSkipped, result.FilesErrored)
@@ -322,7 +358,10 @@ const key = "api_key: 1234567890abcdef1234567890"
 	cancel() // Cancel immediately
 
 	scanner := New()
-	result := scanner.ScanFiles(ctx, dir, []string{"a.go", "b.go"}, "")
+	result, err := scanner.ScanFiles(ctx, dir, []string{"a.go", "b.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	// Should stop early — may scan 0 or 1 files.
 	if result.FilesScanned > 1 {
@@ -330,7 +369,7 @@ const key = "api_key: 1234567890abcdef1234567890"
 	}
 }
 
-func TestDeduplicateFindings_MergesOverlap(t *testing.T) {
+func TestMergeScannerFindings_MergesOverlap(t *testing.T) {
 	scanFindings := []SecurityFinding{
 		{
 			RuleID:   "SEC-001",
@@ -352,42 +391,48 @@ func TestDeduplicateFindings_MergesOverlap(t *testing.T) {
 		},
 	}
 
-	merged := DeduplicateFindings(scanFindings, llmFindings)
+	merged, err := MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
 
 	// Should have 1 finding (merged), not 2.
 	if len(merged) != 1 {
 		t.Fatalf("expected 1 merged finding, got %d", len(merged))
 	}
 
-	// LLM finding should be boosted.
+	// The LLM finding stays the representative; the scanner's signal is folded
+	// in: confidence boosted (0.8+0.15), severity upgraded to critical, and the
+	// SAST rule ID appended to the evidence.
 	if merged[0].Confidence < 0.9 {
 		t.Errorf("confidence should be boosted, got %f", merged[0].Confidence)
 	}
-	// Severity should be upgraded to critical.
 	if merged[0].Severity != "critical" {
 		t.Errorf("severity should be upgraded to critical, got %s", merged[0].Severity)
 	}
-	// Should have SAST marker in evidence.
 	if !strings.Contains(merged[0].Evidence, "SAST: SEC-001") {
 		t.Error("merged finding should contain SAST rule reference")
 	}
 }
 
-func TestDeduplicateFindings_CategoryMismatchNoMerge(t *testing.T) {
+func TestMergeScannerFindings_CategoryMismatchNoMerge(t *testing.T) {
 	scanFindings := []SecurityFinding{
 		{RuleID: "SEC-001", Severity: "critical", Category: "security", File: "config.go", Line: 10},
 	}
 	llmFindings := []reviewengine.Finding{
 		{Severity: "medium", Category: "correctness", File: "config.go", Line: 10, Confidence: 0.8},
 	}
-	merged := DeduplicateFindings(scanFindings, llmFindings)
+	merged, err := MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
 	// Category mismatch — should NOT merge, should have 2 findings.
 	if len(merged) != 2 {
 		t.Fatalf("expected 2 findings (category mismatch), got %d", len(merged))
 	}
 }
 
-func TestDeduplicateFindings_NearbyLineMatch(t *testing.T) {
+func TestMergeScannerFindings_NearbyLineMatch(t *testing.T) {
 	scanFindings := []SecurityFinding{
 		{RuleID: "SEC-010", Severity: "high", Category: "security", File: "db.go", Line: 42},
 	}
@@ -395,18 +440,44 @@ func TestDeduplicateFindings_NearbyLineMatch(t *testing.T) {
 		{Severity: "medium", Category: "security", File: "db.go", Line: 44, Confidence: 0.7},
 	}
 
-	merged := DeduplicateFindings(scanFindings, llmFindings)
+	merged, err := MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
 
-	// Line 42 and 44 are within ±3, should merge.
+	// Line 42 and 44 are within the shared ±2 identity window, so they merge.
 	if len(merged) != 1 {
 		t.Fatalf("expected 1 merged finding (nearby line), got %d", len(merged))
 	}
+	if merged[0].Severity != "high" {
+		t.Errorf("severity should be upgraded to high, got %s", merged[0].Severity)
+	}
 	if !strings.Contains(merged[0].Evidence, "SAST") {
-		t.Error("nearby-line match should still merge")
+		t.Error("nearby-line match should fold in the scanner signal")
 	}
 }
 
-func TestDeduplicateFindings_UnmatchedPrepended(t *testing.T) {
+func TestMergeScannerFindings_OutsideWindowNoMerge(t *testing.T) {
+	// Three lines apart is outside the shared ±2 identity window, so the scanner
+	// finding does not merge into the LLM finding (this asserts the narrowed
+	// window — the old scanner path used ±3).
+	scanFindings := []SecurityFinding{
+		{RuleID: "SEC-010", Severity: "high", Category: "security", File: "db.go", Line: 42},
+	}
+	llmFindings := []reviewengine.Finding{
+		{Severity: "medium", Category: "security", File: "db.go", Line: 45, Confidence: 0.7},
+	}
+
+	merged, err := MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
+	if len(merged) != 2 {
+		t.Fatalf("expected 2 findings (outside ±2 window), got %d", len(merged))
+	}
+}
+
+func TestMergeScannerFindings_UnmatchedPrepended(t *testing.T) {
 	scanFindings := []SecurityFinding{
 		{RuleID: "SEC-070", Severity: "high", Category: "security", File: "http.go", Line: 5},
 	}
@@ -414,7 +485,10 @@ func TestDeduplicateFindings_UnmatchedPrepended(t *testing.T) {
 		{Severity: "medium", Category: "correctness", File: "main.go", Line: 100, Confidence: 0.6},
 	}
 
-	merged := DeduplicateFindings(scanFindings, llmFindings)
+	merged, err := MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
 
 	// Should have 2 findings — scanner finding prepended.
 	if len(merged) != 2 {
@@ -431,7 +505,7 @@ func TestDeduplicateFindings_UnmatchedPrepended(t *testing.T) {
 	}
 }
 
-func TestDeduplicateFindings_SensitiveMatchCanonicalizesSpan(t *testing.T) {
+func TestMergeScannerFindings_SensitiveMatchCanonicalizesSpan(t *testing.T) {
 	scanFindings := []SecurityFinding{
 		{
 			RuleID:      "SECRET-001",
@@ -462,7 +536,10 @@ func TestDeduplicateFindings_SensitiveMatchCanonicalizesSpan(t *testing.T) {
 		},
 	}
 
-	merged := DeduplicateFindings(scanFindings, llmFindings)
+	merged, err := MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
 	if len(merged) != 1 {
 		t.Fatalf("expected 1 merged finding, got %d", len(merged))
 	}
@@ -480,7 +557,7 @@ func TestDeduplicateFindings_SensitiveMatchCanonicalizesSpan(t *testing.T) {
 	}
 }
 
-func TestDeduplicateFindings_SensitiveUnmatched(t *testing.T) {
+func TestMergeScannerFindings_SensitiveUnmatched(t *testing.T) {
 	scanFindings := []SecurityFinding{
 		{
 			RuleID:      "SECRET-002",
@@ -497,7 +574,10 @@ func TestDeduplicateFindings_SensitiveUnmatched(t *testing.T) {
 		},
 	}
 
-	merged := DeduplicateFindings(scanFindings, nil)
+	merged, err := MergeScannerFindings(scanFindings, nil)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
 	if len(merged) != 1 {
 		t.Fatalf("expected 1 unmatched scanner finding, got %d", len(merged))
 	}
@@ -509,7 +589,7 @@ func TestDeduplicateFindings_SensitiveUnmatched(t *testing.T) {
 	}
 }
 
-func TestDeduplicateFindings_SensitiveCategoryMismatchMerges(t *testing.T) {
+func TestMergeScannerFindings_SensitiveCategoryMismatchMerges(t *testing.T) {
 	scanFindings := []SecurityFinding{
 		{
 			RuleID:      "SECRET-003",
@@ -529,7 +609,10 @@ func TestDeduplicateFindings_SensitiveCategoryMismatchMerges(t *testing.T) {
 		{Severity: "medium", Category: "correctness", File: "config.go", Line: 21, Evidence: "raw", Confidence: 0.8},
 	}
 
-	merged := DeduplicateFindings(scanFindings, llmFindings)
+	merged, err := MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
 	if len(merged) != 1 {
 		t.Fatalf("expected category mismatch to merge, got %d findings", len(merged))
 	}
@@ -538,7 +621,7 @@ func TestDeduplicateFindings_SensitiveCategoryMismatchMerges(t *testing.T) {
 	}
 }
 
-func TestDeduplicateFindings_SensitiveMatchesMultipleOverlaps(t *testing.T) {
+func TestMergeScannerFindings_SensitiveMatchesMultipleOverlaps(t *testing.T) {
 	scanFindings := []SecurityFinding{
 		{
 			RuleID:      "SECRET-004",
@@ -559,7 +642,10 @@ func TestDeduplicateFindings_SensitiveMatchesMultipleOverlaps(t *testing.T) {
 		{Severity: "medium", Category: "correctness", File: "config.go", Line: 15, Evidence: "raw second", Confidence: 0.8},
 	}
 
-	merged := DeduplicateFindings(scanFindings, llmFindings)
+	merged, err := MergeScannerFindings(scanFindings, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
 	if len(merged) != 2 {
 		t.Fatalf("expected both overlapping LLM findings to merge, got %d findings", len(merged))
 	}
@@ -573,12 +659,15 @@ func TestDeduplicateFindings_SensitiveMatchesMultipleOverlaps(t *testing.T) {
 	}
 }
 
-func TestDeduplicateFindings_EmptyScan(t *testing.T) {
+func TestMergeScannerFindings_EmptyScan(t *testing.T) {
 	llmFindings := []reviewengine.Finding{
 		{Severity: "medium", File: "main.go", Line: 1},
 	}
 
-	merged := DeduplicateFindings(nil, llmFindings)
+	merged, err := MergeScannerFindings(nil, llmFindings)
+	if err != nil {
+		t.Fatalf("MergeScannerFindings error: %v", err)
+	}
 	if len(merged) != 1 {
 		t.Fatalf("expected 1 finding, got %d", len(merged))
 	}
@@ -600,15 +689,20 @@ func TestParseDiffAddedLines(t *testing.T) {
 +++ b/first.go
 @@ -8,2 +10,3 @@
  context
+-removed
 +first addition
 +second addition
 diff --git a/second.go b/second.go
 --- a/second.go
 +++ b/second.go
 @@ -1 +3 @@
+-old line
 +third addition
 `
-	got := ParseDiffAddedLines(diff)
+	got, err := ParseDiffAddedLines(diff)
+	if err != nil {
+		t.Fatalf("ParseDiffAddedLines: %v", err)
+	}
 	for file, lines := range map[string][]int{
 		"first.go":  {11, 12},
 		"second.go": {3},
@@ -621,6 +715,92 @@ diff --git a/second.go b/second.go
 	}
 	if got["first.go"][10] {
 		t.Fatalf("context line was reported as added: %#v", got["first.go"])
+	}
+}
+
+func TestParseDiffAddedLines_MalformedDiffErrors(t *testing.T) {
+	// A diff whose hunk header line counts do not match its body is unparseable.
+	// Such a diff must surface as an error, never as an empty (apparently clean)
+	// result — otherwise a diff-scoped scan silently reports nothing found.
+	diff := "diff --git a/f.go b/f.go\n" +
+		"--- a/f.go\n" +
+		"+++ b/f.go\n" +
+		"@@ -1,5 +1,5 @@\n" +
+		"+only one line\n"
+
+	got, err := ParseDiffAddedLines(diff)
+	if err == nil {
+		t.Fatalf("expected an error for an unparseable diff, got result %#v", got)
+	}
+	if got != nil {
+		t.Errorf("expected nil result on parse error, got %#v", got)
+	}
+}
+
+func TestScanFiles_UnparseableDiffErrors(t *testing.T) {
+	// The same invariant at the ScanFiles boundary: a supplied-but-unparseable
+	// diff must return an error rather than a zero-finding ScanResult.
+	dir := t.TempDir()
+	writeFile(t, dir, "config.go", "package main\nconst apiKey = \"AKIAIOSFODNN7EXAMPLE\"\n")
+	diff := "diff --git a/config.go b/config.go\n" +
+		"--- a/config.go\n" +
+		"+++ b/config.go\n" +
+		"@@ -1,5 +1,5 @@\n" +
+		"+only one line\n"
+
+	_, err := New().ScanFiles(context.Background(), dir, []string{"config.go"}, diff)
+	if err == nil {
+		t.Fatal("expected ScanFiles to error on an unparseable diff, got nil")
+	}
+}
+
+func TestParseDiffAddedLines_NoNewlineAtEOFDoesNotDrift(t *testing.T) {
+	// A '\ No newline at end of file' marker must not advance the new-line
+	// counter. The old hand-rolled parser treated it as a context line, so
+	// every added line after it was attributed one line too high.
+	diff := "diff --git a/f.go b/f.go\n" +
+		"--- a/f.go\n" +
+		"+++ b/f.go\n" +
+		"@@ -1 +1,2 @@\n" +
+		"-foo\n" +
+		"\\ No newline at end of file\n" +
+		"+foo\n" +
+		"+bar\n" +
+		"\\ No newline at end of file\n"
+
+	got, err := ParseDiffAddedLines(diff)
+	if err != nil {
+		t.Fatalf("ParseDiffAddedLines: %v", err)
+	}
+	if !got["f.go"][1] {
+		t.Errorf("added line 1 missing (attribution drifted): %#v", got["f.go"])
+	}
+	if !got["f.go"][2] {
+		t.Errorf("added line 2 missing: %#v", got["f.go"])
+	}
+	if got["f.go"][3] {
+		t.Errorf("line 3 was reported as added (drift past no-newline marker): %#v", got["f.go"])
+	}
+}
+
+func TestParseDiffAddedLines_NoPrefix(t *testing.T) {
+	// 'git diff --no-prefix' emits headers without the a//b/ prefix. The old
+	// parser only recognized '+++ b/', so it never set the current file and
+	// silently skipped the whole diff.
+	diff := "diff --git f.go f.go\n" +
+		"index e69de29..0000001 100644\n" +
+		"--- f.go\n" +
+		"+++ f.go\n" +
+		"@@ -0,0 +1,2 @@\n" +
+		"+package main\n" +
+		"+var x = 1\n"
+
+	got, err := ParseDiffAddedLines(diff)
+	if err != nil {
+		t.Fatalf("ParseDiffAddedLines: %v", err)
+	}
+	if !got["f.go"][1] || !got["f.go"][2] {
+		t.Fatalf("no-prefix diff was skipped entirely: %#v", got)
 	}
 }
 
@@ -642,24 +822,6 @@ func TestSecurityFindingMetadataJSONRoundTrip(t *testing.T) {
 	}
 	if got.EndLine != want.EndLine || got.Sensitive != want.Sensitive {
 		t.Fatalf("metadata round trip = %+v, want end_line=%d sensitive=%t", got, want.EndLine, want.Sensitive)
-	}
-}
-
-func TestParseHunkNewStart(t *testing.T) {
-	tests := []struct {
-		line     string
-		expected int
-	}{
-		{"@@ -1,5 +1,7 @@", 1},
-		{"@@ -10,3 +15,5 @@", 15},
-		{"@@ -0,0 +1,10 @@ package main", 1},
-		{"@@ -5 +5 @@", 5},
-	}
-	for _, tc := range tests {
-		got := parseHunkNewStart(tc.line)
-		if got != tc.expected {
-			t.Errorf("parseHunkNewStart(%q) = %d, want %d", tc.line, got, tc.expected)
-		}
 	}
 }
 
@@ -685,7 +847,10 @@ func TestEvidenceTruncation(t *testing.T) {
 	writeFile(t, dir, "long.go", "package main\n"+longLine+"\n")
 
 	scanner := New()
-	result := scanner.ScanFiles(context.Background(), dir, []string{"long.go"}, "")
+	result, err := scanner.ScanFiles(context.Background(), dir, []string{"long.go"}, "")
+	if err != nil {
+		t.Fatalf("ScanFiles: %v", err)
+	}
 
 	for _, f := range result.Findings {
 		if len(f.Evidence) > 210 { // 200 + "..."

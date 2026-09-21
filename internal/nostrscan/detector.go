@@ -8,12 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+
+	"git.sharegap.net/cascadia/drydock/internal/gitexec"
 )
 
 const (
@@ -216,7 +217,7 @@ type treeFile struct {
 }
 
 func gitFiles(ctx context.Context, repoPath, ref string) ([]treeFile, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoPath, "ls-tree", "-r", "-z", ref).Output()
+	out, err := gitexec.RunBytes(ctx, repoPath, "ls-tree", "-r", "-z", ref)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +265,7 @@ func scanPath(path string) bool {
 }
 
 func gitBlob(ctx context.Context, repoPath, hash string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "cat-file", "blob", hash)
+	cmd := gitexec.Command(ctx, repoPath, "cat-file", "blob", hash)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -615,10 +616,9 @@ func lineAt(data []byte, offset int) int {
 }
 
 func gitOutput(ctx context.Context, repoPath string, args ...string) (string, error) {
-	cmdArgs := append([]string{"-C", repoPath}, args...)
-	out, err := exec.CommandContext(ctx, "git", cmdArgs...).CombinedOutput()
+	out, err := gitexec.Run(ctx, repoPath, args...)
 	if err != nil {
-		return "", fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
+		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out), nil
 }

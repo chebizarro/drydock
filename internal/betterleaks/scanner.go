@@ -141,7 +141,10 @@ func (s *commandScanner) Scan(ctx context.Context, req ScanRequest) (ScanResult,
 		return ScanResult{}, fmt.Errorf("betterleaks: parse JSON report: %w", err)
 	}
 
-	addedLines := securityscan.ParseDiffAddedLines(req.Diff)
+	addedLines, err := securityscan.ParseDiffAddedLines(req.Diff)
+	if err != nil {
+		return ScanResult{}, fmt.Errorf("betterleaks: parse diff: %w", err)
+	}
 	patchMode := req.Diff != ""
 	findings := make([]securityscan.SecurityFinding, 0, len(report))
 	for i, raw := range report {

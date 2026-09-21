@@ -75,7 +75,10 @@ func TestConsensusPreservesHighestPriorityAcrossConfidence(t *testing.T) {
 		}}}},
 	}
 	for _, ordered := range [][]modelResult{reviews, {reviews[1], reviews[0]}} {
-		got := mergeFindings(ordered, EnsembleConfig{}, slog.Default())
+		got, err := mergeFindings(ordered, EnsembleConfig{}, slog.Default())
+		if err != nil {
+			t.Fatalf("mergeFindings error: %v", err)
+		}
 		if len(got) != 1 || got[0].Priority != PriorityP0 || got[0].Severity != "critical" || got[0].Confidence != 1.0 {
 			t.Fatalf("consensus downgraded canonical priority: %+v", got)
 		}
@@ -83,10 +86,13 @@ func TestConsensusPreservesHighestPriorityAcrossConfidence(t *testing.T) {
 }
 
 func TestDeduplicateFindingsPreservesHighestPriority(t *testing.T) {
-	got := DeduplicateFindings([]Finding{
+	got, err := DeduplicateFindings([]Finding{
 		{Priority: PriorityP0, Severity: "critical", File: "same.go", Category: "security", Line: 10, Confidence: 0.61},
 		{Priority: PriorityP1, Severity: "high", File: "same.go", Category: "security", Line: 11, Confidence: 0.99},
 	})
+	if err != nil {
+		t.Fatalf("DeduplicateFindings error: %v", err)
+	}
 	if len(got) != 1 || got[0].Priority != PriorityP0 || got[0].Severity != "critical" || got[0].Confidence != 0.99 {
 		t.Fatalf("deduplication downgraded canonical priority: %+v", got)
 	}
@@ -101,7 +107,10 @@ func TestConsensusSortRecognizesCanonicalPriorities(t *testing.T) {
 			{Priority: PriorityP1, Severity: "high", File: "p1.go", Category: "correctness", Line: 1, Confidence: 0.80},
 		}},
 	}}
-	got := mergeFindings(reviews, EnsembleConfig{}, slog.Default())
+	got, err := mergeFindings(reviews, EnsembleConfig{}, slog.Default())
+	if err != nil {
+		t.Fatalf("mergeFindings error: %v", err)
+	}
 	if len(got) != 3 || got[0].Priority != PriorityP0 || got[1].Priority != PriorityP1 || got[2].Priority != PriorityP2 {
 		t.Fatalf("priority order = %+v", got)
 	}

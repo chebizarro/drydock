@@ -97,11 +97,17 @@ type ReviewerStats struct {
 
 // UpsertReviewerProfile inserts or updates a reviewer profile.
 func (s *Store) UpsertReviewerProfile(ctx context.Context, profile ReviewerProfile, eventID string) error {
-	languagesJSON, _ := json.Marshal(profile.Languages)
-	domainsJSON, _ := json.Marshal(profile.Domains)
+	languagesJSON, err := json.Marshal(profile.Languages)
+	if err != nil {
+		return fmt.Errorf("encode reviewer languages: %w", err)
+	}
+	domainsJSON, err := json.Marshal(profile.Domains)
+	if err != nil {
+		return fmt.Errorf("encode reviewer domains: %w", err)
+	}
 	now := time.Now().Unix()
 
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO reviewer_profiles (
 			pubkey, display_name, languages, domains,
 			availability, price_per_review, max_concurrent, payout_destination,
@@ -122,7 +128,10 @@ func (s *Store) UpsertReviewerProfile(ctx context.Context, profile ReviewerProfi
 		profile.Availability, profile.PricePerReview, profile.MaxConcurrent, profile.PayoutDestination,
 		eventID, now, now,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("upsert reviewer profile: %w", err)
+	}
+	return nil
 }
 
 // GetReviewerProfile retrieves a reviewer profile by pubkey.
@@ -141,14 +150,18 @@ func (s *Store) GetReviewerProfile(ctx context.Context, pubkey string) (*Reviewe
 		&p.EventID, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("reviewer not found: %s", pubkey)
+		return nil, fmt.Errorf("reviewer not found %s: %w", pubkey, sql.ErrNoRows)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get reviewer profile: %w", err)
 	}
 
-	_ = json.Unmarshal([]byte(languagesJSON), &p.Languages)
-	_ = json.Unmarshal([]byte(domainsJSON), &p.Domains)
+	if err := json.Unmarshal([]byte(languagesJSON), &p.Languages); err != nil {
+		return nil, fmt.Errorf("decode reviewer languages: %w", err)
+	}
+	if err := json.Unmarshal([]byte(domainsJSON), &p.Domains); err != nil {
+		return nil, fmt.Errorf("decode reviewer domains: %w", err)
+	}
 
 	return &p, nil
 }
@@ -164,7 +177,7 @@ func (s *Store) ListAvailableReviewers(ctx context.Context) ([]ReviewerProfile, 
 		ORDER BY updated_at DESC
 	`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list available reviewers: %w", err)
 	}
 	defer rows.Close()
 
@@ -178,16 +191,23 @@ func (s *Store) ListAvailableReviewers(ctx context.Context) ([]ReviewerProfile, 
 			&p.Availability, &p.PricePerReview, &p.MaxConcurrent, &p.PayoutDestination,
 			&p.EventID, &p.CreatedAt, &p.UpdatedAt,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan reviewer profile: %w", err)
 		}
 
-		_ = json.Unmarshal([]byte(languagesJSON), &p.Languages)
-		_ = json.Unmarshal([]byte(domainsJSON), &p.Domains)
+		if err := json.Unmarshal([]byte(languagesJSON), &p.Languages); err != nil {
+			return nil, fmt.Errorf("decode reviewer languages: %w", err)
+		}
+		if err := json.Unmarshal([]byte(domainsJSON), &p.Domains); err != nil {
+			return nil, fmt.Errorf("decode reviewer domains: %w", err)
+		}
 
 		profiles = append(profiles, p)
 	}
 
-	return profiles, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate available reviewers: %w", err)
+	}
+	return profiles, nil
 }
 
 // UpdateReviewerAvailability updates a reviewer's availability status.
@@ -196,7 +216,10 @@ func (s *Store) UpdateReviewerAvailability(ctx context.Context, pubkey, availabi
 		UPDATE reviewer_profiles SET availability = ?, updated_at = ?
 		WHERE pubkey = ?
 	`, availability, time.Now().Unix(), pubkey)
-	return err
+	if err != nil {
+		return fmt.Errorf("update reviewer availability: %w", err)
+	}
+	return nil
 }
 
 // CountActiveAssignments returns how many pending/accepted assignments a reviewer has.
@@ -206,7 +229,10 @@ func (s *Store) CountActiveAssignments(ctx context.Context, pubkey string) (int,
 		SELECT COUNT(*) FROM review_assignments
 		WHERE reviewer_pubkey = ? AND status IN ('pending', 'accepted')
 	`, pubkey).Scan(&count)
-	return count, err
+	if err != nil {
+		return 0, fmt.Errorf("count active assignments: %w", err)
+	}
+	return count, nil
 }
 
 // GetReviewerReputation retrieves a reviewer's reputation score.
@@ -228,7 +254,7 @@ func (s *Store) GetReviewerReputation(ctx context.Context, pubkey string) (*Repu
 		}, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get reviewer reputation: %w", err)
 	}
 	return &r, nil
 }
@@ -255,7 +281,10 @@ func (s *Store) UpsertReviewerReputation(ctx context.Context, rep ReputationScor
 		rep.Pubkey, rep.OverallScore, rep.TotalReviews, rep.AcceptedCount, rep.RejectedCount,
 		rep.AverageRating, rep.AcceptanceRate, rep.LastReviewAt, now,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("upsert reviewer reputation: %w", err)
+	}
+	return nil
 }
 
 // CreateAssignment atomically inserts an assignment and reserves settled funds
@@ -276,7 +305,7 @@ func (s *Store) createAssignment(ctx context.Context, a ReviewAssignment, idempo
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin create assignment transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -327,7 +356,7 @@ func (s *Store) createAssignment(ctx context.Context, a ReviewAssignment, idempo
 		a.ExpiresAt, now, now,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("insert assignment: %w", err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
@@ -363,7 +392,10 @@ func (s *Store) createAssignment(ctx context.Context, a ReviewAssignment, idempo
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit create assignment: %w", err)
+	}
+	return nil
 }
 
 func reserveAssignmentEscrowTx(ctx context.Context, tx *sql.Tx, assignmentID int, paymentPatchEventID string, amountSats, settledAmount, now int64) error {
@@ -404,7 +436,10 @@ func (s *Store) GetMarketplaceEscrowAllocation(ctx context.Context, assignmentID
 		FROM marketplace_escrow_allocations WHERE assignment_id = ?`, assignmentID).Scan(
 		&rec.AssignmentID, &rec.PaymentPatchEventID, &rec.AmountSats, &rec.Currency,
 		&rec.Status, &rec.PayoutPaymentHash, &rec.PaidAt, &rec.CreatedAt, &rec.UpdatedAt)
-	return rec, err
+	if err != nil {
+		return MarketplaceEscrowAllocation{}, fmt.Errorf("get marketplace escrow allocation: %w", err)
+	}
+	return rec, nil
 }
 
 // GetAssignmentByID retrieves an assignment by its database ID.
@@ -458,7 +493,7 @@ func (s *Store) getAssignment(ctx context.Context, column string, value any) (*R
 		return nil, fmt.Errorf("assignment not found %v: %w", value, sql.ErrNoRows)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get assignment: %w", err)
 	}
 	if acceptanceEventID.Valid {
 		a.AcceptanceEventID = acceptanceEventID.String
@@ -492,7 +527,10 @@ func (s *Store) UpdateAssignmentStatus(ctx context.Context, id int, status strin
 	}
 
 	_, err := s.db.ExecContext(ctx, query, args...)
-	return err
+	if err != nil {
+		return fmt.Errorf("update assignment status: %w", err)
+	}
+	return nil
 }
 
 // TransitionPendingAssignment atomically accepts or rejects a pending,
@@ -507,7 +545,7 @@ func (s *Store) TransitionPendingAssignment(ctx context.Context, id int, reviewe
 		WHERE id = ? AND reviewer_pubkey = ? AND status = 'pending' AND expires_at >= ?
 	`, status, eventID, now, id, reviewerPubkey, now)
 	if err != nil {
-		return err
+		return fmt.Errorf("transition pending assignment: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
@@ -553,7 +591,7 @@ func (s *Store) ListPendingAssignments(ctx context.Context, pubkey string) ([]Re
 		ORDER BY priority ASC, created_at ASC
 	`, pubkey)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list pending assignments: %w", err)
 	}
 	defer rows.Close()
 
@@ -565,12 +603,15 @@ func (s *Store) ListPendingAssignments(ctx context.Context, pubkey string) ([]Re
 			&a.Status, &a.Priority, &a.PriceSats, &a.AssignmentEventID,
 			&a.ExpiresAt, &a.CreatedAt, &a.UpdatedAt,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan pending assignment: %w", err)
 		}
 		assignments = append(assignments, a)
 	}
 
-	return assignments, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending assignments: %w", err)
+	}
+	return assignments, nil
 }
 
 // ListAssignmentsForPatch returns all assignments for a given patch.
@@ -584,7 +625,7 @@ func (s *Store) ListAssignmentsForPatch(ctx context.Context, patchEventID string
 		ORDER BY created_at DESC
 	`, patchEventID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list assignments for patch: %w", err)
 	}
 	defer rows.Close()
 
@@ -596,12 +637,15 @@ func (s *Store) ListAssignmentsForPatch(ctx context.Context, patchEventID string
 			&a.Status, &a.Priority, &a.PriceSats, &a.AssignmentEventID,
 			&a.ExpiresAt, &a.CreatedAt, &a.UpdatedAt,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan patch assignment: %w", err)
 		}
 		assignments = append(assignments, a)
 	}
 
-	return assignments, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate patch assignments: %w", err)
+	}
+	return assignments, nil
 }
 
 // ExpireStaleAssignments marks assignments past their expiry as expired.
@@ -614,10 +658,14 @@ func (s *Store) ExpireStaleAssignments(ctx context.Context) (int64, error) {
 		WHERE status = 'pending' AND expires_at < ?
 	`, now, now)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("expire stale assignments: %w", err)
 	}
 
-	return result.RowsAffected()
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read expire stale assignments result: %w", err)
+	}
+	return affected, nil
 }
 
 // RecordFeedback stores immutable first-write-wins feedback and updates the
@@ -642,11 +690,11 @@ func (s *Store) RecordFeedback(ctx context.Context, fb ReviewFeedback) (bool, er
 		fb.Rating, fb.Comment, fb.EventID, now,
 	)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("insert review feedback: %w", err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("read feedback rows affected: %w", err)
 	}
 	if inserted == 0 {
 		return false, nil
@@ -728,7 +776,7 @@ func (s *Store) GetReviewerStats(ctx context.Context, pubkey string) (*ReviewerS
 		&stats.LastReviewAt,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get reviewer assignment stats: %w", err)
 	}
 
 	// Count feedback and total rating
@@ -738,7 +786,7 @@ func (s *Store) GetReviewerStats(ctx context.Context, pubkey string) (*ReviewerS
 		WHERE reviewer_pubkey = ?
 	`, pubkey).Scan(&stats.TotalFeedback, &stats.TotalRatingSum)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get reviewer feedback stats: %w", err)
 	}
 
 	return &stats, nil
@@ -758,5 +806,8 @@ func (s *Store) CountAvailableReviewers(ctx context.Context) (int, error) {
 		SELECT COUNT(*) FROM reviewer_profiles
 		WHERE availability = 'available'
 	`).Scan(&count)
-	return count, err
+	if err != nil {
+		return 0, fmt.Errorf("count available reviewers: %w", err)
+	}
+	return count, nil
 }
