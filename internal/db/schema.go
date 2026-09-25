@@ -616,6 +616,63 @@ CREATE TABLE IF NOT EXISTS rate_limits (
   timestamp INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rate_limits_key_timestamp ON rate_limits(key, timestamp);
+
+-- dependency_upgrades is the durable identity of a proposed dependency upgrade.
+-- The row exists to stop every trigger from republishing the same upgrade
+-- patch: a re-scan or re-trigger short-circuits at the UNIQUE identity instead
+-- of minting a new record. Identity is (repo, ecosystem, package, from, to);
+-- ecosystem is part of the key because package namespaces are per-ecosystem, so
+-- a polyglot repo can legitimately hold same-named packages. status is a closed
+-- lifecycle enum owned entirely by this package, so it carries a CHECK. policy
+-- deliberately carries NO CHECK: the version-policy value set ('next_patch',
+-- 'latest', ...) is an open product decision owned by config/service, and the
+-- schema must tolerate a third value arriving without a migration. to_version
+-- is empty for 'no_fix_available' rows (a vulnerable package with no known fix
+-- yet), so it is not required to be non-empty.
+CREATE TABLE IF NOT EXISTS dependency_upgrades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id TEXT NOT NULL,
+  ecosystem TEXT NOT NULL,
+  package_name TEXT NOT NULL,
+  purl TEXT NOT NULL DEFAULT '',
+  from_version TEXT NOT NULL,
+  to_version TEXT NOT NULL DEFAULT '',
+  manifest_path TEXT NOT NULL DEFAULT '',
+  lockfile_path TEXT NOT NULL DEFAULT '',
+  advisories_csv TEXT NOT NULL DEFAULT '',
+  policy TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open', 'superseded', 'merged', 'rejected', 'failed',
+                      'no_fix_available')),
+  patch_event_id TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (repo_id, ecosystem, package_name, from_version, to_version)
+);
+CREATE INDEX IF NOT EXISTS idx_dependency_upgrades_status
+  ON dependency_upgrades(status, repo_id);
+CREATE INDEX IF NOT EXISTS idx_dependency_upgrades_repo_package
+  ON dependency_upgrades(repo_id, ecosystem, package_name);
+
+-- dependency_upgrade_outbox is the single-event delivery-idempotency table for
+-- an upgrade's NIP-34 patch publication. It is the reviewOutbox shape (see
+-- store.go) keyed on upgrade_id: reserve-then-mark reuses the exact stored
+-- event on retry, so a repeated relay publish keeps the same Nostr event ID.
+-- One upgrade publishes exactly one patch, so the key is a single column,
+-- mirroring review_failure_notice_outbox rather than the four-column
+-- review_publication_outbox.
+CREATE TABLE IF NOT EXISTS dependency_upgrade_outbox (
+  upgrade_id INTEGER NOT NULL,
+  event_id TEXT NOT NULL UNIQUE,
+  raw_event_json TEXT NOT NULL,
+  delivered_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (upgrade_id),
+  FOREIGN KEY (upgrade_id) REFERENCES dependency_upgrades(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dependency_upgrade_outbox_delivery
+  ON dependency_upgrade_outbox(delivered_at);
 ` + reviewSessionSchemaSQL
 
 const reviewSessionSchemaSQL = `

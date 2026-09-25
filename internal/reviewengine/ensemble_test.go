@@ -297,6 +297,61 @@ func TestSameFindingLocus(t *testing.T) {
 	}
 }
 
+// TestSameFindingLocusDistinguishesPackages guards the dependency-finding
+// identity branch: SCA findings are identified by package, not by (file, line).
+// A single go.mod holds many packages and scanners report every one against
+// that one file (osv-scanner emits no line at all), so the positional predicate
+// would collapse distinct vulnerable packages into one finding.
+func TestSameFindingLocusDistinguishesPackages(t *testing.T) {
+	bar := Finding{File: "go.mod", Category: "security", Line: 1, RuleID: "CVE-1",
+		Package: &PackageIdentity{Ecosystem: "go", Name: "github.com/foo/bar", InstalledVersion: "1.2.0"}}
+	sameBar := Finding{File: "go.mod", Category: "security", Line: 1, RuleID: "CVE-1",
+		Package: &PackageIdentity{Ecosystem: "go", Name: "github.com/foo/bar", InstalledVersion: "1.2.0"}}
+	qux := Finding{File: "go.mod", Category: "security", Line: 1, RuleID: "CVE-2",
+		Package: &PackageIdentity{Ecosystem: "go", Name: "github.com/baz/qux", InstalledVersion: "0.9.0"}}
+	nonPkg := Finding{File: "go.mod", Category: "security", Line: 1}
+
+	if !SameFindingLocus(bar, sameBar) {
+		t.Fatal("identical package identity should share a locus")
+	}
+	if SameFindingLocus(bar, qux) {
+		t.Fatal("distinct packages in one manifest must not share a locus")
+	}
+	if SameFindingLocus(bar, nonPkg) || SameFindingLocus(nonPkg, bar) {
+		t.Fatal("a package finding must never share a locus with a non-package finding")
+	}
+}
+
+// TestDeduplicateFindingsKeepsDistinctPackages is the end-to-end regression for
+// the collision: parseSARIFFindings runs every SCA finding through
+// DeduplicateFindings, and before package identity participated in the key, two
+// packages reported against the same manifest line collapsed into one.
+func TestDeduplicateFindingsKeepsDistinctPackages(t *testing.T) {
+	findings := []Finding{
+		{Severity: "high", Category: "security", File: "go.mod", Line: 1, RuleID: "CVE-1", Confidence: 0.9,
+			Package: &PackageIdentity{Ecosystem: "go", Name: "github.com/foo/bar", InstalledVersion: "1.2.0", FixedVersion: "1.2.4"}},
+		{Severity: "critical", Category: "security", File: "go.mod", Line: 1, RuleID: "CVE-2", Confidence: 0.9,
+			Package: &PackageIdentity{Ecosystem: "go", Name: "github.com/baz/qux", InstalledVersion: "0.9.0", FixedVersion: "0.9.1"}},
+	}
+	got, err := DeduplicateFindings(findings)
+	if err != nil {
+		t.Fatalf("DeduplicateFindings: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("distinct packages collapsed: got %d findings, want 2: %#v", len(got), got)
+	}
+
+	// A genuine duplicate (same package, version, and advisory — e.g. an
+	// idempotent re-scan) still merges to one.
+	got, err = DeduplicateFindings(append(findings, findings[0]))
+	if err != nil {
+		t.Fatalf("DeduplicateFindings dupe: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("identical package finding not merged: got %d findings, want 2: %#v", len(got), got)
+	}
+}
+
 // TestMergeFindings_StableAnchorNoChaining is the worked example from the
 // clustering-identity fix: three findings in the same file+category at lines
 // 1/3/5 with confidences 0.5/0.9/0.7. With a stable per-cluster anchor they

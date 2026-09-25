@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -211,6 +212,95 @@ func TestParseSARIFFindingsResolvesRealSeverity(t *testing.T) {
 				t.Fatalf("severity = %q, want %q", findings[0].Severity, tc.want)
 			}
 		})
+	}
+}
+
+// TestParseSARIFFindingsExtractsPackageIdentity pins per-tool package-identity
+// extraction against checked-in SARIF goldens (trivy fs, grype dir:, osv-scanner
+// --format sarif). None of these tools ship in the image or CI, so goldens are
+// the only way to test this; the fixtures are trimmed but structurally faithful
+// to real tool output. Each reports two distinct packages against one go.mod,
+// which also guards the dedup fix: before package identity participated in
+// finding identity, both collapsed into a single finding.
+func TestParseSARIFFindingsExtractsPackageIdentity(t *testing.T) {
+	cases := []struct {
+		tool string
+		file string
+		want map[string]reviewengine.PackageIdentity
+	}{
+		{
+			tool: "trivy",
+			file: "trivy_go.sarif",
+			want: map[string]reviewengine.PackageIdentity{
+				"github.com/foo/bar": {Ecosystem: "go", Name: "github.com/foo/bar", InstalledVersion: "1.2.0", FixedVersion: "1.2.4", Advisories: []string{"CVE-2024-1111"}},
+				"github.com/baz/qux": {Ecosystem: "go", Name: "github.com/baz/qux", InstalledVersion: "0.9.0", FixedVersion: "0.9.1", Advisories: []string{"CVE-2024-2222"}},
+			},
+		},
+		{
+			tool: "grype",
+			file: "grype_dir.sarif",
+			want: map[string]reviewengine.PackageIdentity{
+				"github.com/foo/bar": {Ecosystem: "go", Name: "github.com/foo/bar", InstalledVersion: "1.2.0", FixedVersion: "1.2.4", PURL: "pkg:golang/github.com/foo/bar@1.2.0", Advisories: []string{"CVE-2024-1111"}},
+				"github.com/baz/qux": {Ecosystem: "go", Name: "github.com/baz/qux", InstalledVersion: "0.9.0", FixedVersion: "0.9.1", PURL: "pkg:golang/github.com/baz/qux@0.9.0", Advisories: []string{"CVE-2024-2222"}},
+			},
+		},
+		{
+			tool: "osv-scanner",
+			file: "osv-scanner.sarif",
+			want: map[string]reviewengine.PackageIdentity{
+				"github.com/gogo/protobuf": {Ecosystem: "go", Name: "github.com/gogo/protobuf", InstalledVersion: "1.3.1", FixedVersion: "1.3.2", Advisories: []string{"CVE-2021-3121", "GO-2021-0053", "GHSA-c3h9-896r-86jm"}},
+				"golang.org/x/net":         {Ecosystem: "go", Name: "golang.org/x/net", InstalledVersion: "0.6.0", FixedVersion: "0.7.0", Advisories: []string{"CVE-2022-41717", "GO-2022-1144", "GHSA-xrjj-mj9h-534m"}},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tool, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", tc.file))
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			findings, err := parseSARIFFindings(tc.tool, data)
+			if err != nil {
+				t.Fatalf("parseSARIFFindings: %v", err)
+			}
+			if len(findings) != len(tc.want) {
+				t.Fatalf("got %d findings, want %d (distinct packages collapsed in dedup?): %#v", len(findings), len(tc.want), findings)
+			}
+			for _, f := range findings {
+				if f.Package == nil {
+					t.Fatalf("finding missing package identity: %#v", f)
+				}
+				want, ok := tc.want[f.Package.Name]
+				if !ok {
+					t.Fatalf("unexpected package %q", f.Package.Name)
+				}
+				if !reflect.DeepEqual(*f.Package, want) {
+					t.Fatalf("package identity mismatch for %s:\n got %#v\nwant %#v", f.Package.Name, *f.Package, want)
+				}
+			}
+		})
+	}
+}
+
+// TestFindingKeyDistinguishesPackages guards the second collision the SARIF
+// dedup fix does not cover: the audit aggregation step keys findings by
+// file:line:category and fingerprints them by nearby code, both of which
+// collapse distinct packages sharing one manifest. Non-package findings must
+// keep their exact legacy key so existing baselines are unaffected.
+func TestFindingKeyDistinguishesPackages(t *testing.T) {
+	plain := reviewengine.Finding{File: "a.go", Line: 10, Category: "security"}
+	if got := findingKey(plain); got != "a.go:10:security" {
+		t.Fatalf("legacy finding key changed: %q", got)
+	}
+	bar := reviewengine.Finding{File: "go.mod", Line: 1, Category: "security", RuleID: "CVE-1",
+		Package: &reviewengine.PackageIdentity{Ecosystem: "go", Name: "github.com/foo/bar", InstalledVersion: "1.2.0"}}
+	qux := reviewengine.Finding{File: "go.mod", Line: 1, Category: "security", RuleID: "CVE-2",
+		Package: &reviewengine.PackageIdentity{Ecosystem: "go", Name: "github.com/baz/qux", InstalledVersion: "0.9.0"}}
+	if findingKey(bar) == findingKey(qux) {
+		t.Fatalf("distinct packages share a finding key: %q", findingKey(bar))
+	}
+	if findingFingerprintContext("", bar) == findingFingerprintContext("", qux) {
+		t.Fatal("distinct packages share a fingerprint context")
 	}
 }
 

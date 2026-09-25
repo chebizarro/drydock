@@ -420,7 +420,7 @@ func (e *Engine) Run(ctx context.Context, req Request) (result Result, runErr er
 	fingerprints := make(map[string]string, len(verified))
 	for _, finding := range verified {
 		cwe := findingCWE(finding)
-		fingerprint := db.SecurityFindingFingerprint(finding.File, cwe, nearbyCode(repoPath, finding))
+		fingerprint := db.SecurityFindingFingerprint(finding.File, cwe, findingFingerprintContext(repoPath, finding))
 		fingerprints[findingKey(finding)] = fingerprint
 		persisted = append(persisted, db.SecurityAuditFinding{File: finding.File, Line: finding.Line, CWE: cwe, Severity: finding.Severity, Confidence: finding.Confidence, Verified: true, RefuteVotes: budget.VerifyVotes, Fingerprint: fingerprint})
 	}
@@ -831,7 +831,27 @@ func findingCWE(finding reviewengine.Finding) string {
 	return "CWE-000"
 }
 func findingKey(finding reviewengine.Finding) string {
-	return strings.ToLower(finding.File) + ":" + strconv.Itoa(finding.Line) + ":" + strings.ToLower(finding.Category)
+	key := strings.ToLower(finding.File) + ":" + strconv.Itoa(finding.Line) + ":" + strings.ToLower(finding.Category)
+	if p := finding.Package; p != nil {
+		// Dependency findings share one manifest file and often one line, so
+		// file:line:category collides across distinct packages. Fold in package
+		// identity so the aggregation map and baseline lookup keep them separate.
+		key += ":" + strings.ToLower(p.Ecosystem+"/"+p.Name+"@"+p.InstalledVersion) + ":" + strings.ToLower(finding.RuleID)
+	}
+	return key
+}
+
+// findingFingerprintContext returns the text that seeds a finding's persisted
+// fingerprint. For a dependency finding the identity is its package coordinates,
+// not the surrounding manifest text — several packages share a manifest and
+// often a line, so nearby code cannot distinguish them (and osv-scanner reports
+// no line at all). For every other finding it is the nearby source code, exactly
+// as before.
+func findingFingerprintContext(repoPath string, finding reviewengine.Finding) string {
+	if p := finding.Package; p != nil {
+		return strings.ToLower(p.Ecosystem + "\x00" + p.Name + "\x00" + p.InstalledVersion)
+	}
+	return nearbyCode(repoPath, finding)
 }
 func nearbyCode(repoPath string, finding reviewengine.Finding) string {
 	data, err := os.ReadFile(filepath.Join(repoPath, filepath.FromSlash(finding.File)))
@@ -891,55 +911,9 @@ func (e *Engine) availableTool(names ...string) (string, bool) {
 	return "", false
 }
 
-// sarifDocument is the minimal SARIF 2.1.0 shape emitted by trivy, grype, and
-// osv-scanner. Decoding it typed keeps each result's file path and message
-// together, instead of guessing field names across three schemas where they
-// live in different objects — the bug that made the old walker drop every
-// finding (DRYDOCK-rnmo).
-type sarifDocument struct {
-	Runs []struct {
-		Tool struct {
-			Driver struct {
-				Rules []struct {
-					ID               string `json:"id"`
-					ShortDescription struct {
-						Text string `json:"text"`
-					} `json:"shortDescription"`
-					FullDescription struct {
-						Text string `json:"text"`
-					} `json:"fullDescription"`
-					// GitHub convention carries real severity here: security-severity is
-					// a CVSS base score, and several scanners also emit a Severity token.
-					Properties struct {
-						SecuritySeverity string `json:"security-severity"`
-						Severity         string `json:"severity"`
-					} `json:"properties"`
-				} `json:"rules"`
-			} `json:"driver"`
-		} `json:"tool"`
-		Results []struct {
-			RuleID  string `json:"ruleId"`
-			Level   string `json:"level"`
-			Message struct {
-				Text string `json:"text"`
-			} `json:"message"`
-			Properties struct {
-				SecuritySeverity string `json:"security-severity"`
-				Severity         string `json:"severity"`
-			} `json:"properties"`
-			Locations []struct {
-				PhysicalLocation struct {
-					ArtifactLocation struct {
-						URI string `json:"uri"`
-					} `json:"artifactLocation"`
-					Region struct {
-						StartLine int `json:"startLine"`
-					} `json:"region"`
-				} `json:"physicalLocation"`
-			} `json:"locations"`
-		} `json:"results"`
-	} `json:"runs"`
-}
+// The SARIF 2.1.0 document shape shared by trivy, grype, and osv-scanner lives
+// in sca_sarif.go as named types, alongside the per-tool package-identity
+// extraction that consumes them.
 
 func parseSARIFFindings(tool string, data []byte) ([]reviewengine.Finding, error) {
 	var doc sarifDocument
@@ -950,7 +924,9 @@ func parseSARIFFindings(tool string, data []byte) ([]reviewengine.Finding, error
 	for _, run := range doc.Runs {
 		descriptions := make(map[string]string, len(run.Tool.Driver.Rules))
 		ruleSeverities := make(map[string]string, len(run.Tool.Driver.Rules))
+		rulesByID := make(map[string]sarifRule, len(run.Tool.Driver.Rules))
 		for _, rule := range run.Tool.Driver.Rules {
+			rulesByID[rule.ID] = rule
 			text := strings.TrimSpace(rule.ShortDescription.Text)
 			if text == "" {
 				text = strings.TrimSpace(rule.FullDescription.Text)
@@ -980,7 +956,7 @@ func parseSARIFFindings(tool string, data []byte) ([]reviewengine.Finding, error
 			if file == "" || message == "" {
 				continue
 			}
-			findings = append(findings, reviewengine.Finding{
+			finding := reviewengine.Finding{
 				Severity:    sarifResultSeverity(res.Properties.Severity, res.Properties.SecuritySeverity, ruleSeverities[res.RuleID], res.Level),
 				Category:    "security",
 				File:        filepath.ToSlash(file),
@@ -989,7 +965,11 @@ func parseSARIFFindings(tool string, data []byte) ([]reviewengine.Finding, error
 				Explanation: message,
 				RuleID:      strings.TrimSpace(res.RuleID),
 				Confidence:  .9,
-			})
+			}
+			if pkg := extractPackageIdentity(tool, rulesByID[res.RuleID], res); pkg != nil {
+				finding.Package = pkg
+			}
+			findings = append(findings, finding)
 		}
 	}
 	return reviewengine.DeduplicateFindings(findings)

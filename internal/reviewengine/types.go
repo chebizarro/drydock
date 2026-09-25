@@ -84,6 +84,25 @@ const (
 	PriorityP2 Priority = "P2"
 )
 
+// PackageIdentity carries software-composition-analysis (SCA) dependency
+// identity for a finding produced by a dependency scanner (trivy, grype,
+// osv-scanner). It is nil for every finding that is not about a vulnerable
+// package — i.e. every LLM reviewer path — so the canonical Finding stays clean
+// and the wire form omits it entirely. The dependency-upgrade service consumes
+// it as typed input: which package, at which installed version, fixed in which
+// version. Grouping the six SCA-only fields behind one nullable field, rather
+// than inlining them, is the deliberate choice: it keeps the shared canonical
+// type uncluttered while still letting the dedup predicate and the upgrade
+// service read package identity as structured data.
+type PackageIdentity struct {
+	Ecosystem        string   `json:"ecosystem,omitempty"`         // normalized: "go", "npm", "cargo", "pip"
+	Name             string   `json:"name,omitempty"`              // package/module name
+	InstalledVersion string   `json:"installed_version,omitempty"` // version present in the manifest/lockfile
+	FixedVersion     string   `json:"fixed_version,omitempty"`     // scanner-reported first fixed version (may be empty)
+	PURL             string   `json:"purl,omitempty"`              // package URL, when the scanner emits one
+	Advisories       []string `json:"advisories,omitempty"`        // e.g. CVE-…, GHSA-…, GO-…, RUSTSEC-…
+}
+
 type Finding struct {
 	// Priority is canonical. Severity remains on the wire for compatibility
 	// with existing scanners, publishers, and stored review artifacts.
@@ -104,6 +123,12 @@ type Finding struct {
 	SuggestedCode string  `json:"suggested_code,omitempty"`
 	Sensitive     bool    `json:"sensitive,omitempty"`
 	Confidence    float64 `json:"confidence"`
+	// Package carries dependency identity for SCA findings and is nil for every
+	// other finding. It is the load-bearing input for the dependency-upgrade
+	// service and it also drives finding identity for dependency findings (see
+	// SameFindingLocus): several vulnerable packages share one manifest file and
+	// line, so package identity — not (file, line) — distinguishes them.
+	Package *PackageIdentity `json:"package,omitempty"`
 }
 
 func ParsePlannerOutput(raw string) (PlannerOutput, error) {

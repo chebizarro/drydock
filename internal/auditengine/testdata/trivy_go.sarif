@@ -1,0 +1,80 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0-rtm.5.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "fullName": "Trivy Vulnerability Scanner",
+          "name": "Trivy",
+          "rules": [
+            {
+              "id": "CVE-2024-1111",
+              "name": "LanguageSpecificPackageVulnerability",
+              "shortDescription": { "text": "CVE-2024-1111 Package: github.com/foo/bar" },
+              "fullDescription": { "text": "foo/bar mishandles untrusted input leading to a panic." },
+              "defaultConfiguration": { "level": "error" },
+              "helpUri": "https://avd.aquasec.com/nvd/cve-2024-1111",
+              "help": {
+                "text": "Vulnerability CVE-2024-1111\nSeverity: HIGH\nPackage: github.com/foo/bar\nInstalled Version: 1.2.0\nFixed Version: 1.2.4\nLink: [CVE-2024-1111](https://avd.aquasec.com/nvd/cve-2024-1111)",
+                "markdown": "**Vulnerability CVE-2024-1111**\n| Severity | Package | Installed Version | Fixed Version | Link |\n| --- | --- | --- | --- | --- |\n| HIGH | github.com/foo/bar | 1.2.0 | 1.2.4 | [CVE-2024-1111](https://avd.aquasec.com/nvd/cve-2024-1111) |\n"
+              },
+              "properties": {
+                "precision": "very-high",
+                "security-severity": "7.5",
+                "tags": ["vulnerability", "security", "HIGH"]
+              }
+            },
+            {
+              "id": "CVE-2024-2222",
+              "name": "LanguageSpecificPackageVulnerability",
+              "shortDescription": { "text": "CVE-2024-2222 Package: github.com/baz/qux" },
+              "fullDescription": { "text": "baz/qux is vulnerable to path traversal." },
+              "defaultConfiguration": { "level": "error" },
+              "helpUri": "https://avd.aquasec.com/nvd/cve-2024-2222",
+              "help": {
+                "text": "Vulnerability CVE-2024-2222\nSeverity: CRITICAL\nPackage: github.com/baz/qux\nInstalled Version: 0.9.0\nFixed Version: 0.9.1\nLink: [CVE-2024-2222](https://avd.aquasec.com/nvd/cve-2024-2222)",
+                "markdown": "**Vulnerability CVE-2024-2222**\n| Severity | Package | Installed Version | Fixed Version | Link |\n| --- | --- | --- | --- | --- |\n| CRITICAL | github.com/baz/qux | 0.9.0 | 0.9.1 | [CVE-2024-2222](https://avd.aquasec.com/nvd/cve-2024-2222) |\n"
+              },
+              "properties": {
+                "precision": "very-high",
+                "security-severity": "9.8",
+                "tags": ["vulnerability", "security", "CRITICAL"]
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "CVE-2024-1111",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": { "text": "Package: github.com/foo/bar\nInstalled Version: 1.2.0\nVulnerability CVE-2024-1111\nSeverity: HIGH\nFixed Version: 1.2.4" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "go.mod", "uriBaseId": "ROOTPATH" },
+                "region": { "startLine": 5, "startColumn": 1, "endLine": 5, "endColumn": 1 }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "CVE-2024-2222",
+          "ruleIndex": 1,
+          "level": "error",
+          "message": { "text": "Package: github.com/baz/qux\nInstalled Version: 0.9.0\nVulnerability CVE-2024-2222\nSeverity: CRITICAL\nFixed Version: 0.9.1" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "go.mod", "uriBaseId": "ROOTPATH" },
+                "region": { "startLine": 6, "startColumn": 1, "endLine": 6, "endColumn": 1 }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

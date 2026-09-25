@@ -253,6 +253,15 @@ func joinErrors(errs []error) string {
 // single definition of finding identity, shared by mergeFindings,
 // DeduplicateFindings, and securityscan.MergeScannerFindings.
 func SameFindingLocus(a, b Finding) bool {
+	// Dependency (SCA) findings are identified by the vulnerable package, not by
+	// (file, category, line): a single manifest (go.mod, package-lock.json) holds
+	// many packages, and scanners report every one against that one file — often
+	// with no line at all — so the positional predicate would collapse distinct
+	// vulnerable packages into a single finding. Compare package identity
+	// whenever either side carries it.
+	if a.Package != nil || b.Package != nil {
+		return samePackageLocus(a, b)
+	}
 	if !strings.EqualFold(a.File, b.File) || !strings.EqualFold(a.Category, b.Category) {
 		return false
 	}
@@ -261,6 +270,21 @@ func SameFindingLocus(a, b Finding) bool {
 		delta = -delta
 	}
 	return delta <= 2
+}
+
+// samePackageLocus decides identity for dependency findings: same normalized
+// ecosystem, package name, installed version, and rule (advisory) id. A finding
+// that carries package identity never merges with one that does not, and two
+// findings that differ in package, version, or advisory stay distinct so each
+// vulnerable dependency yields its own finding — and its own upgrade candidate.
+func samePackageLocus(a, b Finding) bool {
+	if a.Package == nil || b.Package == nil {
+		return false
+	}
+	return strings.EqualFold(a.Package.Ecosystem, b.Package.Ecosystem) &&
+		strings.EqualFold(a.Package.Name, b.Package.Name) &&
+		strings.EqualFold(a.Package.InstalledVersion, b.Package.InstalledVersion) &&
+		strings.EqualFold(a.RuleID, b.RuleID)
 }
 
 // mergedFinding tracks a finding across multiple models.

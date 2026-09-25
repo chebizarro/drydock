@@ -1,0 +1,66 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0-rtm.5.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/google/osv-scanner",
+          "name": "osv-scanner",
+          "rules": [
+            {
+              "id": "CVE-2021-3121",
+              "name": "CVE-2021-3121",
+              "shortDescription": { "text": "CVE-2021-3121: Panic due to improper input validation in github.com/gogo/protobuf" },
+              "fullDescription": { "text": "Due to improper bounds checking, maliciously crafted input to generated Unmarshal methods can cause an out-of-bounds panic.", "markdown": "Due to improper bounds checking, maliciously crafted input to generated Unmarshal methods can cause an out-of-bounds panic." },
+              "deprecatedIds": ["CVE-2021-3121", "GO-2021-0053", "GHSA-c3h9-896r-86jm"],
+              "help": {
+                "text": "**Your dependency is vulnerable to [CVE-2021-3121](https://osv.dev/CVE-2021-3121)**.\n\n### Affected Packages\n\n| Source | Package Name | Package Version |\n| --- | --- | --- |\n| lockfile:/path/to/go.mod | github.com/gogo/protobuf | 1.3.1 |\n\n## Remediation\n\n### Fixed Versions\n\n| Vulnerability ID | Package Name | Fixed Version |\n| --- | --- | --- |\n| GO-2021-0053 | github.com/gogo/protobuf | 1.3.2 |\n",
+                "markdown": "**Your dependency is vulnerable to [CVE-2021-3121](https://osv.dev/CVE-2021-3121)**.\n\n### Affected Packages\n\n| Source | Package Name | Package Version |\n| --- | --- | --- |\n| lockfile:/path/to/go.mod | github.com/gogo/protobuf | 1.3.1 |\n\n## Remediation\n\n### Fixed Versions\n\n| Vulnerability ID | Package Name | Fixed Version |\n| --- | --- | --- |\n| GO-2021-0053 | github.com/gogo/protobuf | 1.3.2 |\n"
+              }
+            },
+            {
+              "id": "CVE-2022-41717",
+              "name": "CVE-2022-41717",
+              "shortDescription": { "text": "CVE-2022-41717: Excessive memory growth in net/http and golang.org/x/net/http2" },
+              "fullDescription": { "text": "An attacker can cause excessive memory growth in a Go server accepting HTTP/2 requests.", "markdown": "An attacker can cause excessive memory growth in a Go server accepting HTTP/2 requests." },
+              "deprecatedIds": ["CVE-2022-41717", "GO-2022-1144", "GHSA-xrjj-mj9h-534m"],
+              "help": {
+                "text": "**Your dependency is vulnerable to [CVE-2022-41717](https://osv.dev/CVE-2022-41717)**.\n\n### Affected Packages\n\n| Source | Package Name | Package Version |\n| --- | --- | --- |\n| lockfile:/path/to/go.mod | golang.org/x/net | 0.6.0 |\n\n## Remediation\n\n### Fixed Versions\n\n| Vulnerability ID | Package Name | Fixed Version |\n| --- | --- | --- |\n| GO-2022-1144 | golang.org/x/net | 0.7.0 |\n",
+                "markdown": "**Your dependency is vulnerable to [CVE-2022-41717](https://osv.dev/CVE-2022-41717)**.\n\n### Affected Packages\n\n| Source | Package Name | Package Version |\n| --- | --- | --- |\n| lockfile:/path/to/go.mod | golang.org/x/net | 0.6.0 |\n\n## Remediation\n\n### Fixed Versions\n\n| Vulnerability ID | Package Name | Fixed Version |\n| --- | --- | --- |\n| GO-2022-1144 | golang.org/x/net | 0.7.0 |\n"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "CVE-2021-3121",
+          "ruleIndex": 0,
+          "level": "warning",
+          "message": { "text": "Package 'github.com/gogo/protobuf@1.3.1' is vulnerable to 'CVE-2021-3121' (also known as 'GO-2021-0053', 'GHSA-c3h9-896r-86jm')." },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "file:///path/to/go.mod" }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "CVE-2022-41717",
+          "ruleIndex": 1,
+          "level": "warning",
+          "message": { "text": "Package 'golang.org/x/net@0.6.0' is vulnerable to 'CVE-2022-41717' (also known as 'GO-2022-1144', 'GHSA-xrjj-mj9h-534m')." },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "file:///path/to/go.mod" }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
