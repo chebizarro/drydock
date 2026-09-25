@@ -1041,24 +1041,89 @@ func TestProviderNoRepoID(t *testing.T) {
 	}
 }
 
-func TestPayloadInt(t *testing.T) {
-	tests := []struct {
-		name string
-		val  any
-		want int
-	}{
-		{"float64", float64(42), 42},
-		{"int", int(10), 10},
-		{"int64", int64(99), 99},
-		{"string", "nope", 0},
-		{"nil", nil, 0},
+func TestChunkPayloadRoundTrip(t *testing.T) {
+	original := ChunkPayload{
+		RepoID:        "repo",
+		FilePath:      "pkg/file.go",
+		SymbolName:    "Foo",
+		SymbolKind:    "function",
+		ParentSymbol:  "Bar",
+		StartLine:     10,
+		EndLine:       20,
+		Language:      "go",
+		Content:       "func Foo() {}",
+		ContentHash:   "abc123",
+		IndexedCommit: "deadbeef",
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := payloadInt(map[string]any{"k": tt.val}, "k")
-			if got != tt.want {
-				t.Errorf("payloadInt = %d, want %d", got, tt.want)
-			}
-		})
+
+	payload, err := vectorstore.EncodePayload(original)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	// Qdrant returns JSON numbers as float64; the previous untyped read used a
+	// payloadInt coercion to recover int line numbers. The typed decode must do
+	// the same across the float64 boundary or headers print line 0.
+	if _, ok := payload["start_line"].(float64); !ok {
+		t.Fatalf("start_line should be float64 in payload map, got %T", payload["start_line"])
+	}
+
+	var decoded ChunkPayload
+	if err := vectorstore.DecodePayload(payload, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded != original {
+		t.Errorf("round trip mismatch:\n got %+v\nwant %+v", decoded, original)
+	}
+}
+
+// TestChunkPayloadWireCompat locks the invariant that routing the indexer write
+// path through ChunkPayload + EncodePayload produces a byte-identical Qdrant
+// payload to the previous inline map literal. Upsert re-marshals the Point, so
+// on-the-wire equality is what matters; a future field that loses precision
+// through the float64 round-trip (e.g. an int64 > 2^53) would break this.
+func TestChunkPayloadWireCompat(t *testing.T) {
+	chunk := ChunkPayload{
+		RepoID:        "repo",
+		FilePath:      "pkg/file.go",
+		SymbolName:    "Foo",
+		SymbolKind:    "function",
+		ParentSymbol:  "Bar",
+		StartLine:     11,
+		EndLine:       21,
+		Language:      "go",
+		Content:       "func Foo() {}",
+		ContentHash:   "abc123",
+		IndexedCommit: "deadbeef",
+	}
+
+	// The exact map literal the indexer built before this refactor.
+	legacy := map[string]any{
+		"repo_id":        chunk.RepoID,
+		"file_path":      chunk.FilePath,
+		"symbol_name":    chunk.SymbolName,
+		"symbol_kind":    chunk.SymbolKind,
+		"parent_symbol":  chunk.ParentSymbol,
+		"start_line":     chunk.StartLine,
+		"end_line":       chunk.EndLine,
+		"language":       chunk.Language,
+		"content":        chunk.Content,
+		"content_hash":   chunk.ContentHash,
+		"indexed_commit": chunk.IndexedCommit,
+	}
+
+	got, err := vectorstore.EncodePayload(chunk)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal got: %v", err)
+	}
+	wantJSON, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy: %v", err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Errorf("wire payload drift:\n got %s\nwant %s", gotJSON, wantJSON)
 	}
 }

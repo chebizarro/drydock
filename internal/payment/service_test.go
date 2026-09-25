@@ -752,7 +752,7 @@ func TestReconcilePendingPayments_FinalizesTimelySettlementAfterExpiryAndRequeue
 		PubKey: mustParsePubKey("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
 		Tags:   nostr.Tags{{"cashu", token}},
 	}
-	if acquired, err := store.BeginReview(ctx, event.ID.Hex(), "repo/test"); err != nil || !acquired {
+	if acquired, err := store.BeginReviewWithClaim(ctx, event.ID.Hex(), "repo/test", db.ReviewClaim{}); err != nil || !acquired {
 		t.Fatalf("BeginReview: acquired=%v err=%v", acquired, err)
 	}
 	result, err := svc.AuthorizePatch(ctx, event, "repo/test", repoconfig.PaymentsConfig{Enabled: true, PriceSats: 100})

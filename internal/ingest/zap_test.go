@@ -136,7 +136,7 @@ func TestZapReceiptValidation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			processor := NewProcessor(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), WithZapReceipts(tt.service, tt.trusted))
+			processor := NewProcessor(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), WithServiceIdentity(tt.service), WithZapReceipts(tt.trusted))
 			event := nostr.Event{Kind: 9735, PubKey: zapperPubkey, Tags: tt.tags}
 			receipt, err := processor.validateZapReceipt(event)
 			if tt.wantErr == "" {
@@ -186,7 +186,7 @@ func TestZapReceiptLateRequeuesPaymentBlockedReview(t *testing.T) {
 	serviceKey := nostr.GetPublicKey(nostr.Generate())
 	const patchID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const repoID = "owner:repo"
-	acquired, err := store.BeginReview(ctx, patchID, repoID)
+	acquired, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{})
 	if err != nil || !acquired {
 		t.Fatalf("BeginReview = %v, %v", acquired, err)
 	}
@@ -201,7 +201,8 @@ func TestZapReceiptLateRequeuesPaymentBlockedReview(t *testing.T) {
 	processor := NewProcessor(
 		store,
 		logger,
-		WithZapReceipts(serviceKey.Hex(), []string{nostr.GetPublicKey(zapperKey).Hex()}),
+		WithServiceIdentity(serviceKey.Hex()),
+		WithZapReceipts([]string{nostr.GetPublicKey(zapperKey).Hex()}),
 		WithReviewOrders(orders),
 	)
 	receipt := nostr.Event{

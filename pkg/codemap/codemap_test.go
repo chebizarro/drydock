@@ -13,6 +13,7 @@ import (
 
 	internalcodemap "git.sharegap.net/cascadia/drydock/internal/codemap"
 	"git.sharegap.net/cascadia/drydock/internal/symbols"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 )
 
 // TestPublicTypesMirrorInternalFields is the compile-agnostic parity guard for
@@ -67,7 +68,7 @@ func TestLanguageAndSymbolGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertCodemapGolden(t, "testdata/language_symbols.golden.json", string(encoded)+"\n")
+	testutil.AssertGolden(t, "testdata/language_symbols.golden.json", string(encoded)+"\n")
 }
 
 func TestParserConcurrentCallsAreSerializedSafely(t *testing.T) {
@@ -121,7 +122,7 @@ func TestRepositoryMapGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertCodemapGolden(t, "testdata/repository_map.golden.json", string(encoded)+"\n")
+	testutil.AssertGolden(t, "testdata/repository_map.golden.json", string(encoded)+"\n")
 }
 
 func writeCodemapFixture(t *testing.T, root, path, content string) {
@@ -143,21 +144,3 @@ func runCodemapGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
-func assertCodemapGolden(t *testing.T, path, got string) {
-	t.Helper()
-	if os.Getenv("UPDATE_GOLDEN") == "1" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	want, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != string(want) {
-		t.Fatalf("golden mismatch for %s\nwant:\n%s\ngot:\n%s", path, want, got)
-	}
-}

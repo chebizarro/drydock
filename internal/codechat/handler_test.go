@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"git.sharegap.net/cascadia/drydock/internal/codeindex"
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/ratelimit"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
+	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/keyer"
@@ -280,23 +282,25 @@ func (failingRateLimitStore) CleanupOldRateLimits(context.Context, int64) (int64
 	return 0, errors.New("backend unavailable")
 }
 
-func TestPayloadInt(t *testing.T) {
-	cases := []struct {
-		payload map[string]any
-		key     string
-		want    int
-	}{
-		{map[string]any{"line": float64(42)}, "line", 42},
-		{map[string]any{"line": 42}, "line", 42},
-		{map[string]any{"line": int64(42)}, "line", 42},
-		{map[string]any{}, "line", 0},
-		{map[string]any{"line": "not a number"}, "line", 0},
+func TestChunkPayloadDecode(t *testing.T) {
+	// Qdrant returns JSON numbers as float64; the code-chat header formats the
+	// symbol location as %d, so the typed decode must recover an int start line
+	// (previously done by the deleted untyped payloadInt helper).
+	payload := map[string]any{
+		"file_path":   "pkg/file.go",
+		"symbol_name": "Foo",
+		"symbol_kind": "function",
+		"content":     "func Foo() {}",
+		"start_line":  float64(42),
 	}
-
-	for _, tc := range cases {
-		got := payloadInt(tc.payload, tc.key)
-		if got != tc.want {
-			t.Errorf("payloadInt(%v, %q) = %d, want %d", tc.payload, tc.key, got, tc.want)
-		}
+	var chunk codeindex.ChunkPayload
+	if err := vectorstore.DecodePayload(payload, &chunk); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if chunk.StartLine != 42 {
+		t.Errorf("StartLine = %d, want 42", chunk.StartLine)
+	}
+	if chunk.FilePath != "pkg/file.go" || chunk.SymbolName != "Foo" || chunk.SymbolKind != "function" {
+		t.Errorf("unexpected chunk decode: %+v", chunk)
 	}
 }

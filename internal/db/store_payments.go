@@ -866,9 +866,7 @@ func (s *Store) CompleteAssignmentAndAllocatePayout(ctx context.Context, assignm
 	return rec, true, nil
 }
 
-func getMarketplacePayoutTx(ctx context.Context, q interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, assignmentID int) (MarketplacePayoutRecord, error) {
+func getMarketplacePayoutTx(ctx context.Context, q RowQuerier, assignmentID int) (MarketplacePayoutRecord, error) {
 	var rec MarketplacePayoutRecord
 	err := q.QueryRowContext(ctx, `
 		SELECT assignment_id, idempotency_key, amount_sats, destination, status,

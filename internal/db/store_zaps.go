@@ -48,7 +48,7 @@ func (s *Store) InsertZapReceiptAndClaimBlockedReviews(ctx context.Context, rece
 		return false, nil, nil
 	}
 
-	rows, err := tx.QueryContext(ctx, `SELECT patch_event_id, repo_id, force, invocation, requester_pubkey, order_id
+	rows, err := tx.QueryContext(ctx, `SELECT `+reviewTaskColumns+`
 		FROM review_log
 		WHERE patch_event_id=? AND status='failed' AND failure_reason LIKE 'payment_blocked:%'`,
 		receipt.PatchEventID)
@@ -57,8 +57,8 @@ func (s *Store) InsertZapReceiptAndClaimBlockedReviews(ctx context.Context, rece
 	}
 	var candidates []ReviewTask
 	for rows.Next() {
-		var task ReviewTask
-		if err := rows.Scan(&task.PatchEventID, &task.RepoID, &task.Force, &task.Invocation, &task.RequesterPubkey, &task.OrderID); err != nil {
+		task, err := scanReviewTask(rows)
+		if err != nil {
 			rows.Close()
 			return false, nil, fmt.Errorf("scan payment-blocked review: %w", err)
 		}

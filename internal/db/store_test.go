@@ -85,7 +85,7 @@ func TestRecordReviewDiffProvenance(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	patchID := strings.Repeat("a", 64)
 	repoID := "owner:repo"
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 	base := strings.Repeat("b", 40)
@@ -118,15 +118,21 @@ func TestMigrateAppliesVersionedMigrationsIdempotently(t *testing.T) {
 		t.Fatalf("second migrate: %v", err)
 	}
 
+	// Pin against the characterized migration count (bump deliberately alongside
+	// TestSchemaMigrationNumbersAreContiguous) rather than len(schemaMigrations),
+	// so this asserts the DB ledger against an external constant instead of
+	// re-deriving both sides from the same var. A second Migrate must leave
+	// exactly this many rows (idempotent, no duplicate ledger entries).
+	const wantMigrations = 14
 	var count, maxVersion int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&count, &maxVersion); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
 	}
-	if count != len(schemaMigrations) {
-		t.Fatalf("schema_migrations count = %d, want %d", count, len(schemaMigrations))
+	if count != wantMigrations {
+		t.Fatalf("schema_migrations count = %d, want %d", count, wantMigrations)
 	}
-	if maxVersion != schemaMigrations[len(schemaMigrations)-1].version {
-		t.Fatalf("max schema version = %d, want %d", maxVersion, schemaMigrations[len(schemaMigrations)-1].version)
+	if maxVersion != wantMigrations {
+		t.Fatalf("max schema version = %d, want %d", maxVersion, wantMigrations)
 	}
 }
 
@@ -431,7 +437,13 @@ type tableColumn struct {
 
 func readTableColumns(t *testing.T, ctx context.Context, db *sql.DB, table string) []tableColumn {
 	t.Helper()
-	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	// Quote the identifier through the same guard the production hasColumn path
+	// applies, so the schema-parity check exercises the query that actually ships.
+	quotedTable, err := quoteSQLiteIdent(table)
+	if err != nil {
+		t.Fatalf("quote table %s: %v", table, err)
+	}
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+quotedTable+")")
 	if err != nil {
 		t.Fatalf("table_info(%s): %v", table, err)
 	}
@@ -685,7 +697,7 @@ func TestBeginReviewForceReopensOnlyStatusSkipped(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
 
-	acquired, err := store.BeginReview(ctx, "patch", "repo", false)
+	acquired, err := store.BeginReviewWithClaim(ctx, "patch", "repo", ReviewClaim{})
 	if err != nil || !acquired {
 		t.Fatalf("initial BeginReview = %v, %v", acquired, err)
 	}
@@ -693,7 +705,7 @@ func TestBeginReviewForceReopensOnlyStatusSkipped(t *testing.T) {
 		t.Fatalf("MarkReviewFailed: %v", err)
 	}
 
-	acquired, err = store.BeginReview(ctx, "patch", "repo", false)
+	acquired, err = store.BeginReviewWithClaim(ctx, "patch", "repo", ReviewClaim{})
 	if err != nil {
 		t.Fatalf("ordinary BeginReview: %v", err)
 	}
@@ -701,7 +713,7 @@ func TestBeginReviewForceReopensOnlyStatusSkipped(t *testing.T) {
 		t.Fatal("ordinary request reopened status_skipped review")
 	}
 
-	acquired, err = store.BeginReview(ctx, "patch", "repo", true)
+	acquired, err = store.BeginReviewWithClaim(ctx, "patch", "repo", ReviewClaim{Force: true})
 	if err != nil || !acquired {
 		t.Fatalf("forced BeginReview = %v, %v", acquired, err)
 	}

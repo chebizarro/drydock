@@ -461,9 +461,9 @@ func TestAgenticAuditRealServiceUsesCanonicalFrozenSnapshot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	runGitForAuditTest(t, repoPath, "init", "-q")
-	runGitForAuditTest(t, repoPath, "add", ".")
-	runGitForAuditTest(t, repoPath, "-c", "user.name=drydock-test", "-c", "user.email=drydock@example.test", "commit", "-qm", "fixture")
+	testutil.RunGit(t, repoPath, "init", "-q")
+	testutil.RunGit(t, repoPath, "add", ".")
+	testutil.RunGit(t, repoPath, "-c", "user.name=drydock-test", "-c", "user.email=drydock@example.test", "commit", "-qm", "fixture")
 	commitBytes, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
 	if err != nil {
 		t.Fatal(err)
@@ -667,9 +667,9 @@ func newSecretAuditFixture(t *testing.T, scanner betterleaks.Scanner) secretAudi
 		}
 		codeMapFiles[path] = codemap.File{Path: path}
 	}
-	runGitForAuditTest(t, repoPath, "init", "-q")
-	runGitForAuditTest(t, repoPath, "add", ".")
-	runGitForAuditTest(t, repoPath, "-c", "user.name=drydock-test", "-c", "user.email=drydock@example.test", "commit", "-qm", "initial")
+	testutil.RunGit(t, repoPath, "init", "-q")
+	testutil.RunGit(t, repoPath, "add", ".")
+	testutil.RunGit(t, repoPath, "-c", "user.name=drydock-test", "-c", "user.email=drydock@example.test", "commit", "-qm", "initial")
 	commitBytes, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
 	if err != nil {
 		t.Fatal(err)
@@ -789,9 +789,9 @@ func TestRunFailsAndPersistsCoverageOnScanErrors(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repoPath, "main.go"), []byte("package main\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runGitForAuditTest(t, repoPath, "init", "-q")
-	runGitForAuditTest(t, repoPath, "add", "main.go")
-	runGitForAuditTest(t, repoPath, "-c", "user.name=drydock-test", "-c", "user.email=drydock@example.test", "commit", "-qm", "initial")
+	testutil.RunGit(t, repoPath, "init", "-q")
+	testutil.RunGit(t, repoPath, "add", "main.go")
+	testutil.RunGit(t, repoPath, "-c", "user.name=drydock-test", "-c", "user.email=drydock@example.test", "commit", "-qm", "initial")
 
 	store := &coverageAuditStore{}
 	pub := &recordingAuditPublisher{}
@@ -820,14 +820,6 @@ func TestRunFailsAndPersistsCoverageOnScanErrors(t *testing.T) {
 	want := db.SecurityAuditCoverage{ScanOperationsScanned: 5, ScanOperationsSkipped: 3, ScanOperationsErrored: 3}
 	if store.coverage[0] != want || result.Coverage != want {
 		t.Fatalf("coverage persisted=%+v result=%+v want=%+v", store.coverage[0], result.Coverage, want)
-	}
-}
-
-func runGitForAuditTest(t *testing.T, dir string, args ...string) {
-	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 }
 

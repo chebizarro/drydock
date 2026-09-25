@@ -27,3 +27,9 @@ const (
 	ZapReceipt             nostr.Kind = 9735
 	CASAudit               nostr.Kind = 4903
 )
+
+// AutofixTagValue is the NIP-12 "t" topic-tag value Drydock stamps on the
+// autofix patches it publishes. The publisher stamps it and the ingest path
+// reads it back for review-loop suppression, so both sides must agree on the
+// exact string; a rename on one side alone makes Drydock review its own output.
+const AutofixTagValue = "drydock-autofix"

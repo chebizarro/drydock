@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 )
 
 func TestTreeAndSearchGolden(t *testing.T) {
@@ -46,7 +48,7 @@ func TestTreeAndSearchGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertRepoGolden(t, "testdata/tree_search.golden.json", string(encoded)+"\n")
+	testutil.AssertGolden(t, "testdata/tree_search.golden.json", string(encoded)+"\n")
 }
 
 func TestManagedGitRootPinsCheckout(t *testing.T) {
@@ -120,21 +122,3 @@ func runGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
-func assertRepoGolden(t *testing.T, path, got string) {
-	t.Helper()
-	if os.Getenv("UPDATE_GOLDEN") == "1" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	want, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != string(want) {
-		t.Fatalf("golden mismatch for %s\nwant:\n%s\ngot:\n%s", path, want, got)
-	}
-}

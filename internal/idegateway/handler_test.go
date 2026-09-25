@@ -261,7 +261,7 @@ func TestPatchReviewRequestForcedMaintainerReopensStatusSkipped(t *testing.T) {
 	h, store, orders := newPatchRequestHandler(t, requester, loader, nil)
 	patch, repoID := seedPatchReviewTarget(t, store, ownerSK, patchSK)
 
-	acquired, err := store.BeginReview(context.Background(), patch.ID.Hex(), repoID, false)
+	acquired, err := store.BeginReviewWithClaim(context.Background(), patch.ID.Hex(), repoID, db.ReviewClaim{})
 	if err != nil || !acquired {
 		t.Fatalf("BeginReview = %v, %v", acquired, err)
 	}

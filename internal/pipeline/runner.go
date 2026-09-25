@@ -67,7 +67,7 @@ func retryablePaymentError(auth payment.AuthorizeResult) error {
 
 // SecurityReviewStage runs the verified security lens over an assembled context bundle.
 type SecurityReviewStage interface {
-	Run(context.Context, contextbuilder.ContextBundle, string, repoconfig.SecurityConfig) securityreview.SecurityResult
+	Run(context.Context, contextbuilder.ContextBundle, string, repoconfig.SecurityConfig) (securityreview.SecurityResult, error)
 }
 
 // BetterleaksScanner is the secret-scanner seam used by patch reviews.
@@ -615,9 +615,9 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		}
 		stageConfig := repoCfg.Security
 		stageConfig.Enabled = generalSecurity
-		securityResult := r.securityReviewer.Run(ctx, bundle, prep.RepoPath, stageConfig)
-		if securityResult.Error != nil {
-			return fmt.Errorf("security review: %w", securityResult.Error)
+		securityResult, secErr := r.securityReviewer.Run(ctx, bundle, prep.RepoPath, stageConfig)
+		if secErr != nil {
+			return fmt.Errorf("security review: %w", secErr)
 		}
 		verifiedSecurityFindings = securityResult.Findings
 		log.Info("security review completed", "findings", len(verifiedSecurityFindings))

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 
 	"fiatjaf.com/nostr"
@@ -123,7 +124,7 @@ func buildFixPatchTags(scope commentScope, in PublishFixPatchInput) nostr.Tags {
 		// Repository reference
 		{"a", repositoryAddress(in.RepoID)},
 		// Mark this as an autofix patch (used for loop suppression + filtering)
-		{"t", "drydock-autofix"},
+		{"t", eventkind.AutofixTagValue},
 		// Expiration
 		{"expiration", fmt.Sprintf("%d", time.Now().Add(90*24*time.Hour).Unix())},
 	}

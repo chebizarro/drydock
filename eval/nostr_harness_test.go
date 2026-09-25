@@ -3,7 +3,6 @@ package eval
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -11,6 +10,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/codemap"
 	"git.sharegap.net/cascadia/drydock/internal/nostrscan"
 	"git.sharegap.net/cascadia/drydock/internal/securityscan"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 )
 
 // nostrRoleFixture pairs an eval fixture repository with the rule IDs the
@@ -20,13 +20,12 @@ import (
 // a wish list: they were observed by running the wiring, and each entry is a
 // real detection that would break if the rule regressed.
 //
-// Coverage gap (tracked in DRYDOCK-09c1): the eval relay fixture and the
-// absence rules NOSTR-V1/V5/V7/R1/R2 are NOT exercised by this corpus — the
-// fixtures are too thin to seed the absence analyzer's ingest-to-use walk (for
-// example the relay fixture never presents a tagged event-ingest surface, so
-// NOSTR-R1 cannot fire). Those rules are covered by internal/nostrscan's own
-// vulnerable/fixed fixtures (rules_test.go, absence_test.go); this harness
-// covers the role-gated auditengine wiring end to end.
+// The corpus exercises the full NP25 set end to end (DRYDOCK-09c1): the client
+// fixture seeds the absence walk for NOSTR-V1/V2/V7/R2 and the presence rules
+// NOSTR-V3/V5/V6; the signer fixture covers NOSTR-V3/V4; and the relay fixture
+// presents an ["EVENT", ...] ingest surface that reaches persistence, seeding
+// NOSTR-R1. The vulnerable/fixed call chains are real function calls, so they
+// hold under both the LSP-resolved and the grep-fallback code map.
 type nostrRoleFixture struct {
 	role      nostrscan.Role
 	source    string   // file within the fixture repo, e.g. "client.go"
@@ -34,8 +33,9 @@ type nostrRoleFixture struct {
 }
 
 var nostrRoleFixtures = []nostrRoleFixture{
-	{role: nostrscan.RoleClient, source: "client.go", wantRules: []string{"NOSTR-V2", "NOSTR-V3", "NOSTR-V6"}},
+	{role: nostrscan.RoleClient, source: "client.go", wantRules: []string{"NOSTR-V1", "NOSTR-V2", "NOSTR-V3", "NOSTR-V5", "NOSTR-V6", "NOSTR-V7", "NOSTR-R2"}},
 	{role: nostrscan.RoleSigner, source: "signer.go", wantRules: []string{"NOSTR-V3", "NOSTR-V4"}},
+	{role: nostrscan.RoleRelay, source: "relay.go", wantRules: []string{"NOSTR-R1"}},
 }
 
 // TestNostrProductionWiringFlagsVulnerableFixtures runs the exact scan wiring
@@ -105,7 +105,7 @@ func sortedKeys(set map[string]bool) []string {
 
 func initNostrFixtureRepo(t *testing.T, fixture string) string {
 	t.Helper()
-	repo := t.TempDir()
+	files := make(map[string]string)
 	err := filepath.WalkDir(fixture, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -121,27 +121,11 @@ func initNostrFixtureRepo(t *testing.T, fixture string) string {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(repo, relative)
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		return os.WriteFile(target, data, 0o644)
+		files[relative] = string(data)
+		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	runFixtureGit(t, repo, "init", "-q")
-	runFixtureGit(t, repo, "config", "user.email", "test@example.test")
-	runFixtureGit(t, repo, "config", "user.name", "Test")
-	runFixtureGit(t, repo, "add", ".")
-	runFixtureGit(t, repo, "commit", "-qm", "fixture")
-	return repo
-}
-
-func runFixtureGit(t *testing.T, repo string, args ...string) {
-	t.Helper()
-	out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
-	}
+	return testutil.InitRepo(t, files)
 }

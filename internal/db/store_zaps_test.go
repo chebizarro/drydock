@@ -12,7 +12,7 @@ func TestInsertZapReceiptClaimsPaymentBlockedReview(t *testing.T) {
 	const patchID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const repoID = "owner:repo"
 
-	acquired, err := store.BeginReview(ctx, patchID, repoID, true)
+	acquired, err := store.BeginReviewWithClaim(ctx, patchID, repoID, ReviewClaim{Force: true})
 	if err != nil || !acquired {
 		t.Fatalf("BeginReview = %v, %v", acquired, err)
 	}
@@ -67,7 +67,7 @@ func TestMarkReviewPaymentBlockedUsesZapCursor(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 
 	const blockedPatch = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-	acquired, err := store.BeginReview(ctx, blockedPatch, "owner:blocked")
+	acquired, err := store.BeginReviewWithClaim(ctx, blockedPatch, "owner:blocked", ReviewClaim{})
 	if err != nil || !acquired {
 		t.Fatalf("BeginReview = %v, %v", acquired, err)
 	}
@@ -88,7 +88,7 @@ func TestMarkReviewPaymentBlockedUsesZapCursor(t *testing.T) {
 	}
 
 	const pendingPatch = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-	if acquired, err = store.BeginReview(ctx, pendingPatch, "owner:pending"); err != nil || !acquired {
+	if acquired, err = store.BeginReviewWithClaim(ctx, pendingPatch, "owner:pending", ReviewClaim{}); err != nil || !acquired {
 		t.Fatalf("BeginReview pending = %v, %v", acquired, err)
 	}
 	if err := store.MarkReviewFailed(ctx, pendingPatch, "owner:pending", "payment_pending"); err != nil {
@@ -108,7 +108,7 @@ func TestMarkReviewPaymentBlockedUsesZapCursor(t *testing.T) {
 	}
 
 	const racingPatch = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-	acquired, err = store.BeginReview(ctx, racingPatch, "owner:racing")
+	acquired, err = store.BeginReviewWithClaim(ctx, racingPatch, "owner:racing", ReviewClaim{})
 	if err != nil || !acquired {
 		t.Fatalf("BeginReview = %v, %v", acquired, err)
 	}
@@ -136,7 +136,7 @@ func TestInsertZapReceiptDoesNotClaimOtherFailures(t *testing.T) {
 	store := mustOpenStore(t, ctx)
 	const patchID = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	const repoID = "owner:repo"
-	acquired, err := store.BeginReview(ctx, patchID, repoID)
+	acquired, err := store.BeginReviewWithClaim(ctx, patchID, repoID, ReviewClaim{})
 	if err != nil || !acquired {
 		t.Fatalf("BeginReview = %v, %v", acquired, err)
 	}

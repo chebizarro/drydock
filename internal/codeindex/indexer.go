@@ -46,6 +46,17 @@ type fileIndexResult struct {
 	embedErrors    int
 }
 
+// indexTotals folds every file's per-file counts and error flag together so the
+// "intended>0 && upserted==0" guard sees every indexed file through one
+// accumulation path — a rename, modify, or full-rebuild arm cannot silently
+// skip a counter.
+type indexTotals struct {
+	intended    int
+	upserted    int
+	embedErrors int
+	hadErrors   bool
+}
+
 // Indexer manages semantic code indexing into Qdrant.
 // It is safe for concurrent use; per-repo serialisation is enforced internally.
 type Indexer struct {
@@ -136,10 +147,7 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 	extractor := symbols.New()
 	defer extractor.Close()
 
-	var totalIntended int
-	var totalUpserted int
-	var totalEmbedErrors int
-	var hadErrors bool
+	var totals indexTotals
 
 	// Determine whether to do a full rebuild or incremental update.
 	fullRebuild := state.Commit == "" || forceRebuild
@@ -170,25 +178,16 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 					if err := idx.deleteFilePoints(ctx, repoID, change.oldPath); err != nil {
 						idx.logger.Warn("failed to delete chunks for removed file",
 							"file", change.oldPath, "error", err)
-						hadErrors = true
+						totals.hadErrors = true
 					}
 
 				case strings.HasPrefix(change.status, "R"):
 					if err := idx.deleteFilePoints(ctx, repoID, change.oldPath); err != nil {
 						idx.logger.Warn("failed to delete chunks for renamed file",
 							"old_path", change.oldPath, "error", err)
-						hadErrors = true
+						totals.hadErrors = true
 					}
-					res, err := idx.indexFile(ctx, extractor, repoPath, repoID, currentCommit, change.newPath)
-					totalIntended += res.intendedChunks
-					totalUpserted += res.upserted
-					totalEmbedErrors += res.embedErrors
-					if err != nil {
-						idx.logger.Warn("failed to index renamed file", "file", change.newPath, "error", err)
-						hadErrors = true
-					} else if res.embedErrors > 0 {
-						hadErrors = true
-					}
+					idx.indexFileInto(ctx, extractor, repoPath, repoID, currentCommit, change.newPath, "failed to index renamed file", &totals)
 
 				case change.status == "A" || change.status == "M" ||
 					change.status == "T" || change.status == "C":
@@ -196,19 +195,10 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 						if err := idx.deleteFilePoints(ctx, repoID, change.effectivePath()); err != nil {
 							idx.logger.Warn("failed to delete old chunks",
 								"file", change.effectivePath(), "error", err)
-							hadErrors = true
+							totals.hadErrors = true
 						}
 					}
-					res, err := idx.indexFile(ctx, extractor, repoPath, repoID, currentCommit, change.effectivePath())
-					totalIntended += res.intendedChunks
-					totalUpserted += res.upserted
-					totalEmbedErrors += res.embedErrors
-					if err != nil {
-						idx.logger.Warn("failed to index file", "file", change.effectivePath(), "error", err)
-						hadErrors = true
-					} else if res.embedErrors > 0 {
-						hadErrors = true
-					}
+					idx.indexFileInto(ctx, extractor, repoPath, repoID, currentCommit, change.effectivePath(), "failed to index file", &totals)
 
 				default:
 					idx.logger.Warn("unknown git diff status, skipping",
@@ -225,7 +215,7 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 		// Delete any stale points for this repo.
 		if err := idx.deleteRepoPoints(ctx, repoID); err != nil {
 			idx.logger.Warn("failed to clean stale points", "repo_id", repoID, "error", err)
-			hadErrors = true
+			totals.hadErrors = true
 		}
 
 		files, err := gitListFiles(ctx, repoPath, currentCommit)
@@ -240,34 +230,22 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 			default:
 			}
 
-			res, err := idx.indexFile(ctx, extractor, repoPath, repoID, currentCommit, filePath)
-			totalIntended += res.intendedChunks
-			totalUpserted += res.upserted
-			totalEmbedErrors += res.embedErrors
-			if err != nil {
-				idx.logger.Warn("failed to index file during full build",
-					"file", filePath, "error", err)
-				hadErrors = true
-				continue
-			}
-			if res.embedErrors > 0 {
-				hadErrors = true
-			}
+			idx.indexFileInto(ctx, extractor, repoPath, repoID, currentCommit, filePath, "failed to index file during full build", &totals)
 		}
 	}
 
 	// Only persist state if indexing completed without errors.
 	// Partial indexes leave the state unchanged so the next run retries.
-	if hadErrors {
+	if totals.hadErrors {
 		idx.logger.Warn("code index completed with errors, state not advanced",
 			"repo_id", repoID,
-			"chunks_intended", totalIntended,
-			"chunks_upserted", totalUpserted,
-			"embed_errors", totalEmbedErrors)
-		return fmt.Errorf("code index incomplete: intended_chunks=%d upserted_chunks=%d embed_errors=%d", totalIntended, totalUpserted, totalEmbedErrors)
+			"chunks_intended", totals.intended,
+			"chunks_upserted", totals.upserted,
+			"embed_errors", totals.embedErrors)
+		return fmt.Errorf("code index incomplete: intended_chunks=%d upserted_chunks=%d embed_errors=%d", totals.intended, totals.upserted, totals.embedErrors)
 	}
-	if totalIntended > 0 && totalUpserted == 0 {
-		return fmt.Errorf("code index produced no upserted chunks from %d intended chunks", totalIntended)
+	if totals.intended > 0 && totals.upserted == 0 {
+		return fmt.Errorf("code index produced no upserted chunks from %d intended chunks", totals.intended)
 	}
 	if err := writeState(repoPath, indexState{
 		Commit:    currentCommit,
@@ -278,9 +256,27 @@ func (idx *Indexer) IndexRepo(ctx context.Context, repoPath, repoID string) erro
 
 	idx.logger.Info("code index complete",
 		"repo_id", repoID, "commit", currentCommit[:min(8, len(currentCommit))],
-		"chunks_intended", totalIntended,
-		"chunks_upserted", totalUpserted)
+		"chunks_intended", totals.intended,
+		"chunks_upserted", totals.upserted)
 	return nil
+}
+
+// indexFileInto indexes one file and folds its per-file counts into totals,
+// logging warnMsg and marking hadErrors on failure. It is the single place file
+// counts are accumulated, so no arm can forget a counter.
+func (idx *Indexer) indexFileInto(ctx context.Context, extractor *symbols.Extractor, repoPath, repoID, commit, filePath, warnMsg string, totals *indexTotals) {
+	res, err := idx.indexFile(ctx, extractor, repoPath, repoID, commit, filePath)
+	totals.intended += res.intendedChunks
+	totals.upserted += res.upserted
+	totals.embedErrors += res.embedErrors
+	if err != nil {
+		idx.logger.Warn(warnMsg, "file", filePath, "error", err)
+		totals.hadErrors = true
+		return
+	}
+	if res.embedErrors > 0 {
+		totals.hadErrors = true
+	}
 }
 
 // indexFile reads a single file from the canonical ref, extracts symbols,
@@ -347,22 +343,28 @@ func (idx *Indexer) indexFile(
 			continue
 		}
 
+		payload, err := vectorstore.EncodePayload(ChunkPayload{
+			RepoID:        repoID,
+			FilePath:      filePath,
+			SymbolName:    sym.Name,
+			SymbolKind:    string(sym.Kind),
+			ParentSymbol:  sym.Parent,
+			StartLine:     int(sym.StartLine) + 1, // 1-based
+			EndLine:       int(sym.EndLine) + 1,   // 1-based
+			Language:      lang,
+			Content:       content,
+			ContentHash:   hashutil.SHA256Hex([]byte(content)),
+			IndexedCommit: commit,
+		})
+		if err != nil {
+			idx.logger.Warn("encode chunk payload, skip chunk",
+				"file", filePath, "symbol", sym.Name, "error", err)
+			continue
+		}
 		points = append(points, vectorstore.Point{
-			ID:     chunkPointID(repoID, filePath, sym),
-			Vector: vec,
-			Payload: map[string]any{
-				"repo_id":        repoID,
-				"file_path":      filePath,
-				"symbol_name":    sym.Name,
-				"symbol_kind":    string(sym.Kind),
-				"parent_symbol":  sym.Parent,
-				"start_line":     int(sym.StartLine) + 1, // 1-based
-				"end_line":       int(sym.EndLine) + 1,   // 1-based
-				"language":       lang,
-				"content":        content,
-				"content_hash":   hashutil.SHA256Hex([]byte(content)),
-				"indexed_commit": commit,
-			},
+			ID:      chunkPointID(repoID, filePath, sym),
+			Vector:  vec,
+			Payload: payload,
 		})
 
 		// Batch upsert when buffer is full.
@@ -409,6 +411,24 @@ func extractChunk(lines []string, sym symbols.Symbol) []byte {
 	}
 
 	return []byte(strings.Join(lines[ctxStart:ctxEnd+1], "\n"))
+}
+
+// ChunkPayload is the typed schema of a code_chunks Qdrant point payload. The
+// indexer writes it (via vectorstore.EncodePayload) and the retrieval providers
+// read it (via vectorstore.DecodePayload) through this one struct, so a renamed
+// field is a compile error at every site rather than a silent empty read.
+type ChunkPayload struct {
+	RepoID        string `json:"repo_id"`
+	FilePath      string `json:"file_path"`
+	SymbolName    string `json:"symbol_name"`
+	SymbolKind    string `json:"symbol_kind"`
+	ParentSymbol  string `json:"parent_symbol"`
+	StartLine     int    `json:"start_line"`
+	EndLine       int    `json:"end_line"`
+	Language      string `json:"language"`
+	Content       string `json:"content"`
+	ContentHash   string `json:"content_hash"`
+	IndexedCommit string `json:"indexed_commit"`
 }
 
 // chunkPointID generates a stable deterministic ID for a code chunk.

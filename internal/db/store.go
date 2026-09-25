@@ -748,6 +748,20 @@ type rowsQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
+// RowQuerier is the single-row read subset of *sql.DB / *sql.Tx. It is exported
+// so sibling persistence packages (e.g. reviewsession) can share one row-scanner
+// helper signature instead of each declaring an identical anonymous interface.
+type RowQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+// execRowQuerier is the read/write subset used by the outbox helper, which both
+// reserves (INSERT/UPDATE) and reads back (single-row SELECT) against *sql.DB.
+type execRowQuerier interface {
+	RowQuerier
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 func hasColumn(ctx context.Context, q rowsQuerier, table, column string) (bool, error) {
 	quotedTable, err := quoteSQLiteIdent(table)
 	if err != nil {
@@ -1280,149 +1294,139 @@ func (s *Store) InsertReviewEvent(ctx context.Context, event nostr.Event, patchE
 	return nil
 }
 
-// GetReviewPublication returns an exact signed event reserved for relay delivery.
-// The stored event is reused across retries so a repeated relay publish has the
-// same Nostr event ID and is idempotent.
-func (s *Store) GetReviewPublication(ctx context.Context, patchEventID, repoID, eventType string, detailIndex int) (event nostr.Event, delivered, found bool, err error) {
+// reviewOutbox is a single-event delivery-idempotency table: a signed event is
+// reserved before any relay delivery and the exact stored event is reused
+// across retries, so a repeated publish keeps the same Nostr event ID. The
+// review-publication and failure-notice outboxes are this same shape over
+// different key columns. (The security-audit outbox is a set-oriented shape —
+// three publications plus a SARIF artifact reserved atomically — and stays in
+// store_security.go rather than being forced through this helper.)
+type reviewOutbox struct {
+	table   string
+	keyCols []string
+	noun    string // used verbatim in error messages, e.g. "review publication"
+}
+
+var (
+	reviewPublicationOutbox = reviewOutbox{
+		table:   "review_publication_outbox",
+		keyCols: []string{"patch_event_id", "repo_id", "event_type", "detail_index"},
+		noun:    "review publication",
+	}
+	reviewFailureNoticeOutbox = reviewOutbox{
+		table:   "review_failure_notice_outbox",
+		keyCols: []string{"patch_event_id", "repo_id"},
+		noun:    "review failure notice",
+	}
+)
+
+func (o reviewOutbox) whereClause() string {
+	terms := make([]string, len(o.keyCols))
+	for i, col := range o.keyCols {
+		terms[i] = col + "=?"
+	}
+	return strings.Join(terms, " AND ")
+}
+
+// get returns the exact signed event reserved for relay delivery keyed by the
+// outbox's key columns. The stored event is reused across retries so a repeated
+// relay publish has the same Nostr event ID and is idempotent.
+func (o reviewOutbox) get(ctx context.Context, q execRowQuerier, key ...any) (event nostr.Event, delivered, found bool, err error) {
 	var raw string
 	var deliveredAt int64
-	err = s.db.QueryRowContext(ctx,
-		`SELECT raw_event_json, delivered_at
-		FROM review_publication_outbox
-		WHERE patch_event_id=? AND repo_id=? AND event_type=? AND detail_index=?`,
-		patchEventID, repoID, eventType, detailIndex,
+	err = q.QueryRowContext(ctx,
+		"SELECT raw_event_json, delivered_at FROM "+o.table+" WHERE "+o.whereClause(),
+		key...,
 	).Scan(&raw, &deliveredAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nostr.Event{}, false, false, nil
 		}
-		return nostr.Event{}, false, false, fmt.Errorf("get review publication: %w", err)
+		return nostr.Event{}, false, false, fmt.Errorf("get %s: %w", o.noun, err)
 	}
 	if err := json.Unmarshal([]byte(raw), &event); err != nil {
-		return nostr.Event{}, false, false, fmt.Errorf("decode reserved review publication: %w", err)
+		return nostr.Event{}, false, false, fmt.Errorf("decode reserved %s: %w", o.noun, err)
 	}
 	return event, deliveredAt > 0, true, nil
+}
+
+// reserve durably stores a signed event before relay delivery. If another
+// attempt already reserved this logical event, that exact event is returned
+// instead of replacing it.
+func (o reviewOutbox) reserve(ctx context.Context, q execRowQuerier, event nostr.Event, key ...any) (nostr.Event, bool, error) {
+	cols := append(append([]string{}, o.keyCols...), "event_id", "raw_event_json", "created_at")
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(cols)), ", ")
+	insert := "INSERT INTO " + o.table + "(" + strings.Join(cols, ", ") + ") VALUES (" + placeholders + ")" +
+		" ON CONFLICT(" + strings.Join(o.keyCols, ", ") + ") DO NOTHING"
+	args := append(append([]any{}, key...), event.ID.Hex(), event.String(), time.Now().Unix())
+	if _, err := q.ExecContext(ctx, insert, args...); err != nil {
+		return nostr.Event{}, false, fmt.Errorf("reserve %s: %w", o.noun, err)
+	}
+	reserved, delivered, found, err := o.get(ctx, q, key...)
+	if err != nil {
+		return nostr.Event{}, false, err
+	}
+	if !found {
+		return nostr.Event{}, false, fmt.Errorf("reserved %s not found", o.noun)
+	}
+	return reserved, delivered, nil
+}
+
+func (o reviewOutbox) markDelivered(ctx context.Context, q execRowQuerier, key ...any) error {
+	args := append([]any{time.Now().Unix()}, key...)
+	res, err := q.ExecContext(ctx,
+		"UPDATE "+o.table+" SET delivered_at=? WHERE "+o.whereClause(),
+		args...,
+	)
+	if err != nil {
+		return fmt.Errorf("mark %s delivered: %w", o.noun, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s rows affected: %w", o.noun, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("%s reservation not found", o.noun)
+	}
+	return nil
+}
+
+// GetReviewPublication returns an exact signed event reserved for relay delivery.
+// The stored event is reused across retries so a repeated relay publish has the
+// same Nostr event ID and is idempotent.
+func (s *Store) GetReviewPublication(ctx context.Context, patchEventID, repoID, eventType string, detailIndex int) (event nostr.Event, delivered, found bool, err error) {
+	return reviewPublicationOutbox.get(ctx, s.db, patchEventID, repoID, eventType, detailIndex)
 }
 
 // ReserveReviewPublication durably stores a signed event before relay delivery.
 // If another attempt already reserved this logical event, that exact event is
 // returned instead of replacing it.
 func (s *Store) ReserveReviewPublication(ctx context.Context, patchEventID, repoID, eventType string, detailIndex int, event nostr.Event) (nostr.Event, bool, error) {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO review_publication_outbox
-			(patch_event_id, repo_id, event_type, detail_index, event_id, raw_event_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(patch_event_id, repo_id, event_type, detail_index) DO NOTHING`,
-		patchEventID, repoID, eventType, detailIndex, event.ID.Hex(), event.String(), time.Now().Unix(),
-	)
-	if err != nil {
-		return nostr.Event{}, false, fmt.Errorf("reserve review publication: %w", err)
-	}
-	reserved, delivered, found, err := s.GetReviewPublication(ctx, patchEventID, repoID, eventType, detailIndex)
-	if err != nil {
-		return nostr.Event{}, false, err
-	}
-	if !found {
-		return nostr.Event{}, false, errors.New("reserved review publication not found")
-	}
-	return reserved, delivered, nil
+	return reviewPublicationOutbox.reserve(ctx, s.db, event, patchEventID, repoID, eventType, detailIndex)
 }
 
 func (s *Store) MarkReviewPublicationDelivered(ctx context.Context, patchEventID, repoID, eventType string, detailIndex int) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE review_publication_outbox SET delivered_at=?
-		WHERE patch_event_id=? AND repo_id=? AND event_type=? AND detail_index=?`,
-		time.Now().Unix(), patchEventID, repoID, eventType, detailIndex,
-	)
-	if err != nil {
-		return fmt.Errorf("mark review publication delivered: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("review publication rows affected: %w", err)
-	}
-	if affected == 0 {
-		return errors.New("review publication reservation not found")
-	}
-	return nil
+	return reviewPublicationOutbox.markDelivered(ctx, s.db, patchEventID, repoID, eventType, detailIndex)
 }
 
 // GetReviewFailureNotice returns the exact signed operational notice reserved
 // for a failed review preparation. It is separate from the review publication
 // outbox so a later successful retry can still publish an ordinary review.
 func (s *Store) GetReviewFailureNotice(ctx context.Context, patchEventID, repoID string) (event nostr.Event, delivered, found bool, err error) {
-	var raw string
-	var deliveredAt int64
-	err = s.db.QueryRowContext(ctx,
-		`SELECT raw_event_json, delivered_at
-		FROM review_failure_notice_outbox
-		WHERE patch_event_id=? AND repo_id=?`,
-		patchEventID, repoID,
-	).Scan(&raw, &deliveredAt)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nostr.Event{}, false, false, nil
-		}
-		return nostr.Event{}, false, false, fmt.Errorf("get review failure notice: %w", err)
-	}
-	if err := json.Unmarshal([]byte(raw), &event); err != nil {
-		return nostr.Event{}, false, false, fmt.Errorf("decode reserved review failure notice: %w", err)
-	}
-	return event, deliveredAt > 0, true, nil
+	return reviewFailureNoticeOutbox.get(ctx, s.db, patchEventID, repoID)
 }
 
 func (s *Store) ReserveReviewFailureNotice(ctx context.Context, patchEventID, repoID string, event nostr.Event) (nostr.Event, bool, error) {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO review_failure_notice_outbox
-			(patch_event_id, repo_id, event_id, raw_event_json, created_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(patch_event_id, repo_id) DO NOTHING`,
-		patchEventID, repoID, event.ID.Hex(), event.String(), time.Now().Unix(),
-	)
-	if err != nil {
-		return nostr.Event{}, false, fmt.Errorf("reserve review failure notice: %w", err)
-	}
-	reserved, delivered, found, err := s.GetReviewFailureNotice(ctx, patchEventID, repoID)
-	if err != nil {
-		return nostr.Event{}, false, err
-	}
-	if !found {
-		return nostr.Event{}, false, errors.New("reserved review failure notice not found")
-	}
-	return reserved, delivered, nil
+	return reviewFailureNoticeOutbox.reserve(ctx, s.db, event, patchEventID, repoID)
 }
 
 func (s *Store) MarkReviewFailureNoticeDelivered(ctx context.Context, patchEventID, repoID string) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE review_failure_notice_outbox SET delivered_at=?
-		WHERE patch_event_id=? AND repo_id=?`,
-		time.Now().Unix(), patchEventID, repoID,
-	)
-	if err != nil {
-		return fmt.Errorf("mark review failure notice delivered: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("review failure notice rows affected: %w", err)
-	}
-	if affected == 0 {
-		return errors.New("review failure notice reservation not found")
-	}
-	return nil
-}
-
-// BeginReview transitions a patch/repo from pending|failed -> reviewing.
-// It preserves the legacy force-only API; new intake paths should use
-// BeginReviewWithClaim so invocation metadata survives recovery.
-func (s *Store) BeginReview(ctx context.Context, patchEventID, repoID string, force ...bool) (bool, error) {
-	claim := ReviewClaim{}
-	if len(force) > 0 {
-		claim.Force = force[0]
-	}
-	return s.BeginReviewWithClaim(ctx, patchEventID, repoID, claim)
+	return reviewFailureNoticeOutbox.markDelivered(ctx, s.db, patchEventID, repoID)
 }
 
 // BeginReviewWithClaim atomically claims a review with durable invocation data.
+// It transitions a patch/repo from pending|failed -> reviewing, persisting the
+// claim's invocation metadata so it survives recovery.
 func (s *Store) BeginReviewWithClaim(ctx context.Context, patchEventID, repoID string, claim ReviewClaim) (bool, error) {
 	claim, err := claim.normalized()
 	if err != nil {
@@ -2338,6 +2342,18 @@ type ReviewTask struct {
 	OrderID         string
 }
 
+// reviewTaskColumns is the single column ordering for the three review_log
+// queries that hydrate a ReviewTask. scanReviewTask reads them in the same
+// order, so a schema change is a one-line edit rather than three positionally
+// aligned scans that fail silently on a mismatch.
+const reviewTaskColumns = `patch_event_id, repo_id, force, invocation, requester_pubkey, order_id`
+
+func scanReviewTask(sc rowScanner) (ReviewTask, error) {
+	var t ReviewTask
+	err := sc.Scan(&t.PatchEventID, &t.RepoID, &t.Force, &t.Invocation, &t.RequesterPubkey, &t.OrderID)
+	return t, err
+}
+
 // ResetStuckReviews transitions entries stuck in "reviewing" (e.g. from a crash)
 // back to "pending" so they can be retried.
 func (s *Store) ResetStuckReviews(ctx context.Context) (int64, error) {
@@ -2362,7 +2378,7 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 	// Exclude permanent denials from requeue: payment rejections
 	// ('payment_blocked:') and status-gated skips ('status_skipped:').
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT patch_event_id, repo_id, force, invocation, requester_pubkey, order_id FROM review_log
+		`SELECT `+reviewTaskColumns+` FROM review_log
 		WHERE status='failed' AND updated_at < ?
 		AND (failure_reason IS NULL OR failure_reason = ''
 			OR (failure_reason NOT LIKE 'payment_blocked:%' AND failure_reason NOT LIKE 'status_skipped:%'))
@@ -2375,8 +2391,8 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 
 	var tasks []ReviewTask
 	for rows.Next() {
-		var t ReviewTask
-		if err := rows.Scan(&t.PatchEventID, &t.RepoID, &t.Force, &t.Invocation, &t.RequesterPubkey, &t.OrderID); err != nil {
+		t, err := scanReviewTask(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan failed review: %w", err)
 		}
 		tasks = append(tasks, t)
@@ -2407,7 +2423,7 @@ func (s *Store) RequeueFailedReviews(ctx context.Context, minAgeSeconds int64, l
 func (s *Store) ListStalePendingReviews(ctx context.Context, minAgeSeconds int64, limit int) ([]ReviewTask, error) {
 	cutoff := time.Now().Unix() - minAgeSeconds
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT patch_event_id, repo_id, force, invocation, requester_pubkey, order_id FROM review_log
+		`SELECT `+reviewTaskColumns+` FROM review_log
 		WHERE status='pending' AND updated_at <= ?
 		ORDER BY updated_at ASC
 		LIMIT ?`, cutoff, limit)
@@ -2418,8 +2434,8 @@ func (s *Store) ListStalePendingReviews(ctx context.Context, minAgeSeconds int64
 
 	var tasks []ReviewTask
 	for rows.Next() {
-		var t ReviewTask
-		if err := rows.Scan(&t.PatchEventID, &t.RepoID, &t.Force, &t.Invocation, &t.RequesterPubkey, &t.OrderID); err != nil {
+		t, err := scanReviewTask(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan pending review: %w", err)
 		}
 		tasks = append(tasks, t)
@@ -2584,23 +2600,34 @@ func (s *Store) InsertPromptVersion(ctx context.Context, promptName, content str
 	return res.LastInsertId()
 }
 
+// promptVersionColumns is the prompt_versions SELECT list in scanPromptVersion's
+// Scan order, shared by the by-name and by-number reads below.
+const promptVersionColumns = `id, prompt_name, version, content, parent_version, source_gap_ids, status, eval_score, created_at`
+
+func scanPromptVersion(sc rowScanner) (PromptVersion, error) {
+	var pv PromptVersion
+	var evalScore sql.NullFloat64
+	if err := sc.Scan(&pv.ID, &pv.PromptName, &pv.Version, &pv.Content, &pv.ParentVersion, &pv.SourceGapIDs, &pv.Status, &evalScore, &pv.CreatedAt); err != nil {
+		return PromptVersion{}, err
+	}
+	if evalScore.Valid {
+		pv.EvalScore = &evalScore.Float64
+	}
+	return pv, nil
+}
+
 // GetActivePromptVersion returns the active version for the given prompt name.
 // Returns sql.ErrNoRows wrapped in error if no active version exists.
 func (s *Store) GetActivePromptVersion(ctx context.Context, promptName string) (PromptVersion, error) {
-	var pv PromptVersion
-	var evalScore sql.NullFloat64
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, prompt_name, version, content, parent_version, source_gap_ids, status, eval_score, created_at
+	pv, err := scanPromptVersion(s.db.QueryRowContext(ctx,
+		`SELECT `+promptVersionColumns+`
 		FROM prompt_versions
 		WHERE prompt_name=? AND status='active'
 		ORDER BY version DESC LIMIT 1`,
 		promptName,
-	).Scan(&pv.ID, &pv.PromptName, &pv.Version, &pv.Content, &pv.ParentVersion, &pv.SourceGapIDs, &pv.Status, &evalScore, &pv.CreatedAt)
+	))
 	if err != nil {
 		return PromptVersion{}, fmt.Errorf("get active prompt version %q: %w", promptName, err)
-	}
-	if evalScore.Valid {
-		pv.EvalScore = &evalScore.Float64
 	}
 	return pv, nil
 }
@@ -2692,19 +2719,14 @@ func (s *Store) SetPromptVersionEvalScore(ctx context.Context, id int64, score f
 
 // GetPromptVersionByNumber returns a prompt version by its name and version number.
 func (s *Store) GetPromptVersionByNumber(ctx context.Context, promptName string, version int) (PromptVersion, error) {
-	var pv PromptVersion
-	var evalScore sql.NullFloat64
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, prompt_name, version, content, parent_version, source_gap_ids, status, eval_score, created_at
+	pv, err := scanPromptVersion(s.db.QueryRowContext(ctx,
+		`SELECT `+promptVersionColumns+`
 		FROM prompt_versions
 		WHERE prompt_name=? AND version=?`,
 		promptName, version,
-	).Scan(&pv.ID, &pv.PromptName, &pv.Version, &pv.Content, &pv.ParentVersion, &pv.SourceGapIDs, &pv.Status, &evalScore, &pv.CreatedAt)
+	))
 	if err != nil {
 		return PromptVersion{}, fmt.Errorf("get prompt version %q v%d: %w", promptName, version, err)
-	}
-	if evalScore.Valid {
-		pv.EvalScore = &evalScore.Float64
 	}
 	return pv, nil
 }

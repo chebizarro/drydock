@@ -55,7 +55,7 @@ func TestPublishReviewSummaryAndHighDetail(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -138,7 +138,7 @@ func TestPublishReviewRedactsSensitiveFindingText(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -261,7 +261,7 @@ func TestPublishReviewPRUpdateUsesRootAndParentScopes(t *testing.T) {
 	if err := store.RecordPatchEventRelay(ctx, updateEvt.ID.Hex(), "wss://relay.patch.example"); err != nil {
 		t.Fatalf("seed patch relay: %v", err)
 	}
-	if _, err := store.BeginReview(ctx, updateEvt.ID.Hex(), db.RepoIDFromPatch(updateEvt)); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, updateEvt.ID.Hex(), db.RepoIDFromPatch(updateEvt), db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -334,7 +334,7 @@ func TestPublishReviewFailsGracefullyWhenAllRelaysReject(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -365,7 +365,7 @@ func TestPublishReviewExcludedFilesInFooter(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -419,7 +419,7 @@ func TestPublishReviewDetailFailureLeavesReviewRetryable(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -467,7 +467,7 @@ func TestPublishReviewReservationFailureBlocksRelayPublish(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 	if _, err := store.DB().ExecContext(ctx, `CREATE TRIGGER fail_review_event_reservation
@@ -491,7 +491,7 @@ func TestPublishReviewRetrySkipsDeliveredEvents(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -535,7 +535,7 @@ func TestPublishReviewWithStructuredSuggestions(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -599,7 +599,7 @@ func TestPublishReviewWithWalkthrough(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -655,7 +655,7 @@ func TestPublishReviewPerRequestDetailFloor(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 
@@ -697,7 +697,7 @@ func TestPublishReviewPartialRelayFailureStillSucceeds(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 

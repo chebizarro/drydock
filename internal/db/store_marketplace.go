@@ -135,47 +135,51 @@ func (s *Store) UpsertReviewerProfile(ctx context.Context, profile ReviewerProfi
 }
 
 // GetReviewerProfile retrieves a reviewer profile by pubkey.
-func (s *Store) GetReviewerProfile(ctx context.Context, pubkey string) (*ReviewerProfile, error) {
+// reviewerProfileColumns is the reviewer_profiles SELECT list in
+// scanReviewerProfile's Scan order, shared by every reviewer_profiles read so
+// the positional alignment (and the languages/domains JSON decode) lives once.
+const reviewerProfileColumns = `pubkey, display_name, languages, domains,
+	availability, price_per_review, max_concurrent, payout_destination,
+	event_id, created_at, updated_at`
+
+func scanReviewerProfile(sc rowScanner) (ReviewerProfile, error) {
 	var p ReviewerProfile
 	var languagesJSON, domainsJSON string
-
-	err := s.db.QueryRowContext(ctx, `
-		SELECT pubkey, display_name, languages, domains,
-				availability, price_per_review, max_concurrent, payout_destination,
-				event_id, created_at, updated_at
-		FROM reviewer_profiles WHERE pubkey = ?
-	`, pubkey).Scan(
+	if err := sc.Scan(
 		&p.Pubkey, &p.DisplayName, &languagesJSON, &domainsJSON,
 		&p.Availability, &p.PricePerReview, &p.MaxConcurrent, &p.PayoutDestination,
 		&p.EventID, &p.CreatedAt, &p.UpdatedAt,
-	)
+	); err != nil {
+		return ReviewerProfile{}, err
+	}
+	if err := json.Unmarshal([]byte(languagesJSON), &p.Languages); err != nil {
+		return ReviewerProfile{}, fmt.Errorf("decode reviewer languages: %w", err)
+	}
+	if err := json.Unmarshal([]byte(domainsJSON), &p.Domains); err != nil {
+		return ReviewerProfile{}, fmt.Errorf("decode reviewer domains: %w", err)
+	}
+	return p, nil
+}
+
+func (s *Store) GetReviewerProfile(ctx context.Context, pubkey string) (*ReviewerProfile, error) {
+	p, err := scanReviewerProfile(s.db.QueryRowContext(ctx,
+		`SELECT `+reviewerProfileColumns+` FROM reviewer_profiles WHERE pubkey = ?`, pubkey))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("reviewer not found %s: %w", pubkey, sql.ErrNoRows)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get reviewer profile: %w", err)
 	}
-
-	if err := json.Unmarshal([]byte(languagesJSON), &p.Languages); err != nil {
-		return nil, fmt.Errorf("decode reviewer languages: %w", err)
-	}
-	if err := json.Unmarshal([]byte(domainsJSON), &p.Domains); err != nil {
-		return nil, fmt.Errorf("decode reviewer domains: %w", err)
-	}
-
 	return &p, nil
 }
 
 // ListAvailableReviewers returns all reviewers who are not unavailable.
 func (s *Store) ListAvailableReviewers(ctx context.Context) ([]ReviewerProfile, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT pubkey, display_name, languages, domains,
-				availability, price_per_review, max_concurrent, payout_destination,
-				event_id, created_at, updated_at
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+reviewerProfileColumns+`
 		FROM reviewer_profiles
 		WHERE availability != 'unavailable'
-		ORDER BY updated_at DESC
-	`)
+		ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list available reviewers: %w", err)
 	}
@@ -183,24 +187,10 @@ func (s *Store) ListAvailableReviewers(ctx context.Context) ([]ReviewerProfile, 
 
 	var profiles []ReviewerProfile
 	for rows.Next() {
-		var p ReviewerProfile
-		var languagesJSON, domainsJSON string
-
-		if err := rows.Scan(
-			&p.Pubkey, &p.DisplayName, &languagesJSON, &domainsJSON,
-			&p.Availability, &p.PricePerReview, &p.MaxConcurrent, &p.PayoutDestination,
-			&p.EventID, &p.CreatedAt, &p.UpdatedAt,
-		); err != nil {
+		p, err := scanReviewerProfile(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan reviewer profile: %w", err)
 		}
-
-		if err := json.Unmarshal([]byte(languagesJSON), &p.Languages); err != nil {
-			return nil, fmt.Errorf("decode reviewer languages: %w", err)
-		}
-		if err := json.Unmarshal([]byte(domainsJSON), &p.Domains); err != nil {
-			return nil, fmt.Errorf("decode reviewer domains: %w", err)
-		}
-
 		profiles = append(profiles, p)
 	}
 
@@ -550,16 +540,30 @@ func (s *Store) TransitionPendingAssignment(ctx context.Context, id int, reviewe
 	return fmt.Errorf("assignment %s transition did not apply", assignmentEventID)
 }
 
+// reviewAssignmentListColumns is the review_assignments SELECT list (excluding
+// the acceptance/completion/review event IDs that getAssignment also reads) in
+// scanReviewAssignmentListRow's Scan order, shared by the list queries below.
+const reviewAssignmentListColumns = `id, patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
+	status, priority, price_sats, assignment_event_id,
+	expires_at, created_at, updated_at`
+
+func scanReviewAssignmentListRow(sc rowScanner) (ReviewAssignment, error) {
+	var a ReviewAssignment
+	err := sc.Scan(
+		&a.ID, &a.PatchEventID, &a.RepoID, &a.ReviewerPubkey, &a.RequesterPubkey,
+		&a.Status, &a.Priority, &a.PriceSats, &a.AssignmentEventID,
+		&a.ExpiresAt, &a.CreatedAt, &a.UpdatedAt,
+	)
+	return a, err
+}
+
 // ListPendingAssignments returns all pending assignments for a reviewer.
 func (s *Store) ListPendingAssignments(ctx context.Context, pubkey string) ([]ReviewAssignment, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
-				status, priority, price_sats, assignment_event_id,
-				expires_at, created_at, updated_at
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+reviewAssignmentListColumns+`
 		FROM review_assignments
 		WHERE reviewer_pubkey = ? AND status = 'pending'
-		ORDER BY priority ASC, created_at ASC
-	`, pubkey)
+		ORDER BY priority ASC, created_at ASC`, pubkey)
 	if err != nil {
 		return nil, fmt.Errorf("list pending assignments: %w", err)
 	}
@@ -567,12 +571,8 @@ func (s *Store) ListPendingAssignments(ctx context.Context, pubkey string) ([]Re
 
 	var assignments []ReviewAssignment
 	for rows.Next() {
-		var a ReviewAssignment
-		if err := rows.Scan(
-			&a.ID, &a.PatchEventID, &a.RepoID, &a.ReviewerPubkey, &a.RequesterPubkey,
-			&a.Status, &a.Priority, &a.PriceSats, &a.AssignmentEventID,
-			&a.ExpiresAt, &a.CreatedAt, &a.UpdatedAt,
-		); err != nil {
+		a, err := scanReviewAssignmentListRow(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan pending assignment: %w", err)
 		}
 		assignments = append(assignments, a)
@@ -586,14 +586,11 @@ func (s *Store) ListPendingAssignments(ctx context.Context, pubkey string) ([]Re
 
 // ListAssignmentsForPatch returns all assignments for a given patch.
 func (s *Store) ListAssignmentsForPatch(ctx context.Context, patchEventID string) ([]ReviewAssignment, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, patch_event_id, repo_id, reviewer_pubkey, requester_pubkey,
-			status, priority, price_sats, assignment_event_id,
-			expires_at, created_at, updated_at
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+reviewAssignmentListColumns+`
 		FROM review_assignments
 		WHERE patch_event_id = ?
-		ORDER BY created_at DESC
-	`, patchEventID)
+		ORDER BY created_at DESC`, patchEventID)
 	if err != nil {
 		return nil, fmt.Errorf("list assignments for patch: %w", err)
 	}
@@ -601,12 +598,8 @@ func (s *Store) ListAssignmentsForPatch(ctx context.Context, patchEventID string
 
 	var assignments []ReviewAssignment
 	for rows.Next() {
-		var a ReviewAssignment
-		if err := rows.Scan(
-			&a.ID, &a.PatchEventID, &a.RepoID, &a.ReviewerPubkey, &a.RequesterPubkey,
-			&a.Status, &a.Priority, &a.PriceSats, &a.AssignmentEventID,
-			&a.ExpiresAt, &a.CreatedAt, &a.UpdatedAt,
-		); err != nil {
+		a, err := scanReviewAssignmentListRow(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan patch assignment: %w", err)
 		}
 		assignments = append(assignments, a)

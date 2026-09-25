@@ -15,6 +15,13 @@ import (
 	"fiatjaf.com/nostr"
 )
 
+// errNilTransport reports a nil *Transport receiver. NewTransport never returns
+// a nil Transport without an error, but a nil *Transport can still be assigned
+// into an interface (e.g. AuditProgressNotifier) where an == nil check on the
+// interface value is false; each exported method guards against that so a
+// misconfigured wiring returns this error instead of panicking on a nil deref.
+var errNilTransport = errors.New("contextvm transport is nil")
+
 // Pool is the subset of nostr.Pool used by Transport.
 type Pool interface {
 	PublishMany(ctx context.Context, urls []string, evt nostr.Event) chan nostr.PublishResult
@@ -30,7 +37,17 @@ type Transport struct {
 	logger      *slog.Logger
 }
 
-func NewTransport(pool Pool, signer signing.Signer, readRelays, writeRelays []string, logger *slog.Logger) *Transport {
+// NewTransport validates the pool and signer once so the publish/subscribe
+// methods can assume both are present. Relay requirements stay per-method
+// because they differ (Send/SendResponse need write relays, Subscribe needs
+// read relays, Notify accepts per-call relays).
+func NewTransport(pool Pool, signer signing.Signer, readRelays, writeRelays []string, logger *slog.Logger) (*Transport, error) {
+	if pool == nil {
+		return nil, errors.New("contextvm transport requires pool")
+	}
+	if signer == nil {
+		return nil, errors.New("contextvm transport requires signer")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -40,12 +57,15 @@ func NewTransport(pool Pool, signer signing.Signer, readRelays, writeRelays []st
 		readRelays:  append([]string(nil), readRelays...),
 		writeRelays: append([]string(nil), writeRelays...),
 		logger:      logger,
-	}
+	}, nil
 }
 
 // Send publishes a kind 25910 JSON-RPC request with a generated correlation
 // ID. The signed Nostr event ID is returned to callers.
 func (t *Transport) Send(ctx context.Context, method string, params any, recipients ...nostr.PubKey) (string, error) {
+	if t == nil {
+		return "", errNilTransport
+	}
 	id, err := randomRequestID()
 	if err != nil {
 		return "", err
@@ -56,14 +76,11 @@ func (t *Transport) Send(ctx context.Context, method string, params any, recipie
 // SendWithID publishes a kind 25910 JSON-RPC request with an explicit
 // request/response correlation id.
 func (t *Transport) SendWithID(ctx context.Context, id, method string, params any, recipients ...nostr.PubKey) (string, error) {
+	if t == nil {
+		return "", errNilTransport
+	}
 	if id == "" {
 		return "", errors.New("contextvm request id is required")
-	}
-	if t.pool == nil {
-		return "", errors.New("contextvm transport requires pool")
-	}
-	if t.signer == nil {
-		return "", errors.New("contextvm transport requires signer")
 	}
 	if method == "" {
 		return "", errors.New("contextvm method is required")
@@ -114,11 +131,8 @@ type Notification struct {
 
 // Notify publishes a kind 25910 JSON-RPC notification.
 func (t *Transport) Notify(ctx context.Context, notification Notification) (string, error) {
-	if t.pool == nil {
-		return "", errors.New("contextvm transport requires pool")
-	}
-	if t.signer == nil {
-		return "", errors.New("contextvm transport requires signer")
+	if t == nil {
+		return "", errNilTransport
 	}
 	if notification.Method == "" {
 		return "", errors.New("contextvm method is required")
@@ -161,20 +175,20 @@ func (t *Transport) Notify(ctx context.Context, notification Notification) (stri
 
 // SendResponse publishes a kind 25910 JSON-RPC response addressed to recipients.
 func (t *Transport) SendResponse(ctx context.Context, id string, result any, rpcErr *Error, recipients ...nostr.PubKey) error {
+	if t == nil {
+		return errNilTransport
+	}
 	return t.SendResponseToEvent(ctx, "", id, result, rpcErr, recipients...)
 }
 
 // SendResponseToEvent publishes a kind 25910 JSON-RPC response with an "e" tag
 // referencing the request event id.
 func (t *Transport) SendResponseToEvent(ctx context.Context, requestEventID, id string, result any, rpcErr *Error, recipients ...nostr.PubKey) error {
+	if t == nil {
+		return errNilTransport
+	}
 	if id == "" {
 		return errors.New("contextvm response id is required")
-	}
-	if t.pool == nil {
-		return errors.New("contextvm transport requires pool")
-	}
-	if t.signer == nil {
-		return errors.New("contextvm transport requires signer")
 	}
 	if len(t.writeRelays) == 0 {
 		return errors.New("contextvm transport requires write relays")
@@ -220,11 +234,8 @@ func responseTags(requestEventID string, recipients []nostr.PubKey) nostr.Tags {
 // Subscribe opens a long-lived subscription for kind 25910 messages addressed to
 // our pubkey and returns decoded requests/responses.
 func (t *Transport) Subscribe(ctx context.Context) (<-chan Request, <-chan error, error) {
-	if t.pool == nil {
-		return nil, nil, errors.New("contextvm transport requires pool")
-	}
-	if t.signer == nil {
-		return nil, nil, errors.New("contextvm transport requires signer")
+	if t == nil {
+		return nil, nil, errNilTransport
 	}
 	if len(t.readRelays) == 0 {
 		return nil, nil, errors.New("contextvm transport requires read relays")

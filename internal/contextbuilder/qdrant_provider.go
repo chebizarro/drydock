@@ -43,6 +43,20 @@ func NewQdrantProvider(qdrant *vectorstore.Client, embedder *embedding.Client) *
 func (p *QdrantProvider) LayerName() string { return LayerQdrantDocs }
 func (p *QdrantProvider) Priority() int     { return 8 }
 
+// nipSpecPayload and projectDocPayload are the typed schemas of the nip_specs
+// and project_docs Qdrant point payloads, decoded via vectorstore.DecodePayload
+// so a renamed key surfaces as a zero field rather than a silent empty layer.
+type nipSpecPayload struct {
+	NIPID        string `json:"nip_id"`
+	SectionTitle string `json:"section_title"`
+	Content      string `json:"content"`
+}
+
+type projectDocPayload struct {
+	SectionTitle string `json:"section_title"`
+	Content      string `json:"content"`
+}
+
 func (p *QdrantProvider) Build(ctx context.Context, in BuildInput) (string, error) {
 	// Embed the patch diff as the query vector.
 	queryText := in.PatchEventContent
@@ -72,14 +86,15 @@ func (p *QdrantProvider) Build(ctx context.Context, in BuildInput) (string, erro
 		} else if len(results) > 0 {
 			out.WriteString("### NIP Specifications\n\n")
 			for _, r := range results {
-				nipID, _ := r.Payload["nip_id"].(string)
-				section, _ := r.Payload["section_title"].(string)
-				content, _ := r.Payload["content"].(string)
-				if content == "" {
+				var spec nipSpecPayload
+				if err := vectorstore.DecodePayload(r.Payload, &spec); err != nil {
 					continue
 				}
-				out.WriteString(fmt.Sprintf("**NIP-%s: %s** (relevance: %.2f)\n", nipID, section, r.Score))
-				out.WriteString(content)
+				if spec.Content == "" {
+					continue
+				}
+				out.WriteString(fmt.Sprintf("**NIP-%s: %s** (relevance: %.2f)\n", spec.NIPID, spec.SectionTitle, r.Score))
+				out.WriteString(spec.Content)
 				out.WriteString("\n\n")
 			}
 		}
@@ -96,15 +111,17 @@ func (p *QdrantProvider) Build(ctx context.Context, in BuildInput) (string, erro
 	} else if len(results) > 0 {
 		out.WriteString("### Retrieved Project Documentation\n\n")
 		for _, r := range results {
-			title, _ := r.Payload["section_title"].(string)
-			content, _ := r.Payload["content"].(string)
-			if content == "" {
+			var doc projectDocPayload
+			if err := vectorstore.DecodePayload(r.Payload, &doc); err != nil {
 				continue
 			}
-			if title != "" {
-				out.WriteString(fmt.Sprintf("**%s** (relevance: %.2f)\n", title, r.Score))
+			if doc.Content == "" {
+				continue
 			}
-			out.WriteString(content)
+			if doc.SectionTitle != "" {
+				out.WriteString(fmt.Sprintf("**%s** (relevance: %.2f)\n", doc.SectionTitle, r.Score))
+			}
+			out.WriteString(doc.Content)
 			out.WriteString("\n\n")
 		}
 	}

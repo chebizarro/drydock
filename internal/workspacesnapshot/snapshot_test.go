@@ -282,6 +282,122 @@ func TestManagerRejectsLeaseShorterThanSessionLifetime(t *testing.T) {
 	}
 }
 
+func TestRestoreRejectsSymlinkedStorage(t *testing.T) {
+	ctx := context.Background()
+
+	create := func(t *testing.T, storage string) *Snapshot {
+		t.Helper()
+		workspace := t.TempDir()
+		writeFile(t, workspace, "main.go", "package main\n")
+		m := restoreManager(t, storage)
+		s, err := m.CreateMutable(ctx, MutableCopyOptions{
+			WorkspacePath: workspace, Patch: []byte("diff"), Allowlist: []string{"."},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	// Baseline: a clean restore through a fresh manager still succeeds, so the
+	// symlink rejection has not weakened the manifest/hash verification path.
+	t.Run("clean restore succeeds", func(t *testing.T) {
+		storage := t.TempDir()
+		created := create(t, storage)
+		if _, err := restoreManager(t, storage).Restore(ctx, created.StoragePath(), created.ID, created.ManifestDigest(), created.PatchDigest()); err != nil {
+			t.Fatalf("clean restore: %v", err)
+		}
+	})
+
+	t.Run("symlinked storage directory", func(t *testing.T) {
+		storage := t.TempDir()
+		created := create(t, storage)
+		link := filepath.Join(storage, "link")
+		if err := os.Symlink(created.StoragePath(), link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := restoreManager(t, storage).Restore(ctx, link, created.ID, created.ManifestDigest(), created.PatchDigest()); !errors.Is(err, ErrSymlink) {
+			t.Fatalf("restore via symlinked storage dir = %v, want ErrSymlink", err)
+		}
+	})
+
+	t.Run("symlinked descriptor", func(t *testing.T) {
+		storage := t.TempDir()
+		created := create(t, storage)
+		swapWithSymlink(t, filepath.Join(created.StoragePath(), "descriptor.json"))
+		if _, err := restoreManager(t, storage).Restore(ctx, created.StoragePath(), created.ID, created.ManifestDigest(), created.PatchDigest()); !errors.Is(err, ErrSymlink) {
+			t.Fatalf("restore with symlinked descriptor = %v, want ErrSymlink", err)
+		}
+	})
+
+	t.Run("symlinked patch", func(t *testing.T) {
+		storage := t.TempDir()
+		created := create(t, storage)
+		swapWithSymlink(t, filepath.Join(created.StoragePath(), "patch"))
+		if _, err := restoreManager(t, storage).Restore(ctx, created.StoragePath(), created.ID, created.ManifestDigest(), created.PatchDigest()); !errors.Is(err, ErrSymlink) {
+			t.Fatalf("restore with symlinked patch = %v, want ErrSymlink", err)
+		}
+	})
+
+	t.Run("symlinked files root", func(t *testing.T) {
+		storage := t.TempDir()
+		created := create(t, storage)
+		swapWithSymlink(t, filepath.Join(created.StoragePath(), "files"))
+		if _, err := restoreManager(t, storage).Restore(ctx, created.StoragePath(), created.ID, created.ManifestDigest(), created.PatchDigest()); !errors.Is(err, ErrSymlink) {
+			t.Fatalf("restore with symlinked files root = %v, want ErrSymlink", err)
+		}
+	})
+}
+
+// TestMutableReadRejectsSymlinkedFilesRoot covers the mutable read path: the
+// files root itself was never Lstat'd, so a component swapped to a symlink
+// after materialization would silently redirect every read.
+func TestMutableReadRejectsSymlinkedFilesRoot(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	writeFile(t, workspace, "main.go", "package main\n")
+	manager := newTestManager(t, nil)
+	created, err := manager.CreateMutable(ctx, MutableCopyOptions{
+		WorkspacePath: workspace, Patch: []byte("diff"), Allowlist: []string{"."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := created.ReadFile(ctx, "main.go"); err != nil {
+		t.Fatalf("baseline read: %v", err)
+	}
+	swapWithSymlink(t, filepath.Join(created.StoragePath(), "files"))
+	if _, err := created.ReadFile(ctx, "main.go"); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("read after files-root symlink swap = %v, want ErrSymlink", err)
+	}
+	if _, err := created.Resolve("main.go"); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("resolve after files-root symlink swap = %v, want ErrSymlink", err)
+	}
+}
+
+// swapWithSymlink renames path to path+".real" and replaces path with a symlink
+// pointing at it, so the entry keeps its name but is now a symlink. It works for
+// both files (descriptor/patch) and directories (files root).
+func swapWithSymlink(t *testing.T, path string) {
+	t.Helper()
+	real := path + ".real"
+	if err := os.Rename(path, real); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(real), path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func restoreManager(t *testing.T, storage string) *Manager {
+	t.Helper()
+	manager, err := NewManager(Config{StorageRoot: storage, LeaseTTL: time.Hour, SessionLifetime: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manager
+}
+
 func newTestManager(t *testing.T, clock Clock) *Manager {
 	t.Helper()
 	manager, err := NewManager(Config{

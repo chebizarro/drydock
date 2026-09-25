@@ -37,7 +37,6 @@ type Server struct {
 	mux               *http.ServeMux
 	srv               *http.Server
 	logger            *slog.Logger
-	db                Checker
 	ready             atomic.Bool
 	lastActivityUnix  atomic.Int64
 	lastHeartbeatUnix atomic.Int64
@@ -51,9 +50,13 @@ func New(db Checker, logger *slog.Logger) *Server {
 	s := &Server{
 		mux:              http.NewServeMux(),
 		logger:           logger,
-		db:               db,
 		heartbeatTimeout: 60 * time.Second,
 	}
+	// Register the database through the same readiness path as every other
+	// dependency so a DB outage surfaces as a "degraded" component. It used to be
+	// special-cased to report "not_ready", which a monitoring rule keyed on
+	// "degraded" would miss.
+	_ = s.AddReadinessCheck("database", db)
 	s.RecordActivity()
 	s.recordHeartbeat()
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
@@ -246,13 +249,6 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-
-	if err := s.db.Ping(ctx); err != nil {
-		s.logger.Warn("readiness check failed: database unreachable", "error", err)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(healthResponse{Status: "not_ready", Error: "database unreachable", Degraded: []string{"database"}, Components: []componentStatus{{Name: "database", Status: "degraded", Error: err.Error()}}})
-		return
-	}
 
 	components := s.runReadinessChecks(ctx)
 	degraded := degradedComponents(components)

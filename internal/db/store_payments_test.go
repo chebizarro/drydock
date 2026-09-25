@@ -279,7 +279,7 @@ func TestPaymentRecoveryCandidatesAndAuthorizedRequeue(t *testing.T) {
 		InvoiceID: "invoice", InvoiceRequest: "lnbc1", InvoiceAmountMSats: 100000,
 		InvoiceExpiresAt: time.Now().Add(time.Hour).Unix(),
 	}
-	if acquired, err := store.BeginReview(ctx, rec.PatchEventID, rec.RepoID); err != nil || !acquired {
+	if acquired, err := store.BeginReviewWithClaim(ctx, rec.PatchEventID, rec.RepoID, ReviewClaim{}); err != nil || !acquired {
 		t.Fatalf("BeginReview: acquired=%v err=%v", acquired, err)
 	}
 	if err := store.MarkReviewFailed(ctx, rec.PatchEventID, rec.RepoID, "payment_blocked:payment_pending"); err != nil {
@@ -419,21 +419,18 @@ func TestAuthorizeReviewFromSubscription(t *testing.T) {
 		t.Fatalf("AuthorizeReviewFromSubscription: %v", err)
 	}
 
-	// Verify the authorization was created by checking the row directly
-	// (GetReviewPayment has issues with NULL token_hash)
-	var status, accessKind string
-	err := store.db.QueryRowContext(ctx,
-		`SELECT status, access_kind FROM review_payments WHERE patch_event_id = ?`,
-		"new-patch",
-	).Scan(&status, &accessKind)
+	// Read back through the production accessor. GetReviewPayment COALESCEs a
+	// NULL token_hash to "", so the subscription-authorization row (which has no
+	// token) is readable — exercising the caller-visible path, not raw SQL.
+	rec, err := store.GetReviewPayment(ctx, "new-patch")
 	if err != nil {
-		t.Fatalf("Query: %v", err)
+		t.Fatalf("GetReviewPayment: %v", err)
 	}
-	if status != "authorized" {
-		t.Errorf("expected status 'authorized', got %q", status)
+	if rec.Status != "authorized" {
+		t.Errorf("expected status 'authorized', got %q", rec.Status)
 	}
-	if accessKind != "subscription" {
-		t.Errorf("expected access_kind 'subscription', got %q", accessKind)
+	if rec.AccessKind != "subscription" {
+		t.Errorf("expected access_kind 'subscription', got %q", rec.AccessKind)
 	}
 }
 

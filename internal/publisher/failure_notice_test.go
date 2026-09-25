@@ -8,13 +8,15 @@ import (
 	"testing"
 
 	"fiatjaf.com/nostr"
+
+	"git.sharegap.net/cascadia/drydock/internal/db"
 )
 
 func TestPublishFailureNoticeIsDistinctIdempotentAndDoesNotBlockReview(t *testing.T) {
 	ctx := context.Background()
 	store := mustStore(t, ctx)
 	patchID, repoID := seedRepoAndPatch(t, ctx, store)
-	if _, err := store.BeginReview(ctx, patchID, repoID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchID, repoID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 

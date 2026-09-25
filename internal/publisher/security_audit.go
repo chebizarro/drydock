@@ -366,9 +366,9 @@ func (s *Service) validateSecurityAuditInput(in PublishSecurityAuditInput) (stri
 	if generatedAt.IsZero() {
 		generatedAt = time.Now()
 	}
-	relays := dedupeNonEmpty(in.Relays)
+	relays := dedupeRelayURLs(in.Relays)
 	if len(relays) == 0 {
-		relays = dedupeNonEmpty(s.cfg.DefaultRelays)
+		relays = dedupeRelayURLs(s.cfg.DefaultRelays)
 	}
 	if len(relays) == 0 {
 		return "", "", time.Time{}, nil, errors.New("no relays available for publishing")

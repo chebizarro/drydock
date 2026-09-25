@@ -195,19 +195,19 @@ func FromEnv() Config {
 		RepoCacheMaxSizeMB:   parseIntOrDefault(envOrDefault("DRYDOCK_REPO_CACHE_MAX_SIZE_MB", "10240"), 10240),
 		PRDiffMaxFiles:       parseIntOrDefault(envOrDefault("DRYDOCK_PR_DIFF_MAX_FILES", "1000"), 1000),
 		PRDiffMaxBytes:       int64(parseIntOrDefault(envOrDefault("DRYDOCK_PR_DIFF_MAX_BYTES", "10485760"), 10*1024*1024)),
-		RepoAllowlist:        normalizeRepositoryAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_ALLOWLIST", ""))),
-		RepoOwnerAllowlist:   normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_REPO_OWNER_ALLOWLIST", ""))),
+		RepoAllowlist:        normalizeRepositoryAllowlist(SplitCSV(envOrDefault("DRYDOCK_REPO_ALLOWLIST", ""))),
+		RepoOwnerAllowlist:   normalizePubkeyAllowlist(SplitCSV(envOrDefault("DRYDOCK_REPO_OWNER_ALLOWLIST", ""))),
 		MonitoredReposAuthor: scope.NormalizePubkey(envOrDefault("DRYDOCK_MONITORED_REPOS_AUTHOR", "")),
-		FreePubkeys:          normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_FREE_PUBKEYS", ""))),
-		TrustedZappers:       normalizePubkeyAllowlist(splitCSV(envOrDefault("DRYDOCK_TRUSTED_ZAPPERS", ""))),
-		Relays: splitCSV(
+		FreePubkeys:          normalizePubkeyAllowlist(SplitCSV(envOrDefault("DRYDOCK_FREE_PUBKEYS", ""))),
+		TrustedZappers:       normalizePubkeyAllowlist(SplitCSV(envOrDefault("DRYDOCK_TRUSTED_ZAPPERS", ""))),
+		Relays: SplitCSV(
 			envOrDefault(
 				"DRYDOCK_RELAYS",
 				devDefault(production, defaultRelays),
 			),
 		),
-		ReadRelays:            splitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
-		WriteRelays:           splitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
+		ReadRelays:            SplitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
+		WriteRelays:           SplitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
 		LogLevel:              parseLogLevel(envOrDefault("DRYDOCK_LOG_LEVEL", "info")),
 		ListenerLookbackMin:   parseIntOrDefault(envOrDefault("DRYDOCK_LISTENER_LOOKBACK_MIN", "5"), 5),
 		ListenerHWMOverlap:    parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_HWM_OVERLAP", "30s"), 30*time.Second),
@@ -222,7 +222,7 @@ func FromEnv() Config {
 		ProfileBannerURL:   envOrDefault("DRYDOCK_PROFILE_BANNER_URL", "https://blossom.sharegap.net/775f7d11c179893f5130f796f1d0b5753a1d975fea39be5a19451d2a9ef51c1e"),
 		ProfileIconPath:    envOrDefault("DRYDOCK_PROFILE_ICON_PATH", ""),
 		ProfileBannerPath:  envOrDefault("DRYDOCK_PROFILE_BANNER_PATH", ""),
-		BlossomServers:     splitCSV(envOrDefault("DRYDOCK_BLOSSOM_SERVERS", "")),
+		BlossomServers:     SplitCSV(envOrDefault("DRYDOCK_BLOSSOM_SERVERS", "")),
 		PlannerBaseURL:     envOrDefault("DRYDOCK_PLANNER_BASE_URL", devDefault(production, defaultPlannerBaseURL)),
 		PlannerModel:       envOrDefault("DRYDOCK_PLANNER_MODEL", devDefault(production, defaultPlannerModel)),
 		Coder32BBaseURL:    envOrDefault("DRYDOCK_CODER32B_BASE_URL", devDefault(production, defaultCoder32BBaseURL)),
@@ -249,8 +249,8 @@ func FromEnv() Config {
 		DevMode:            parseBoolOrDefault(envOrDefault("DEV_MODE", envOrDefault("DRYDOCK_DEV_MODE", "")), false),
 		ChartroomURL:       envOrDefault("DRYDOCK_CHARTROOM_URL", ""),
 		ChartroomToken:     envOrDefault("DRYDOCK_CHARTROOM_TOKEN", envOrDefault("CHARTROOM_HTTP_BEARER_TOKEN", "")),
-		ChartroomCorpusIDs: splitCSV(envOrDefault("DRYDOCK_CHARTROOM_CORPUS_IDS", "")),
-		ChartroomSourceIDs: splitCSV(envOrDefault("DRYDOCK_CHARTROOM_SOURCE_IDS", envOrDefault("DRYDOCK_CHARTROOM_SOURCES", ""))),
+		ChartroomCorpusIDs: SplitCSV(envOrDefault("DRYDOCK_CHARTROOM_CORPUS_IDS", "")),
+		ChartroomSourceIDs: SplitCSV(envOrDefault("DRYDOCK_CHARTROOM_SOURCE_IDS", envOrDefault("DRYDOCK_CHARTROOM_SOURCES", ""))),
 		QdrantURL:          envOrDefault("DRYDOCK_QDRANT_URL", ""),
 		QdrantAPIKey:       envOrDefault("DRYDOCK_QDRANT_API_KEY", ""),
 		QdrantCollections: vectorstore.CollectionNames{
@@ -308,7 +308,7 @@ func FromEnv() Config {
 		BetterleaksValidation:               parseBoolOrDefault(envOrDefault("DRYDOCK_BETTERLEAKS_VALIDATION", "false"), false),
 		SecurityAuditWorkers:                parseIntOrDefault(envOrDefault("DRYDOCK_SECURITY_AUDIT_WORKERS", "2"), 2),
 		SecurityNostrEnabled:                parseNostrEnabled(envOrDefault("DRYDOCK_SECURITY_NOSTR_ENABLED", "auto")),
-		SecurityNostrProbeTargets:           splitCSV(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_TARGETS", "")),
+		SecurityNostrProbeTargets:           SplitCSV(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_TARGETS", "")),
 		SecurityNostrProbeActive:            parseBoolOrDefault(envOrDefault("DRYDOCK_SECURITY_NOSTR_PROBE_ACTIVE", "false"), false),
 		CodeChatLimit:                       parseIntOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_REQUESTS", "20"), 20),
 		CodeChatWindow:                      parseDurationOrDefault(envOrDefault("DRYDOCK_CODECHAT_RATE_LIMIT_WINDOW", "1h"), time.Hour),
@@ -417,7 +417,15 @@ func validCollectionName(name string) bool {
 	return true
 }
 
-func splitCSV(v string) []string {
+// SplitCSV splits v on commas, trims whitespace from each field, and drops
+// empty fields. It always returns a non-nil slice (empty or whitespace-only
+// input yields []string{}). This is the canonical comma-list splitter.
+//
+// Lean binaries that must not import internal/config keep local mirrors of
+// this logic rather than link config's transitive deps (the SQLite driver via
+// modernc.org/sqlite and internal/vectorstore): see cmd/lsp-bridge/main.go and
+// cmd/drydock-mcp/main.go. That duplication is deliberate and dependency-bounded.
+func SplitCSV(v string) []string {
 	raw := strings.Split(v, ",")
 	out := make([]string, 0, len(raw))
 	for _, item := range raw {
@@ -458,10 +466,10 @@ func normalizePubkeyAllowlist(values []string) []string {
 }
 
 func paymentTrustedMints() []string {
-	if mints := splitCSV(envOrDefault("DRYDOCK_CASHU_TRUSTED_MINTS", "")); len(mints) > 0 {
+	if mints := SplitCSV(envOrDefault("DRYDOCK_CASHU_TRUSTED_MINTS", "")); len(mints) > 0 {
 		return mints
 	}
-	return splitCSV(envOrDefault("DRYDOCK_CASHU_MINT_URL", ""))
+	return SplitCSV(envOrDefault("DRYDOCK_CASHU_MINT_URL", ""))
 }
 
 func parseLogLevel(v string) slog.Level {

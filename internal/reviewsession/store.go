@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"git.sharegap.net/cascadia/drydock/internal/db"
 )
 
 type Clock func() time.Time
@@ -523,11 +525,7 @@ func (s *SQLStore) BindLease(ctx context.Context, chatID, leaseID string) error 
 	return nil
 }
 
-type sqlQuerier interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}
-
-func loadSession(ctx context.Context, q sqlQuerier, chatID string) (Session, error) {
+func loadSession(ctx context.Context, q db.RowQuerier, chatID string) (Session, error) {
 	var session Session
 	var target string
 	var snapshotExpires, expires, created, updated int64

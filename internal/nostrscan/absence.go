@@ -285,7 +285,12 @@ func emitAbsence(ruleID, severity string, node *absenceNode, line int, path []st
 	*findings = append(*findings, securityscan.SecurityFinding{
 		RuleID: ruleID, Severity: severity, Category: "security",
 		File: node.symbol.Path, Line: line,
-		Evidence:    "[" + ruleID + "] " + strings.Join(labels, " -> "),
+		// The codemap edges this path is built from are references, not proven
+		// calls: with LSP they are type-resolved references, and on the grep
+		// fallback they are \bname\b matches that can come from a comment or
+		// string literal. Label it a "reference path" so a reviewer does not
+		// read "a -> b" as a demonstrated call (DRYDOCK-wm0o).
+		Evidence:    "[" + ruleID + "] reference path: " + strings.Join(labels, " -> "),
 		Description: description, Suggestion: suggestion,
 		Confidence: AbsenceConfidence,
 	})

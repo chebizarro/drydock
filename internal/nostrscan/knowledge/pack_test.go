@@ -1,10 +1,11 @@
 package knowledge
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 )
 
 func TestPackCoverageAndSources(t *testing.T) {
@@ -47,7 +48,7 @@ func TestContextGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertGolden(t, "nostr-protocol.golden.md", got+"\n")
+	testutil.AssertGolden(t, filepath.Join("testdata", "nostr-protocol.golden.md"), got+"\n")
 }
 
 func TestReviewerSystemPreambleGolden(t *testing.T) {
@@ -55,25 +56,6 @@ func TestReviewerSystemPreambleGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertGolden(t, "reviewer-preamble.golden.txt", got+"\n")
+	testutil.AssertGolden(t, filepath.Join("testdata", "reviewer-preamble.golden.txt"), got+"\n")
 }
 
-func assertGolden(t *testing.T, name, got string) {
-	t.Helper()
-	path := filepath.Join("testdata", name)
-	if os.Getenv("UPDATE_GOLDEN") == "1" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	want, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != string(want) {
-		t.Fatalf("golden mismatch for %s; run UPDATE_GOLDEN=1 go test ./internal/nostrscan/knowledge", name)
-	}
-}

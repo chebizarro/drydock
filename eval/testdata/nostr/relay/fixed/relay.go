@@ -8,7 +8,9 @@ type Event struct {
 	Tags [][]string
 }
 
-func websocketRelayServer(message string, event Event) {
+// handleEVENT ingests ["EVENT", ...] and applies the R1 replay defenses:
+// signature verification, id recomputation + comparison, dedup, and freshness.
+func handleEVENT(message string, event Event) {
 	if message != "EVENT" || !verifySignature(event) {
 		return
 	}

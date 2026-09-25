@@ -231,6 +231,38 @@ func Filter(conditions ...map[string]any) map[string]any {
 	return map[string]any{"must": conditions}
 }
 
+// DecodePayload re-encodes a Qdrant payload map and decodes it into dst, so
+// callers read fields through struct tags instead of untyped map[string]any
+// assertions. A renamed or mistyped key then surfaces as a typed zero value on
+// a struct the caller and its tests can see, rather than a silent map miss
+// repeated across call sites. dst must be a non-nil pointer.
+func DecodePayload(payload map[string]any, dst any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode payload: %w", err)
+	}
+	if err := json.Unmarshal(data, dst); err != nil {
+		return fmt.Errorf("decode payload: %w", err)
+	}
+	return nil
+}
+
+// EncodePayload converts a typed payload struct into the map[string]any shape
+// Point.Payload requires, so writers describe payloads with the same typed
+// schema readers decode via DecodePayload. A field renamed on the struct is
+// then a compile error at both the write and read sites.
+func EncodePayload(v any) (map[string]any, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("encode payload: %w", err)
+	}
+	out := make(map[string]any)
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("decode payload: %w", err)
+	}
+	return out, nil
+}
+
 // Search performs a nearest-neighbor vector search and returns up to limit results.
 // An optional filter map is passed directly to Qdrant's filter field.
 func (c *Client) Search(ctx context.Context, collection string, vector []float32, limit int, filter map[string]any) ([]SearchResult, error) {

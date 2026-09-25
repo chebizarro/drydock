@@ -8,11 +8,20 @@ type Event struct {
 	Tags [][]string
 }
 
-func websocketRelayServer(message string, event Event) {
+// handleEVENT is the relay's ["EVENT", ...] ingest surface. It persists the
+// event with no id recomputation, deduplication, or created_at freshness check,
+// so a replayed or forged-id event is accepted (NOSTR-R1).
+func handleEVENT(message string, event Event) {
 	if message == "EVENT" {
-		storeEvent(event)
+		persistEvent(event)
 	}
 	_ = "OK"
 }
 
-func storeEvent(Event) {}
+func persistEvent(event Event) { db.Put(event) }
+
+var db database
+
+type database struct{}
+
+func (database) Put(Event) {}

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"git.sharegap.net/cascadia/drydock/internal/codeindex"
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/embedding"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
@@ -387,14 +388,14 @@ func (h *Handler) queryCodeIndex(ctx context.Context, repoID, question string) (
 			continue
 		}
 
-		filePath, _ := r.Payload["file_path"].(string)
-		symbolName, _ := r.Payload["symbol_name"].(string)
-		symbolKind, _ := r.Payload["symbol_kind"].(string)
-		content, _ := r.Payload["content"].(string)
-		startLine := payloadInt(r.Payload, "start_line")
+		var chunk codeindex.ChunkPayload
+		if err := vectorstore.DecodePayload(r.Payload, &chunk); err != nil {
+			continue
+		}
+		content := chunk.Content
 
 		header := fmt.Sprintf("### %s (%s) — %s:%d\n```\n",
-			symbolName, symbolKind, filePath, startLine)
+			chunk.SymbolName, chunk.SymbolKind, chunk.FilePath, chunk.StartLine)
 		footer := "\n```\n\n"
 
 		entryLen := len(header) + len(content) + len(footer)
@@ -419,24 +420,6 @@ func (h *Handler) queryCodeIndex(ctx context.Context, repoID, question string) (
 	}
 
 	return sb.String(), nil
-}
-
-// payloadInt extracts an integer from a Qdrant payload field.
-func payloadInt(payload map[string]any, key string) int {
-	v, ok := payload[key]
-	if !ok {
-		return 0
-	}
-	switch n := v.(type) {
-	case float64:
-		return int(n)
-	case int:
-		return n
-	case int64:
-		return int(n)
-	default:
-		return 0
-	}
 }
 
 func (h *Handler) publishStoredResponse(ctx context.Context, incomingEvent nostr.Event, response, relayURL string) error {

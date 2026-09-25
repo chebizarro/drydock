@@ -100,6 +100,10 @@ func parseConfig(args []string, getenv func(string) string) (bridgeConfig, error
 	return cfg, nil
 }
 
+// splitTokens is a local mirror of config.SplitCSV kept here so this lean
+// sidecar binary does not link internal/config's transitive deps (the SQLite
+// driver via modernc.org/sqlite and internal/vectorstore). Unlike SplitCSV it
+// returns nil for empty input, which is immaterial to its len()-based callers.
 func splitTokens(value string) []string {
 	var tokens []string
 	for _, token := range strings.Split(value, ",") {

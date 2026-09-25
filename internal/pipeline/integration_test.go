@@ -153,7 +153,7 @@ func seedIntegrationDBWithDiff(t *testing.T, ctx context.Context, store *db.Stor
 	}
 
 	rID := db.RepoIDFromPatch(patchEvt)
-	if _, err := store.BeginReview(ctx, patchEvt.ID.Hex(), rID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchEvt.ID.Hex(), rID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 	return patchEvt.ID.Hex(), rID
@@ -777,7 +777,7 @@ func TestIntegrationApplyFailurePublishesOperationalNotice(t *testing.T) {
 	store.RecordPatchEventRelay(ctx, patchEvt.ID.Hex(), "wss://relay.test")
 
 	rID := db.RepoIDFromPatch(patchEvt)
-	store.BeginReview(ctx, patchEvt.ID.Hex(), rID)
+	store.BeginReviewWithClaim(ctx, patchEvt.ID.Hex(), rID, db.ReviewClaim{})
 
 	// 2. Pre-clone repo into cache with only main.go — the bad diff won't apply
 	cacheDir := filepath.Join(t.TempDir(), "repos")

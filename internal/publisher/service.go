@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -322,7 +321,7 @@ func (s *Service) resolveRelays(ctx context.Context, patchEventID, repoID string
 	if len(relays) == 0 {
 		relays = append([]string(nil), s.cfg.DefaultRelays...)
 	}
-	relays = dedupeNonEmpty(relays)
+	relays = dedupeRelayURLs(relays)
 	if len(relays) == 0 {
 		return nil, errors.New("no relays available for publishing")
 	}
@@ -401,22 +400,6 @@ func deriveCommentScope(target nostr.Event) (commentScope, error) {
 	}
 
 	return scope, nil
-}
-
-func dedupeNonEmpty(items []string) []string {
-	set := map[string]struct{}{}
-	for _, item := range items {
-		item = strings.TrimSpace(item)
-		if item != "" {
-			set[item] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(set))
-	for item := range set {
-		out = append(out, item)
-	}
-	slices.Sort(out)
-	return out
 }
 
 const sensitiveFindingSafeText = "[REDACTED: sensitive finding]"

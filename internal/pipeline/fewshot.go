@@ -90,6 +90,14 @@ type fewShotMeta struct {
 	CreatedAt  int64    `json:"created_at"`
 }
 
+// fewShotPayload is the full typed schema of a few_shot_reviews Qdrant point:
+// the example content plus its metadata. Decoding through it lets fewShotMeta's
+// JSON tags do the field mapping instead of hand-rolled map assertions.
+type fewShotPayload struct {
+	Content string `json:"content"`
+	fewShotMeta
+}
+
 func (r *QdrantFewShotRetriever) RetrieveFewShots(ctx context.Context, query FewShotQuery) ([]string, error) {
 	if query.Limit <= 0 {
 		return nil, nil
@@ -131,12 +139,16 @@ func (r *QdrantFewShotRetriever) RetrieveFewShots(ctx context.Context, query Few
 			continue
 		}
 
-		content, _ := res.Payload["content"].(string)
+		var payload fewShotPayload
+		if err := vectorstore.DecodePayload(res.Payload, &payload); err != nil {
+			continue
+		}
+		content := payload.Content
 		if content == "" {
 			continue
 		}
 
-		meta := extractMeta(res.Payload)
+		meta := payload.fewShotMeta
 
 		// Composite score: similarity * w1 + quality * w2 + recency * w3 + lang * w4
 		similarity := float64(res.Score)
@@ -206,32 +218,6 @@ func buildFewShotFilter(query FewShotQuery) map[string]any {
 
 func (r *QdrantFewShotRetriever) fallback(ctx context.Context, limit int) ([]string, error) {
 	return r.store.GetRecentFewShots(ctx, limit)
-}
-
-// extractMeta reads few-shot metadata from a Qdrant payload.
-func extractMeta(payload map[string]any) fewShotMeta {
-	meta := fewShotMeta{}
-	if v, ok := payload["language"].(string); ok {
-		meta.Language = v
-	}
-	if v, ok := payload["repo_id"].(string); ok {
-		meta.RepoID = v
-	}
-	if v, ok := payload["quality"].(float64); ok {
-		meta.Quality = v
-	}
-	if v, ok := payload["created_at"].(float64); ok {
-		meta.CreatedAt = int64(v)
-	}
-	// Categories may be stored as []any.
-	if cats, ok := payload["categories"].([]any); ok {
-		for _, c := range cats {
-			if s, ok := c.(string); ok {
-				meta.Categories = append(meta.Categories, s)
-			}
-		}
-	}
-	return meta
 }
 
 // recencyScore returns a 0–1 score that decays over time.

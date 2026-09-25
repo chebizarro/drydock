@@ -75,6 +75,7 @@ type Processor struct {
 	contextVMResponder ContextVMResponder
 	localAutofixPubKey string // if set, skip review of patches from this pubkey
 	servicePubkey      string
+	zapReceiptsEnabled bool
 	trustedZappers     map[string]struct{}
 	maxEventFutureSkew time.Duration
 	maxEventPastAge    time.Duration
@@ -115,10 +116,23 @@ func WithReviewOrders(service ReviewOrderer) func(*Processor) {
 	}
 }
 
-// WithZapReceipts configures NIP-57 receipt validation for the service identity.
-func WithZapReceipts(servicePubkey string, trustedZappers []string) func(*Processor) {
+// WithServiceIdentity sets this service's own pubkey. It gates ContextVM
+// (kind-25910) recipient/method-tag enforcement so requests addressed to other
+// services are dropped, and identifies the recipient NIP-57 zap receipts must
+// name. It is independent of WithZapReceipts: a deployment can enforce ContextVM
+// addressing without accepting zaps.
+func WithServiceIdentity(servicePubkey string) func(*Processor) {
 	return func(p *Processor) {
 		p.servicePubkey = scope.NormalizePubkey(servicePubkey)
+	}
+}
+
+// WithZapReceipts enables NIP-57 receipt processing and sets the trusted-zapper
+// allowlist. Receipt validation requires the service identity from
+// WithServiceIdentity to name the recipient.
+func WithZapReceipts(trustedZappers []string) func(*Processor) {
+	return func(p *Processor) {
+		p.zapReceiptsEnabled = true
 		p.trustedZappers = make(map[string]struct{}, len(trustedZappers))
 		for _, zapper := range trustedZappers {
 			p.trustedZappers[scope.NormalizePubkey(zapper)] = struct{}{}
@@ -285,7 +299,7 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 		_, err = p.reviewOrders.SubmitReactive(ctx, event, repository)
 		return err
 	case eventkind.ZapReceipt:
-		if p.servicePubkey == "" {
+		if !p.zapReceiptsEnabled {
 			return nil
 		}
 		receipt, err := p.validateZapReceipt(event)
@@ -490,22 +504,10 @@ func eventTimestampPlausibleForKind(kind nostr.Kind, ts nostr.Timestamp, maxFutu
 	return !createdAt.Before(now.Add(-maxPastAge))
 }
 
-func eventTimestampPlausible(ts nostr.Timestamp, maxFutureSkew, maxPastAge time.Duration) bool {
-	now := time.Now()
-	createdAt := time.Unix(int64(ts), 0)
-	if createdAt.After(now.Add(maxFutureSkew)) {
-		return false
-	}
-	if createdAt.Before(now.Add(-maxPastAge)) {
-		return false
-	}
-	return true
-}
-
 // hasAutofixTag checks if an event carries the drydock-autofix tag.
 func hasAutofixTag(event nostr.Event) bool {
 	for _, tag := range event.Tags {
-		if len(tag) >= 2 && tag[0] == "t" && tag[1] == "drydock-autofix" {
+		if len(tag) >= 2 && tag[0] == "t" && tag[1] == eventkind.AutofixTagValue {
 			return true
 		}
 	}

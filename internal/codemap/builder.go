@@ -31,8 +31,15 @@ func WithCacheDir(dir string) Option {
 }
 
 // WithLSPClient enables type-aware reference discovery before grep fallback.
+// A nil client is ignored so the builder keeps its untyped analyzer field nil
+// and degrades to the grep path — assigning a typed nil *lspbridge.Client into
+// the interface would make it non-nil and panic on the first Analyze call.
 func WithLSPClient(client *lspbridge.Client) Option {
-	return func(b *Builder) { b.lsp = client }
+	return func(b *Builder) {
+		if client != nil {
+			b.lsp = client
+		}
+	}
 }
 
 // WithLSPAnalyzer enables an Analyze-compatible LSP bridge implementation.

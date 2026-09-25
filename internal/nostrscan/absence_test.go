@@ -3,7 +3,6 @@ package nostrscan
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +10,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/codemap"
 	"git.sharegap.net/cascadia/drydock/internal/securityscan"
 	"git.sharegap.net/cascadia/drydock/internal/securityscan/surface"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 )
 
 func TestNameHasUseVerb(t *testing.T) {
@@ -96,6 +96,21 @@ func TestAbsenceConfidenceIsCappedAndEvidenceCarriesPath(t *testing.T) {
 	}
 }
 
+func TestAbsenceEvidenceLabelsReferencePathNotCall(t *testing.T) {
+	result := analyzeAbsenceFixture(t, "v2", "vulnerable.go")
+	finding := findingByRule(result.Findings, "NOSTR-V2")
+	if finding == nil {
+		t.Fatalf("expected NOSTR-V2 finding: %#v", result.Findings)
+	}
+	// The codemap edges are references, not proven calls (grep matches can come
+	// from comments or strings), so the evidence must frame the arrows as a
+	// reference path and not let a reviewer read "a -> b" as a demonstrated
+	// call (DRYDOCK-wm0o).
+	if !strings.Contains(finding.Evidence, "reference path") {
+		t.Fatalf("evidence does not label the path as references: %q", finding.Evidence)
+	}
+}
+
 func TestAbsenceUsesNostrSurfaceTags(t *testing.T) {
 	repo := t.TempDir()
 	source := "package fixture\nfunc receive(raw string) { consume(raw) }\nfunc consume(raw string) { persistEvent(raw) }\nfunc persistEvent(string) {}\n"
@@ -123,33 +138,17 @@ func TestAbsenceUsesNostrSurfaceTags(t *testing.T) {
 
 func analyzeAbsenceFixture(t *testing.T, role, variant string) securityscan.ScanResult {
 	t.Helper()
-	repo := t.TempDir()
 	data, err := os.ReadFile(filepath.Join("testdata", "absence", role, variant))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(repo, "app.go"), data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runAbsenceGit(t, repo, "init")
-	runAbsenceGit(t, repo, "config", "user.email", "nostrscan@example.com")
-	runAbsenceGit(t, repo, "config", "user.name", "Nostrscan Test")
-	runAbsenceGit(t, repo, "add", "app.go")
-	runAbsenceGit(t, repo, "commit", "-m", "fixture")
+	repo := testutil.InitRepo(t, map[string]string{"app.go": string(data)})
 
 	codeMap, err := codemap.New(codemap.WithCacheDir(t.TempDir())).Build(context.Background(), repo, "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
 	return AnalyzeAbsences(context.Background(), repo, codeMap, surface.Result{})
-}
-
-func runAbsenceGit(t *testing.T, repo string, args ...string) {
-	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-	}
 }
 
 func findingByRule(findings []securityscan.SecurityFinding, ruleID string) *securityscan.SecurityFinding {

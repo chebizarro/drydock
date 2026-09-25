@@ -11,6 +11,53 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 )
 
+func TestDecodePayloadTypedFields(t *testing.T) {
+	type sample struct {
+		Name string `json:"name"`
+		Line int    `json:"line"`
+	}
+
+	// Qdrant returns JSON numbers as float64; DecodePayload must yield a typed int.
+	var ok sample
+	if err := DecodePayload(map[string]any{"name": "x", "line": float64(7)}, &ok); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if ok.Name != "x" || ok.Line != 7 {
+		t.Fatalf("unexpected decode: %+v", ok)
+	}
+
+	// A wrong-typed field surfaces as a decode error instead of the silent zero
+	// value the previous `Payload[key].(T)` reads produced with a discarded ok.
+	var bad sample
+	if err := DecodePayload(map[string]any{"line": "not a number"}, &bad); err == nil {
+		t.Fatal("expected decode error for string in int field, got nil")
+	}
+}
+
+func TestEncodePayloadRoundTrip(t *testing.T) {
+	type sample struct {
+		Name string `json:"name"`
+		Line int    `json:"line"`
+	}
+
+	in := sample{Name: "x", Line: 42}
+	payload, err := EncodePayload(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, isFloat := payload["line"].(float64); !isFloat {
+		t.Fatalf("expected line to be float64 in payload map, got %T", payload["line"])
+	}
+
+	var out sample
+	if err := DecodePayload(payload, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out != in {
+		t.Fatalf("round trip mismatch: got %+v want %+v", out, in)
+	}
+}
+
 func TestEnsureCollection_AlreadyExists(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/collections/test_col" {

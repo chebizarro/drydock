@@ -166,7 +166,7 @@ func seedPatchForPipeline(t *testing.T, ctx context.Context, store *db.Store) (p
 	}
 
 	rID := db.RepoIDFromPatch(patchEvt)
-	if _, err := store.BeginReview(ctx, patchEvt.ID.Hex(), rID); err != nil {
+	if _, err := store.BeginReviewWithClaim(ctx, patchEvt.ID.Hex(), rID, db.ReviewClaim{}); err != nil {
 		t.Fatalf("begin review: %v", err)
 	}
 	return patchEvt.ID.Hex(), rID
@@ -457,7 +457,7 @@ func TestRetryablePaymentPendingUsesOrdinaryRequeuePath(t *testing.T) {
 
 	ctx := context.Background()
 	store := mustStore(t, ctx)
-	if acquired, err := store.BeginReview(ctx, "payment-patch", "repo-1"); err != nil || !acquired {
+	if acquired, err := store.BeginReviewWithClaim(ctx, "payment-patch", "repo-1", db.ReviewClaim{}); err != nil || !acquired {
 		t.Fatalf("BeginReview: acquired=%v err=%v", acquired, err)
 	}
 	if err := store.MarkReviewFailed(ctx, "payment-patch", "repo-1", payment.ReasonPaymentPending); err != nil {

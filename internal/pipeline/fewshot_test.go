@@ -423,7 +423,10 @@ func TestFormatFewShotNoMetadata(t *testing.T) {
 	}
 }
 
-func TestExtractMeta(t *testing.T) {
+func TestFewShotPayloadDecode(t *testing.T) {
+	// Payload numbers arrive as float64 (Qdrant JSON) and categories as []any;
+	// decoding through fewShotPayload's tags must recover the typed fields,
+	// including an int64 created_at, that the deleted extractMeta coerced by hand.
 	payload := map[string]any{
 		"content":    "test content",
 		"repo_id":    "repo-1",
@@ -432,28 +435,37 @@ func TestExtractMeta(t *testing.T) {
 		"categories": []any{"security", "performance"},
 		"created_at": float64(1234567890),
 	}
-	meta := extractMeta(payload)
-	if meta.Language != "go" {
-		t.Errorf("expected go, got %s", meta.Language)
+	var p fewShotPayload
+	if err := vectorstore.DecodePayload(payload, &p); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
-	if meta.RepoID != "repo-1" {
-		t.Errorf("expected repo-1, got %s", meta.RepoID)
+	if p.Content != "test content" {
+		t.Errorf("expected content, got %q", p.Content)
 	}
-	if meta.Quality != 0.9 {
-		t.Errorf("expected 0.9, got %f", meta.Quality)
+	if p.Language != "go" {
+		t.Errorf("expected go, got %s", p.Language)
 	}
-	if len(meta.Categories) != 2 {
-		t.Errorf("expected 2 categories, got %d", len(meta.Categories))
+	if p.RepoID != "repo-1" {
+		t.Errorf("expected repo-1, got %s", p.RepoID)
 	}
-	if meta.CreatedAt != 1234567890 {
-		t.Errorf("expected 1234567890, got %d", meta.CreatedAt)
+	if p.Quality != 0.9 {
+		t.Errorf("expected 0.9, got %f", p.Quality)
+	}
+	if len(p.Categories) != 2 {
+		t.Errorf("expected 2 categories, got %d", len(p.Categories))
+	}
+	if p.CreatedAt != 1234567890 {
+		t.Errorf("expected 1234567890, got %d", p.CreatedAt)
 	}
 }
 
-func TestExtractMetaEmpty(t *testing.T) {
-	meta := extractMeta(map[string]any{})
-	if meta.Language != "" || meta.RepoID != "" || meta.Quality != 0 {
-		t.Errorf("empty payload should yield zero meta, got: %+v", meta)
+func TestFewShotPayloadDecodeEmpty(t *testing.T) {
+	var p fewShotPayload
+	if err := vectorstore.DecodePayload(map[string]any{}, &p); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if p.Language != "" || p.RepoID != "" || p.Quality != 0 {
+		t.Errorf("empty payload should yield zero meta, got: %+v", p.fewShotMeta)
 	}
 }
 

@@ -43,9 +43,9 @@ func TestStageRunExtractsEvidenceRoutesVerifiesAndClassifies(t *testing.T) {
 	cfg.Enabled = true
 	cfg.Nostr.Enabled = "false"
 	findingsBefore := metrics.SecurityFindings.With("CWE-89", "high").Value()
-	result := stage.Run(context.Background(), bundle, t.TempDir(), cfg)
-	if result.Error != nil {
-		t.Fatalf("Run() error = %v", result.Error)
+	result, err := stage.Run(context.Background(), bundle, t.TempDir(), cfg)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 	if result.Evidence.SAST != "SAST hit" || result.Evidence.TaintPaths != "source -> sink" || !strings.Contains(result.Evidence.SecuritySurface, "boundary") {
 		t.Fatalf("unexpected evidence: %#v", result.Evidence)
@@ -107,9 +107,9 @@ func TestStageRunActivatesNostrKnowledgeAndPreamble(t *testing.T) {
 	cfg.Nostr.AbsenceAnalysis = false
 	cfg.Nostr.Rules = repoconfig.NostrRulesConfig{Include: []string{"NOSTR-V6"}}
 	bundle := contextbuilder.ContextBundle{Content: "## patch\n", ChangedFiles: []string{"package.json"}}
-	result := stage.Run(context.Background(), bundle, repoPath, cfg)
-	if result.Error != nil {
-		t.Fatalf("Run() error = %v", result.Error)
+	result, err := stage.Run(context.Background(), bundle, repoPath, cfg)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 	if !result.NostrActive {
 		t.Fatal("Nostr lens was not activated")
@@ -134,9 +134,9 @@ func TestStageRunNonNostrRepoHasZeroBehaviorChange(t *testing.T) {
 
 	stage := New(nil, nil, reviewengine.ModelEndpoint{}, reviewengine.ModelEndpoint{})
 	cfg := repoconfig.Default().Security
-	result := stage.Run(context.Background(), contextbuilder.ContextBundle{Content: "unchanged", ChangedFiles: []string{"README.md"}}, repoPath, cfg)
-	if result.Error != nil {
-		t.Fatalf("Run() error = %v", result.Error)
+	result, err := stage.Run(context.Background(), contextbuilder.ContextBundle{Content: "unchanged", ChangedFiles: []string{"README.md"}}, repoPath, cfg)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 	if result.NostrActive || len(result.Findings) != 0 || result.Evidence != (SecurityEvidence{}) {
 		t.Fatalf("non-Nostr repository changed security behavior: %#v", result)

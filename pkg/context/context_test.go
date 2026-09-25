@@ -13,6 +13,7 @@ import (
 
 	"git.sharegap.net/cascadia/drydock/internal/agenttools"
 	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 	"git.sharegap.net/cascadia/drydock/internal/workspacesnapshot"
 )
 
@@ -161,7 +162,7 @@ func TestMultiRootManifestGolden(t *testing.T) {
 	if hex.EncodeToString(sum[:]) != manifestDigest {
 		t.Fatalf("manifest digest does not bind returned public DTO")
 	}
-	assertGolden(t, "testdata/multi_root.golden.json", firstJSON)
+	testutil.AssertGolden(t, "testdata/multi_root.golden.json", firstJSON)
 }
 
 func TestBudgetErrorIsOwned(t *testing.T) {
@@ -204,23 +205,5 @@ func goldenJSON(t *testing.T, value any) string {
 	return string(encoded) + "\n"
 }
 
-func assertGolden(t *testing.T, path, got string) {
-	t.Helper()
-	if os.Getenv("UPDATE_GOLDEN") == "1" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	want, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != string(want) {
-		t.Fatalf("golden mismatch for %s\nwant:\n%s\ngot:\n%s", path, want, got)
-	}
-}
 
 var _ contextbuilder.TokenCounter = goldenTokenizer{}

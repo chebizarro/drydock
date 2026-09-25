@@ -23,6 +23,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/circuitbreaker"
 	"git.sharegap.net/cascadia/drydock/internal/codechat"
 	"git.sharegap.net/cascadia/drydock/internal/codeindex"
+	"git.sharegap.net/cascadia/drydock/internal/codemap"
 	"git.sharegap.net/cascadia/drydock/internal/config"
 	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
 	"git.sharegap.net/cascadia/drydock/internal/contextvm"
@@ -297,7 +298,17 @@ func main() {
 	}
 
 	// --- ContextVM transport (MCP-over-Nostr JSON-RPC foundation) ---
-	contextVMTransport := contextvm.NewTransport(pool, signer, readRelays, writeRelays, logger)
+	// The transport needs a signer; without one every ContextVM consumer below
+	// is already gated off, so leave it nil rather than fail startup.
+	var contextVMTransport *contextvm.Transport
+	if signer != nil {
+		var err error
+		contextVMTransport, err = contextvm.NewTransport(pool, signer, readRelays, writeRelays, logger)
+		if err != nil {
+			logger.Error("failed to initialize contextvm transport", "error", err)
+			os.Exit(1)
+		}
+	}
 	contextVMRouter := contextvm.NewRouter()
 	logger.Info("contextvm transport initialized",
 		"kind", int(contextvm.KindContextVM),
@@ -356,7 +367,8 @@ func main() {
 			servicePubkey = signerPubKey.Hex()
 			processorOpts = append(processorOpts,
 				ingest.WithLocalAutofixAuthor(servicePubkey),
-				ingest.WithZapReceipts(servicePubkey, cfg.TrustedZappers),
+				ingest.WithServiceIdentity(servicePubkey),
+				ingest.WithZapReceipts(cfg.TrustedZappers),
 			)
 			logger.Info("autofix loop suppression enabled", "signer_pubkey", servicePubkey)
 			if len(cfg.TrustedZappers) == 0 {
@@ -626,6 +638,7 @@ func main() {
 		reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel},
 		reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel},
 		securityreview.WithNostrEnabled(cfg.SecurityNostrEnabled),
+		securityreview.WithLSPClient(lspClient),
 	)
 
 	// Verify configured model names against what each endpoint actually
@@ -671,8 +684,13 @@ func main() {
 				NostrProbeActive:  cfg.SecurityNostrProbeActive,
 			},
 			auditengine.Dependencies{
-				Repos:         repoManager,
-				Store:         store,
+				Repos: repoManager,
+				Store: store,
+				// Wire the LSP bridge into the audit code map so the absence
+				// analyzer walks a type-aware reference graph when the sidecar
+				// is up; WithLSPClient ignores a nil client, so this degrades
+				// to the grep path when the bridge is unconfigured/unreachable.
+				CodeMap:       codemap.New(codemap.WithLSPClient(lspClient)),
 				Scanner:       secScanner,
 				SecretScanner: betterleaksScanner,
 				AgenticReview: agenticReviewSvc,

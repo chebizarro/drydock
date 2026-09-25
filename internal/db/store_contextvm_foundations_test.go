@@ -170,7 +170,7 @@ func TestAcceptReviewOrderIdempotencyAndConflict(t *testing.T) {
 func TestMarkReviewSkippedIsDurableAndOnDemandCanReopen(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
-	if acquired, err := store.BeginReview(ctx, "patch", "repo"); err != nil || !acquired {
+	if acquired, err := store.BeginReviewWithClaim(ctx, "patch", "repo", ReviewClaim{}); err != nil || !acquired {
 		t.Fatalf("BeginReview: acquired=%v err=%v", acquired, err)
 	}
 	if err := store.MarkReviewSkipped(ctx, "patch", "repo", "monitoring_removed"); err != nil {

@@ -7,13 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"git.sharegap.net/cascadia/drydock/internal/codemap"
 	"git.sharegap.net/cascadia/drydock/internal/gitexec"
+	"git.sharegap.net/cascadia/drydock/internal/testutil"
 )
 
 func TestDetectorProfilesGolden(t *testing.T) {
@@ -52,20 +52,8 @@ func TestDetectorProfilesGolden(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got = append(got, '\n')
 			golden := filepath.Join("testdata", tt.name+".golden.json")
-			if os.Getenv("UPDATE_GOLDEN") == "1" {
-				if err := os.WriteFile(golden, got, 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}
-			want, err := os.ReadFile(golden)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(got, want) {
-				t.Fatalf("profile mismatch (-want +got):\nwant:\n%s\ngot:\n%s", want, got)
-			}
+			testutil.AssertGolden(t, golden, string(got)+"\n")
 		})
 	}
 }
@@ -87,7 +75,7 @@ func TestDependencyManifests(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			repo := initRepo(t, map[string]string{tt.path: tt.content})
+			repo := testutil.InitRepo(t, map[string]string{tt.path: tt.content})
 			profile, err := Detect(
 				context.Background(),
 				repo,
@@ -177,7 +165,7 @@ func TestBelowFloorSkipsAndLogs(t *testing.T) {
 }
 
 func TestProtocolMarkersRequireCorroboration(t *testing.T) {
-	repo := initRepo(t, map[string]string{
+	repo := testutil.InitRepo(t, map[string]string{
 		"README.md": "Integration follows NIP-01.",
 	})
 	var logs bytes.Buffer
@@ -282,34 +270,5 @@ func fixtureRepo(t *testing.T, name string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return initRepo(t, files)
-}
-
-func initRepo(t *testing.T, files map[string]string) string {
-	t.Helper()
-	repo := t.TempDir()
-	for path, content := range files {
-		fullPath := filepath.Join(repo, path)
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	runGit(t, repo, "init", "-q")
-	runGit(t, repo, "config", "user.email", "test@example.test")
-	runGit(t, repo, "config", "user.name", "Test")
-	runGit(t, repo, "add", ".")
-	runGit(t, repo, "commit", "-qm", "fixture")
-	return repo
-}
-
-func runGit(t *testing.T, repo string, args ...string) {
-	t.Helper()
-	cmdArgs := append([]string{"-C", repo}, args...)
-	out, err := exec.Command("git", cmdArgs...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
-	}
+	return testutil.InitRepo(t, files)
 }

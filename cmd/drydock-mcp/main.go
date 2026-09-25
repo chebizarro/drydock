@@ -80,6 +80,9 @@ func main() {
 	}
 }
 
+// splitCSV is a local mirror of config.SplitCSV kept here so this binary does
+// not link internal/config's transitive deps (the SQLite driver via
+// modernc.org/sqlite). Same contract: non-nil, trimmed, empties dropped.
 func splitCSV(value string) []string {
 	parts := strings.Split(value, ",")
 	out := make([]string, 0, len(parts))

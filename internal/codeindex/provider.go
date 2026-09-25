@@ -120,7 +120,11 @@ func (p *Provider) Build(ctx context.Context, in contextbuilder.BuildInput) (str
 			continue
 		}
 
-		filePath, _ := r.Payload["file_path"].(string)
+		var chunk ChunkPayload
+		if err := vectorstore.DecodePayload(r.Payload, &chunk); err != nil {
+			continue
+		}
+		filePath := chunk.FilePath
 		if filePath == "" {
 			continue
 		}
@@ -150,22 +154,17 @@ func (p *Provider) Build(ctx context.Context, in contextbuilder.BuildInput) (str
 		}
 		fileHitCount[filePath]++
 
-		symbolName, _ := r.Payload["symbol_name"].(string)
-		symbolKind, _ := r.Payload["symbol_kind"].(string)
-		content, _ := r.Payload["content"].(string)
-		startLine := payloadInt(r.Payload, "start_line")
-		endLine := payloadInt(r.Payload, "end_line")
-
+		content := chunk.Content
 		if len(content) > maxSnippetBytes {
 			content = content[:maxSnippetBytes] + "\n// ... truncated"
 		}
 
 		hits = append(hits, hit{
 			filePath:   filePath,
-			symbolName: symbolName,
-			symbolKind: symbolKind,
-			startLine:  startLine,
-			endLine:    endLine,
+			symbolName: chunk.SymbolName,
+			symbolKind: chunk.SymbolKind,
+			startLine:  chunk.StartLine,
+			endLine:    chunk.EndLine,
 			content:    content,
 			score:      r.Score,
 		})
@@ -195,23 +194,4 @@ func (p *Provider) Build(ctx context.Context, in contextbuilder.BuildInput) (str
 	}
 
 	return sb.String(), nil
-}
-
-// payloadInt extracts an integer from a Qdrant payload field.
-// JSON numbers decode as float64 in map[string]any.
-func payloadInt(payload map[string]any, key string) int {
-	v, ok := payload[key]
-	if !ok {
-		return 0
-	}
-	switch n := v.(type) {
-	case float64:
-		return int(n)
-	case int:
-		return n
-	case int64:
-		return int(n)
-	default:
-		return 0
-	}
 }

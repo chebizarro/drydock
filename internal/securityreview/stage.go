@@ -8,6 +8,7 @@ import (
 
 	"git.sharegap.net/cascadia/drydock/internal/codemap"
 	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
+	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/nostrscan"
 	"git.sharegap.net/cascadia/drydock/internal/nostrscan/knowledge"
@@ -29,7 +30,6 @@ type SecurityResult struct {
 	Evidence    SecurityEvidence
 	Findings    []reviewengine.Finding
 	NostrActive bool
-	Error       error
 }
 
 // Option configures a security review stage.
@@ -48,6 +48,14 @@ func WithNostrEnabled(mode string) Option {
 	}
 }
 
+// WithLSPClient supplies the LSP bridge client used to build a type-aware
+// reference graph for Nostr absence analysis. A nil client is safe: the code
+// map degrades to the ripgrep path (see codemap.WithLSPClient), so the audit
+// never depends on the sidecar being reachable.
+func WithLSPClient(client *lspbridge.Client) Option {
+	return func(s *Stage) { s.lsp = client }
+}
+
 // Stage runs security review, adversarial verification, and classification.
 type Stage struct {
 	reviewer         *reviewengine.Engine
@@ -55,6 +63,7 @@ type Stage struct {
 	verifyEndpoint   reviewengine.ModelEndpoint
 	classifyEndpoint reviewengine.ModelEndpoint
 	nostrEnabled     string
+	lsp              *lspbridge.Client
 }
 
 // New constructs a security review stage.
@@ -79,34 +88,30 @@ func New(
 }
 
 // Run executes the PR security lens for an already-built context bundle.
-func (s *Stage) Run(ctx context.Context, bundle contextbuilder.ContextBundle, repoPath string, cfg repoconfig.SecurityConfig) SecurityResult {
+func (s *Stage) Run(ctx context.Context, bundle contextbuilder.ContextBundle, repoPath string, cfg repoconfig.SecurityConfig) (SecurityResult, error) {
 	result := SecurityResult{}
 	if strings.TrimSpace(repoPath) == "" {
-		result.Error = fmt.Errorf("securityreview: empty repo path")
-		return result
+		return result, fmt.Errorf("securityreview: empty repo path")
 	}
 
 	profile, nostrActive, err := s.detectNostr(ctx, repoPath, cfg.Nostr)
 	if err != nil {
-		result.Error = err
-		return result
+		return result, err
 	}
 	result.NostrActive = nostrActive
 	if !cfg.Enabled && !nostrActive {
-		return result
+		return result, nil
 	}
-	if s == nil || s.reviewer == nil {
-		result.Error = fmt.Errorf("securityreview: nil reviewer")
-		return result
+	if s.reviewer == nil {
+		return result, fmt.Errorf("securityreview: nil reviewer")
 	}
 
 	var nostrPreamble string
 	var nostrCandidates []reviewengine.Finding
 	if nostrActive {
-		bundle, nostrPreamble, nostrCandidates, err = activateNostr(ctx, bundle, repoPath, profile, cfg.Nostr)
+		bundle, nostrPreamble, nostrCandidates, err = activateNostr(ctx, bundle, repoPath, profile, cfg.Nostr, s.lsp)
 		if err != nil {
-			result.Error = err
-			return result
+			return result, err
 		}
 	}
 
@@ -128,8 +133,7 @@ func (s *Stage) Run(ctx context.Context, bundle contextbuilder.ContextBundle, re
 		SkipWalkthrough:              true,
 	})
 	if err != nil {
-		result.Error = fmt.Errorf("security reviewer: %w", err)
-		return result
+		return result, fmt.Errorf("security reviewer: %w", err)
 	}
 
 	packet := evidence.prompt()
@@ -153,13 +157,11 @@ func (s *Stage) Run(ctx context.Context, bundle contextbuilder.ContextBundle, re
 	}
 	deduped, err := reviewengine.DeduplicateFindings(candidates)
 	if err != nil {
-		result.Error = fmt.Errorf("deduplicate security findings: %w", err)
-		return result
+		return result, fmt.Errorf("deduplicate security findings: %w", err)
 	}
 	verified, err := securityverify.New(s.client, verifyCfg).Run(ctx, deduped)
 	if err != nil {
-		result.Error = fmt.Errorf("security verify: %w", err)
-		return result
+		return result, fmt.Errorf("security verify: %w", err)
 	}
 
 	for i := range verified {
@@ -172,11 +174,11 @@ func (s *Stage) Run(ctx context.Context, bundle contextbuilder.ContextBundle, re
 		verified[i].Category = "security"
 	}
 	result.Findings = verified
-	return result
+	return result, nil
 }
 
 func (s *Stage) detectNostr(ctx context.Context, repoPath string, cfg repoconfig.NostrConfig) (nostrscan.NostrProfile, bool, error) {
-	if s == nil || s.nostrEnabled == "false" || cfg.Enabled == "false" || cfg.Enabled == "" {
+	if s.nostrEnabled == "false" || cfg.Enabled == "false" || cfg.Enabled == "" {
 		return nostrscan.NostrProfile{}, false, nil
 	}
 	profile, err := nostrscan.Detect(ctx, repoPath, "HEAD", nostrscan.WithMinConfidence(cfg.MinDetectConfidence))
@@ -186,10 +188,10 @@ func (s *Stage) detectNostr(ctx context.Context, repoPath string, cfg repoconfig
 	return profile, profile.IsNostr, nil
 }
 
-func activateNostr(ctx context.Context, bundle contextbuilder.ContextBundle, repoPath string, profile nostrscan.NostrProfile, cfg repoconfig.NostrConfig) (contextbuilder.ContextBundle, string, []reviewengine.Finding, error) {
+func activateNostr(ctx context.Context, bundle contextbuilder.ContextBundle, repoPath string, profile nostrscan.NostrProfile, cfg repoconfig.NostrConfig, lsp *lspbridge.Client) (contextbuilder.ContextBundle, string, []reviewengine.Finding, error) {
 	var codeMap *codemap.Map
 	if cfg.AbsenceAnalysis {
-		built, err := codemap.New().Build(ctx, repoPath, "HEAD")
+		built, err := codemap.New(codemap.WithLSPClient(lsp)).Build(ctx, repoPath, "HEAD")
 		if err != nil {
 			return bundle, "", nil, fmt.Errorf("securityreview: build codemap for nostr absence analysis: %w", err)
 		}

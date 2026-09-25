@@ -348,7 +348,19 @@ func (m *Manager) Restore(ctx context.Context, storagePath, expectedID, expected
 		}
 		return existing, nil
 	}
-	descriptorData, err := os.ReadFile(filepath.Join(root, "descriptor.json"))
+	// Defence in depth: a caller-supplied storage path — or a component swapped
+	// underneath the trusted storage root after creation — must not redirect the
+	// descriptor, patch, or copied files through a symlink. Manifest and patch
+	// hash verification below still fails closed, but rejecting symlink
+	// components closes the TOCTOU window before any bytes are read.
+	if err := safepath.RejectSymlinkComponents(m.storageRoot, root); err != nil {
+		return nil, err
+	}
+	descriptorPath := filepath.Join(root, "descriptor.json")
+	if err := safepath.RejectSymlinkComponents(m.storageRoot, descriptorPath); err != nil {
+		return nil, err
+	}
+	descriptorData, err := os.ReadFile(descriptorPath)
 	if err != nil {
 		return nil, fmt.Errorf("workspace snapshot: read descriptor: %w", err)
 	}
@@ -377,7 +389,11 @@ func (m *Manager) Restore(ctx context.Context, storagePath, expectedID, expected
 		}
 		entries[path] = entry
 	}
-	patch, err := os.ReadFile(filepath.Join(root, "patch"))
+	patchPath := filepath.Join(root, "patch")
+	if err := safepath.RejectSymlinkComponents(m.storageRoot, patchPath); err != nil {
+		return nil, err
+	}
+	patch, err := os.ReadFile(patchPath)
 	if err != nil || hashBytes(patch) != descriptor.PatchHash {
 		return nil, ErrHashMismatch
 	}
@@ -404,7 +420,11 @@ func (m *Manager) Restore(ctx context.Context, storagePath, expectedID, expected
 			return nil, ErrHashMismatch
 		}
 	case KindMutableCopy:
-		snapshot.filesRoot = filepath.Join(root, "files")
+		filesRoot := filepath.Join(root, "files")
+		if err := safepath.RejectSymlinkComponents(m.storageRoot, filesRoot); err != nil {
+			return nil, err
+		}
+		snapshot.filesRoot = filesRoot
 	default:
 		return nil, ErrHashMismatch
 	}
@@ -583,6 +603,12 @@ func (s *Snapshot) Resolve(path string) (string, error) {
 	entry, ok := s.entries[normalized]
 	if !ok {
 		return "", ErrNotFound
+	}
+	// RejectSymlinkComponents(filesRoot, resolved) below only walks components
+	// *under* filesRoot, so Lstat filesRoot itself first — otherwise a filesRoot
+	// swapped to a symlink after restore would silently redirect every read.
+	if err := safepath.RejectSymlinkComponents(s.storagePath, s.filesRoot); err != nil {
+		return "", err
 	}
 	resolved := filepath.Join(s.filesRoot, filepath.FromSlash(normalized))
 	if !insideRoot(s.filesRoot, resolved) {

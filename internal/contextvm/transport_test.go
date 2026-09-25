@@ -6,8 +6,19 @@ import (
 	"errors"
 	"testing"
 
+	"git.sharegap.net/cascadia/drydock/internal/signing"
+
 	"fiatjaf.com/nostr"
 )
+
+func mustTransport(t *testing.T, pool Pool, signer signing.Signer, readRelays, writeRelays []string) *Transport {
+	t.Helper()
+	tr, err := NewTransport(pool, signer, readRelays, writeRelays, nil)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+	return tr
+}
 
 type testSigner struct{ sk [32]byte }
 
@@ -54,12 +65,33 @@ func (p *fakePool) SubscribeManyNotifyClosed(ctx context.Context, urls []string,
 	return p.events, p.closed
 }
 
+func TestNilTransportThroughNotifierInterfaceReturnsErrorNotPanic(t *testing.T) {
+	// A nil *Transport assigned into the AuditProgressNotifier interface is a
+	// non-nil interface value, so AuditFeedbackReporter.publish's r.notifier == nil
+	// guard does not catch it. Without a receiver guard on the Transport methods
+	// this panics on a nil-receiver deref (t.signer); it must return an error.
+	var nilTransport *Transport
+	reporter := NewAuditFeedbackReporter(nilTransport, []string{"wss://relay.test"})
+	ctx := context.WithValue(context.Background(), auditFeedbackContextKey{}, auditFeedbackTarget{
+		RequestEventID: "req-event",
+		Requester:      nostr.GetPublicKey(nostr.Generate()),
+		Relays:         []string{"wss://relay.test"},
+	})
+	err := reporter.ReportAuditProgress(ctx, 1, "processing")
+	if err == nil {
+		t.Fatal("expected an error from a nil transport, got nil")
+	}
+	if !errors.Is(err, errNilTransport) {
+		t.Fatalf("expected errNilTransport, got %v", err)
+	}
+}
+
 func TestTransportSendPublishesContextVMEvent(t *testing.T) {
 	ctx := context.Background()
 	pool := &fakePool{}
 	signer := newTestSigner(1)
 	recipient, _ := newTestSigner(2).GetPublicKey(ctx)
-	tr := NewTransport(pool, signer, []string{"wss://read"}, []string{"wss://write"}, nil)
+	tr := mustTransport(t, pool, signer, []string{"wss://read"}, []string{"wss://write"})
 
 	id, err := tr.Send(ctx, "tools/list", map[string]string{"scope": "all"}, recipient)
 	if err != nil {
@@ -94,7 +126,7 @@ func TestTransportSendPublishesContextVMEvent(t *testing.T) {
 }
 
 func TestTransportSendWithIDRequiresExplicitID(t *testing.T) {
-	tr := NewTransport(&fakePool{}, newTestSigner(1), nil, []string{"wss://write"}, nil)
+	tr := mustTransport(t, &fakePool{}, newTestSigner(1), nil, []string{"wss://write"})
 	if _, err := tr.SendWithID(context.Background(), "", "tools/list", nil); err == nil {
 		t.Fatal("expected missing request id error")
 	}
@@ -105,7 +137,7 @@ func TestTransportNotifyPublishesIDLessMessage(t *testing.T) {
 	pool := &fakePool{}
 	signer := newTestSigner(1)
 	recipient, _ := newTestSigner(2).GetPublicKey(ctx)
-	tr := NewTransport(pool, signer, nil, []string{"wss://default"}, nil)
+	tr := mustTransport(t, pool, signer, nil, []string{"wss://default"})
 
 	eventID, err := tr.Notify(ctx, Notification{
 		Method:         "review/progress",
@@ -141,7 +173,7 @@ func TestTransportNotifyPublishesIDLessMessage(t *testing.T) {
 
 func TestTransportRejectsMissingOrZeroRecipients(t *testing.T) {
 	ctx := context.Background()
-	tr := NewTransport(&fakePool{}, newTestSigner(1), nil, []string{"wss://write"}, nil)
+	tr := mustTransport(t, &fakePool{}, newTestSigner(1), nil, []string{"wss://write"})
 	if _, err := tr.SendWithID(ctx, "id", "tools/list", nil); err == nil {
 		t.Fatal("request without recipient succeeded")
 	}
@@ -157,7 +189,7 @@ func TestTransportSendReturnsPublishError(t *testing.T) {
 	pool := &fakePool{pubErr: errors.New("blocked")}
 	signer := newTestSigner(1)
 	recipient, _ := newTestSigner(2).GetPublicKey(context.Background())
-	tr := NewTransport(pool, signer, nil, []string{"wss://write"}, nil)
+	tr := mustTransport(t, pool, signer, nil, []string{"wss://write"})
 	if _, err := tr.Send(context.Background(), "tools/list", nil, recipient); err == nil {
 		t.Fatal("expected publish error")
 	}
@@ -169,7 +201,7 @@ func TestTransportSubscribeDecodesAddressedEvents(t *testing.T) {
 	pool := &fakePool{events: make(chan nostr.RelayEvent, 1), closed: make(chan nostr.RelayClosed)}
 	signer := newTestSigner(1)
 	pubkey, _ := signer.GetPublicKey(ctx)
-	tr := NewTransport(pool, signer, []string{"wss://read"}, nil, nil)
+	tr := mustTransport(t, pool, signer, []string{"wss://read"}, nil)
 
 	requests, errs, err := tr.Subscribe(ctx)
 	if err != nil {

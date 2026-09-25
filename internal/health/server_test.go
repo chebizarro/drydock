@@ -134,8 +134,16 @@ func TestReadyzDBDown(t *testing.T) {
 	}
 	var resp healthResponse
 	json.NewDecoder(rec.Body).Decode(&resp)
-	if resp.Status != "not_ready" {
-		t.Fatalf("expected status not_ready, got %s", resp.Status)
+	// A DB outage must report through the shared "degraded" path so monitoring
+	// rules keyed on "degraded" catch it, not a special-cased "not_ready".
+	if resp.Status != "degraded" {
+		t.Fatalf("expected status degraded, got %s", resp.Status)
+	}
+	if len(resp.Degraded) != 1 || resp.Degraded[0] != "database" {
+		t.Fatalf("expected database in degraded list, got %#v", resp.Degraded)
+	}
+	if len(resp.Components) != 1 || resp.Components[0].Name != "database" || resp.Components[0].Status != "degraded" || resp.Components[0].Error == "" {
+		t.Fatalf("unexpected database component status: %#v", resp.Components)
 	}
 }
 
@@ -193,7 +201,14 @@ func TestReadyzReportsDegradedDependency(t *testing.T) {
 	if len(resp.Degraded) != 1 || resp.Degraded[0] != "qdrant" {
 		t.Fatalf("expected qdrant degraded component, got %#v", resp.Degraded)
 	}
-	if len(resp.Components) != 1 || resp.Components[0].Name != "qdrant" || resp.Components[0].Status != "degraded" || resp.Components[0].Error == "" {
+	// database (ok) is now a regular component alongside qdrant.
+	var qdrant *componentStatus
+	for i := range resp.Components {
+		if resp.Components[i].Name == "qdrant" {
+			qdrant = &resp.Components[i]
+		}
+	}
+	if qdrant == nil || qdrant.Status != "degraded" || qdrant.Error == "" {
 		t.Fatalf("unexpected component status: %#v", resp.Components)
 	}
 }

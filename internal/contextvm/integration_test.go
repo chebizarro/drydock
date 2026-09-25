@@ -13,7 +13,7 @@ func TestIntegrationRequestResponseCorrelationViaJSONRPCID(t *testing.T) {
 	pool := &fakePool{}
 	sender := newTestSigner(11)
 	recipient, _ := newTestSigner(12).GetPublicKey(ctx)
-	transport := NewTransport(pool, sender, []string{"wss://read.test"}, []string{"wss://write.test"}, nil)
+	transport := mustTransport(t, pool, sender, []string{"wss://read.test"}, []string{"wss://write.test"})
 
 	rpcID := "jsonrpc-correlation-1"
 	reqEventID, err := transport.SendWithID(ctx, rpcID, "review/request", map[string]string{"repo": "drydock"}, recipient)
