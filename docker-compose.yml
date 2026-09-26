@@ -60,6 +60,10 @@ services:
       # unauthenticated /analyze calls, so core needs the same token.
       DRYDOCK_LSP_BRIDGE_URL: ${DRYDOCK_LSP_BRIDGE_URL:-http://lsp-bridge:8082}
       DRYDOCK_LSP_BRIDGE_TOKEN: ${LSP_BRIDGE_AUTH_TOKEN:-}
+      # Dependency-upgrade runner sidecar (service name on shared network). The
+      # runner rejects unauthenticated /update calls, so core needs the same token.
+      DRYDOCK_DEP_RUNNER_URL: ${DRYDOCK_DEP_RUNNER_URL:-http://dep-runner:8083}
+      DRYDOCK_DEP_RUNNER_TOKEN: ${DEP_RUNNER_AUTH_TOKEN:-}
     volumes:
       - drydock_data:/data
       - ./eval:/app/eval:ro
@@ -106,6 +110,54 @@ services:
       interval: 15s
       timeout: 5s
       start_period: 30s  # language servers need time to initialize
+      retries: 3
+    networks:
+      - drydock_net
+
+  # --- Dependency-upgrade runner (optional — activate with:
+  #     docker compose --profile depupgrade up) ---
+  #
+  # Runs go/npm/cargo/pip against UNTRUSTED repository manifests. It never mounts
+  # the repo cache: manifests arrive over HTTP, edits are returned over HTTP, and
+  # the whole job runs in a per-request temp root inside this disposable, network-
+  # and privilege-constrained container.
+  dep-runner:
+    build:
+      context: .
+      dockerfile: docker/dep-runner/Dockerfile
+    image: drydock-dep-runner:latest
+    restart: unless-stopped
+    profiles:
+      - depupgrade
+    environment:
+      DEP_RUNNER_AUTH_TOKEN: ${DEP_RUNNER_AUTH_TOKEN:?Set DEP_RUNNER_AUTH_TOKEN in .env before starting the dep-runner}
+      # Lifecycle scripts (npm postinstall, cargo build.rs, pip setup.py) execute
+      # attacker-controlled code. Opt in ONLY for a trusted, network-isolated
+      # deployment that needs lockfiles those scripts produce. Default off.
+      DEP_RUNNER_ALLOW_SCRIPTS: ${DEP_RUNNER_ALLOW_SCRIPTS:-false}
+      # Operator-pinnable registries. Package *installation* must fetch tarballs,
+      # so this container needs egress to exactly these hosts and nothing else —
+      # enforce that at the network layer (firewall/NetworkPolicy).
+      DEP_RUNNER_GOPROXY: ${DEP_RUNNER_GOPROXY:-https://proxy.golang.org,direct}
+      DEP_RUNNER_NPM_REGISTRY: ${DEP_RUNNER_NPM_REGISTRY:-https://registry.npmjs.org}
+      DEP_RUNNER_PIP_INDEX_URL: ${DEP_RUNNER_PIP_INDEX_URL:-https://pypi.org/simple}
+      DEP_RUNNER_TIMEOUT: ${DEP_RUNNER_TIMEOUT:-4m}
+    read_only: true
+    tmpfs:
+      - /work:size=${DEP_RUNNER_WORK_TMPFS:-2g},mode=1777
+      - /tmp:size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: ${DEP_RUNNER_MEM_LIMIT:-2g}
+    cpus: ${DEP_RUNNER_CPUS:-2.0}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8083/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
       retries: 3
     networks:
       - drydock_net

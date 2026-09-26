@@ -119,6 +119,12 @@ type Config struct {
 	PaymentTrustedMints                 []string
 	LSPBridgeURL                        string
 	LSPBridgeToken                      string
+	DepRunnerURL                        string
+	DepRunnerToken                      string
+	GoRegistryURL                       string
+	NPMRegistryURL                      string
+	CargoRegistryURL                    string
+	PyPIRegistryURL                     string
 	MetaBaseURL                         string
 	MetaModel                           string
 	MetaMaxInputBytes                   int
@@ -268,6 +274,12 @@ func FromEnv() Config {
 		PaymentTrustedMints:                 paymentTrustedMints(),
 		LSPBridgeURL:                        envOrDefault("DRYDOCK_LSP_BRIDGE_URL", ""),
 		LSPBridgeToken:                      envOrDefault("DRYDOCK_LSP_BRIDGE_TOKEN", os.Getenv("LSP_BRIDGE_AUTH_TOKEN")),
+		DepRunnerURL:                        envOrDefault("DRYDOCK_DEP_RUNNER_URL", ""),
+		DepRunnerToken:                      envOrDefault("DRYDOCK_DEP_RUNNER_TOKEN", os.Getenv("DEP_RUNNER_AUTH_TOKEN")),
+		GoRegistryURL:                       envOrDefault("DRYDOCK_GO_REGISTRY_URL", "https://proxy.golang.org"),
+		NPMRegistryURL:                      envOrDefault("DRYDOCK_NPM_REGISTRY_URL", "https://registry.npmjs.org"),
+		CargoRegistryURL:                    envOrDefault("DRYDOCK_CARGO_REGISTRY_URL", "https://crates.io"),
+		PyPIRegistryURL:                     envOrDefault("DRYDOCK_PYPI_REGISTRY_URL", "https://pypi.org"),
 		MetaBaseURL:                         envOrDefault("DRYDOCK_META_BASE_URL", devDefault(production, defaultMetaBaseURL)),
 		MetaModel:                           envOrDefault("DRYDOCK_META_MODEL", devDefault(production, defaultMetaModel)),
 		MetaMaxInputBytes:                   parseIntOrDefault(envOrDefault("DRYDOCK_META_MAX_INPUT_BYTES", "131072"), defaultMetaMaxInputBytes),
@@ -596,6 +608,17 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 		}
 	}
 
+	// --- Operator-pinned version registry endpoints ---
+	for _, e := range c.registryEndpoints() {
+		if strings.TrimSpace(e.baseURL) == "" {
+			continue // optional until dependency upgrades are enabled
+		}
+		u, err := url.Parse(e.baseURL)
+		if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			result.Errors = append(result.Errors, fmt.Sprintf("%s must be an HTTP(S) registry base URL without credentials, query, or fragment", e.env))
+		}
+	}
+
 	// --- Operator-authored monitored repository list ---
 	monitoredAuthor := strings.TrimSpace(c.MonitoredReposAuthor)
 	if monitoredAuthor == "" {
@@ -814,6 +837,16 @@ func (c *Config) modelEndpoints() []modelEndpointSpec {
 	}
 }
 
+// registryEndpoints is the single validation table for operator-pinned version registries.
+func (c *Config) registryEndpoints() []struct{ env, baseURL string } {
+	return []struct{ env, baseURL string }{
+		{"DRYDOCK_GO_REGISTRY_URL", c.GoRegistryURL},
+		{"DRYDOCK_NPM_REGISTRY_URL", c.NPMRegistryURL},
+		{"DRYDOCK_CARGO_REGISTRY_URL", c.CargoRegistryURL},
+		{"DRYDOCK_PYPI_REGISTRY_URL", c.PyPIRegistryURL},
+	}
+}
+
 // requireTLSEndpoint rejects loopback and non-HTTPS URLs for a configured
 // endpoint. Empty values are ignored so optional endpoints stay optional while
 // still being guarded the moment an operator points one at a plaintext URL.
@@ -858,6 +891,9 @@ func (c *Config) validateProductionConfig(result *ValidationResult) {
 	}
 	c.requireTLSEndpoint(result, "DRYDOCK_QDRANT_URL", c.QdrantURL)
 	c.requireTLSEndpoint(result, "DRYDOCK_EMBED_BASE_URL", c.EmbedBaseURL)
+	for _, e := range c.registryEndpoints() {
+		c.requireTLSEndpoint(result, e.env, e.baseURL)
+	}
 
 	c.requireExplicit(result, "DRYDOCK_QDRANT_URL", c.QdrantURL)
 	c.requireExplicit(result, "DRYDOCK_QDRANT_API_KEY", c.QdrantAPIKey)

@@ -37,6 +37,7 @@ type RepoConfig struct {
 	Payments     PaymentsConfig `yaml:"payments"`
 	Security     SecurityConfig `yaml:"security"`
 	Ensemble     EnsembleConfig `yaml:"ensemble"`
+	Upgrades     UpgradesConfig `yaml:"upgrades"`
 	Instructions string         `yaml:"instructions"`
 }
 
@@ -216,6 +217,22 @@ type AutoFixConfig struct {
 	Enabled       bool    `yaml:"enabled"`
 	MinConfidence float64 `yaml:"min_confidence"` // minimum finding confidence to include
 	MaxFindings   int     `yaml:"max_findings"`   // cap on findings per auto-fix patch
+}
+
+// UpgradesConfig controls automated dependency-upgrade patches.
+//
+// This block is intentionally minimal: the trigger/policy fields land with the
+// upgrade trigger stage. AllowScripts is decoded here solely so a repository can
+// be explicitly REJECTED for trying to loosen it. Permitting package lifecycle
+// scripts (npm postinstall, cargo build.rs, pip setup.py) means executing
+// attacker-controlled code from the repository under review, so it is an
+// operator-only, sidecar-side decision and must never be settable from
+// repository config. Mirrors the security.nostr.probe.authorized_targets
+// rejection precedent.
+type UpgradesConfig struct {
+	// AllowScripts uses a pointer so an explicit value (true or false) is
+	// distinguishable from an absent key; any presence is rejected.
+	AllowScripts *bool `yaml:"allow_scripts"`
 }
 
 // StatusConfig controls NIP-34 review status event publication.
@@ -523,6 +540,12 @@ func Parse(data []byte) (RepoConfig, error) {
 	}
 	if len(raw.Security.Nostr.Probe.AuthorizedTargets) > 0 {
 		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.probe.authorized_targets is operator-only and cannot be set by repository config")
+	}
+
+	// Reject repository attempts to enable package lifecycle scripts: that is an
+	// operator-only, sidecar-side knob (see UpgradesConfig).
+	if raw.Upgrades.AllowScripts != nil {
+		return Default(), fmt.Errorf(".drydock.yaml: upgrades.allow_scripts is operator-only and cannot be set by repository config")
 	}
 	if raw.Security.Nostr.Probe.Timeout <= 0 {
 		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.probe.timeout must be greater than zero")
