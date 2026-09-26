@@ -107,11 +107,11 @@ type Config struct {
 
 // Dependencies are the collaborators wired at the composition root.
 type Dependencies struct {
-	Store      Store
-	Workspaces Workspaces
-	Scanner    Scanner
-	Updater    Updater
-	Resolver   VersionResolver
+	Store        Store
+	Workspaces   Workspaces
+	Scanner      Scanner
+	Updater      Updater
+	Resolver     VersionResolver
 	Publisher    Publisher
 	Monitoring   Membership
 	Repositories Repositories
@@ -206,8 +206,9 @@ func (s *Service) ScanRepository(ctx context.Context, repoID string, trigger Tri
 
 	cfg, err := repoconfig.Parse(prep.BaseRepoConfig)
 	if err != nil {
-		// A malformed .drydock.yaml fails closed: do not upgrade against defaults.
-		return fmt.Errorf("parse repository config: %w", err)
+		// Upgrades execute repository changes, so every malformed config fails
+		// closed here, including documents that contain only tuning blocks.
+		return fmt.Errorf("invalid repository gating policy: %w", err)
 	}
 	up := cfg.Upgrades
 	if !up.Enabled {

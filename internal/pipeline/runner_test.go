@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"fiatjaf.com/nostr"
 	"git.sharegap.net/cascadia/drydock/internal/betterleaks"
 	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
 	"git.sharegap.net/cascadia/drydock/internal/db"
@@ -22,7 +24,6 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 	"git.sharegap.net/cascadia/drydock/internal/securityscan"
 	"git.sharegap.net/cascadia/drydock/internal/testutil"
-	"fiatjaf.com/nostr"
 )
 
 // --- Mocks ---
@@ -180,6 +181,73 @@ func TestWithBetterleaksScanner(t *testing.T) {
 	WithBetterleaksScanner(scanner)(runner)
 	if runner.betterleaksScanner != scanner {
 		t.Fatal("WithBetterleaksScanner did not install the scanner")
+	}
+}
+
+func TestProcessRejectsInvalidGatingPolicyAndPublishesNotice(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, ctx)
+	patchID, repoID := seedIntegrationDB(t, ctx, store)
+	logger := testLogger()
+
+	cacheDir := filepath.Join(t.TempDir(), "repos")
+	repoPath := initRepoInCanonicalCache(t, cacheDir, repoID)
+	invalidConfig := []byte("security:\n  enabled: true\n  gate_severty: critical\n")
+	if err := os.WriteFile(filepath.Join(repoPath, ".drydock.yaml"), invalidConfig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repoPath, "add", ".drydock.yaml")
+	gitRun(t, repoPath, "commit", "-m", "add invalid gating policy")
+
+	fakeLLM := &testutil.FakeLLM{Responses: []string{
+		`{"change_type":"bugfix","risk_areas":[],"needed_context":[],"review_focus":"logic","model_route":"coder32b"}`,
+		`{"summary":"unexpected review","findings":[],"needs_more_context":[]}`,
+		`{"walkthrough":"unexpected review","file_summaries":[]}`,
+	}}
+	engine := reviewengine.New(reviewengine.Config{
+		Planner:  reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "planner"},
+		Coder32B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "coder32b"},
+		LLM70B:   reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "llm70b"},
+		Coder14B: reviewengine.ModelEndpoint{BaseURL: "http://test", Model: "coder14b"},
+	}, fakeLLM, logger)
+	relayPub := &collectingRelayPublisher{}
+	pubSvc := publisher.New(publisher.Config{
+		DefaultRelays: []string{"wss://relay.test"}, DefaultTTL: 90 * 24 * time.Hour,
+	}, store, testSigner{sk: nostr.Generate()}, relayPub, logger)
+	repoSvc := repo.NewService(store, repo.NewManager(cacheDir, logger), logger)
+	runner := New(Config{Workers: 1}, store, repoSvc, contextbuilder.NewDefault(), engine, pubSvc, nil, make(chan db.ReviewTask), logger, WithMonitoringRegistry(allowAllRegistry{}))
+
+	err := runner.process(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID})
+	if err == nil || !strings.Contains(err.Error(), "invalid repository gating policy") {
+		t.Fatalf("process error = %v, want invalid repository gating policy", err)
+	}
+	if len(fakeLLM.Requests) != 0 {
+		t.Fatalf("invalid gating policy reached reviewer with %d LLM requests", len(fakeLLM.Requests))
+	}
+	if status, statusErr := store.GetReviewStatus(ctx, patchID, repoID); statusErr != nil || status != "failed" {
+		t.Fatalf("invalid gating policy status = %q err=%v, want terminal failed", status, statusErr)
+	}
+	if tasks, requeueErr := store.RequeueFailedReviews(ctx, 0, 10); requeueErr != nil || len(tasks) != 0 {
+		t.Fatalf("invalid gating policy requeued: tasks=%+v err=%v", tasks, requeueErr)
+	}
+	if len(relayPub.events) != 1 {
+		t.Fatalf("failure notice count = %d, want 1", len(relayPub.events))
+	}
+	if retryErr := runner.process(ctx, db.ReviewTask{PatchEventID: patchID, RepoID: repoID}); retryErr == nil {
+		t.Fatal("retry with invalid gating policy unexpectedly succeeded")
+	}
+	if len(relayPub.events) != 1 {
+		t.Fatalf("retry republished failure notice: count = %d, want 1", len(relayPub.events))
+	}
+	notice := relayPub.events[0]
+	typeTag := notice.Tags.Find("drydock-type")
+	stageTag := notice.Tags.Find("failure-stage")
+	if typeTag == nil || len(typeTag) < 2 || typeTag[1] != publisher.FailureNoticeType ||
+		stageTag == nil || len(stageTag) < 2 || stageTag[1] != "repo_config" {
+		t.Fatalf("failure notice tags = %#v", notice.Tags)
+	}
+	if !strings.Contains(notice.Content, "invalid .drydock.yaml gating policy") {
+		t.Fatalf("failure notice content = %q", notice.Content)
 	}
 }
 

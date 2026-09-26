@@ -359,3 +359,203 @@ func (s *Store) ReserveDependencyUpgradePublication(ctx context.Context, upgrade
 func (s *Store) MarkDependencyUpgradePublicationDelivered(ctx context.Context, upgradeID int64) error {
 	return dependencyUpgradeOutbox.markDelivered(ctx, s.db, upgradeID)
 }
+
+// PendingDependencyUpgradeScan is one coalesced reactive scan request. The
+// generation changes when a new head movement arrives while a scan is running,
+// allowing completion of the older scan to preserve the newer request.
+type PendingDependencyUpgradeScan struct {
+	RepoID      string
+	Status      string
+	Generation  int64
+	AvailableAt int64
+	LeaseUntil  int64
+	LastError   string
+	CreatedAt   int64
+	UpdatedAt   int64
+}
+
+const pendingDependencyUpgradeScanColumns = `repo_id, status, generation, available_at,
+	lease_until, last_error, created_at, updated_at`
+
+func scanPendingDependencyUpgradeScan(scanner rowScanner) (PendingDependencyUpgradeScan, error) {
+	var scan PendingDependencyUpgradeScan
+	err := scanner.Scan(&scan.RepoID, &scan.Status, &scan.Generation, &scan.AvailableAt,
+		&scan.LeaseUntil, &scan.LastError, &scan.CreatedAt, &scan.UpdatedAt)
+	return scan, err
+}
+
+// UpsertPendingDependencyUpgradeScan durably records a reactive scan without
+// creating more than one row per repository. A trigger received while a scan is
+// processing advances its generation; pending triggers otherwise coalesce.
+// The returned bool reports whether the caller should offer a wake-up hint to
+// the in-memory queue.
+func (s *Store) UpsertPendingDependencyUpgradeScan(ctx context.Context, repoID string, now int64) (bool, error) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return false, errors.New("pending dependency-upgrade scan repo id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin pending dependency-upgrade scan upsert: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO pending_dependency_upgrade_scans
+		(repo_id, status, generation, available_at, lease_until, last_error, created_at, updated_at)
+		VALUES (?, 'pending', 1, ?, 0, '', ?, ?)`, repoID, now, now, now)
+	if err != nil {
+		return false, fmt.Errorf("insert pending dependency-upgrade scan: %w", err)
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read pending dependency-upgrade scan insert: %w", err)
+	}
+	if inserted == 0 {
+		// Do not start a concurrent scan. Advancing the generation is enough for
+		// the running worker to preserve and re-enqueue the newer request.
+		if _, err := tx.ExecContext(ctx, `UPDATE pending_dependency_upgrade_scans
+			SET generation=generation+1, updated_at=?
+			WHERE repo_id=? AND status='processing'`, now, repoID); err != nil {
+			return false, fmt.Errorf("coalesce pending dependency-upgrade scan: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit pending dependency-upgrade scan upsert: %w", err)
+	}
+	return inserted == 1, nil
+}
+
+// ReservePendingDependencyUpgradeScan atomically claims a due row before work.
+// Duplicate queue hints are harmless because only pending rows can be claimed.
+func (s *Store) ReservePendingDependencyUpgradeScan(ctx context.Context, repoID string, now, leaseUntil int64) (PendingDependencyUpgradeScan, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PendingDependencyUpgradeScan{}, false, fmt.Errorf("begin pending dependency-upgrade scan reserve: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE pending_dependency_upgrade_scans
+		SET status='processing', lease_until=?, last_error='', updated_at=?
+		WHERE repo_id=? AND status='pending' AND available_at<=?`, leaseUntil, now, repoID, now)
+	if err != nil {
+		return PendingDependencyUpgradeScan{}, false, fmt.Errorf("reserve pending dependency-upgrade scan: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return PendingDependencyUpgradeScan{}, false, fmt.Errorf("read pending dependency-upgrade scan reserve: %w", err)
+	}
+	if affected == 0 {
+		if err := tx.Commit(); err != nil {
+			return PendingDependencyUpgradeScan{}, false, fmt.Errorf("commit empty dependency-upgrade scan reserve: %w", err)
+		}
+		return PendingDependencyUpgradeScan{}, false, nil
+	}
+	scan, err := scanPendingDependencyUpgradeScan(tx.QueryRowContext(ctx,
+		`SELECT `+pendingDependencyUpgradeScanColumns+` FROM pending_dependency_upgrade_scans WHERE repo_id=?`, repoID))
+	if err != nil {
+		return PendingDependencyUpgradeScan{}, false, fmt.Errorf("read reserved dependency-upgrade scan: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return PendingDependencyUpgradeScan{}, false, fmt.Errorf("commit pending dependency-upgrade scan reserve: %w", err)
+	}
+	return scan, true, nil
+}
+
+// CompletePendingDependencyUpgradeScan removes a completed row unless a newer
+// head movement advanced its generation during the scan. In that case the row
+// returns to pending and true tells the worker to enqueue another wake-up hint.
+func (s *Store) CompletePendingDependencyUpgradeScan(ctx context.Context, repoID string, generation, now int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin pending dependency-upgrade scan completion: %w", err)
+	}
+	defer tx.Rollback()
+	var status string
+	var currentGeneration int64
+	err = tx.QueryRowContext(ctx, `SELECT status, generation FROM pending_dependency_upgrade_scans WHERE repo_id=?`, repoID).
+		Scan(&status, &currentGeneration)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read pending dependency-upgrade scan completion: %w", err)
+	}
+	if status != "processing" || currentGeneration < generation {
+		return false, nil
+	}
+	if currentGeneration == generation {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pending_dependency_upgrade_scans
+			WHERE repo_id=? AND status='processing' AND generation=?`, repoID, generation); err != nil {
+			return false, fmt.Errorf("delete completed dependency-upgrade scan: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit dependency-upgrade scan completion: %w", err)
+		}
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE pending_dependency_upgrade_scans
+		SET status='pending', available_at=?, lease_until=0, last_error='', updated_at=?
+		WHERE repo_id=? AND status='processing'`, now, now, repoID); err != nil {
+		return false, fmt.Errorf("preserve newer dependency-upgrade scan: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit newer dependency-upgrade scan: %w", err)
+	}
+	return true, nil
+}
+
+// DeferPendingDependencyUpgradeScan releases a failed reservation after a
+// cooldown. Updating generations newer than the reservation is intentional: a
+// persistently failing repository must not spin merely because its head moved.
+func (s *Store) DeferPendingDependencyUpgradeScan(ctx context.Context, repoID string, generation, now, availableAt int64, lastError string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE pending_dependency_upgrade_scans
+		SET status='pending', available_at=?, lease_until=0, last_error=?, updated_at=?
+		WHERE repo_id=? AND status='processing' AND generation>=?`,
+		availableAt, lastError, now, repoID, generation)
+	if err != nil {
+		return fmt.Errorf("defer pending dependency-upgrade scan: %w", err)
+	}
+	return nil
+}
+
+// ResetStuckPendingDependencyUpgradeScans releases expired reservations after a
+// process crash. At-least-once replay is safe because scan persistence is
+// idempotent; a duplicate scan is wasteful but does not duplicate upgrades.
+func (s *Store) ResetStuckPendingDependencyUpgradeScans(ctx context.Context, now int64) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE pending_dependency_upgrade_scans
+		SET status='pending', available_at=?, lease_until=0, updated_at=?
+		WHERE status='processing' AND lease_until>0 AND lease_until<=?`, now, now, now)
+	if err != nil {
+		return 0, fmt.Errorf("reset stuck pending dependency-upgrade scans: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// ListDuePendingDependencyUpgradeScans returns durable work that is ready for a
+// queue wake-up. Reservation remains the atomic claim, so repeated listings are
+// safe and do not duplicate processing.
+func (s *Store) ListDuePendingDependencyUpgradeScans(ctx context.Context, now int64, limit int) ([]PendingDependencyUpgradeScan, error) {
+	if limit < 1 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+pendingDependencyUpgradeScanColumns+`
+		FROM pending_dependency_upgrade_scans
+		WHERE status='pending' AND available_at<=?
+		ORDER BY available_at ASC, repo_id ASC
+		LIMIT ?`, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query due pending dependency-upgrade scans: %w", err)
+	}
+	defer rows.Close()
+	var scans []PendingDependencyUpgradeScan
+	for rows.Next() {
+		scan, err := scanPendingDependencyUpgradeScan(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan due pending dependency-upgrade scan: %w", err)
+		}
+		scans = append(scans, scan)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate due pending dependency-upgrade scans: %w", err)
+	}
+	return scans, nil
+}

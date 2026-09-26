@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -259,6 +260,44 @@ func TestReviewOrderPaymentPreflightReturnsStructuredErrorWithoutReceipt(t *test
 	}
 	if _, ok, err := f.store.GetReviewOrder(f.ctx, nostr.GetPublicKey(f.requesterKey).Hex(), "payment"); err != nil || ok {
 		t.Fatalf("payment denial created receipt: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSubmitOnDemandRejectsInvalidGatingPolicy(t *testing.T) {
+	loader := orderConfigLoader{config: []byte("security:\n  enabled: true\n  gate_severty: critical\n")}
+	f := newOrderFixture(t, true, []string{""}, loader, nil, 20)
+
+	_, err := f.service.SubmitOnDemand(f.ctx, OnDemandRequest{
+		PatchEventID:    f.patch.ID.Hex(),
+		RequesterPubkey: nostr.GetPublicKey(f.requesterKey).Hex(),
+		OrderID:         "invalid-gating-policy",
+		Invocation:      db.ReviewInvocationIDE,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid repository gating policy") {
+		t.Fatalf("SubmitOnDemand error = %v, want invalid repository gating policy", err)
+	}
+
+	_, rpcErr := f.request(t, "invalid-gating-policy-rpc", ReviewOrderParams{PatchEventID: f.patch.ID.Hex()}, nil)
+	if rpcErr == nil || rpcErr.Code != contextvm.ErrorInvalidParams || !strings.Contains(rpcErr.Message, "invalid repository gating policy") {
+		t.Fatalf("review order RPC error = %+v, want visible invalid gating policy", rpcErr)
+	}
+}
+
+func TestSubmitOnDemandAllowsInvalidTuningOnlyPolicy(t *testing.T) {
+	loader := orderConfigLoader{config: []byte("context:\n  tokne_budget: 1000\n")}
+	f := newOrderFixture(t, true, []string{""}, loader, nil, 20)
+
+	accepted, err := f.service.SubmitOnDemand(f.ctx, OnDemandRequest{
+		PatchEventID:    f.patch.ID.Hex(),
+		RequesterPubkey: nostr.GetPublicKey(f.requesterKey).Hex(),
+		OrderID:         "invalid-tuning-policy",
+		Invocation:      db.ReviewInvocationIDE,
+	})
+	if err != nil {
+		t.Fatalf("SubmitOnDemand tuning-only error = %v", err)
+	}
+	if !accepted.Queued {
+		t.Fatalf("SubmitOnDemand result = %+v, want queued", accepted)
 	}
 }
 

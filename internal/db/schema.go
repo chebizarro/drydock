@@ -674,6 +674,24 @@ CREATE TABLE IF NOT EXISTS dependency_upgrade_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_dependency_upgrade_outbox_delivery
   ON dependency_upgrade_outbox(delivered_at);
+
+-- pending_dependency_upgrade_scans is the durable source of truth for reactive
+-- default-branch scans. The in-memory channel is only a wake-up hint. A single
+-- row per repository coalesces bursts, while generation preserves a trigger
+-- that arrives during an in-flight scan.
+CREATE TABLE IF NOT EXISTS pending_dependency_upgrade_scans (
+  repo_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'processing')),
+  generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0),
+  available_at INTEGER NOT NULL,
+  lease_until INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_dependency_upgrade_scans_ready
+  ON pending_dependency_upgrade_scans(status, available_at);
 ` + reviewSessionSchemaSQL
 
 const reviewSessionSchemaSQL = `

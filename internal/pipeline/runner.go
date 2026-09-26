@@ -53,6 +53,7 @@ type CodeIndexer interface {
 var (
 	errPaymentBlockPersisted = errors.New("review payment blocked")
 	errReactiveReviewSkipped = errors.New("reactive review skipped because repository is no longer monitored")
+	errRepoPolicyInvalid     = errors.New("invalid repository gating policy")
 )
 
 func retryablePaymentError(auth payment.AuthorizeResult) error {
@@ -279,9 +280,9 @@ func (r *Runner) work(ctx context.Context, id int) {
 
 			taskLog.Info("processing review task", "invocation", task.Invocation)
 			if err := r.process(taskCtx, task); err != nil {
-				if errors.Is(err, errReactiveReviewSkipped) {
+				if errors.Is(err, errReactiveReviewSkipped) || errors.Is(err, errRepoPolicyInvalid) {
 					metrics.ReviewsFinished.With("skipped").Inc()
-					taskLog.Info("reactive review skipped after monitoring change",
+					taskLog.Info("review skipped",
 						"error", err,
 						"elapsed_ms", tracing.Elapsed(taskCtx).Milliseconds())
 				} else {
@@ -381,11 +382,23 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		var cfgErr error
 		repoCfg, cfgErr = repoconfig.Parse(prep.BaseRepoConfig)
 		if cfgErr != nil {
-			r.logger.Warn("failed to parse .drydock.yaml, using defaults",
-				"patch_event_id", task.PatchEventID, "repo_id", task.RepoID, "error", cfgErr)
 			if repoconfig.ContainsPaymentsConfig(prep.BaseRepoConfig) {
+				if err := r.publishInvalidRepoPolicy(ctx, task, cfgErr); err != nil {
+					return err
+				}
 				return fmt.Errorf("payment_blocked:invalid_repo_payment_policy")
 			}
+			if repoconfig.RequiresFailClosed(prep.BaseRepoConfig) {
+				if err := r.publishInvalidRepoPolicy(ctx, task, cfgErr); err != nil {
+					return err
+				}
+				if err := r.store.MarkReviewSkipped(ctx, task.PatchEventID, task.RepoID, "invalid_repo_gating_policy"); err != nil {
+					return fmt.Errorf("persist invalid repository gating policy skip: %w", err)
+				}
+				return fmt.Errorf("%w: %v", errRepoPolicyInvalid, cfgErr)
+			}
+			r.logger.Warn("failed to parse tuning-only .drydock.yaml, using defaults",
+				"patch_event_id", task.PatchEventID, "repo_id", task.RepoID, "error", cfgErr)
 			repoCfg = repoconfig.Default()
 		}
 	}
@@ -1001,6 +1014,22 @@ func (r *Runner) requireReactiveMonitoring(ctx context.Context, task db.ReviewTa
 		return fmt.Errorf("persist reactive monitoring skip at %s: %w", stage, err)
 	}
 	return fmt.Errorf("%w at %s", errReactiveReviewSkipped, stage)
+}
+
+func (r *Runner) publishInvalidRepoPolicy(ctx context.Context, task db.ReviewTask, parseErr error) error {
+	r.logger.Warn("refusing review because repository gating policy is invalid",
+		"patch_event_id", task.PatchEventID,
+		"repo_id", task.RepoID,
+		"error", parseErr,
+	)
+	if r.pubSvc == nil {
+		return nil
+	}
+	if err := r.requireReactiveMonitoring(ctx, task, "pre_publication"); err != nil {
+		return err
+	}
+	r.publishApplyFailure(ctx, task, "repo_config", "invalid .drydock.yaml gating policy: "+parseErr.Error())
+	return nil
 }
 
 func (r *Runner) publishApplyFailure(ctx context.Context, task db.ReviewTask, stage, hint string) {

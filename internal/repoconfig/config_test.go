@@ -270,6 +270,37 @@ reveiw:
 	}
 }
 
+func TestRequiresFailClosedClassifiesRepositoryPolicy(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{name: "review", yaml: "review:\n  severty_floor: high\n", want: true},
+		{name: "status", yaml: "status:\n  enabledd: true\n", want: true},
+		{name: "payments", yaml: "payments:\n  enabledd: true\n", want: true},
+		{name: "security", yaml: "security:\n  gate_severty: high\n", want: true},
+		{name: "upgrades", yaml: "upgrades:\n  ecosytems: [go]\n", want: true},
+		{name: "unknown top-level may be gating typo", yaml: "securty:\n  enabled: true\n", want: true},
+		{name: "malformed intent unknown", yaml: "security: [", want: true},
+		{name: "non-mapping intent unknown", yaml: "review", want: true},
+		{name: "comment only", yaml: "# repository config placeholder\n", want: false},
+		{name: "empty document", yaml: "---\n", want: false},
+		{name: "null document", yaml: "null\n", want: false},
+		{name: "context only", yaml: "version: 1\ncontext:\n  tokne_budget: 100\n", want: false},
+		{name: "autofix only", yaml: "autofix:\n  max_findingz: 2\n", want: false},
+		{name: "ensemble only", yaml: "ensemble:\n  modelz: [coder32b]\n", want: false},
+		{name: "instructions only", yaml: "instructions:\n  nested: invalid\n", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RequiresFailClosed([]byte(tt.yaml)); got != tt.want {
+				t.Fatalf("RequiresFailClosed() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRepoSuppliedBetterleaksValidationRejected(t *testing.T) {
 	yaml := "version: 1\nsecurity:\n  secret_scan: true\n  validation: true\n"
 	_, err := Parse([]byte(yaml))

@@ -292,7 +292,10 @@ func (h *SecurityAuditHandler) auditConfig(ctx context.Context, repoID, requeste
 		if err != nil {
 			h.logger.Warn("failed to load repository config for security audit; using defaults", "repo_id", repoID, "error", err)
 		} else if parsed, err := repoconfig.Parse(raw); err != nil {
-			h.logger.Warn("invalid repository config for security audit; using defaults", "repo_id", repoID, "error", err)
+			if repoconfig.RequiresFailClosed(raw) {
+				return "", repoconfig.RepoConfig{}, fmt.Errorf("invalid repository gating policy: %w", err)
+			}
+			h.logger.Warn("invalid tuning-only repository config for security audit; using defaults", "repo_id", repoID, "error", err)
 		} else {
 			cfg = parsed
 		}

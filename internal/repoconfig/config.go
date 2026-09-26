@@ -113,12 +113,11 @@ type SecurityAuditConfig struct {
 	// AutoOnSnapshot is a deprecation shim: accepted for backward compatibility,
 	// read by nothing, and slated for removal once existing .drydock.yaml files
 	// have dropped the key. It must stay declared because Parse uses
-	// KnownFields(true), so removing it turns a stale key into a decode error —
-	// and the hot callers (pipeline/runner.go, revieworder/service.go) react to a
-	// parse error by discarding the ENTIRE repository config and falling back to
-	// Default(), silently downgrading the repository's gating/review/ignore
-	// settings. Tolerating the key parses harmlessly and preserves those real
-	// settings. This is a backward-compatibility policy, not a live knob.
+	// KnownFields(true), so removing it turns a stale key into a decode error.
+	// RequiresFailClosed prevents that error from silently downgrading policy,
+	// but retaining the shim avoids unnecessarily stopping repositories that
+	// still carry this harmless legacy key. This is a compatibility policy, not
+	// a live knob.
 	AutoOnSnapshot bool `yaml:"auto_on_snapshot"`
 }
 
@@ -848,9 +847,54 @@ func (c RepoConfig) DocsEnabled() bool {
 	return *c.Context.IncludeDocs
 }
 
+// RequiresFailClosed reports whether discarding an invalid document in favor of
+// Default would risk relaxing repository policy. Review selection, status,
+// payments, security, and dependency-upgrade settings all gate, suppress, or
+// constrain service output, so their presence makes every parse error fatal.
+//
+// Context, autofix, ensemble, and instructions only tune an operation (and
+// their defaults do not grant an operation that was otherwise forbidden), so a
+// document containing only those known blocks may still degrade to defaults.
+// Unknown top-level keys and malformed YAML fail closed because their intended
+// block cannot be classified safely. Schema extensions must be added to one of
+// these two sets deliberately; leaving a new key unclassified is fail-closed.
+func RequiresFailClosed(data []byte) bool {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return false
+	}
+
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return true
+	}
+	if len(document.Content) == 0 {
+		return false
+	}
+	root := document.Content[0]
+	if root.Kind == yaml.ScalarNode && root.Tag == "!!null" {
+		return false
+	}
+	if root.Kind != yaml.MappingNode || len(root.Content)%2 != 0 {
+		return true
+	}
+	for i := 0; i < len(root.Content); i += 2 {
+		key := strings.TrimSpace(root.Content[i].Value)
+		switch key {
+		case "review", "status", "payments", "security", "upgrades":
+			return true
+		case "version", "context", "autofix", "ensemble", "instructions":
+			// Known tuning or schema metadata: a parse failure cannot relax a
+			// declared gate because this document declares none.
+		default:
+			return true
+		}
+	}
+	return false
+}
+
 // ContainsPaymentsConfig returns true if the raw YAML data contains a top-level
-// "payments:" key. Used to implement fail-closed behavior when the payments
-// section is present but the config fails to parse.
+// "payments:" key. It preserves the payment-specific protocol error while all
+// other restrictive policy uses RequiresFailClosed.
 func ContainsPaymentsConfig(data []byte) bool {
 	for _, line := range bytes.Split(data, []byte("\n")) {
 		trimmed := strings.TrimSpace(string(line))

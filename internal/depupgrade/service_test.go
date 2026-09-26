@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
@@ -120,8 +121,8 @@ func newTestService(t *testing.T, ctx context.Context, updater *stubUpdater, rel
 				FixedVersion: "1.0.1", Advisories: []string{"CVE-2024-9999"},
 			},
 		}}},
-		Updater:    updater,
-		Resolver:   stubResolver{res: Resolution{TargetVersion: "v1.0.1", Status: StatusResolved, Source: "registry"}},
+		Updater:      updater,
+		Resolver:     stubResolver{res: Resolution{TargetVersion: "v1.0.1", Status: StatusResolved, Source: "registry"}},
 		Publisher:    pub,
 		Monitoring:   stubMonitoring{ok: true},
 		Repositories: stubRepositories{ids: []string{"abc123def:app"}},
@@ -195,6 +196,22 @@ func TestScanRepositoryPublishesRootUpgradePatch(t *testing.T) {
 	}
 	if len(rows) != 1 {
 		t.Fatalf("re-run created extra rows: got %d", len(rows))
+	}
+}
+
+func TestScanRepositoryRejectsMalformedRepositoryConfig(t *testing.T) {
+	ctx := context.Background()
+	relay := &captureRelay{}
+	svc, _, repoID := newTestService(t, ctx, &stubUpdater{}, relay)
+	workspaces := svc.deps.Workspaces.(*stubWorkspaces)
+	workspaces.baseConfig = []byte("context:\n  tokne_budget: 1000\n")
+
+	err := svc.ScanRepository(ctx, repoID, TriggerManual)
+	if err == nil || !strings.Contains(err.Error(), "invalid repository gating policy") {
+		t.Fatalf("ScanRepository error = %v, want invalid repository gating policy", err)
+	}
+	if len(relay.events) != 0 {
+		t.Fatalf("malformed config published %d upgrade events", len(relay.events))
 	}
 }
 

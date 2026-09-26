@@ -8,11 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/deprunner"
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 	"git.sharegap.net/cascadia/drydock/internal/publisher"
+	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
 // fakeStore implements the depupgrade.Store interface with in-memory canned data
@@ -54,6 +56,16 @@ func (f *fakeStore) GetRootStatus(_ context.Context, rootID, _ string) (int, str
 		return 0, "", 0, false, nil
 	}
 	return kind, "status-evt", 0, true, nil
+}
+
+type recordingScanner struct {
+	calls int
+	err   error
+}
+
+func (s *recordingScanner) Scan(context.Context, string) ([]reviewengine.Finding, error) {
+	s.calls++
+	return nil, s.err
 }
 
 type stubPublisher struct{}
@@ -103,6 +115,106 @@ func TestOnDefaultBranchHeadChangedSkipsUnmonitored(t *testing.T) {
 	}
 	if len(svc.queue) != 0 {
 		t.Fatalf("queue length = %d, want 0 (unmonitored must not enqueue)", len(svc.queue))
+	}
+}
+
+func newDurableTriggerService(t *testing.T, scanner Scanner, queueSize int) (*Service, *db.Store) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := db.Open(ctx, filepath.Join(t.TempDir(), "trigger.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc, err := New(Config{QueueSize: queueSize}, Dependencies{
+		Store: store,
+		Workspaces: &stubWorkspaces{
+			root:       t.TempDir(),
+			baseConfig: []byte("version: 1\nupgrades:\n  enabled: true\n  ecosystems: [go]\n  policy: next_patch\n"),
+		},
+		Scanner:      scanner,
+		Updater:      &stubUpdater{},
+		Resolver:     stubResolver{},
+		Publisher:    stubPublisher{},
+		Monitoring:   stubMonitoring{ok: true},
+		Repositories: stubRepositories{},
+		Logger:       logger,
+	})
+	if err != nil {
+		t.Fatalf("new durable trigger service: %v", err)
+	}
+	return svc, store
+}
+
+func TestDroppedReactiveScanIsDrainedFromDurableState(t *testing.T) {
+	ctx := context.Background()
+	scanner := &recordingScanner{}
+	svc, store := newDurableTriggerService(t, scanner, 1)
+
+	if err := svc.OnDefaultBranchHeadChanged(ctx, "repo-one", "head-1"); err != nil {
+		t.Fatalf("enqueue first scan: %v", err)
+	}
+	if err := svc.OnDefaultBranchHeadChanged(ctx, "repo-two", "head-2"); err != nil {
+		t.Fatalf("defer second scan: %v", err)
+	}
+	if len(svc.queue) != 1 {
+		t.Fatalf("queue length=%d, want bounded length 1", len(svc.queue))
+	}
+	pending, err := store.ListDuePendingDependencyUpgradeScans(ctx, time.Now().Unix(), 10)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("durable pending scans=%+v err=%v, want both repositories", pending, err)
+	}
+
+	svc.runJob(ctx, <-svc.queue)
+	svc.RunScheduled(ctx)
+	if len(svc.queue) != 1 {
+		t.Fatalf("scheduled drain queue length=%d, want deferred scan", len(svc.queue))
+	}
+	job := <-svc.queue
+	if job.repoID != "repo-two" || job.trigger != TriggerDefaultBranch {
+		t.Fatalf("drained job=%+v, want repo-two default_branch", job)
+	}
+	svc.runJob(ctx, job)
+	if scanner.calls != 2 {
+		t.Fatalf("scanner calls=%d, want both reactive scans executed", scanner.calls)
+	}
+	pending, err = store.ListDuePendingDependencyUpgradeScans(ctx, time.Now().Add(time.Hour).Unix(), 10)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("completed scans remained pending: pending=%+v err=%v", pending, err)
+	}
+}
+
+func TestFailingReactiveScanWaitsForCooldown(t *testing.T) {
+	ctx := context.Background()
+	scanner := &recordingScanner{err: errors.New("scanner offline")}
+	svc, store := newDurableTriggerService(t, scanner, 1)
+
+	if err := svc.OnDefaultBranchHeadChanged(ctx, "repo-one", "head-1"); err != nil {
+		t.Fatalf("enqueue scan: %v", err)
+	}
+	svc.runJob(ctx, <-svc.queue)
+	if scanner.calls != 1 {
+		t.Fatalf("scanner calls=%d, want 1", scanner.calls)
+	}
+
+	svc.RunScheduled(ctx)
+	if len(svc.queue) != 0 {
+		t.Fatalf("failed repository was immediately requeued: queue length=%d", len(svc.queue))
+	}
+	pending, err := store.ListDuePendingDependencyUpgradeScans(ctx,
+		time.Now().Add(pendingScanRetryCooldown/2).Unix(), 10)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("failed scan became due before cooldown: pending=%+v err=%v", pending, err)
+	}
+	pending, err = store.ListDuePendingDependencyUpgradeScans(ctx,
+		time.Now().Add(2*pendingScanRetryCooldown).Unix(), 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("failed scan missing after cooldown: pending=%+v err=%v", pending, err)
 	}
 }
 

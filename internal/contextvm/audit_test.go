@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"git.sharegap.net/cascadia/drydock/internal/auditengine"
@@ -136,6 +137,41 @@ func TestSecurityAuditMethodRunsEngineAndPublishesProgress(t *testing.T) {
 	}
 	assertAuditProgressNotification(t, published.notifications[0], requestEvent.ID.Hex(), requester, "prepare", "processing")
 	assertAuditProgressNotification(t, published.notifications[1], requestEvent.ID.Hex(), requester, "published", "success")
+}
+
+func TestSecurityAuditRejectsInvalidGatingPolicy(t *testing.T) {
+	handler := NewSecurityAuditHandler(
+		&auditTestRunner{},
+		auditTestStore{},
+		auditTestConfigLoader{data: []byte("security:\n  enabled: true\n  gate_severty: critical\n")},
+		nil,
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+
+	_, _, err := handler.auditConfig(context.Background(), "repo", "")
+	if err == nil || !strings.Contains(err.Error(), "invalid repository gating policy") {
+		t.Fatalf("auditConfig error = %v, want invalid repository gating policy", err)
+	}
+}
+
+func TestSecurityAuditAllowsInvalidTuningOnlyPolicy(t *testing.T) {
+	handler := NewSecurityAuditHandler(
+		&auditTestRunner{},
+		auditTestStore{},
+		auditTestConfigLoader{data: []byte("context:\n  tokne_budget: 1000\n")},
+		nil,
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+
+	depth, cfg, err := handler.auditConfig(context.Background(), "repo", "")
+	if err != nil {
+		t.Fatalf("auditConfig tuning-only error = %v", err)
+	}
+	if depth != auditengine.DepthStandard || cfg.Security.Enabled {
+		t.Fatalf("auditConfig defaults = depth %q security.enabled %v", depth, cfg.Security.Enabled)
+	}
 }
 
 func TestSecurityAuditMethodPublishesFailure(t *testing.T) {

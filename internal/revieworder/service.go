@@ -305,7 +305,10 @@ func (s *Service) SubmitOnDemand(ctx context.Context, req OnDemandRequest) (Acce
 			if repoconfig.ContainsPaymentsConfig(rawConfig) {
 				return AcceptedOrder{}, &PaymentDeniedError{Reason: "invalid_repo_payment_policy"}
 			}
-			s.logger.Warn("failed to parse .drydock.yaml for on-demand review, using defaults",
+			if repoconfig.RequiresFailClosed(rawConfig) {
+				return AcceptedOrder{}, fmt.Errorf("%w: invalid repository gating policy: %v", ErrInvalidTarget, parseErr)
+			}
+			s.logger.Warn("failed to parse tuning-only .drydock.yaml for on-demand review, using defaults",
 				"patch_event_id", req.PatchEventID, "repo_id", repository.RepositoryID, "error", parseErr)
 		} else {
 			repoCfg = parsed

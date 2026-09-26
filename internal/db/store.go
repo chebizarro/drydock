@@ -704,6 +704,41 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 16,
+		name:    "pending_dependency_upgrade_scans",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			// Migrate applies schemaSQL first, so this guard normally observes the
+			// freshly created table. Keep the DDL here as the versioned ownership
+			// record and for direct migration execution in tooling/tests.
+			exists, err := hasColumn(ctx, tx, "pending_dependency_upgrade_scans", "repo_id")
+			if err != nil {
+				return fmt.Errorf("check pending_dependency_upgrade_scans.repo_id: %w", err)
+			}
+			if exists {
+				return nil
+			}
+			for _, ddl := range []string{
+				`CREATE TABLE IF NOT EXISTS pending_dependency_upgrade_scans (
+					repo_id TEXT PRIMARY KEY,
+					status TEXT NOT NULL DEFAULT 'pending'
+						CHECK (status IN ('pending', 'processing')),
+					generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0),
+					available_at INTEGER NOT NULL,
+					lease_until INTEGER NOT NULL DEFAULT 0,
+					last_error TEXT NOT NULL DEFAULT '',
+					created_at INTEGER NOT NULL,
+					updated_at INTEGER NOT NULL)`,
+				`CREATE INDEX IF NOT EXISTS idx_pending_dependency_upgrade_scans_ready
+					ON pending_dependency_upgrade_scans(status, available_at)`,
+			} {
+				if _, err := tx.ExecContext(ctx, ddl); err != nil {
+					return fmt.Errorf("apply pending dependency-upgrade scan ddl: %w", err)
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

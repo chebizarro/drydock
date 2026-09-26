@@ -341,3 +341,89 @@ func TestDependencyUpgradeOutboxMarkDeliveredMissing(t *testing.T) {
 		t.Fatal("expected error marking a nonexistent reservation delivered")
 	}
 }
+
+func TestPendingDependencyUpgradeScanCoalescesAndPreservesNewerGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	queued, err := store.UpsertPendingDependencyUpgradeScan(ctx, "repo1", 100)
+	if err != nil || !queued {
+		t.Fatalf("insert pending scan: queued=%v err=%v", queued, err)
+	}
+	queued, err = store.UpsertPendingDependencyUpgradeScan(ctx, "repo1", 101)
+	if err != nil || queued {
+		t.Fatalf("coalesce pending scan: queued=%v err=%v", queued, err)
+	}
+	pending, err := store.ListDuePendingDependencyUpgradeScans(ctx, 101, 10)
+	if err != nil || len(pending) != 1 || pending[0].Generation != 1 {
+		t.Fatalf("list coalesced scan: pending=%+v err=%v", pending, err)
+	}
+
+	reserved, ok, err := store.ReservePendingDependencyUpgradeScan(ctx, "repo1", 101, 150)
+	if err != nil || !ok || reserved.Generation != 1 {
+		t.Fatalf("reserve pending scan: scan=%+v ok=%v err=%v", reserved, ok, err)
+	}
+	queued, err = store.UpsertPendingDependencyUpgradeScan(ctx, "repo1", 102)
+	if err != nil || queued {
+		t.Fatalf("coalesce in-flight scan: queued=%v err=%v", queued, err)
+	}
+	requeue, err := store.CompletePendingDependencyUpgradeScan(ctx, "repo1", reserved.Generation, 103)
+	if err != nil || !requeue {
+		t.Fatalf("complete older generation: requeue=%v err=%v", requeue, err)
+	}
+	pending, err = store.ListDuePendingDependencyUpgradeScans(ctx, 103, 10)
+	if err != nil || len(pending) != 1 || pending[0].Generation != 2 {
+		t.Fatalf("newer generation not preserved: pending=%+v err=%v", pending, err)
+	}
+
+	reserved, ok, err = store.ReservePendingDependencyUpgradeScan(ctx, "repo1", 103, 160)
+	if err != nil || !ok {
+		t.Fatalf("reserve newer scan: ok=%v err=%v", ok, err)
+	}
+	requeue, err = store.CompletePendingDependencyUpgradeScan(ctx, "repo1", reserved.Generation, 104)
+	if err != nil || requeue {
+		t.Fatalf("complete latest generation: requeue=%v err=%v", requeue, err)
+	}
+	pending, err = store.ListDuePendingDependencyUpgradeScans(ctx, 1000, 10)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("completed scan remained pending: pending=%+v err=%v", pending, err)
+	}
+}
+
+func TestPendingDependencyUpgradeScanCooldownAndCrashRecovery(t *testing.T) {
+	ctx := context.Background()
+	store := mustOpenStore(t, ctx)
+
+	if queued, err := store.UpsertPendingDependencyUpgradeScan(ctx, "repo1", 100); err != nil || !queued {
+		t.Fatalf("insert pending scan: queued=%v err=%v", queued, err)
+	}
+	reserved, ok, err := store.ReservePendingDependencyUpgradeScan(ctx, "repo1", 100, 150)
+	if err != nil || !ok {
+		t.Fatalf("reserve pending scan: ok=%v err=%v", ok, err)
+	}
+	if err := store.DeferPendingDependencyUpgradeScan(ctx, "repo1", reserved.Generation, 110, 200, "scanner offline"); err != nil {
+		t.Fatalf("defer failed scan: %v", err)
+	}
+	pending, err := store.ListDuePendingDependencyUpgradeScans(ctx, 199, 10)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("failed scan retried before cooldown: pending=%+v err=%v", pending, err)
+	}
+	pending, err = store.ListDuePendingDependencyUpgradeScans(ctx, 200, 10)
+	if err != nil || len(pending) != 1 || pending[0].LastError != "scanner offline" {
+		t.Fatalf("failed scan missing after cooldown: pending=%+v err=%v", pending, err)
+	}
+
+	if _, ok, err = store.ReservePendingDependencyUpgradeScan(ctx, "repo1", 200, 250); err != nil || !ok {
+		t.Fatalf("reserve retry: ok=%v err=%v", ok, err)
+	}
+	if reset, err := store.ResetStuckPendingDependencyUpgradeScans(ctx, 249); err != nil || reset != 0 {
+		t.Fatalf("reset live reservation: reset=%d err=%v", reset, err)
+	}
+	if reset, err := store.ResetStuckPendingDependencyUpgradeScans(ctx, 250); err != nil || reset != 1 {
+		t.Fatalf("reset expired reservation: reset=%d err=%v", reset, err)
+	}
+	pending, err = store.ListDuePendingDependencyUpgradeScans(ctx, 250, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("crash-recovered scan not due: pending=%+v err=%v", pending, err)
+	}
+}
