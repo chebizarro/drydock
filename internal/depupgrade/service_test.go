@@ -54,6 +54,10 @@ type stubMonitoring struct{ ok bool }
 
 func (m stubMonitoring) Contains(string) bool { return m.ok }
 
+type stubRepositories struct{ ids []string }
+
+func (r stubRepositories) MonitoredRepositoryIDs() []string { return r.ids }
+
 // stubWorkspaces creates a real temp worktree seeded with a go.mod so the manifest
 // gathering and change-apply paths run for real, but skips git by returning a
 // canned diff after invoking mutate.
@@ -118,9 +122,10 @@ func newTestService(t *testing.T, ctx context.Context, updater *stubUpdater, rel
 		}}},
 		Updater:    updater,
 		Resolver:   stubResolver{res: Resolution{TargetVersion: "v1.0.1", Status: StatusResolved, Source: "registry"}},
-		Publisher:  pub,
-		Monitoring: stubMonitoring{ok: true},
-		Logger:     logger,
+		Publisher:    pub,
+		Monitoring:   stubMonitoring{ok: true},
+		Repositories: stubRepositories{ids: []string{"abc123def:app"}},
+		Logger:       logger,
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)

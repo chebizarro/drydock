@@ -686,6 +686,24 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 15,
+		name:    "repository_snapshots_head_commit",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			exists, err := hasColumn(ctx, tx, "repository_snapshots", "head_commit")
+			if err != nil {
+				return fmt.Errorf("check repository_snapshots.head_commit: %w", err)
+			}
+			if exists {
+				return nil
+			}
+			if _, err := tx.ExecContext(ctx,
+				"ALTER TABLE repository_snapshots ADD COLUMN head_commit TEXT NOT NULL DEFAULT ''"); err != nil {
+				return fmt.Errorf("add repository_snapshots.head_commit: %w", err)
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -963,24 +981,67 @@ func (s *Store) GetRepositoryCloneURLs(ctx context.Context, repoID string) ([]st
 	return urls, nil
 }
 
-func (s *Store) UpsertRepositorySnapshot(ctx context.Context, event nostr.Event) error {
+// SnapshotUpsert reports the outcome of persisting a repository-state snapshot.
+// HeadChanged is the load-bearing signal for reactive dependency-upgrade scans:
+// the in-place upsert overwrites the head with no retained history, so "the
+// default branch moved" is only knowable by comparing at write time.
+type SnapshotUpsert struct {
+	RepoID      string
+	HeadChanged bool
+	NewHead     string
+}
+
+// UpsertRepositorySnapshot persists the latest repository-state snapshot and
+// reports whether the default-branch head commit changed. The prior head is read
+// and the write applied atomically so a concurrent upsert cannot race the
+// comparison. An out-of-order (older) event is ignored by the created_at guard
+// and never reported as a change. A first-ever snapshot with a non-empty head is
+// reported as a change so a newly monitored repository is scanned once.
+func (s *Store) UpsertRepositorySnapshot(ctx context.Context, event nostr.Event) (SnapshotUpsert, error) {
 	state := nip34.ParseRepositoryState(event)
 	repoID := event.PubKey.Hex() + ":" + state.ID
 	commits := snapshotRefCommits(event)
 	slices.Sort(commits)
 	commits = slices.Compact(commits)
+	// The head commit is the commit the HEAD branch resolves to; an empty value
+	// (no HEAD tag or no matching branch tag) is never treated as a change.
+	newHead := strings.ToLower(strings.TrimSpace(state.Branches[state.HEAD]))
 	now := time.Now().Unix()
 
-	_, err := s.db.ExecContext(
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SnapshotUpsert{}, fmt.Errorf("begin repository snapshot transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		oldHead      string
+		oldCreatedAt int64
+		exists       bool
+	)
+	err = tx.QueryRowContext(ctx,
+		`SELECT head_commit, created_at FROM repository_snapshots WHERE repo_id=?`, repoID,
+	).Scan(&oldHead, &oldCreatedAt)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		exists = false
+	case err != nil:
+		return SnapshotUpsert{}, fmt.Errorf("read prior repository snapshot: %w", err)
+	default:
+		exists = true
+	}
+
+	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO repository_snapshots
-			(repo_id, snapshot_event_id, author_pubkey, head_branch, ref_commits_csv, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+			(repo_id, snapshot_event_id, author_pubkey, head_branch, ref_commits_csv, head_commit, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(repo_id) DO UPDATE SET
 		    snapshot_event_id=excluded.snapshot_event_id,
 		    author_pubkey=excluded.author_pubkey,
 		    head_branch=excluded.head_branch,
 		    ref_commits_csv=excluded.ref_commits_csv,
+		    head_commit=excluded.head_commit,
 		    created_at=excluded.created_at,
 		    updated_at=excluded.updated_at
 		  WHERE excluded.created_at >= repository_snapshots.created_at`,
@@ -989,13 +1050,21 @@ func (s *Store) UpsertRepositorySnapshot(ctx context.Context, event nostr.Event)
 		event.PubKey.Hex(),
 		state.HEAD,
 		strings.Join(commits, ","),
+		newHead,
 		int64(event.CreatedAt),
 		now,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert repository snapshot: %w", err)
+	); err != nil {
+		return SnapshotUpsert{}, fmt.Errorf("upsert repository snapshot: %w", err)
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return SnapshotUpsert{}, fmt.Errorf("commit repository snapshot transaction: %w", err)
+	}
+
+	// The write only took effect if this event is not older than the stored one
+	// (the ON CONFLICT guard); otherwise the head is unchanged from our view.
+	applied := !exists || int64(event.CreatedAt) >= oldCreatedAt
+	headChanged := applied && newHead != "" && newHead != oldHead
+	return SnapshotUpsert{RepoID: repoID, HeadChanged: headChanged, NewHead: newHead}, nil
 }
 
 func (s *Store) InsertPatchEvent(ctx context.Context, event nostr.Event) error {

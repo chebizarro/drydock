@@ -168,6 +168,54 @@ func TestFromEnvContextInfrastructureDefaults(t *testing.T) {
 	}
 }
 
+func TestValidate_DepUpgradeRequiresSidecar(t *testing.T) {
+	cfg := Config{
+		Relays:             []string{"wss://relay.test"},
+		DatabaseURL:        ":memory:",
+		DepUpgradeEnabled:  true,
+		DepUpgradeInterval: 0,
+		DepUpgradeWorkers:  0,
+		// DepRunnerURL and MonitoredReposAuthor deliberately empty.
+	}
+
+	result := cfg.Validate(context.Background())
+
+	want := []string{
+		"DRYDOCK_DEPUPGRADE_INTERVAL must be greater than 0",
+		"DRYDOCK_DEPUPGRADE_WORKERS must be at least 1",
+		"DRYDOCK_DEP_RUNNER_URL",
+		"DRYDOCK_MONITORED_REPOS_AUTHOR",
+	}
+	for _, w := range want {
+		found := false
+		for _, err := range result.Errors {
+			if contains(err, w) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected dependency-upgrade validation error containing %q; errors = %#v", w, result.Errors)
+		}
+	}
+}
+
+func TestValidate_DepUpgradeDisabledSkipsChecks(t *testing.T) {
+	cfg := Config{
+		Relays:            []string{"wss://relay.test"},
+		DatabaseURL:       ":memory:",
+		DepUpgradeEnabled: false,
+	}
+
+	result := cfg.Validate(context.Background())
+
+	for _, err := range result.Errors {
+		if contains(err, "DEPUPGRADE") || contains(err, "DEP_RUNNER") {
+			t.Errorf("disabled dependency upgrades must not raise dep-upgrade errors: %q", err)
+		}
+	}
+}
+
 func TestValidate_NoRelays(t *testing.T) {
 	cfg := Config{
 		Relays:          []string{},

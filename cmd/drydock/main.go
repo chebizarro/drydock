@@ -30,6 +30,8 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/conversation"
 	"git.sharegap.net/cascadia/drydock/internal/dashboard"
 	"git.sharegap.net/cascadia/drydock/internal/db"
+	"git.sharegap.net/cascadia/drydock/internal/deprunner"
+	"git.sharegap.net/cascadia/drydock/internal/depupgrade"
 	"git.sharegap.net/cascadia/drydock/internal/driftguard"
 	"git.sharegap.net/cascadia/drydock/internal/embedding"
 	"git.sharegap.net/cascadia/drydock/internal/health"
@@ -52,6 +54,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 	"git.sharegap.net/cascadia/drydock/internal/revieworder"
 	"git.sharegap.net/cascadia/drydock/internal/reviewsession"
+	"git.sharegap.net/cascadia/drydock/internal/sca"
 	"git.sharegap.net/cascadia/drydock/internal/scope"
 	"git.sharegap.net/cascadia/drydock/internal/securityreview"
 	"git.sharegap.net/cascadia/drydock/internal/securityscan"
@@ -753,6 +756,47 @@ func main() {
 	if monitoredRepos == nil {
 		logger.Warn("reactive review disabled: no monitored repositories author is configured")
 	}
+
+	// --- Dependency-upgrade service (operator-disabled by default) ---
+	// It genuinely cannot run without the sidecar that performs manifest edits, a
+	// signer to publish patches, and the monitored-repository control plane, so a
+	// misconfiguration with the feature enabled is a hard startup failure.
+	var depUpgradeSvc *depupgrade.Service
+	if cfg.DepUpgradeEnabled {
+		if pubSvc == nil {
+			logger.Error("dependency upgrades enabled but no signer is configured; cannot publish upgrade patches")
+			os.Exit(1)
+		}
+		if monitoredRepos == nil {
+			logger.Error("dependency upgrades enabled but no monitored repositories author is configured")
+			os.Exit(1)
+		}
+		resolver, err := depupgrade.NewResolver(cfg, nil)
+		if err != nil {
+			logger.Error("failed to configure dependency-upgrade version resolver", "error", err)
+			os.Exit(1)
+		}
+		depUpgradeSvc, err = depupgrade.New(depupgrade.Config{
+			Workers: cfg.DepUpgradeWorkers,
+		}, depupgrade.Dependencies{
+			Store:        store,
+			Workspaces:   repoSvc,
+			Scanner:      sca.NewScanner(sca.OSRunner{}, logger),
+			Updater:      deprunner.NewClientWithToken(cfg.DepRunnerURL, cfg.DepRunnerToken),
+			Resolver:     resolver,
+			Publisher:    pubSvc,
+			Monitoring:   monitoredRepos,
+			Repositories: monitoredRepos,
+			Logger:       logger,
+		})
+		if err != nil {
+			logger.Error("failed to configure dependency-upgrade service", "error", err)
+			os.Exit(1)
+		}
+		processorOpts = append(processorOpts, ingest.WithDependencyUpgrades(depUpgradeSvc))
+		logger.Info("dependency-upgrade service enabled",
+			"workers", cfg.DepUpgradeWorkers, "interval", cfg.DepUpgradeInterval, "dep_runner", cfg.DepRunnerURL)
+	}
 	var ideHandler *idegateway.Handler
 	if signer != nil && qdrantClient != nil && embedClient != nil {
 		if keyer, ok := signer.(codechat.Keyer); ok {
@@ -1008,6 +1052,12 @@ func main() {
 
 	go runReviewLifecycle(ctx, cfg.SnapshotGCInterval, sessionStore, snapshotManager, logger)
 
+	// --- Dependency-upgrade workers + periodic sweep ---
+	if depUpgradeSvc != nil {
+		go depUpgradeSvc.Run(ctx)
+		go runDepUpgradeSchedule(ctx, cfg.DepUpgradeInterval, depUpgradeSvc, logger)
+	}
+
 	// --- Background prompt refinement loop (checks every 5 minutes) ---
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -1202,6 +1252,30 @@ func resolveMCPHTTPScope(ctx context.Context, chatID string, sessions *reviewses
 	}
 	return agenttools.NewScope("mcp-http:"+chatID+":"+snapshot.ManifestDigest(),
 		snapshot, agenttools.RoleExternalReadonly), nil
+}
+
+// runDepUpgradeSchedule drives the periodic dependency-upgrade sweep from an
+// in-process ticker — the single composition root, no external scheduler. Each
+// tick reconciles open upgrades against their published patches' NIP-34 status
+// and enqueues a scan for every monitored repository (each scan self-gates on
+// the repository's enabled flag and schedule opt-in). The interval is the sweep
+// granularity and the effective scan cadence; per-repository cadence is
+// deliberately not modeled (see repoconfig.UpgradeTriggersConfig).
+func runDepUpgradeSchedule(ctx context.Context, interval time.Duration, svc *depupgrade.Service, logger *slog.Logger) {
+	if interval <= 0 || svc == nil {
+		return
+	}
+	svc.RunScheduled(ctx)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			svc.RunScheduled(ctx)
+		}
+	}
 }
 
 func runReviewLifecycle(ctx context.Context, interval time.Duration, sessions *reviewsession.SQLStore, snapshots *workspacesnapshot.Manager, logger *slog.Logger) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os/exec"
 
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
@@ -80,6 +81,22 @@ func NewScanner(runner Runner, logger *slog.Logger) *Scanner {
 // Scan runs every available SCA tool against repoPath.
 func (s *Scanner) Scan(ctx context.Context, repoPath string) ([]reviewengine.Finding, error) {
 	return Scan(ctx, s.runner, repoPath, s.logger)
+}
+
+// OSRunner is the production Runner: it looks tools up on PATH and executes
+// them, returning combined output. It carries no toolchain of its own — the SCA
+// binaries (trivy/grype/osv-scanner) are a deployment concern and are absent
+// from the lean drydock image, in which case Scan finds no tool and returns no
+// findings. It mirrors the audit engine's tool runner so both share behavior.
+type OSRunner struct{}
+
+// LookPath resolves a tool binary on PATH.
+func (OSRunner) LookPath(name string) (string, error) { return exec.LookPath(name) }
+
+// Run executes the tool and returns its combined stdout+stderr. The context
+// bounds the invocation; callers supply a deadline.
+func (OSRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
 func availableTool(runner Runner, names ...string) (string, bool) {

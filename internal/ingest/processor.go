@@ -47,6 +47,15 @@ type MonitoringHandler interface {
 	ApplyDeletion(ctx context.Context, event nostr.Event) (bool, error)
 }
 
+// DependencyUpgrader receives the default-branch head-change signal and decides
+// (fail-closed on monitoring and repository policy) whether to enqueue a
+// dependency-upgrade scan. It is optional: an unconfigured processor ignores the
+// signal entirely. The call must not block ingest — the implementation enqueues
+// and returns.
+type DependencyUpgrader interface {
+	OnDefaultBranchHeadChanged(ctx context.Context, repoID, newHead string) error
+}
+
 // ReviewOrderer owns reactive admission and the durable review queue.
 type ReviewOrderer interface {
 	SubmitReactive(context.Context, nostr.Event, scope.RepositoryRef) (revieworder.SubmissionResult, error)
@@ -66,6 +75,7 @@ type Processor struct {
 	// revieworder.Service owns the underlying channel.
 	ReviewQueue        <-chan db.ReviewTask
 	reviewOrders       ReviewOrderer
+	dependencyUpgrades DependencyUpgrader
 	conversation       ConversationHandler
 	codeChat           CodeChatHandler
 	ideGateway         IDEGatewayHandler
@@ -113,6 +123,14 @@ func WithLocalAutofixAuthor(pubkey string) func(*Processor) {
 func WithReviewOrders(service ReviewOrderer) func(*Processor) {
 	return func(p *Processor) {
 		p.reviewOrders = service
+	}
+}
+
+// WithDependencyUpgrades registers the handler notified when a monitored
+// repository's default-branch head commit changes.
+func WithDependencyUpgrades(handler DependencyUpgrader) func(*Processor) {
+	return func(p *Processor) {
+		p.dependencyUpgrades = handler
 	}
 }
 
@@ -250,7 +268,19 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 	case eventkind.RepositoryAnnouncement:
 		return p.store.UpsertRepositoryAnnouncement(ctx, event)
 	case eventkind.RepositoryState:
-		return p.store.UpsertRepositorySnapshot(ctx, event)
+		change, err := p.store.UpsertRepositorySnapshot(ctx, event)
+		if err != nil {
+			return err
+		}
+		// A moved default-branch head is the reactive dependency-upgrade trigger.
+		// The handler applies the fail-closed monitoring gate and repository policy
+		// itself; here we only forward the signal when something changed.
+		if change.HeadChanged && p.dependencyUpgrades != nil {
+			if err := p.dependencyUpgrades.OnDefaultBranchHeadChanged(ctx, change.RepoID, change.NewHead); err != nil {
+				return err
+			}
+		}
+		return nil
 	case eventkind.StatusOpen, eventkind.StatusApplied, eventkind.StatusClosed, eventkind.StatusDraft:
 		return p.store.UpsertRootStatus(ctx, event)
 	case eventkind.Patch, eventkind.GitPullRequest, eventkind.GitPullRequestUpdate:

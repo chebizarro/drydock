@@ -231,3 +231,27 @@ func TestSecurityConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestSecurityAuditAutoOnSnapshotDeprecatedKeyTolerated pins the backward-
+// compatibility property: a .drydock.yaml still carrying the deprecated
+// auto_on_snapshot key must PARSE and RETAIN its other real settings. Because
+// Parse uses KnownFields(true) and the hot callers fall back to Default() on any
+// parse error, deleting the field would silently downgrade a live repository's
+// entire security/review/ignore policy. This test fails against that deletion.
+func TestSecurityAuditAutoOnSnapshotDeprecatedKeyTolerated(t *testing.T) {
+	data := []byte("version: 1\n" +
+		"review:\n  severity_floor: high\n" +
+		"security:\n  enabled: true\n  gate_severity: critical\n  audit:\n    auto_on_snapshot: true\n")
+
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("deprecated auto_on_snapshot key must parse without error, got: %v", err)
+	}
+	// Non-default values below prove the config did NOT fall back to Default().
+	if cfg.Review.SeverityFloor != "high" {
+		t.Fatalf("real review setting lost: severity_floor = %q, want high (fell back to defaults)", cfg.Review.SeverityFloor)
+	}
+	if !cfg.Security.Enabled || cfg.Security.GateSeverity != "critical" {
+		t.Fatalf("real security settings lost: %+v (fell back to defaults)", cfg.Security)
+	}
+}

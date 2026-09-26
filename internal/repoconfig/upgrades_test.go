@@ -63,6 +63,38 @@ func TestUpgradesPolicyBlockParsesAndValidates(t *testing.T) {
 	}
 }
 
+func TestUpgradeTriggersDefaultsAndParsing(t *testing.T) {
+	// Absent triggers block: default_branch defaults enabled, schedule disabled.
+	cfg, err := Parse([]byte("version: 1\nupgrades:\n  enabled: true\n"))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if !cfg.Upgrades.Triggers.DefaultBranchEnabled() {
+		t.Fatalf("absent triggers: default_branch should default enabled")
+	}
+	if cfg.Upgrades.Triggers.Schedule {
+		t.Fatalf("absent triggers: schedule should default disabled")
+	}
+
+	// Explicit values are honored.
+	cfg, err = Parse([]byte("version: 1\nupgrades:\n  enabled: true\n  triggers:\n    default_branch: false\n    schedule: true\n"))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if cfg.Upgrades.Triggers.DefaultBranchEnabled() {
+		t.Fatalf("explicit default_branch:false should disable the reactive trigger")
+	}
+	if !cfg.Upgrades.Triggers.Schedule {
+		t.Fatalf("explicit schedule:true should enable the periodic trigger")
+	}
+
+	// An unknown trigger key is a hard error (KnownFields), e.g. the dropped
+	// new_patch knob or a cron-style schedule value.
+	if _, err := Parse([]byte("version: 1\nupgrades:\n  enabled: true\n  triggers:\n    new_patch: true\n")); err == nil {
+		t.Fatalf("unknown trigger key should be rejected")
+	}
+}
+
 func TestUpgradesRejectsInvalidValues(t *testing.T) {
 	for _, tc := range []struct {
 		name string

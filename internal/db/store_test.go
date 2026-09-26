@@ -123,7 +123,7 @@ func TestMigrateAppliesVersionedMigrationsIdempotently(t *testing.T) {
 	// so this asserts the DB ledger against an external constant instead of
 	// re-deriving both sides from the same var. A second Migrate must leave
 	// exactly this many rows (idempotent, no duplicate ledger entries).
-	const wantMigrations = 14
+	const wantMigrations = 15
 	var count, maxVersion int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&count, &maxVersion); err != nil {
 		t.Fatalf("query schema_migrations: %v", err)
@@ -149,8 +149,8 @@ func TestSchemaMigrationNumbersAreContiguous(t *testing.T) {
 			t.Fatalf("schema migration %d has empty name", migration.version)
 		}
 	}
-	if got := schemaMigrations[len(schemaMigrations)-1].version; got != 14 {
-		t.Fatalf("latest characterized schema migration = %d, want 14 (next reserved version is 15)", got)
+	if got := schemaMigrations[len(schemaMigrations)-1].version; got != 15 {
+		t.Fatalf("latest characterized schema migration = %d, want 15 (next reserved version is 16)", got)
 	}
 }
 

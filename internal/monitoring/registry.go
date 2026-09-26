@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -228,6 +229,29 @@ func (r *Registry) Contains(repositoryAddress string) bool {
 	}
 	_, ok := current.Repositories[ref.Address]
 	return ok
+}
+
+// MonitoredRepositoryIDs returns the "<pubkey>:<identifier>" repository ids of
+// every currently monitored repository. It is used by the scheduled
+// dependency-upgrade sweep to enumerate candidates; membership for the
+// fail-closed gate still goes through Contains.
+func (r *Registry) MonitoredRepositoryIDs() []string {
+	current := r.snapshot.Load()
+	if current == nil || !current.Initialized || current.Deleted {
+		return nil
+	}
+	ids := make([]string, 0, len(current.Repositories))
+	for address := range current.Repositories {
+		ref, err := scope.ParseRepositoryRef(address)
+		if err != nil {
+			continue
+		}
+		ids = append(ids, ref.RepositoryID)
+	}
+	// Sort so the scheduled sweep processes repositories in a stable order
+	// across runs (deterministic logging; map iteration is randomized).
+	sort.Strings(ids)
+	return ids
 }
 
 func (r *Registry) Snapshot() Snapshot {

@@ -105,11 +105,21 @@ type SecurityConfig struct {
 
 // SecurityAuditConfig controls defaults for full repository security audits.
 type SecurityAuditConfig struct {
-	Localizer      string `yaml:"localizer"`
-	Depth          string `yaml:"depth"`
-	VerifyVotes    int    `yaml:"verify_votes"`
-	AutoOnSnapshot bool   `yaml:"auto_on_snapshot"`
-	SARIF          bool   `yaml:"sarif"`
+	Localizer   string `yaml:"localizer"`
+	Depth       string `yaml:"depth"`
+	VerifyVotes int    `yaml:"verify_votes"`
+	SARIF       bool   `yaml:"sarif"`
+
+	// AutoOnSnapshot is a deprecation shim: accepted for backward compatibility,
+	// read by nothing, and slated for removal once existing .drydock.yaml files
+	// have dropped the key. It must stay declared because Parse uses
+	// KnownFields(true), so removing it turns a stale key into a decode error —
+	// and the hot callers (pipeline/runner.go, revieworder/service.go) react to a
+	// parse error by discarding the ENTIRE repository config and falling back to
+	// Default(), silently downgrading the repository's gating/review/ignore
+	// settings. Tolerating the key parses harmlessly and preserves those real
+	// settings. This is a backward-compatibility policy, not a live knob.
+	AutoOnSnapshot bool `yaml:"auto_on_snapshot"`
 }
 
 // NostrConfig controls the protocol-specific Nostr security lens.
@@ -234,6 +244,9 @@ type UpgradesConfig struct {
 	// Enabled gates the whole feature for the repository; defaults false
 	// (fail-closed, like security).
 	Enabled bool `yaml:"enabled"`
+	// Triggers selects which events cause a scan for this repository. The block
+	// owns the *when*; the fields below own the *what* and *how*.
+	Triggers UpgradeTriggersConfig `yaml:"triggers"`
 	// Policy selects the target-version resolution policy: "next_patch" (smallest
 	// published version at or above the scanner's fixed version) or "latest".
 	Policy string `yaml:"policy"`
@@ -250,6 +263,32 @@ type UpgradesConfig struct {
 	// AllowScripts uses a pointer so an explicit value (true or false) is
 	// distinguishable from an absent key; any presence is rejected.
 	AllowScripts *bool `yaml:"allow_scripts"`
+}
+
+// UpgradeTriggersConfig selects which trigger sources scan this repository.
+//
+// DefaultBranch is a pointer so an omitted key defaults to enabled (the cheap,
+// event-driven path) while an explicit false disables reactive scanning.
+//
+// Schedule is a plain boolean opt-in, deliberately NOT a cadence token: the
+// scan cadence is an operator concern (a single in-process ticker at
+// DRYDOCK_DEPUPGRADE_INTERVAL), and a per-repository weekly/monthly token would
+// be a false promise — honoring it would require either per-repo persistence or
+// a wasted clone every sweep to read the in-repo cadence. This flag only opts a
+// repository into the operator's periodic sweep.
+//
+// A new-patch (kind-1617/1618) trigger is intentionally absent: cheap manifest
+// pre-detection is only possible for kind-1617 (the diff is in the content),
+// so a new_patch knob would silently do nothing for pull-request events.
+type UpgradeTriggersConfig struct {
+	DefaultBranch *bool `yaml:"default_branch"`
+	Schedule      bool  `yaml:"schedule"`
+}
+
+// DefaultBranchEnabled reports whether default-branch head-change scans run for
+// this repository. An absent key defaults to enabled.
+func (t UpgradeTriggersConfig) DefaultBranchEnabled() bool {
+	return t.DefaultBranch == nil || *t.DefaultBranch
 }
 
 // StatusConfig controls NIP-34 review status event publication.

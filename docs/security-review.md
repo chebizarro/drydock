@@ -259,8 +259,10 @@ security:
     localizer: heuristic      # heuristic | antares
     depth: standard           # quick | standard | deep
     verify_votes: 3
-    auto_on_snapshot: false   # react to kind 30618 snapshots (event-driven)
     sarif: true
+    # auto_on_snapshot: deprecated — accepted for backward compatibility but read
+    # by nothing; remove it from your config. Slated for deletion once configs
+    # have migrated.
 ```
 
 Validation mirrors existing repoconfig rules (strict unknown-field rejection, severity/confidence range checks). A `security` section that fails to parse follows the existing conservative policy: log and apply defaults, except gating fields fail closed (no accidental "blocking" without valid policy), matching how `payments` already fails closed.

@@ -20,19 +20,20 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 	"git.sharegap.net/cascadia/drydock/internal/safepath"
 
+	"golang.org/x/mod/modfile"
 	gomodsemver "golang.org/x/mod/semver"
 )
 
-// Trigger records what caused a scan; it is informational (logging/metrics). The
-// trigger layer that supplies it — default-branch head change, new patch,
-// schedule — lands in a later stage.
+// Trigger records what caused a scan; it is informational (logging/metrics).
+// A new-patch trigger is intentionally absent: cheap manifest pre-detection is
+// only possible for kind-1617 patches (diff in content), so it would silently
+// no-op for pull-request events — see repoconfig.UpgradeTriggersConfig.
 type Trigger string
 
 const (
 	TriggerManual        Trigger = "manual"
 	TriggerSchedule      Trigger = "schedule"
 	TriggerDefaultBranch Trigger = "default_branch"
-	TriggerNewPatch      Trigger = "new_patch"
 )
 
 // Scanner runs software-composition analysis over a prepared worktree and
@@ -75,18 +76,33 @@ type Membership interface {
 	Contains(repositoryAddress string) bool
 }
 
+// Repositories enumerates the monitored repositories for the scheduled sweep.
+// *monitoring.Registry is the production implementation. Enumeration is separate
+// from the Membership gate: the sweep lists candidates, then every scan still
+// passes through Contains (fail-closed) at entry and again before publishing.
+type Repositories interface {
+	MonitoredRepositoryIDs() []string
+}
+
 // Store is the persistence surface the service needs. *db.Store satisfies it.
 type Store interface {
 	InsertDependencyUpgrade(ctx context.Context, up db.DependencyUpgrade) (db.DependencyUpgradeResult, error)
 	SupersedeOpenDependencyUpgrades(ctx context.Context, repoID, ecosystem, packageName, keepFrom, keepTo string) (int, error)
 	MarkDependencyUpgradeStatus(ctx context.Context, id int64, status db.DependencyUpgradeStatus, lastError string) error
 	RecordDependencyUpgradePatchEvent(ctx context.Context, id int64, patchEventID string) error
+	GetOpenDependencyUpgrades(ctx context.Context, repoID string) ([]db.DependencyUpgrade, error)
+	GetRootStatus(ctx context.Context, rootID, repoID string) (kind int, eventID string, createdAt int64, ok bool, err error)
 }
 
 // Config carries operator-level knobs for the service.
 type Config struct {
 	// Model is the deterministic producer label stamped on published patches.
 	Model string
+	// Workers is the number of concurrent scan workers draining the queue.
+	// Defaults to 1.
+	Workers int
+	// QueueSize bounds the pending-scan channel. Defaults to defaultQueueSize.
+	QueueSize int
 }
 
 // Dependencies are the collaborators wired at the composition root.
@@ -96,16 +112,28 @@ type Dependencies struct {
 	Scanner    Scanner
 	Updater    Updater
 	Resolver   VersionResolver
-	Publisher  Publisher
-	Monitoring Membership
-	Logger     *slog.Logger
+	Publisher    Publisher
+	Monitoring   Membership
+	Repositories Repositories
+	Logger       *slog.Logger
+}
+
+// defaultQueueSize bounds pending scans when the caller does not set QueueSize.
+const defaultQueueSize = 64
+
+// scanJob is a queued repository scan request.
+type scanJob struct {
+	repoID  string
+	trigger Trigger
 }
 
 // Service turns vulnerable-dependency findings into published upgrade patches.
 // The path is deliberately LLM-free: policy is deterministic configuration.
 type Service struct {
-	cfg  Config
-	deps Dependencies
+	cfg     Config
+	deps    Dependencies
+	workers int
+	queue   chan scanJob
 }
 
 // New validates dependencies and returns a Service.
@@ -131,13 +159,24 @@ func New(cfg Config, deps Dependencies) (*Service, error) {
 	if deps.Monitoring == nil {
 		return nil, errors.New("depupgrade: monitoring gate is required")
 	}
+	if deps.Repositories == nil {
+		return nil, errors.New("depupgrade: repository enumerator is required")
+	}
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
 	}
 	if strings.TrimSpace(cfg.Model) == "" {
 		cfg.Model = "drydock-depupgrade"
 	}
-	return &Service{cfg: cfg, deps: deps}, nil
+	workers := cfg.Workers
+	if workers < 1 {
+		workers = 1
+	}
+	queueSize := cfg.QueueSize
+	if queueSize < 1 {
+		queueSize = defaultQueueSize
+	}
+	return &Service{cfg: cfg, deps: deps, workers: workers, queue: make(chan scanJob, queueSize)}, nil
 }
 
 // ScanRepository scans one monitored repository for vulnerable dependencies and
@@ -174,6 +213,19 @@ func (s *Service) ScanRepository(ctx context.Context, repoID string, trigger Tri
 	if !up.Enabled {
 		log.Info("dependency upgrades disabled for repository")
 		return nil
+	}
+	// Honor the repository's per-trigger opt-in. A manual scan always runs.
+	switch trigger {
+	case TriggerDefaultBranch:
+		if !up.Triggers.DefaultBranchEnabled() {
+			log.Info("default-branch upgrade trigger disabled for repository")
+			return nil
+		}
+	case TriggerSchedule:
+		if !up.Triggers.Schedule {
+			log.Info("scheduled upgrade trigger disabled for repository")
+			return nil
+		}
 	}
 
 	findings, err := s.deps.Scanner.Scan(ctx, prep.RepoPath)
@@ -321,6 +373,22 @@ func (s *Service) processCandidate(ctx context.Context, repoID string, prep repo
 	if cmp, cmpErr := compareVersion(cand.ecosystem, canonicalFixedVersion(cand.ecosystem, target), canonicalFixedVersion(cand.ecosystem, cand.installed)); cmpErr == nil && cmp <= 0 {
 		clog.Info("installed version already at or above target; skipping", "target", target)
 		return nil
+	}
+
+	// Refuse Go modules carrying a non-local replace directive before recording
+	// any state: a replace pointing at a module path (not a filesystem path) can
+	// redirect `go get`/`go mod tidy` in the sidecar to an arbitrary VCS URL —
+	// untrusted network egress and code fetch on repository-controlled input. No
+	// row is written so the upgrade proceeds naturally once the repository removes
+	// the replace. This is defense-in-depth ahead of the sidecar toolchain.
+	if cand.ecosystem == "go" {
+		if err := s.refuseNonLocalGoReplace(prep.RepoPath, cand.manifestPath); err != nil {
+			if errors.Is(err, errNonLocalReplace) {
+				clog.Warn("skipping Go upgrade: go.mod contains a non-local replace directive", "reason", err)
+				return nil
+			}
+			return fmt.Errorf("check go.mod replace policy: %w", err)
+		}
 	}
 
 	// Enforce at most one open proposal per package, then record this identity.
@@ -513,6 +581,64 @@ func ensureAllowedChangedFiles(ecosystem string, changedFiles []string) error {
 		}
 	}
 	return nil
+}
+
+// errNonLocalReplace signals that a go.mod carries a replace directive pointing
+// at a module path rather than a local filesystem path.
+var errNonLocalReplace = errors.New("go.mod contains a non-local replace directive")
+
+// refuseNonLocalGoReplace reads the go.mod at the candidate's manifest directory
+// and returns errNonLocalReplace if any replace directive targets a module path
+// (a VCS-fetchable replacement) rather than a local filesystem path. A missing
+// go.mod is not an error here — the later manifest gather reports that.
+func (s *Service) refuseNonLocalGoReplace(worktreeRoot, manifestPath string) error {
+	dir := ""
+	if manifestPath != "" {
+		rel, err := safepath.Normalize(manifestPath, true)
+		if err != nil {
+			return fmt.Errorf("normalize manifest path %q: %w", manifestPath, err)
+		}
+		if d := path.Dir(rel); d != "." {
+			dir = d
+		}
+	}
+	rel := "go.mod"
+	if dir != "" {
+		rel = path.Join(dir, "go.mod")
+	}
+	normalized, err := safepath.Normalize(rel, false)
+	if err != nil {
+		return fmt.Errorf("normalize go.mod path %q: %w", rel, err)
+	}
+	abs := filepath.Join(worktreeRoot, filepath.FromSlash(normalized))
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read go.mod %q: %w", normalized, err)
+	}
+	parsed, err := modfile.Parse(normalized, data, nil)
+	if err != nil {
+		return fmt.Errorf("parse go.mod %q: %w", normalized, err)
+	}
+	for _, r := range parsed.Replace {
+		if !isLocalReplacement(r.New.Path, r.New.Version) {
+			return fmt.Errorf("%w: %s => %s", errNonLocalReplace, r.Old.Path, r.New.Path)
+		}
+	}
+	return nil
+}
+
+// isLocalReplacement reports whether a go.mod replace target is a local
+// filesystem path. A module-path replacement carries a version or a bare module
+// path (not prefixed with ./ ../ or an absolute path) and is treated as remote.
+func isLocalReplacement(newPath, newVersion string) bool {
+	if strings.TrimSpace(newVersion) != "" {
+		return false
+	}
+	return strings.HasPrefix(newPath, "./") || strings.HasPrefix(newPath, "../") ||
+		strings.HasPrefix(newPath, "/") || filepath.IsAbs(newPath)
 }
 
 func allowedManifestBase(ecosystem, relPath string) bool {

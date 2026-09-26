@@ -121,6 +121,9 @@ type Config struct {
 	LSPBridgeToken                      string
 	DepRunnerURL                        string
 	DepRunnerToken                      string
+	DepUpgradeEnabled                   bool
+	DepUpgradeInterval                  time.Duration
+	DepUpgradeWorkers                   int
 	GoRegistryURL                       string
 	NPMRegistryURL                      string
 	CargoRegistryURL                    string
@@ -276,6 +279,9 @@ func FromEnv() Config {
 		LSPBridgeToken:                      envOrDefault("DRYDOCK_LSP_BRIDGE_TOKEN", os.Getenv("LSP_BRIDGE_AUTH_TOKEN")),
 		DepRunnerURL:                        envOrDefault("DRYDOCK_DEP_RUNNER_URL", ""),
 		DepRunnerToken:                      envOrDefault("DRYDOCK_DEP_RUNNER_TOKEN", os.Getenv("DEP_RUNNER_AUTH_TOKEN")),
+		DepUpgradeEnabled:                   parseBoolOrDefault(os.Getenv("DRYDOCK_DEPUPGRADE_ENABLED"), false),
+		DepUpgradeInterval:                  parseDurationOrDefault(os.Getenv("DRYDOCK_DEPUPGRADE_INTERVAL"), 24*time.Hour),
+		DepUpgradeWorkers:                   parseIntOrDefault(os.Getenv("DRYDOCK_DEPUPGRADE_WORKERS"), 1),
 		GoRegistryURL:                       envOrDefault("DRYDOCK_GO_REGISTRY_URL", "https://proxy.golang.org"),
 		NPMRegistryURL:                      envOrDefault("DRYDOCK_NPM_REGISTRY_URL", "https://registry.npmjs.org"),
 		CargoRegistryURL:                    envOrDefault("DRYDOCK_CARGO_REGISTRY_URL", "https://crates.io"),
@@ -616,6 +622,22 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 		u, err := url.Parse(e.baseURL)
 		if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 			result.Errors = append(result.Errors, fmt.Sprintf("%s must be an HTTP(S) registry base URL without credentials, query, or fragment", e.env))
+		}
+	}
+
+	// --- Dependency-upgrade service (operator-disabled by default) ---
+	if c.DepUpgradeEnabled {
+		if c.DepUpgradeInterval <= 0 {
+			result.Errors = append(result.Errors, "DRYDOCK_DEPUPGRADE_INTERVAL must be greater than 0 when dependency upgrades are enabled")
+		}
+		if c.DepUpgradeWorkers < 1 {
+			result.Errors = append(result.Errors, "DRYDOCK_DEPUPGRADE_WORKERS must be at least 1 when dependency upgrades are enabled")
+		}
+		if strings.TrimSpace(c.DepRunnerURL) == "" {
+			result.Errors = append(result.Errors, "dependency upgrades require DRYDOCK_DEP_RUNNER_URL (the sidecar that performs manifest edits)")
+		}
+		if strings.TrimSpace(c.MonitoredReposAuthor) == "" {
+			result.Errors = append(result.Errors, "dependency upgrades require DRYDOCK_MONITORED_REPOS_AUTHOR (the monitored-repository control plane)")
 		}
 	}
 

@@ -249,6 +249,7 @@ CREATE TABLE IF NOT EXISTS repository_snapshots (
   author_pubkey TEXT NOT NULL,
   head_branch TEXT NOT NULL DEFAULT '',
   ref_commits_csv TEXT NOT NULL DEFAULT '',
+  head_commit TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
