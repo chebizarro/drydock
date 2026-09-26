@@ -341,6 +341,78 @@ func (s *Service) BuildAutoFixPatch(ctx context.Context, repoPath string, sugges
 	return s.manager.buildAutoFixPatch(ctx, repoPath, suggestions)
 }
 
+// PrepareUpgradeWorkspace checks out the repository's default-branch HEAD in an
+// isolated worktree so the dependency-upgrade service can edit manifests and
+// produce an authoritative diff. It is the review-worktree lifecycle minus patch
+// application: no ancestry is applied because an upgrade is proposed against the
+// canonical tree, not in reply to a patch. Cleanup reuses CleanupPreparedReview.
+func (s *Service) PrepareUpgradeWorkspace(ctx context.Context, repoID string) (PrepareResult, error) {
+	cloneURLs, err := s.store.GetRepositoryCloneURLs(ctx, repoID)
+	if err != nil {
+		return PrepareResult{}, err
+	}
+	if len(cloneURLs) == 0 {
+		return PrepareResult{}, fmt.Errorf("no canonical clone URLs for repository %s", repoID)
+	}
+	lease, err := s.manager.acquireRepoLease(ctx, repoID, cloneURLs, true)
+	if err != nil {
+		return PrepareResult{RepoID: repoID, FailureStage: PrepareFailureFetch, FailureHint: err.Error()}, err
+	}
+	leaseOwned := true
+	defer func() {
+		if leaseOwned {
+			lease.release()
+		}
+	}()
+
+	baseCommit, err := s.manager.resolveCommit(ctx, lease.repoPath, "HEAD")
+	if err != nil {
+		return PrepareResult{RepoID: repoID}, err
+	}
+	canonicalRemoteIdentity, err := s.manager.remoteIdentity(ctx, lease.repoPath)
+	if err != nil {
+		return PrepareResult{RepoID: repoID}, err
+	}
+	baseConfig, cfgErr := s.manager.ReadFileAtDefaultRef(ctx, lease.repoPath, ".drydock.yaml")
+	if cfgErr != nil {
+		return PrepareResult{RepoID: repoID}, fmt.Errorf("read canonical .drydock.yaml: %w", cfgErr)
+	}
+
+	workspace, err := s.manager.createReviewWorktree(ctx, lease, "upgrade-"+repoID, baseCommit)
+	if err != nil {
+		if workspace == nil {
+			return PrepareResult{RepoID: repoID, FailureStage: PrepareFailureCheckout, FailureHint: err.Error()}, err
+		}
+		leaseOwned = false
+		if cleanupErr := s.manager.cleanupReviewWorktree(ctx, workspace); cleanupErr != nil {
+			s.logger.Warn("failed to clean up partially created upgrade worktree", "error", cleanupErr)
+		}
+		return PrepareResult{
+			RepoID: repoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
+			FailureStage: PrepareFailureCheckout, FailureHint: err.Error(), workspace: workspace,
+		}, err
+	}
+	leaseOwned = false
+
+	result := PrepareResult{
+		RepoID: repoID, RepoPath: workspace.path, ExpectedCommit: baseCommit,
+		BaseRepoConfig: baseConfig, workspace: workspace,
+		BaseCommit: baseCommit, CanonicalRemoteIdentity: canonicalRemoteIdentity,
+	}
+	s.logger.Info("prepared dependency-upgrade workspace",
+		"repo_id", repoID, "worktree", workspace.path, "expected_commit", baseCommit)
+	return result, nil
+}
+
+// GenerateWorktreeDiff runs mutate against the prepared worktree and returns the
+// authoritative unified diff plus the changed-file list, resetting the tree
+// afterward. It shares the snapshot → mutate → diff → reset discipline with
+// auto-fix patch synthesis. mutate writes the edits (e.g. the manifest bytes the
+// dep-runner sidecar returned) and must not re-acquire any repository lock.
+func (s *Service) GenerateWorktreeDiff(ctx context.Context, repoPath string, mutate func(context.Context) error) (string, []string, error) {
+	return s.manager.generateWorktreeDiff(ctx, repoPath, mutate)
+}
+
 func (s *Service) AssertPreparedReview(ctx context.Context, prep PrepareResult) error {
 	if err := s.manager.assertReviewWorktree(ctx, prep.workspace, prep.RepoPath, prep.ExpectedCommit); err != nil {
 		return fmt.Errorf("checkout identity assertion: %w", err)

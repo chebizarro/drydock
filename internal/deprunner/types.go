@@ -53,6 +53,38 @@ func IsSupportedEcosystem(eco string) bool {
 	}
 }
 
+// manifestFiles is the manifest/lockfile set for each ecosystem: the files a
+// caller sends in an UpdateRequest and the set the sidecar returns changes for.
+// The first entry is the primary manifest (the one that must be present). This is
+// the shared source of truth for both drydock and the sidecar so the two never
+// drift on which files constitute an ecosystem's manifest set.
+var manifestFiles = map[string][]string{
+	EcosystemGo:    {"go.mod", "go.sum"},
+	EcosystemNPM:   {"package.json", "package-lock.json", "npm-shrinkwrap.json"},
+	EcosystemCargo: {"Cargo.toml", "Cargo.lock"},
+	EcosystemPip:   {"requirements.txt"},
+}
+
+// ManifestFiles returns the manifest/lockfile base names for an ecosystem, or
+// nil for an unsupported one. The first element is the primary manifest.
+func ManifestFiles(eco string) []string {
+	files := manifestFiles[eco]
+	if len(files) == 0 {
+		return nil
+	}
+	return append([]string(nil), files...)
+}
+
+// PrimaryManifest returns the required manifest base name for an ecosystem, or ""
+// for an unsupported one.
+func PrimaryManifest(eco string) string {
+	files := manifestFiles[eco]
+	if len(files) == 0 {
+		return ""
+	}
+	return files[0]
+}
+
 // ManifestFile is a single text file supplied to, or returned from, the sidecar.
 // Path is always repo-relative, forward-slash, and free of traversal; the
 // sidecar rejects anything else rather than writing outside its temp root.

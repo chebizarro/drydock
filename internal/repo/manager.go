@@ -1087,79 +1087,108 @@ func (m *Manager) evictIfNeeded() {
 	}
 }
 
-// buildAutoFixPatch synthesizes a combined patch from eligible suggestions.
+// generateWorktreeDiff runs the shared snapshot → mutate → diff → reset
+// discipline behind both auto-fix patches and dependency upgrades. It commits a
+// baseline snapshot of the worktree, runs mutate to perform the edits (apply
+// suggestion diffs, write updated manifests), stages everything, captures the
+// combined diff against that snapshot and the changed-file list, then hard-resets
+// to the snapshot so the caller's cleanup runs against a clean tree.
 //
-// Algorithm:
-//  1. Commit the current index as a snapshot (so we have a baseline)
-//  2. For each suggestion, try applying. If it works, keep it; otherwise skip.
-//  3. Generate a combined diff from snapshot to current state.
-//  4. Reset to snapshot to restore clean state for branch cleanup.
-func (m *Manager) buildAutoFixPatch(ctx context.Context, repoPath string, suggestions []AutoFixSuggestion) (AutoFixResult, error) {
+// mutate owns its own intra-edit recovery; returning an error aborts the whole
+// operation, and the tree is reset before the error is returned. The returned
+// diff is empty when mutate changed nothing. The repo lock is held for the whole
+// critical section, so mutate must not re-acquire it.
+func (m *Manager) generateWorktreeDiff(ctx context.Context, repoPath string, mutate func(context.Context) error) (string, []string, error) {
 	mu := m.getRepoLock(repoPath)
 	mu.Lock()
 	defer mu.Unlock()
 
-	// 1. Commit snapshot: the reviewed patch is applied but possibly only staged.
+	// The reviewed patch is applied but possibly only staged; the snapshot commit
+	// is the baseline the later `git diff --cached HEAD` is taken against.
 	if err := m.commitSnapshot(ctx, repoPath); err != nil {
-		return AutoFixResult{}, fmt.Errorf("autofix snapshot commit: %w", err)
+		return "", nil, fmt.Errorf("worktree diff snapshot commit: %w", err)
 	}
 
-	// 2. Try applying each suggestion sequentially.
+	if err := mutate(ctx); err != nil {
+		if _, resetErr := m.runGit(ctx, repoPath, "reset", "--hard", "HEAD"); resetErr != nil {
+			return "", nil, fmt.Errorf("worktree diff reset after mutate error: %w (original error: %v)", resetErr, err)
+		}
+		return "", nil, err
+	}
+
+	if _, err := m.runGit(ctx, repoPath, "add", "-A"); err != nil {
+		return "", nil, fmt.Errorf("worktree diff stage changes: %w", err)
+	}
+	diff, err := m.runGit(ctx, repoPath, "diff", "--cached", "HEAD")
+	if err != nil {
+		return "", nil, fmt.Errorf("worktree diff generate: %w", err)
+	}
+	nameOnly, err := m.runGit(ctx, repoPath, "diff", "--cached", "--name-only", "HEAD")
+	if err != nil {
+		return "", nil, fmt.Errorf("worktree diff name list: %w", err)
+	}
+	// Reset to the snapshot so cleanup works normally.
+	if _, err := m.runGit(ctx, repoPath, "reset", "--hard", "HEAD"); err != nil {
+		return "", nil, fmt.Errorf("worktree diff final reset: %w", err)
+	}
+
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(nameOnly), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			files = append(files, line)
+		}
+	}
+	sort.Strings(files)
+	return diff, files, nil
+}
+
+// buildAutoFixPatch synthesizes a combined patch from eligible suggestions by
+// applying each cleanly-applying suggestion inside the shared worktree-diff
+// discipline. AppliedFiles reflects the suggestions that applied (not the raw git
+// name list) to preserve the historical result shape.
+func (m *Manager) buildAutoFixPatch(ctx context.Context, repoPath string, suggestions []AutoFixSuggestion) (AutoFixResult, error) {
 	var appliedCount int
 	appliedFiles := map[string]struct{}{}
 
-	for _, s := range suggestions {
-		patch, err := normalizeSuggestedPatch(s.FilePath, s.SuggestedDiff)
-		if err != nil {
-			m.logger.Debug("autofix: skipping malformed suggestion",
-				"file", s.FilePath, "error", err)
-			continue
-		}
-
-		// Check first without mutating
-		if err := m.checkPatchApplies(ctx, repoPath, patch); err != nil {
-			m.logger.Debug("autofix: suggestion does not apply cleanly",
-				"file", s.FilePath, "error", err)
-			continue
-		}
-
-		// Apply for real
-		if err := m.applyPatchContent(ctx, repoPath, patch); err != nil {
-			m.logger.Warn("autofix: apply failed after check passed",
-				"file", s.FilePath, "error", err)
-			// Reset to last known good state and continue
-			if _, resetErr := m.runGit(ctx, repoPath, "checkout", "--", "."); resetErr != nil {
-				return AutoFixResult{}, fmt.Errorf("autofix: reset after failed apply: %w", resetErr)
+	diff, _, err := m.generateWorktreeDiff(ctx, repoPath, func(ctx context.Context) error {
+		for _, s := range suggestions {
+			patch, err := normalizeSuggestedPatch(s.FilePath, s.SuggestedDiff)
+			if err != nil {
+				m.logger.Debug("autofix: skipping malformed suggestion",
+					"file", s.FilePath, "error", err)
+				continue
 			}
-			continue
-		}
 
-		appliedCount++
-		appliedFiles[s.FilePath] = struct{}{}
+			// Check first without mutating.
+			if err := m.checkPatchApplies(ctx, repoPath, patch); err != nil {
+				m.logger.Debug("autofix: suggestion does not apply cleanly",
+					"file", s.FilePath, "error", err)
+				continue
+			}
+
+			// Apply for real.
+			if err := m.applyPatchContent(ctx, repoPath, patch); err != nil {
+				m.logger.Warn("autofix: apply failed after check passed",
+					"file", s.FilePath, "error", err)
+				// Reset to last known good state and continue.
+				if _, resetErr := m.runGit(ctx, repoPath, "checkout", "--", "."); resetErr != nil {
+					return fmt.Errorf("autofix: reset after failed apply: %w", resetErr)
+				}
+				continue
+			}
+
+			appliedCount++
+			appliedFiles[s.FilePath] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return AutoFixResult{}, err
 	}
 
 	var result AutoFixResult
 	if appliedCount == 0 {
-		// Reset to snapshot
-		if _, err := m.runGit(ctx, repoPath, "reset", "--hard", "HEAD"); err != nil {
-			return AutoFixResult{}, fmt.Errorf("autofix: reset after no applies: %w", err)
-		}
 		return result, nil
-	}
-
-	// 3. Stage all changes and generate combined diff.
-	if _, err := m.runGit(ctx, repoPath, "add", "-A"); err != nil {
-		return AutoFixResult{}, fmt.Errorf("autofix: stage changes: %w", err)
-	}
-
-	diff, err := m.runGit(ctx, repoPath, "diff", "--cached", "HEAD")
-	if err != nil {
-		return AutoFixResult{}, fmt.Errorf("autofix: generate diff: %w", err)
-	}
-
-	// 4. Reset to snapshot so cleanup works normally.
-	if _, err := m.runGit(ctx, repoPath, "reset", "--hard", "HEAD"); err != nil {
-		return AutoFixResult{}, fmt.Errorf("autofix: final reset: %w", err)
 	}
 
 	files := make([]string, 0, len(appliedFiles))

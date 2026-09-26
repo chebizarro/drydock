@@ -217,6 +217,11 @@ var (
 	AutoFixPublishFailures  = &Counter{}
 	AutoFixSkipped          = &Counter{}
 
+	// Dependency upgrades
+	DependencyUpgradePublishAttempts  = &Counter{}
+	DependencyUpgradePublishSuccesses = &Counter{}
+	DependencyUpgradePublishFailures  = &Counter{}
+
 	// Agentic review
 	AgenticLoopTurns               = &Counter{}
 	AgenticToolCalls               = NewCounterVec2() // labels: tool, outcome
@@ -438,6 +443,14 @@ func writeMetrics(w io.Writer) {
 		"Failed auto-fix patch publishes.", AutoFixPublishFailures)
 	writeCounter(w, "drydock_autofix_skipped_total",
 		"Auto-fix skipped (disabled, no eligible findings, etc).", AutoFixSkipped)
+
+	// Dependency upgrades
+	writeCounter(w, "drydock_dependency_upgrade_publish_attempts_total",
+		"Dependency-upgrade patch publish attempts.", DependencyUpgradePublishAttempts)
+	writeCounter(w, "drydock_dependency_upgrade_publish_successes_total",
+		"Successful dependency-upgrade patch publishes.", DependencyUpgradePublishSuccesses)
+	writeCounter(w, "drydock_dependency_upgrade_publish_failures_total",
+		"Failed dependency-upgrade patch publishes.", DependencyUpgradePublishFailures)
 
 	// Agentic review
 	writeCounter(w, "drydock_agentic_loop_turns_total",

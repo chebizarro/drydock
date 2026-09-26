@@ -1,4 +1,4 @@
-package auditengine
+package sca
 
 import (
 	"regexp"

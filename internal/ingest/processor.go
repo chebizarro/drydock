@@ -260,11 +260,15 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 		if err := p.store.RecordPatchEventRelay(ctx, event.ID.Hex(), relayURL); err != nil {
 			return err
 		}
-		// Loop suppression: skip autofix patches we published ourselves.
-		// Requires BOTH conditions: authored by our signer AND tagged as autofix.
-		// This avoids suppressing legitimate patches from the same identity.
-		if p.localAutofixPubKey != "" && event.PubKey.Hex() == p.localAutofixPubKey && hasAutofixTag(event) {
-			p.logger.Info("skipping self-authored autofix patch",
+		// Loop suppression: skip patches we published ourselves (autofix or
+		// dependency upgrade). Requires BOTH conditions: authored by our signer AND
+		// carrying one of our self-published marker tags. This avoids suppressing
+		// legitimate patches from the same identity.
+		// NOTE (Stage 4 reaching into Stage 5): the dependency-upgrade marker is
+		// honoured here so drydock does not review its own upgrade patches; the
+		// broader upgrade trigger wiring lands in the trigger stage.
+		if p.localAutofixPubKey != "" && event.PubKey.Hex() == p.localAutofixPubKey && hasSelfPublishedPatchTag(event) {
+			p.logger.Info("skipping self-authored drydock patch",
 				"event_id", event.ID.Hex(),
 				"pubkey", p.localAutofixPubKey)
 			return nil
@@ -504,10 +508,16 @@ func eventTimestampPlausibleForKind(kind nostr.Kind, ts nostr.Timestamp, maxFutu
 	return !createdAt.Before(now.Add(-maxPastAge))
 }
 
-// hasAutofixTag checks if an event carries the drydock-autofix tag.
-func hasAutofixTag(event nostr.Event) bool {
+// hasSelfPublishedPatchTag reports whether an event carries one of the "t" marker
+// tags drydock stamps on the patches it publishes itself — the autofix marker or
+// the dependency-upgrade marker — so ingest can suppress its own output without
+// suppressing legitimate patches from the same signing identity.
+func hasSelfPublishedPatchTag(event nostr.Event) bool {
 	for _, tag := range event.Tags {
-		if len(tag) >= 2 && tag[0] == "t" && tag[1] == eventkind.AutofixTagValue {
+		if len(tag) < 2 || tag[0] != "t" {
+			continue
+		}
+		if tag[1] == eventkind.AutofixTagValue || tag[1] == eventkind.DependencyUpgradeTagValue {
 			return true
 		}
 	}

@@ -219,17 +219,34 @@ type AutoFixConfig struct {
 	MaxFindings   int     `yaml:"max_findings"`   // cap on findings per auto-fix patch
 }
 
-// UpgradesConfig controls automated dependency-upgrade patches.
+// UpgradesConfig controls automated dependency-upgrade patches: which
+// vulnerable dependencies the upgrade service proposes patches for and how it
+// resolves target versions. The *when* (default-branch/new-patch/schedule
+// triggers) lands with the trigger stage; this block owns the *what* and *how*.
 //
-// This block is intentionally minimal: the trigger/policy fields land with the
-// upgrade trigger stage. AllowScripts is decoded here solely so a repository can
-// be explicitly REJECTED for trying to loosen it. Permitting package lifecycle
-// scripts (npm postinstall, cargo build.rs, pip setup.py) means executing
-// attacker-controlled code from the repository under review, so it is an
-// operator-only, sidecar-side decision and must never be settable from
-// repository config. Mirrors the security.nostr.probe.authorized_targets
-// rejection precedent.
+// AllowScripts is decoded solely so a repository can be explicitly REJECTED for
+// trying to loosen it. Permitting package lifecycle scripts (npm postinstall,
+// cargo build.rs, pip setup.py) means executing attacker-controlled code from the
+// repository under review, so it is an operator-only, sidecar-side decision and
+// must never be settable from repository config. Mirrors the
+// security.nostr.probe.authorized_targets rejection precedent.
 type UpgradesConfig struct {
+	// Enabled gates the whole feature for the repository; defaults false
+	// (fail-closed, like security).
+	Enabled bool `yaml:"enabled"`
+	// Policy selects the target-version resolution policy: "next_patch" (smallest
+	// published version at or above the scanner's fixed version) or "latest".
+	Policy string `yaml:"policy"`
+	// Ecosystems limits which package ecosystems are upgraded. Allowed tokens:
+	// go, npm, cargo, pip. Empty means the default set.
+	Ecosystems []string `yaml:"ecosystems"`
+	// Ignore lists package names that are never upgraded.
+	Ignore []string `yaml:"ignore"`
+	// Allow, when non-empty, restricts upgrades to exactly these package names.
+	Allow []string `yaml:"allow"`
+	// MaxUpgradesPerRun caps how many upgrade patches one scan may propose. Zero
+	// (or absent) means the default cap; to propose none, disable the feature.
+	MaxUpgradesPerRun int `yaml:"max_upgrades_per_run"`
 	// AllowScripts uses a pointer so an explicit value (true or false) is
 	// distinguishable from an absent key; any presence is rejected.
 	AllowScripts *bool `yaml:"allow_scripts"`
@@ -314,6 +331,12 @@ func Default() RepoConfig {
 			Models:           []string{"coder32b", "llm70b"},
 			ConsensusBoost:   0.10,
 			RequireConsensus: false,
+		},
+		Upgrades: UpgradesConfig{
+			Enabled:           false,
+			Policy:            "next_patch",
+			Ecosystems:        []string{"go"},
+			MaxUpgradesPerRun: 5,
 		},
 	}
 }
@@ -547,6 +570,52 @@ func Parse(data []byte) (RepoConfig, error) {
 	if raw.Upgrades.AllowScripts != nil {
 		return Default(), fmt.Errorf(".drydock.yaml: upgrades.allow_scripts is operator-only and cannot be set by repository config")
 	}
+
+	// Default and validate the upgrades policy block. An absent/disabled block
+	// still gets defaults so downstream code never sees an empty policy.
+	if raw.Upgrades.Policy == "" {
+		raw.Upgrades.Policy = defaults.Upgrades.Policy
+	}
+	raw.Upgrades.Policy = strings.ToLower(strings.TrimSpace(raw.Upgrades.Policy))
+	switch raw.Upgrades.Policy {
+	case "next_patch", "latest":
+	default:
+		return Default(), fmt.Errorf(".drydock.yaml: invalid upgrades.policy %q (allowed: next_patch, latest)", raw.Upgrades.Policy)
+	}
+	if len(raw.Upgrades.Ecosystems) == 0 {
+		raw.Upgrades.Ecosystems = defaults.Upgrades.Ecosystems
+	} else {
+		seen := map[string]bool{}
+		valid := make([]string, 0, len(raw.Upgrades.Ecosystems))
+		for _, e := range raw.Upgrades.Ecosystems {
+			e = strings.ToLower(strings.TrimSpace(e))
+			if e == "" {
+				continue
+			}
+			switch e {
+			case "go", "npm", "cargo", "pip":
+			default:
+				return Default(), fmt.Errorf(".drydock.yaml: invalid upgrades.ecosystem %q (allowed: go, npm, cargo, pip)", e)
+			}
+			if !seen[e] {
+				seen[e] = true
+				valid = append(valid, e)
+			}
+		}
+		if len(valid) == 0 {
+			raw.Upgrades.Ecosystems = defaults.Upgrades.Ecosystems
+		} else {
+			raw.Upgrades.Ecosystems = valid
+		}
+	}
+	raw.Upgrades.Ignore = normalizeUpgradePackageList(raw.Upgrades.Ignore)
+	raw.Upgrades.Allow = normalizeUpgradePackageList(raw.Upgrades.Allow)
+	if raw.Upgrades.MaxUpgradesPerRun < 0 {
+		return Default(), fmt.Errorf(".drydock.yaml: upgrades.max_upgrades_per_run must be >= 0, got %d", raw.Upgrades.MaxUpgradesPerRun)
+	}
+	if raw.Upgrades.MaxUpgradesPerRun == 0 {
+		raw.Upgrades.MaxUpgradesPerRun = defaults.Upgrades.MaxUpgradesPerRun
+	}
 	if raw.Security.Nostr.Probe.Timeout <= 0 {
 		return Default(), fmt.Errorf(".drydock.yaml: security.nostr.probe.timeout must be greater than zero")
 	}
@@ -579,6 +648,32 @@ func Parse(data []byte) (RepoConfig, error) {
 	}
 
 	return raw, nil
+}
+
+// normalizeUpgradePackageList trims, drops empty entries, and de-duplicates a
+// list of package names, preserving order and case (package identifiers are
+// case-sensitive across ecosystems, so they are not lowercased).
+func normalizeUpgradePackageList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func validateNostrRoles(config *NostrRolesConfig) error {
