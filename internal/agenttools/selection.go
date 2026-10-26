@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -35,7 +34,7 @@ var (
 	ErrAuthoritativeTokenCounterRequired = errors.New("agent tools: authoritative token counter is required")
 )
 
-const DefaultTokenHeadroom = 0.10
+const DefaultTokenHeadroom = contextbuilder.DefaultTokenHeadroom
 
 type LineRange struct {
 	StartLine int `json:"start_line"`
@@ -463,7 +462,7 @@ func finalizationFailureReason(err error) string {
 }
 
 func effectiveTokenLimit(budget int, headroom float64) int {
-	return int(math.Floor(float64(budget) * (1 - headroom)))
+	return contextbuilder.EffectiveTokenLimit(budget, headroom)
 }
 
 func (s *Selection) renderLocked(ctx context.Context) (string, error) {

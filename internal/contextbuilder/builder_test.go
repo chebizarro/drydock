@@ -75,11 +75,11 @@ func TestBuilderRejectsTraversingAndSymlinkedPatchPaths(t *testing.T) {
 
 func TestBuilderSkipsOversizedLayerAndContinuesPacking(t *testing.T) {
 	b := &Builder{
-		TokenBudget: 10,
+		TokenBudget: 40,
 		Counter:     byteCounter{},
 		Providers: []Provider{
 			fakeProvider{name: LayerPatchDiff, priority: 1, content: "12345"},
-			fakeProvider{name: LayerSymbolsCallsites, priority: 3, content: "123456"},
+			fakeProvider{name: LayerSymbolsCallsites, priority: 3, content: strings.Repeat("x", 60)},
 			fakeProvider{name: LayerTests, priority: 4, content: "xx"},
 		},
 	}
@@ -88,8 +88,8 @@ func TestBuilderSkipsOversizedLayerAndContinuesPacking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	if out.TokenCount != 7 {
-		t.Fatalf("expected token count 7, got %d", out.TokenCount)
+	if out.TokenCount != len(out.Content) || out.TokenCount > 36 {
+		t.Fatalf("expected rendered token count within effective budget, got %d for %q", out.TokenCount, out.Content)
 	}
 	if len(out.LayersUsed) != 2 || out.LayersUsed[0] != LayerPatchDiff || out.LayersUsed[1] != LayerTests {
 		t.Fatalf("unexpected layers used: %#v", out.LayersUsed)

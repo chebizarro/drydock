@@ -170,6 +170,7 @@ type Config struct {
 	HealthAddr                          string
 	DashboardBearerToken                string
 	PipelineWorkers                     int
+	ContextTokenBudget                  int
 	ApplyFailurePublication             string
 	AgenticReviewFallback               bool
 	AgenticDiscoveryBaseURL             string
@@ -214,6 +215,7 @@ type Config struct {
 }
 
 func FromEnv() Config {
+	contextTokenBudget := parseTokenBudget("DRYDOCK_CONTEXT_TOKEN_BUDGET", 64_000)
 	environment := strings.ToLower(strings.TrimSpace(os.Getenv("DRYDOCK_ENV")))
 	production := isProductionMode(environment, os.Getenv("DRYDOCK_PRODUCTION"))
 	defaultCollections := vectorstore.DefaultCollectionNames()
@@ -366,7 +368,8 @@ func FromEnv() Config {
 		AgenticReviewerMaxCumulativeTokens:  parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_REVIEWER_MAX_CUMULATIVE_TOKENS", "384000"), 384000),
 		AgenticMaxToolResultBytes:           parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_MAX_TOOL_RESULT_BYTES", "16384"), 16*1024),
 		AgenticMaxModelContext:              parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_MAX_MODEL_CONTEXT", "256000"), 256000),
-		AgenticPackageTokenBudget:           parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET", "64000"), 64_000),
+		ContextTokenBudget:                  contextTokenBudget,
+		AgenticPackageTokenBudget:           parseTokenBudget("DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET", contextTokenBudget),
 		AgenticTokenHeadroom:                parseFloatOrDefault(envOrDefault("DRYDOCK_AGENTIC_TOKEN_HEADROOM", "0.10"), 0.10),
 		AgenticHistoryTokenBudget:           parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_HISTORY_TOKEN_BUDGET", "64000"), 64_000),
 		SnapshotStoragePath:                 envOrDefault("DRYDOCK_REVIEW_SNAPSHOT_STORAGE_PATH", ""),
@@ -573,6 +576,20 @@ func envOrDefault(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+// parseTokenBudget preserves invalid values for validation rather than silently
+// replacing an operator's requested limit with a larger default.
+func parseTokenBudget(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	budget, err := strconv.Atoi(value)
+	if err != nil {
+		return -1
+	}
+	return budget
 }
 
 func parseIntOrDefault(v string, fallback int) int {
@@ -797,6 +814,12 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 		}
 	}
 
+	if c.ContextTokenBudget < 1024 || c.ContextTokenBudget > 1_048_576 {
+		result.Errors = append(result.Errors, "DRYDOCK_CONTEXT_TOKEN_BUDGET must be an integer between 1024 and 1048576")
+	} else if c.AgenticPackageTokenBudget < c.ContextTokenBudget {
+		result.Errors = append(result.Errors, "DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET must be at least DRYDOCK_CONTEXT_TOKEN_BUDGET")
+	}
+
 	if c.MetaMaxInputBytes <= 0 {
 		result.Errors = append(result.Errors, "DRYDOCK_META_MAX_INPUT_BYTES must be at least 1")
 	}
@@ -805,7 +828,7 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 		c.AgenticDiscoveryMaxCumulativeTokens <= 0 || c.AgenticReviewerMaxTurns <= 0 ||
 		c.AgenticReviewerMaxToolCalls <= 0 || c.AgenticReviewerMaxCumulativeTokens <= 0 ||
 		c.AgenticMaxToolResultBytes <= 0 || c.AgenticMaxModelContext <= 0 ||
-		c.AgenticPackageTokenBudget <= 0 || c.AgenticHistoryTokenBudget <= 0 {
+		c.AgenticHistoryTokenBudget <= 0 {
 		result.Errors = append(result.Errors, "agentic turn, tool-call, token, result, context, package, and history limits must be greater than 0")
 	}
 	if c.AgenticTokenHeadroom < 0 || c.AgenticTokenHeadroom >= 1 {

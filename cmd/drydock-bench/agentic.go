@@ -75,7 +75,7 @@ func newAgenticRunner(ctx context.Context, cfg config.Config, engine *reviewengi
 	if err != nil {
 		return nil, err
 	}
-	builderOpts := contextbuilder.NewBuilderOptions()
+	builderOpts := contextbuilder.NewBuilderOptions(contextbuilder.WithTokenBudget(cfg.ContextTokenBudget, cfg.AgenticTokenHeadroom))
 	registry := agenttools.NewRegistry(agenttools.WithLayerFacade(contextbuilder.NewLayerFacade(builderOpts)))
 	limits := func(turns, calls, tokens int) agenticreview.LoopLimits {
 		return agenticreview.LoopLimits{MaxTurns: turns, MaxToolCalls: calls, MaxCumulativeTokens: tokens,
