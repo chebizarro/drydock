@@ -84,7 +84,7 @@ func newAgenticRunner(ctx context.Context, cfg config.Config, engine *reviewengi
 	discovery, err := agenticreview.NewDiscovery(agenticreview.DiscoveryConfig{
 		Client: client, Registry: registry, Counter: counter, Builder: contextbuilder.NewWithOptions(builderOpts),
 		BaseURL: cfg.AgenticDiscoveryBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.AgenticDiscoveryAPIKey),
-		Model: cfg.AgenticDiscoveryModel, Temperature: 0.1,
+		Model: cfg.AgenticDiscoveryModel, Temperature: 0.1, Timeout: cfg.AgenticDiscoveryTimeout,
 		Limits:      limits(cfg.AgenticDiscoveryMaxTurns, cfg.AgenticDiscoveryMaxToolCalls, cfg.AgenticDiscoveryMaxCumulativeTokens),
 		TokenBudget: cfg.AgenticPackageTokenBudget, Headroom: cfg.AgenticTokenHeadroom,
 	})
@@ -167,7 +167,7 @@ func completionStage(messages []reviewengine.CompletionMessage) string {
 // Complete mirrors reviewengine.OpenAICompatClient.Complete (same request
 // body) and records each loop turn like ChatCompletion records single calls.
 func (c *meteredClient) Complete(ctx context.Context, req reviewengine.CompletionRequest) (reviewengine.CompletionResult, error) {
-	rec := callRecord{Stage: completionStage(req.Messages), Model: req.Model}
+	rec := callRecord{Stage: completionStage(req.Messages), Model: req.Model, ProdTimeoutMS: req.Timeout.Milliseconds()}
 	if n := len(req.Messages); n > 0 && req.Messages[n-1].Role == reviewengine.MessageRoleTool {
 		// The tool result this turn responds to (e.g. a review.submit rejection).
 		rec.LastToolResult = truncate(req.Messages[n-1].Content, 300)

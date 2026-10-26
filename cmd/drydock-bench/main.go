@@ -34,11 +34,6 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 )
 
-// productionCallTimeout mirrors NewOpenAICompatClient's HTTP timeout. The
-// bench runs with a longer limit so accuracy is measurable on slow hardware,
-// and reports how many calls would have exceeded the production limit.
-const productionCallTimeout = 120 * time.Second
-
 type benchCase struct {
 	eval.PatchCase
 	Meta json.RawMessage `json:"bench_meta,omitempty"`
@@ -72,6 +67,11 @@ type callRecord struct {
 	CostUSD        float64  `json:"cost_usd,omitempty"`
 	Retries        int      `json:"retries,omitempty"`
 	Error          string   `json:"error,omitempty"`
+	// ProdTimeoutMS is the production per-call timeout for this call's role
+	// (DRYDOCK_LLM_TIMEOUT or its per-role override). The bench enforces its
+	// own, longer -call-timeout so accuracy stays measurable on slow hardware,
+	// and counts calls over this limit in calls_over_prod_timeout.
+	ProdTimeoutMS int64 `json:"prod_timeout_ms,omitempty"`
 }
 
 type caseResult struct {
@@ -116,6 +116,7 @@ type header struct {
 	Agentic       bool              `json:"agentic,omitempty"`
 	Retries       int               `json:"retries,omitempty"`
 	CallTimeoutS  float64           `json:"call_timeout_s"`
+	ProdTimeoutS  float64           `json:"prod_call_timeout_s"` // DRYDOCK_LLM_TIMEOUT; per-role overrides are per call
 	LineTolerance int               `json:"line_tolerance"`
 	Endpoints     map[string]string `json:"endpoints"`
 	Notes         string            `json:"notes,omitempty"`
@@ -128,7 +129,7 @@ func main() {
 		label         = flag.String("label", "", "run label recorded in the header, e.g. qwen3-coder-30b-a3b@Q4_K_M")
 		notes         = flag.String("notes", "", "free-form notes recorded in the header (serving flags, draft model, quant)")
 		route         = flag.String("route", "", "pin the reviewer route (coder32b|llm70b|coder14b|sec70b); empty uses the planner's choice")
-		callTimeout   = flag.Duration("call-timeout", 15*time.Minute, "per-LLM-call HTTP timeout")
+		callTimeout   = flag.Duration("call-timeout", 15*time.Minute, "per-LLM-call HTTP timeout (production uses DRYDOCK_LLM_TIMEOUT and per-role overrides, reported as calls_over_prod_timeout)")
 		caseTimeout   = flag.Duration("case-timeout", 45*time.Minute, "whole-case timeout")
 		maxCases      = flag.Int("max-cases", 0, "stop after N cases (0 = all)")
 		skipWalk      = flag.Bool("skip-walkthrough", false, "skip the walkthrough stage")
@@ -160,17 +161,19 @@ func main() {
 	}
 
 	cfg := config.FromEnv()
-	ep := func(base, key, model string) reviewengine.ModelEndpoint {
-		return reviewengine.ModelEndpoint{BaseURL: base, APIKey: cfg.EffectiveLLMAPIKey(key), Model: model}
+	// Timeout carries the production per-call limit so meteredClient can
+	// record it; meteredClient enforces -call-timeout instead.
+	ep := func(base, key, model string, timeout time.Duration) reviewengine.ModelEndpoint {
+		return reviewengine.ModelEndpoint{BaseURL: base, APIKey: cfg.EffectiveLLMAPIKey(key), Model: model, Timeout: timeout}
 	}
 	engineCfg := reviewengine.Config{
-		Planner:      ep(cfg.PlannerBaseURL, cfg.PlannerAPIKey, cfg.PlannerModel),
-		Coder32B:     ep(cfg.Coder32BBaseURL, cfg.Coder32BAPIKey, cfg.Coder32BModel),
-		LLM70B:       ep(cfg.LLM70BBaseURL, cfg.LLM70BAPIKey, cfg.LLM70BModel),
-		Coder14B:     ep(cfg.Coder14BBaseURL, cfg.Coder14BAPIKey, cfg.Coder14BModel),
-		Sec70B:       ep(cfg.Sec70BBaseURL, "", cfg.Sec70BModel),
-		SecClassify:  ep(cfg.SecClassifyBaseURL, "", cfg.SecClassifyModel),
-		SecLocalize:  ep(cfg.SecLocalizeBaseURL, "", cfg.SecLocalizeModel),
+		Planner:      ep(cfg.PlannerBaseURL, cfg.PlannerAPIKey, cfg.PlannerModel, cfg.PlannerTimeout),
+		Coder32B:     ep(cfg.Coder32BBaseURL, cfg.Coder32BAPIKey, cfg.Coder32BModel, cfg.Coder32BTimeout),
+		LLM70B:       ep(cfg.LLM70BBaseURL, cfg.LLM70BAPIKey, cfg.LLM70BModel, cfg.LLM70BTimeout),
+		Coder14B:     ep(cfg.Coder14BBaseURL, cfg.Coder14BAPIKey, cfg.Coder14BModel, cfg.Coder14BTimeout),
+		Sec70B:       ep(cfg.Sec70BBaseURL, "", cfg.Sec70BModel, cfg.Sec70BTimeout),
+		SecClassify:  ep(cfg.SecClassifyBaseURL, "", cfg.SecClassifyModel, cfg.SecClassifyTimeout),
+		SecLocalize:  ep(cfg.SecLocalizeBaseURL, "", cfg.SecLocalizeModel, cfg.SecLocalizeTimeout),
 		PlannerTemp:  0.1, // same as drydock-eval and production
 		ReviewerTemp: 0.1,
 	}
@@ -223,7 +226,7 @@ func main() {
 		StartedAt:   time.Now().UTC(),
 		PinnedRoute: *route, MaxTokens: *maxTokens, ExtraBody: *extraBody, Retries: *retries, PromptVariant: *promptVariant,
 		Agentic:      *agentic,
-		CallTimeoutS: callTimeout.Seconds(), LineTolerance: *lineTolerance, Notes: *notes,
+		CallTimeoutS: callTimeout.Seconds(), ProdTimeoutS: cfg.LLMTimeout.Seconds(), LineTolerance: *lineTolerance, Notes: *notes,
 		Endpoints: map[string]string{
 			"planner":  engineCfg.Planner.BaseURL + " " + engineCfg.Planner.Model,
 			"coder32b": engineCfg.Coder32B.BaseURL + " " + engineCfg.Coder32B.Model,
@@ -281,7 +284,7 @@ func runCase(review func(context.Context, benchCase) (reviewengine.RunOutput, er
 		WallMS: time.Since(start).Milliseconds(), Calls: rec.snapshot(), Findings: []reviewengine.Finding{},
 	}
 	for _, call := range res.Calls {
-		if call.WallMS > productionCallTimeout.Milliseconds() {
+		if call.ProdTimeoutMS > 0 && call.WallMS > call.ProdTimeoutMS {
 			res.OverProdLimit++
 		}
 		if strings.HasPrefix(call.Stage, "repair:") {
@@ -504,7 +507,7 @@ func stageOf(system string) string {
 }
 
 func (c *meteredClient) ChatCompletion(ctx context.Context, req reviewengine.ChatRequest) (reviewengine.ChatResult, error) {
-	rec := callRecord{Stage: stageOf(req.System), Model: req.Model}
+	rec := callRecord{Stage: stageOf(req.System), Model: req.Model, ProdTimeoutMS: req.Timeout.Milliseconds()}
 	if suffix := c.promptSuffix[rec.Stage]; suffix != "" {
 		req.System += suffix // repair calls keep reviewengine's own schema hint
 	}

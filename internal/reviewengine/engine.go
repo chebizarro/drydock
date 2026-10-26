@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
 )
@@ -17,6 +18,9 @@ type ModelEndpoint struct {
 	// MaxTokens caps completion tokens per request (sent as max_tokens);
 	// 0 sends no cap.
 	MaxTokens int
+	// Timeout bounds each call to this endpoint (one attempt); 0 uses the
+	// client's default.
+	Timeout time.Duration
 }
 
 type Config struct {
@@ -99,6 +103,7 @@ func (e *Engine) prepareReviewer(ctx context.Context, in RunInput) (reviewerPrep
 		APIKey:      e.cfg.Planner.APIKey,
 		Model:       e.cfg.Planner.Model,
 		MaxTokens:   e.cfg.Planner.MaxTokens,
+		Timeout:     e.cfg.Planner.Timeout,
 		Temperature: e.cfg.PlannerTemp,
 		System:      plannerSystemPrompt(),
 		User:        plannerUserPrompt(in.ContextBundle, in.ChangedFiles),
@@ -230,6 +235,7 @@ func (e *Engine) generateWalkthrough(ctx context.Context, in RunInput) (Walkthro
 		APIKey:      e.cfg.Planner.APIKey,
 		Model:       e.cfg.Planner.Model,
 		MaxTokens:   e.cfg.Planner.MaxTokens,
+		Timeout:     e.cfg.Planner.Timeout,
 		Temperature: e.cfg.PlannerTemp,
 		System:      walkthroughSystemPrompt(),
 		User:        walkthroughUserPrompt(in.ContextBundle, in.ChangedFiles),

@@ -48,7 +48,7 @@ func TestOpenAICompatCompleteEncodesConversationAndDecodesToolCall(t *testing.T)
 	}))
 	defer srv.Close()
 
-	client := NewOpenAICompatClient()
+	client := NewOpenAICompatClient(time.Minute)
 	result, err := client.Complete(context.Background(), CompletionRequest{
 		BaseURL: srv.URL, APIKey: "secret", Model: "configured-model", Temperature: 0.2,
 		Messages: []CompletionMessage{

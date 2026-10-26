@@ -274,6 +274,7 @@ func (s *Service) callRefinementLLM(ctx context.Context, currentPrompt string, g
 		APIKey:      s.cfg.Endpoint.APIKey,
 		Model:       s.cfg.Endpoint.Model,
 		MaxTokens:   s.cfg.Endpoint.MaxTokens,
+		Timeout:     s.cfg.Endpoint.Timeout,
 		Temperature: 0.2,
 		System:      system,
 		User:        user,

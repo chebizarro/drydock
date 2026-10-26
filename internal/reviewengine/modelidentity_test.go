@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func identityTestLogger() *slog.Logger {
@@ -54,7 +55,7 @@ func TestOpenAICompatClientObservesServedModel(t *testing.T) {
 	defer srv.Close()
 
 	mi := NewModelIdentity()
-	client := NewOpenAICompatClient()
+	client := NewOpenAICompatClient(time.Minute)
 	client.Identity = mi
 
 	out, err := client.ChatCompletion(context.Background(), ChatRequest{

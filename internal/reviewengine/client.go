@@ -88,6 +88,9 @@ type CompletionRequest struct {
 	Tools       []ToolSchema
 	// MaxTokens is sent as max_tokens when positive; 0 sends no cap.
 	MaxTokens int
+	// Timeout bounds this call (one attempt, including reading the body);
+	// 0 uses the client's default. See OpenAICompatClient.Timeout.
+	Timeout time.Duration
 }
 
 // CompletionUsage reports provider token accounting when available.
@@ -115,6 +118,11 @@ const FinishReasonLength = "length"
 // ErrOutputTruncated reports a completion cut off by its token limit.
 var ErrOutputTruncated = errors.New("llm output truncated by token limit (finish_reason=length)")
 
+// ErrCallTimeout reports an LLM call that hit its own per-call timeout, as
+// opposed to the caller's context ending. The error also matches
+// context.DeadlineExceeded, so IsTransient treats it as non-retryable.
+var ErrCallTimeout = errors.New("llm call timeout exceeded")
+
 // ChatResult is the outcome of a chat completion.
 type ChatResult struct {
 	// Content is the assistant message content.
@@ -139,6 +147,9 @@ type ChatRequest struct {
 	JSONMode bool
 	// MaxTokens is sent as max_tokens when positive; 0 sends no cap.
 	MaxTokens int
+	// Timeout bounds this call (one attempt, including reading the body);
+	// 0 uses the client's default. See OpenAICompatClient.Timeout.
+	Timeout time.Duration
 }
 
 // LLMHTTPError represents an HTTP-level error from the LLM endpoint.
@@ -165,8 +176,13 @@ func IsTransient(err error) bool {
 	if errors.As(err, &httpErr) {
 		return httpErr.StatusCode == 429 || httpErr.StatusCode >= 500
 	}
-	// Context cancellation is not transient
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// Context cancellation is not transient. Neither is a timeout: in Go 1.26
+	// an http.Client timeout and a ctx deadline both match
+	// context.DeadlineExceeded, whether they fire awaiting headers or reading
+	// the body. A call that ran out of time on slow hardware would run out of
+	// time again, and retrying it would multiply the wait by MaxAttempts.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrCallTimeout) {
 		return false
 	}
 	// For non-HTTP errors (network timeouts, connection refused, DNS failures),
@@ -176,20 +192,55 @@ func IsTransient(err error) bool {
 
 // OpenAICompatClient is a simple, non-retrying LLM client.
 type OpenAICompatClient struct {
+	// HTTP carries no Timeout of its own: per-call deadlines are context
+	// deadlines, so a per-role Timeout can be longer than Timeout below.
 	HTTP *http.Client
+	// Timeout is the per-call deadline for requests whose Timeout is 0;
+	// 0 leaves such calls bounded only by ctx. The deadline is derived from
+	// the caller's ctx, so it can shorten but never extend a review deadline.
+	Timeout time.Duration
 	// Identity, when set, records the model identifier each endpoint reports
 	// serving so published reviews can name the model that actually handled
 	// the request. Safe to leave nil.
 	Identity *ModelIdentity
 }
 
-func NewOpenAICompatClient() *OpenAICompatClient {
-	return &OpenAICompatClient{
-		HTTP: &http.Client{Timeout: 120 * time.Second},
+// NewOpenAICompatClient returns a client whose calls default to timeout
+// (normally config.LLMTimeout) unless the request carries its own.
+func NewOpenAICompatClient(timeout time.Duration) *OpenAICompatClient {
+	return &OpenAICompatClient{HTTP: &http.Client{}, Timeout: timeout}
+}
+
+// withCallTimeout runs one LLM call under the effective per-call timeout:
+// the request's own, else the client default. The deadline is a child of ctx,
+// so an earlier caller deadline still wins (and is reported as the caller's,
+// not as ErrCallTimeout).
+func withCallTimeout[T any](ctx context.Context, timeout, fallback time.Duration, call func(context.Context) (T, error)) (T, error) {
+	if timeout <= 0 {
+		timeout = fallback
 	}
+	if timeout <= 0 {
+		return call(ctx)
+	}
+	// Plain WithTimeout, not WithTimeoutCause: net/http reports
+	// context.Cause, so a custom cause would replace context.DeadlineExceeded
+	// in the returned error and IsTransient would retry the timeout.
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	result, err := call(callCtx)
+	if err != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		err = fmt.Errorf("%w after %s: %w", ErrCallTimeout, timeout, err)
+	}
+	return result, err
 }
 
 func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest) (ChatResult, error) {
+	return withCallTimeout(ctx, req.Timeout, c.Timeout, func(ctx context.Context) (ChatResult, error) {
+		return c.chatCompletion(ctx, req)
+	})
+}
+
+func (c *OpenAICompatClient) chatCompletion(ctx context.Context, req ChatRequest) (ChatResult, error) {
 	metrics.LLMRequests.With(req.Model).Inc()
 	done := metrics.TimerVec(metrics.LLMDuration, req.Model)
 	defer done()
@@ -262,6 +313,12 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 }
 
 func (c *OpenAICompatClient) Complete(ctx context.Context, req CompletionRequest) (CompletionResult, error) {
+	return withCallTimeout(ctx, req.Timeout, c.Timeout, func(ctx context.Context) (CompletionResult, error) {
+		return c.complete(ctx, req)
+	})
+}
+
+func (c *OpenAICompatClient) complete(ctx context.Context, req CompletionRequest) (CompletionResult, error) {
 	metrics.LLMRequests.With(req.Model).Inc()
 	done := metrics.TimerVec(metrics.LLMDuration, req.Model)
 	defer done()

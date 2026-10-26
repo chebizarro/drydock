@@ -329,7 +329,7 @@ func main() {
 	// name the real model even when deployment env vars go stale.
 	modelIdentity := reviewengine.NewModelIdentity()
 	newCompatClient := func() *reviewengine.OpenAICompatClient {
-		c := reviewengine.NewOpenAICompatClient()
+		c := reviewengine.NewOpenAICompatClient(cfg.LLMTimeout)
 		c.Identity = modelIdentity
 		return c
 	}
@@ -347,7 +347,7 @@ func main() {
 			logger,
 		)
 		convHandler = conversation.New(conversation.Config{
-			Endpoint:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens},
+			Endpoint:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens, Timeout: cfg.PlannerTimeout},
 			Temperature:   0.3,
 			DefaultRelays: writeRelays,
 			ResponseTTL:   30 * 24 * time.Hour,
@@ -506,13 +506,13 @@ func main() {
 		logger,
 	)
 	engine := reviewengine.New(reviewengine.Config{
-		Planner:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens},
-		Coder32B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey), Model: cfg.Coder32BModel, MaxTokens: cfg.Coder32BMaxTokens},
-		LLM70B:       reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.LLM70BAPIKey), Model: cfg.LLM70BModel, MaxTokens: cfg.LLM70BMaxTokens},
-		Sec70B:       reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel, MaxTokens: cfg.Sec70BMaxTokens},
-		SecClassify:  reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel, MaxTokens: cfg.SecClassifyMaxTokens},
-		SecLocalize:  reviewengine.ModelEndpoint{BaseURL: cfg.SecLocalizeBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecLocalizeModel, MaxTokens: cfg.SecLocalizeMaxTokens},
-		Coder14B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder14BAPIKey), Model: cfg.Coder14BModel, MaxTokens: cfg.Coder14BMaxTokens},
+		Planner:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens, Timeout: cfg.PlannerTimeout},
+		Coder32B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey), Model: cfg.Coder32BModel, MaxTokens: cfg.Coder32BMaxTokens, Timeout: cfg.Coder32BTimeout},
+		LLM70B:       reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.LLM70BAPIKey), Model: cfg.LLM70BModel, MaxTokens: cfg.LLM70BMaxTokens, Timeout: cfg.LLM70BTimeout},
+		Sec70B:       reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel, MaxTokens: cfg.Sec70BMaxTokens, Timeout: cfg.Sec70BTimeout},
+		SecClassify:  reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel, MaxTokens: cfg.SecClassifyMaxTokens, Timeout: cfg.SecClassifyTimeout},
+		SecLocalize:  reviewengine.ModelEndpoint{BaseURL: cfg.SecLocalizeBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecLocalizeModel, MaxTokens: cfg.SecLocalizeMaxTokens, Timeout: cfg.SecLocalizeTimeout},
+		Coder14B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder14BAPIKey), Model: cfg.Coder14BModel, MaxTokens: cfg.Coder14BMaxTokens, Timeout: cfg.Coder14BTimeout},
 		PlannerTemp:  0.1,
 		ReviewerTemp: 0.2,
 	}, llmClient, logger)
@@ -560,7 +560,7 @@ func main() {
 		Client: llmClient, Registry: agentRegistry, Counter: agentCounter, Builder: ctxBuilder,
 		BaseURL: cfg.AgenticDiscoveryBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.AgenticDiscoveryAPIKey),
 		Model: cfg.AgenticDiscoveryModel, Temperature: 0.1, Limits: discoveryLimits,
-		MaxTokens:   cfg.AgenticDiscoveryMaxTokens,
+		MaxTokens: cfg.AgenticDiscoveryMaxTokens, Timeout: cfg.AgenticDiscoveryTimeout,
 		TokenBudget: cfg.AgenticPackageTokenBudget, Headroom: cfg.AgenticTokenHeadroom,
 	})
 	if err != nil {
@@ -639,8 +639,8 @@ func main() {
 	securityStage := securityreview.New(
 		engine,
 		llmClient,
-		reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel, MaxTokens: cfg.Sec70BMaxTokens},
-		reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel, MaxTokens: cfg.SecClassifyMaxTokens},
+		reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel, MaxTokens: cfg.Sec70BMaxTokens, Timeout: cfg.Sec70BTimeout},
+		reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel, MaxTokens: cfg.SecClassifyMaxTokens, Timeout: cfg.SecClassifyTimeout},
 		securityreview.WithNostrEnabled(cfg.SecurityNostrEnabled),
 		securityreview.WithLSPClient(lspClient),
 	)
@@ -652,14 +652,14 @@ func main() {
 		verifyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		modelIdentity.VerifyEndpoints(verifyCtx, nil, logger,
-			reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens},
-			reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey), Model: cfg.Coder32BModel, MaxTokens: cfg.Coder32BMaxTokens},
-			reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.LLM70BAPIKey), Model: cfg.LLM70BModel, MaxTokens: cfg.LLM70BMaxTokens},
-			reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel, MaxTokens: cfg.Sec70BMaxTokens},
-			reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel, MaxTokens: cfg.SecClassifyMaxTokens},
-			reviewengine.ModelEndpoint{BaseURL: cfg.SecLocalizeBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecLocalizeModel, MaxTokens: cfg.SecLocalizeMaxTokens},
-			reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder14BAPIKey), Model: cfg.Coder14BModel, MaxTokens: cfg.Coder14BMaxTokens},
-			reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.MetaAPIKey), Model: cfg.MetaModel, MaxTokens: cfg.MetaMaxTokens},
+			reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens, Timeout: cfg.PlannerTimeout},
+			reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey), Model: cfg.Coder32BModel, MaxTokens: cfg.Coder32BMaxTokens, Timeout: cfg.Coder32BTimeout},
+			reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.LLM70BAPIKey), Model: cfg.LLM70BModel, MaxTokens: cfg.LLM70BMaxTokens, Timeout: cfg.LLM70BTimeout},
+			reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel, MaxTokens: cfg.Sec70BMaxTokens, Timeout: cfg.Sec70BTimeout},
+			reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel, MaxTokens: cfg.SecClassifyMaxTokens, Timeout: cfg.SecClassifyTimeout},
+			reviewengine.ModelEndpoint{BaseURL: cfg.SecLocalizeBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecLocalizeModel, MaxTokens: cfg.SecLocalizeMaxTokens, Timeout: cfg.SecLocalizeTimeout},
+			reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder14BAPIKey), Model: cfg.Coder14BModel, MaxTokens: cfg.Coder14BMaxTokens, Timeout: cfg.Coder14BTimeout},
+			reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.MetaAPIKey), Model: cfg.MetaModel, MaxTokens: cfg.MetaMaxTokens, Timeout: cfg.MetaTimeout},
 		)
 	}()
 
@@ -677,8 +677,8 @@ func main() {
 
 	var securityAuditHandler *contextvm.SecurityAuditHandler
 	if pubSvc != nil {
-		verifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel, MaxTokens: cfg.Sec70BMaxTokens}
-		classifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel, MaxTokens: cfg.SecClassifyMaxTokens}
+		verifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.Sec70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.Sec70BModel, MaxTokens: cfg.Sec70BMaxTokens, Timeout: cfg.Sec70BTimeout}
+		classifyEndpoint := reviewengine.ModelEndpoint{BaseURL: cfg.SecClassifyBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecClassifyModel, MaxTokens: cfg.SecClassifyMaxTokens, Timeout: cfg.SecClassifyTimeout}
 		feedback := contextvm.NewAuditFeedbackReporter(contextVMTransport, writeRelays)
 		auditEngine := auditengine.New(
 			auditengine.Config{
@@ -706,7 +706,7 @@ func main() {
 				Publisher: pubSvc,
 				Progress:  feedback,
 				Localizer: auditengine.NewAntaresLocalizer(llmClient, reviewengine.ModelEndpoint{
-					BaseURL: cfg.SecLocalizeBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecLocalizeModel, MaxTokens: cfg.SecLocalizeMaxTokens,
+					BaseURL: cfg.SecLocalizeBaseURL, APIKey: cfg.EffectiveLLMAPIKey(""), Model: cfg.SecLocalizeModel, MaxTokens: cfg.SecLocalizeMaxTokens, Timeout: cfg.SecLocalizeTimeout,
 				}),
 			},
 			logger,
@@ -729,7 +729,7 @@ func main() {
 		metaOpts = append(metaOpts, metareview.WithQdrant(qdrantClient, embedClient))
 	}
 	metaSvc := metareview.New(metareview.Config{
-		Endpoint:         reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.MetaAPIKey), Model: cfg.MetaModel, MaxTokens: cfg.MetaMaxTokens},
+		Endpoint:         reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.MetaAPIKey), Model: cfg.MetaModel, MaxTokens: cfg.MetaMaxTokens, Timeout: cfg.MetaTimeout},
 		RandomSampleRate: 0.15,
 		MinReuseJaccard:  0.85,
 		FewShotCap:       500,
@@ -740,7 +740,7 @@ func main() {
 	// --- Prompt refinement (reuses the meta-review LLM endpoint) ---
 	prSvc := promptrefine.New(promptrefine.Config{
 		Threshold:          promptrefine.DefaultThreshold,
-		Endpoint:           reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.MetaAPIKey), Model: cfg.MetaModel, MaxTokens: cfg.MetaMaxTokens},
+		Endpoint:           reviewengine.ModelEndpoint{BaseURL: cfg.MetaBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.MetaAPIKey), Model: cfg.MetaModel, MaxTokens: cfg.MetaMaxTokens, Timeout: cfg.MetaTimeout},
 		EvalScoreTolerance: 0.05,
 	}, store, metaClient, logger)
 
@@ -802,7 +802,7 @@ func main() {
 	if signer != nil && qdrantClient != nil && embedClient != nil {
 		if keyer, ok := signer.(codechat.Keyer); ok {
 			codeChatHandler := codechat.New(codechat.Config{
-				Endpoint:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens},
+				Endpoint:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens, Timeout: cfg.PlannerTimeout},
 				Temperature:   0.4,
 				DefaultRelays: writeRelays,
 			}, store, qdrantClient, embedClient, llmClient, keyer, relayPub, logger).

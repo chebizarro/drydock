@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/agenttools"
 	"git.sharegap.net/cascadia/drydock/internal/contextbuilder"
@@ -40,6 +41,8 @@ type DiscoveryConfig struct {
 	Temperature float64
 	// MaxTokens caps completion tokens per discovery turn; 0 sends no cap.
 	MaxTokens int
+	// Timeout bounds each discovery turn's LLM call; 0 uses the client's default.
+	Timeout time.Duration
 }
 
 type DiscoveryInput struct {
@@ -117,7 +120,7 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 	loopResult, loopErr := (&LoopRunner{Client: d.config.Client}).Run(ctx, LoopRequest{
 		Completion: reviewengine.CompletionRequest{
 			BaseURL: d.config.BaseURL, APIKey: d.config.APIKey, Model: d.config.Model,
-			Temperature: d.config.Temperature, MaxTokens: d.config.MaxTokens,
+			Temperature: d.config.Temperature, MaxTokens: d.config.MaxTokens, Timeout: d.config.Timeout,
 			Messages: []reviewengine.CompletionMessage{
 				{Role: reviewengine.MessageRoleSystem, Content: DiscoverySystemPrompt},
 				{Role: reviewengine.MessageRoleUser, Content: user},

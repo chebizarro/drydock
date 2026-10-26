@@ -43,13 +43,13 @@ func main() {
 	}
 
 	engine := reviewengine.New(reviewengine.Config{
-		Planner:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens},
-		Coder32B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey), Model: cfg.Coder32BModel, MaxTokens: cfg.Coder32BMaxTokens},
-		LLM70B:       reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.LLM70BAPIKey), Model: cfg.LLM70BModel, MaxTokens: cfg.LLM70BMaxTokens},
-		Coder14B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder14BAPIKey), Model: cfg.Coder14BModel, MaxTokens: cfg.Coder14BMaxTokens},
+		Planner:      reviewengine.ModelEndpoint{BaseURL: cfg.PlannerBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.PlannerAPIKey), Model: cfg.PlannerModel, MaxTokens: cfg.PlannerMaxTokens, Timeout: cfg.PlannerTimeout},
+		Coder32B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder32BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder32BAPIKey), Model: cfg.Coder32BModel, MaxTokens: cfg.Coder32BMaxTokens, Timeout: cfg.Coder32BTimeout},
+		LLM70B:       reviewengine.ModelEndpoint{BaseURL: cfg.LLM70BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.LLM70BAPIKey), Model: cfg.LLM70BModel, MaxTokens: cfg.LLM70BMaxTokens, Timeout: cfg.LLM70BTimeout},
+		Coder14B:     reviewengine.ModelEndpoint{BaseURL: cfg.Coder14BBaseURL, APIKey: cfg.EffectiveLLMAPIKey(cfg.Coder14BAPIKey), Model: cfg.Coder14BModel, MaxTokens: cfg.Coder14BMaxTokens, Timeout: cfg.Coder14BTimeout},
 		PlannerTemp:  0.1,
 		ReviewerTemp: 0.1,
-	}, reviewengine.NewOpenAICompatClient(), logger)
+	}, reviewengine.NewOpenAICompatClient(cfg.LLMTimeout), logger)
 
 	h := eval.Harness{
 		Runner:        eval.EngineRunner{Engine: engine},

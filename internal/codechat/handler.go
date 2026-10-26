@@ -229,6 +229,7 @@ func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL stri
 		APIKey:      h.cfg.Endpoint.APIKey,
 		Model:       h.cfg.Endpoint.Model,
 		MaxTokens:   h.cfg.Endpoint.MaxTokens,
+		Timeout:     h.cfg.Endpoint.Timeout,
 		Temperature: h.cfg.Temperature,
 		System:      system,
 		User:        user,

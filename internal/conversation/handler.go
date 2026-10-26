@@ -189,6 +189,7 @@ func (h *Handler) HandleReply(ctx context.Context, replyEvent nostr.Event, relay
 		APIKey:      h.cfg.Endpoint.APIKey,
 		Model:       h.cfg.Endpoint.Model,
 		MaxTokens:   h.cfg.Endpoint.MaxTokens,
+		Timeout:     h.cfg.Endpoint.Timeout,
 		Temperature: h.cfg.Temperature,
 		System:      system,
 		User:        user,

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // capturePayloadServer records the decoded JSON request body and replies with
@@ -36,7 +37,7 @@ func capturePayloadServer(t *testing.T, finishReason string, payload *map[string
 func TestChatCompletionMaxTokensPayload(t *testing.T) {
 	var payload map[string]any
 	srv := capturePayloadServer(t, FinishReasonLength, &payload)
-	client := NewOpenAICompatClient()
+	client := NewOpenAICompatClient(time.Minute)
 
 	res, err := client.ChatCompletion(context.Background(), ChatRequest{BaseURL: srv.URL, Model: "m", MaxTokens: 4096})
 	if err != nil {
@@ -60,7 +61,7 @@ func TestChatCompletionMaxTokensPayload(t *testing.T) {
 func TestCompleteMaxTokensPayload(t *testing.T) {
 	var payload map[string]any
 	srv := capturePayloadServer(t, FinishReasonLength, &payload)
-	client := NewOpenAICompatClient()
+	client := NewOpenAICompatClient(time.Minute)
 	messages := []CompletionMessage{{Role: MessageRoleUser, Content: "hi"}}
 
 	res, err := client.Complete(context.Background(), CompletionRequest{BaseURL: srv.URL, Model: "m", Messages: messages, MaxTokens: 2048})

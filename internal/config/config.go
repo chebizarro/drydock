@@ -43,6 +43,15 @@ const (
 // small-context deployments. See docs/configuration.md for recommended caps.
 const defaultLLMMaxTokens = 0
 
+// defaultLLMTimeout bounds one LLM HTTP call. 120s was too short for local
+// GPUs: a reviewer call on 2x Tesla P40 prefills 5-15k tokens and decodes
+// 1-4k tokens at 10-30 tok/s. maxLLMTimeout rejects values that would hide a
+// hung endpoint for longer than any review is worth waiting.
+const (
+	defaultLLMTimeout = 180 * time.Second
+	maxLLMTimeout     = 30 * time.Minute
+)
+
 var defaultPublicRelaySet = map[string]struct{}{
 	"wss://relay.damus.io":   {},
 	"wss://nos.lol":          {},
@@ -114,7 +123,17 @@ type Config struct {
 	SecClassifyMaxTokens                int
 	SecLocalizeMaxTokens                int
 	MetaMaxTokens                       int
-	AgenticDiscoveryMaxTokens           int // inherits Coder32BMaxTokens, like the rest of the discovery endpoint
+	AgenticDiscoveryMaxTokens           int           // inherits Coder32BMaxTokens, like the rest of the discovery endpoint
+	LLMTimeout                          time.Duration // per-call deadline; per-role timeouts below inherit it
+	PlannerTimeout                      time.Duration
+	Coder32BTimeout                     time.Duration
+	LLM70BTimeout                       time.Duration
+	Coder14BTimeout                     time.Duration
+	Sec70BTimeout                       time.Duration
+	SecClassifyTimeout                  time.Duration
+	SecLocalizeTimeout                  time.Duration
+	MetaTimeout                         time.Duration
+	AgenticDiscoveryTimeout             time.Duration // inherits Coder32BTimeout, like the rest of the discovery endpoint
 	SignerBunkerURL                     string
 	SignerNsec                          string
 	SignerNsecFile                      string
@@ -212,6 +231,8 @@ func FromEnv() Config {
 
 	llmMaxTokens := parseMaxTokens("DRYDOCK_LLM_MAX_TOKENS", defaultLLMMaxTokens)
 	coder32BMaxTokens := parseMaxTokens("DRYDOCK_CODER32B_MAX_TOKENS", llmMaxTokens)
+	llmTimeout := parseLLMTimeout("DRYDOCK_LLM_TIMEOUT", defaultLLMTimeout)
+	coder32BTimeout := parseLLMTimeout("DRYDOCK_CODER32B_TIMEOUT", llmTimeout)
 
 	return Config{
 		Environment:          environment,
@@ -327,6 +348,16 @@ func FromEnv() Config {
 		SecLocalizeMaxTokens:                parseMaxTokens("DRYDOCK_SECLOCALIZE_MAX_TOKENS", llmMaxTokens),
 		MetaMaxTokens:                       parseMaxTokens("DRYDOCK_META_MAX_TOKENS", llmMaxTokens),
 		AgenticDiscoveryMaxTokens:           parseMaxTokens("DRYDOCK_AGENTIC_DISCOVERY_MAX_TOKENS", coder32BMaxTokens),
+		LLMTimeout:                          llmTimeout,
+		PlannerTimeout:                      parseLLMTimeout("DRYDOCK_PLANNER_TIMEOUT", llmTimeout),
+		Coder32BTimeout:                     coder32BTimeout,
+		LLM70BTimeout:                       parseLLMTimeout("DRYDOCK_LLM70B_TIMEOUT", llmTimeout),
+		Coder14BTimeout:                     parseLLMTimeout("DRYDOCK_CODER14B_TIMEOUT", llmTimeout),
+		Sec70BTimeout:                       parseLLMTimeout("DRYDOCK_SEC70B_TIMEOUT", llmTimeout),
+		SecClassifyTimeout:                  parseLLMTimeout("DRYDOCK_SECCLASSIFY_TIMEOUT", llmTimeout),
+		SecLocalizeTimeout:                  parseLLMTimeout("DRYDOCK_SECLOCALIZE_TIMEOUT", llmTimeout),
+		MetaTimeout:                         parseLLMTimeout("DRYDOCK_META_TIMEOUT", llmTimeout),
+		AgenticDiscoveryTimeout:             parseLLMTimeout("DRYDOCK_AGENTIC_DISCOVERY_TIMEOUT", coder32BTimeout),
 		AgenticDiscoveryMaxTurns:            parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MAX_TURNS", "24"), 24),
 		AgenticDiscoveryMaxToolCalls:        parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MAX_TOOL_CALLS", "96"), 96),
 		AgenticDiscoveryMaxCumulativeTokens: parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MAX_CUMULATIVE_TOKENS", "256000"), 256000),
@@ -572,6 +603,29 @@ func parseMaxTokens(key string, inherit int) int {
 	return n
 }
 
+// invalidLLMTimeout marks an LLM timeout variable whose value is not a Go
+// duration in (0, maxLLMTimeout], so Validate can reject it by name.
+const invalidLLMTimeout time.Duration = -1
+
+// parseLLMTimeout resolves a per-call LLM timeout from key. An unset variable
+// inherits; an invalid one becomes invalidLLMTimeout. Inheriting from an
+// invalid parent yields defaultLLMTimeout so one bad variable produces one
+// validation error, not one per role.
+func parseLLMTimeout(key string, inherit time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		if inherit <= 0 {
+			return defaultLLMTimeout
+		}
+		return inherit
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 || d > maxLLMTimeout {
+		return invalidLLMTimeout
+	}
+	return d
+}
+
 func parseFloatOrDefault(v string, fallback float64) float64 {
 	parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 	if err != nil {
@@ -726,6 +780,20 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	for _, endpoint := range c.modelEndpoints() {
 		if endpoint.maxTokens < 0 {
 			result.Errors = append(result.Errors, endpoint.maxTokensEnv+" must be a non-negative integer (0 disables the cap)")
+		}
+	}
+
+	timeoutRule := fmt.Sprintf(" must be a positive Go duration no longer than %s (e.g. 180s)", maxLLMTimeout)
+	timeouts := []modelEndpointSpec{{timeoutEnv: "DRYDOCK_LLM_TIMEOUT", timeout: c.LLMTimeout}}
+	for _, t := range append(timeouts, c.modelEndpoints()...) {
+		switch {
+		case t.timeout <= 0:
+			result.Errors = append(result.Errors, t.timeoutEnv+timeoutRule)
+		case c.IDEAgenticTimeout > 0 && t.timeout >= c.IDEAgenticTimeout:
+			// Not an error: the per-call deadline derives from the caller's
+			// context, so the IDE deadline still wins. Warn because a single
+			// call can then consume the whole IDE agentic budget.
+			result.Warnings = append(result.Warnings, fmt.Sprintf("%s (%s) is not shorter than DRYDOCK_IDE_AGENTIC_TIMEOUT (%s): one slow LLM call can use the whole IDE agentic review budget", t.timeoutEnv, t.timeout, c.IDEAgenticTimeout))
 		}
 	}
 
@@ -902,6 +970,10 @@ type modelEndpointSpec struct {
 	// is its resolved value.
 	maxTokensEnv string
 	maxTokens    int
+	// timeoutEnv names the role's per-call LLM timeout variable; timeout is
+	// its resolved value.
+	timeoutEnv string
+	timeout    time.Duration
 }
 
 // modelEndpoints enumerates every LLM endpoint the binary constructs in
@@ -909,15 +981,15 @@ type modelEndpointSpec struct {
 // (main.go passes EffectiveLLMAPIKey("")), so keyEnv points at the shared key.
 func (c *Config) modelEndpoints() []modelEndpointSpec {
 	return []modelEndpointSpec{
-		{name: "planner", baseURLEnv: "DRYDOCK_PLANNER_BASE_URL", modelEnv: "DRYDOCK_PLANNER_MODEL", keyEnv: "DRYDOCK_PLANNER_API_KEY", baseURL: c.PlannerBaseURL, model: c.PlannerModel, apiKey: c.EffectiveLLMAPIKey(c.PlannerAPIKey), required: true, maxTokensEnv: "DRYDOCK_PLANNER_MAX_TOKENS", maxTokens: c.PlannerMaxTokens},
-		{name: "coder32b", baseURLEnv: "DRYDOCK_CODER32B_BASE_URL", modelEnv: "DRYDOCK_CODER32B_MODEL", keyEnv: "DRYDOCK_CODER32B_API_KEY", baseURL: c.Coder32BBaseURL, model: c.Coder32BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder32BAPIKey), required: true, maxTokensEnv: "DRYDOCK_CODER32B_MAX_TOKENS", maxTokens: c.Coder32BMaxTokens},
-		{name: "70b", baseURLEnv: "DRYDOCK_LLM70B_BASE_URL", modelEnv: "DRYDOCK_LLM70B_MODEL", keyEnv: "DRYDOCK_LLM70B_API_KEY", baseURL: c.LLM70BBaseURL, model: c.LLM70BModel, apiKey: c.EffectiveLLMAPIKey(c.LLM70BAPIKey), required: true, maxTokensEnv: "DRYDOCK_LLM70B_MAX_TOKENS", maxTokens: c.LLM70BMaxTokens},
-		{name: "coder14b", baseURLEnv: "DRYDOCK_CODER14B_BASE_URL", modelEnv: "DRYDOCK_CODER14B_MODEL", keyEnv: "DRYDOCK_CODER14B_API_KEY", baseURL: c.Coder14BBaseURL, model: c.Coder14BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder14BAPIKey), required: true, maxTokensEnv: "DRYDOCK_CODER14B_MAX_TOKENS", maxTokens: c.Coder14BMaxTokens},
-		{name: "meta", baseURLEnv: "DRYDOCK_META_BASE_URL", modelEnv: "DRYDOCK_META_MODEL", keyEnv: "DRYDOCK_META_API_KEY", baseURL: c.MetaBaseURL, model: c.MetaModel, apiKey: c.EffectiveLLMAPIKey(c.MetaAPIKey), required: true, maxTokensEnv: "DRYDOCK_META_MAX_TOKENS", maxTokens: c.MetaMaxTokens},
-		{name: "sec70b", baseURLEnv: "DRYDOCK_SEC70B_BASE_URL", modelEnv: "DRYDOCK_SEC70B_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.Sec70BBaseURL, model: c.Sec70BModel, apiKey: c.EffectiveLLMAPIKey(""), maxTokensEnv: "DRYDOCK_SEC70B_MAX_TOKENS", maxTokens: c.Sec70BMaxTokens},
-		{name: "secclassify", baseURLEnv: "DRYDOCK_SECCLASSIFY_BASE_URL", modelEnv: "DRYDOCK_SECCLASSIFY_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecClassifyBaseURL, model: c.SecClassifyModel, apiKey: c.EffectiveLLMAPIKey(""), maxTokensEnv: "DRYDOCK_SECCLASSIFY_MAX_TOKENS", maxTokens: c.SecClassifyMaxTokens},
-		{name: "seclocalize", baseURLEnv: "DRYDOCK_SECLOCALIZE_BASE_URL", modelEnv: "DRYDOCK_SECLOCALIZE_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecLocalizeBaseURL, model: c.SecLocalizeModel, apiKey: c.EffectiveLLMAPIKey(""), maxTokensEnv: "DRYDOCK_SECLOCALIZE_MAX_TOKENS", maxTokens: c.SecLocalizeMaxTokens},
-		{name: "agentic-discovery", baseURLEnv: "DRYDOCK_AGENTIC_DISCOVERY_BASE_URL", modelEnv: "DRYDOCK_AGENTIC_DISCOVERY_MODEL", keyEnv: "DRYDOCK_AGENTIC_DISCOVERY_API_KEY", baseURL: c.AgenticDiscoveryBaseURL, model: c.AgenticDiscoveryModel, apiKey: c.EffectiveLLMAPIKey(c.AgenticDiscoveryAPIKey), maxTokensEnv: "DRYDOCK_AGENTIC_DISCOVERY_MAX_TOKENS", maxTokens: c.AgenticDiscoveryMaxTokens},
+		{name: "planner", baseURLEnv: "DRYDOCK_PLANNER_BASE_URL", modelEnv: "DRYDOCK_PLANNER_MODEL", keyEnv: "DRYDOCK_PLANNER_API_KEY", baseURL: c.PlannerBaseURL, model: c.PlannerModel, apiKey: c.EffectiveLLMAPIKey(c.PlannerAPIKey), required: true, maxTokensEnv: "DRYDOCK_PLANNER_MAX_TOKENS", maxTokens: c.PlannerMaxTokens, timeoutEnv: "DRYDOCK_PLANNER_TIMEOUT", timeout: c.PlannerTimeout},
+		{name: "coder32b", baseURLEnv: "DRYDOCK_CODER32B_BASE_URL", modelEnv: "DRYDOCK_CODER32B_MODEL", keyEnv: "DRYDOCK_CODER32B_API_KEY", baseURL: c.Coder32BBaseURL, model: c.Coder32BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder32BAPIKey), required: true, maxTokensEnv: "DRYDOCK_CODER32B_MAX_TOKENS", maxTokens: c.Coder32BMaxTokens, timeoutEnv: "DRYDOCK_CODER32B_TIMEOUT", timeout: c.Coder32BTimeout},
+		{name: "70b", baseURLEnv: "DRYDOCK_LLM70B_BASE_URL", modelEnv: "DRYDOCK_LLM70B_MODEL", keyEnv: "DRYDOCK_LLM70B_API_KEY", baseURL: c.LLM70BBaseURL, model: c.LLM70BModel, apiKey: c.EffectiveLLMAPIKey(c.LLM70BAPIKey), required: true, maxTokensEnv: "DRYDOCK_LLM70B_MAX_TOKENS", maxTokens: c.LLM70BMaxTokens, timeoutEnv: "DRYDOCK_LLM70B_TIMEOUT", timeout: c.LLM70BTimeout},
+		{name: "coder14b", baseURLEnv: "DRYDOCK_CODER14B_BASE_URL", modelEnv: "DRYDOCK_CODER14B_MODEL", keyEnv: "DRYDOCK_CODER14B_API_KEY", baseURL: c.Coder14BBaseURL, model: c.Coder14BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder14BAPIKey), required: true, maxTokensEnv: "DRYDOCK_CODER14B_MAX_TOKENS", maxTokens: c.Coder14BMaxTokens, timeoutEnv: "DRYDOCK_CODER14B_TIMEOUT", timeout: c.Coder14BTimeout},
+		{name: "meta", baseURLEnv: "DRYDOCK_META_BASE_URL", modelEnv: "DRYDOCK_META_MODEL", keyEnv: "DRYDOCK_META_API_KEY", baseURL: c.MetaBaseURL, model: c.MetaModel, apiKey: c.EffectiveLLMAPIKey(c.MetaAPIKey), required: true, maxTokensEnv: "DRYDOCK_META_MAX_TOKENS", maxTokens: c.MetaMaxTokens, timeoutEnv: "DRYDOCK_META_TIMEOUT", timeout: c.MetaTimeout},
+		{name: "sec70b", baseURLEnv: "DRYDOCK_SEC70B_BASE_URL", modelEnv: "DRYDOCK_SEC70B_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.Sec70BBaseURL, model: c.Sec70BModel, apiKey: c.EffectiveLLMAPIKey(""), maxTokensEnv: "DRYDOCK_SEC70B_MAX_TOKENS", maxTokens: c.Sec70BMaxTokens, timeoutEnv: "DRYDOCK_SEC70B_TIMEOUT", timeout: c.Sec70BTimeout},
+		{name: "secclassify", baseURLEnv: "DRYDOCK_SECCLASSIFY_BASE_URL", modelEnv: "DRYDOCK_SECCLASSIFY_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecClassifyBaseURL, model: c.SecClassifyModel, apiKey: c.EffectiveLLMAPIKey(""), maxTokensEnv: "DRYDOCK_SECCLASSIFY_MAX_TOKENS", maxTokens: c.SecClassifyMaxTokens, timeoutEnv: "DRYDOCK_SECCLASSIFY_TIMEOUT", timeout: c.SecClassifyTimeout},
+		{name: "seclocalize", baseURLEnv: "DRYDOCK_SECLOCALIZE_BASE_URL", modelEnv: "DRYDOCK_SECLOCALIZE_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecLocalizeBaseURL, model: c.SecLocalizeModel, apiKey: c.EffectiveLLMAPIKey(""), maxTokensEnv: "DRYDOCK_SECLOCALIZE_MAX_TOKENS", maxTokens: c.SecLocalizeMaxTokens, timeoutEnv: "DRYDOCK_SECLOCALIZE_TIMEOUT", timeout: c.SecLocalizeTimeout},
+		{name: "agentic-discovery", baseURLEnv: "DRYDOCK_AGENTIC_DISCOVERY_BASE_URL", modelEnv: "DRYDOCK_AGENTIC_DISCOVERY_MODEL", keyEnv: "DRYDOCK_AGENTIC_DISCOVERY_API_KEY", baseURL: c.AgenticDiscoveryBaseURL, model: c.AgenticDiscoveryModel, apiKey: c.EffectiveLLMAPIKey(c.AgenticDiscoveryAPIKey), maxTokensEnv: "DRYDOCK_AGENTIC_DISCOVERY_MAX_TOKENS", maxTokens: c.AgenticDiscoveryMaxTokens, timeoutEnv: "DRYDOCK_AGENTIC_DISCOVERY_TIMEOUT", timeout: c.AgenticDiscoveryTimeout},
 	}
 }
 
