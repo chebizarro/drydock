@@ -6,7 +6,7 @@ Drydock is designed as a single-instance service backed by SQLite. This document
 
 ### 1. LLM Inference (Primary)
 
-Each patch requires two LLM calls (planner + reviewer) and optionally a third (meta-review). With a 120-second HTTP timeout per call, a single review can take up to 4–5 minutes under load.
+Each patch requires two LLM calls (planner + reviewer) and optionally a third (meta-review). With the default 180-second per-call timeout (`DRYDOCK_LLM_TIMEOUT`), a single review can take up to 6–9 minutes under load.
 
 **Impact**: This is the primary throughput limiter. With 2 pipeline workers and a single Ollama instance, Drydock processes roughly 10–30 patches per hour depending on model size and GPU.
 

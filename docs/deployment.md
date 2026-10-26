@@ -210,7 +210,7 @@ Any OpenAI-compatible `/embeddings` endpoint works (e.g., vLLM, TEI, OpenAI API)
 - [ ] **Secrets**: Never commit `.env` files. Use Docker secrets, Vault, or environment injection
 - [ ] **Database backups**: Back up both `drydock_data` and `qdrant_storage` volumes regularly
 - [ ] **Repo cache sizing**: Set `DRYDOCK_REPO_CACHE_MAX_SIZE_MB` based on available disk. Repos range from 10 MB to 2 GB each
-- [ ] **LLM timeouts**: The HTTP client has a 120-second timeout per request. Ensure your GPU can complete inference within this window for the models you're using
+- [ ] **LLM timeouts**: Each LLM call has a per-call timeout, `DRYDOCK_LLM_TIMEOUT` (default `180s`), with per-role overrides such as `DRYDOCK_CODER32B_TIMEOUT`. Ensure your GPU can complete inference within it for the models you're using; timed-out calls are not retried. See [LLM call timeout](configuration.md#llm-call-timeout)
 - [ ] **Log level**: Use `info` in production. `debug` logs raw LLM responses and is very verbose
 - [ ] **Health monitoring**: Point your orchestrator's health checks at:
   - `GET /readyz` on port 8081 (drydock-core)

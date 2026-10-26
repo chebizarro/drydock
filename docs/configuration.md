@@ -185,8 +185,61 @@ measurements from the local-model benchmark:
 | Thinking on | up to ~19k tokens | `24576` |
 
 Keep prompt tokens plus the cap within each endpoint's context window. Also
-remember that each LLM request has a 120-second HTTP timeout, so a cap your
-hardware cannot generate within that time still ends in a timeout.
+remember that each LLM call has a [per-call timeout](#llm-call-timeout), so a
+cap your hardware cannot generate within that time still ends in a timeout.
+
+### LLM call timeout
+
+A deadline for one LLM call: one `/chat/completions` request, from sending
+the prompt to reading the last byte of the response. It covers single-shot
+calls, JSON repair calls and each agentic turn separately. It is not a
+deadline for a whole review.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_LLM_TIMEOUT` | Go duration | `180s` | Global per-call timeout. |
+| `DRYDOCK_PLANNER_TIMEOUT` | Go duration | *(inherits global)* | Planner and walkthrough calls. The conversation and code-chat handlers also use the planner endpoint. |
+| `DRYDOCK_CODER32B_TIMEOUT` | Go duration | *(inherits global)* | coder32b reviewer route. |
+| `DRYDOCK_LLM70B_TIMEOUT` | Go duration | *(inherits global)* | llm70b reviewer route. |
+| `DRYDOCK_CODER14B_TIMEOUT` | Go duration | *(inherits global)* | coder14b reviewer route. |
+| `DRYDOCK_SEC70B_TIMEOUT` | Go duration | *(inherits global)* | sec70b route and the security verifier. |
+| `DRYDOCK_SECCLASSIFY_TIMEOUT` | Go duration | *(inherits global)* | secclassify route and the security classifier. |
+| `DRYDOCK_SECLOCALIZE_TIMEOUT` | Go duration | *(inherits global)* | seclocalize route and the audit localizer. |
+| `DRYDOCK_META_TIMEOUT` | Go duration | *(inherits global)* | Meta-review and prompt refinement. |
+| `DRYDOCK_AGENTIC_DISCOVERY_TIMEOUT` | Go duration | *(inherits `DRYDOCK_CODER32B_TIMEOUT`)* | Each agentic discovery turn. Its fallback matches the discovery base URL and model. Agentic reviewer turns use the timeout of the reviewer route they run on. |
+
+Values use Go duration syntax (`90s`, `4m`, `2m30s`). A bare number such as
+`180` has no unit and is rejected. Each value must be greater than zero and at
+most `30m`; anything else fails startup validation.
+
+**Sizing.** The default was 120 seconds until local GPUs proved it too short.
+On 2× Tesla P40 a reviewer call prefills a 5–15k-token bundle and decodes
+~1–4k tokens at roughly 10–30 tok/s, so a normal review can run 2–3 minutes.
+A thinking-mode review can produce up to ~19k tokens and needs more time. To
+size a role's timeout, divide its completion-token cap by your decode speed
+and add the prefill time. For example, 24576 tokens at 20 tok/s is about
+20 minutes. Use `drydock-bench` to measure this; its `calls_over_prod_timeout`
+counts calls slower than the configured timeout for their role.
+
+**Retries and surrounding deadlines.**
+
+- A timed-out call is **not retried**. Drydock's retry wrapper retries only
+  HTTP 429, 5xx and connection errors. A call that ran out of time on slow
+  hardware would likely run out again, and retrying would multiply the wait.
+- Each retry of a transient failure gets its own full timeout. The circuit
+  breaker counts a timeout as one failure.
+- The per-call deadline is derived from the caller's context, so it can only
+  shorten a review's deadline, never extend it. Retries stop as soon as that
+  context ends, even during backoff. A review bounded by
+  `DRYDOCK_IDE_AGENTIC_TIMEOUT` (`10m` by default) therefore ends at that
+  deadline whatever the per-call timeout and retry count are.
+- Startup validation warns when a timeout is not shorter than
+  `DRYDOCK_IDE_AGENTIC_TIMEOUT`, because one slow call could then use the
+  whole IDE review budget.
+- Pipeline reviews from Nostr events have no review-level deadline. Their
+  worst case is per-call timeout × attempts (3 for review and meta-review
+  calls, 2 for conversation replies) plus backoff, for each LLM call the
+  review makes.
 
 ### Model name verification
 
