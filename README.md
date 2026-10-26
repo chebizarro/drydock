@@ -31,20 +31,19 @@ Drydock is Nostr-native. See [Nostr Event Kinds](docs/event-kinds.md) for the cu
 
 ## Quick Start
 
-```bash
-# Clone and build
-git clone https://github.com/user/drydock.git && cd drydock
-go build ./...
+The full walkthrough, from an empty host to a verified reviewing instance, is **[Deploying Drydock](docs/deployment.md)**. In short:
 
-# Configure
-cp .env.example .env
-# Edit .env — set your signing identity and LLM endpoints
+1. **Serve a model.** Run llama.cpp with qwen3.8-27b (thinking off) on a 24 GB GPU; see [Local Models](docs/local-models.md).
+2. **Create a signer.** Give Drydock a Nostr identity behind a NIP-46 bunker (or an nsec file).
+3. **Choose repositories.** Publish the monitored-repositories list (kind 30001, `d=drydock:monitored-repositories:v1`) naming the repositories to review.
+4. **Configure and run:**
 
-# Run
-go run ./cmd/drydock
-```
-
-See [Deployment](docs/deployment.md) for Docker, multi-GPU, and production setups.
+   ```bash
+   git clone https://git.sharegap.net/cascadia/drydock.git && cd drydock
+   cp .env.example .env          # set relays, signer, operator pubkey, model endpoints
+   docker compose up -d --build  # drydock-core + qdrant
+   curl -fsS http://127.0.0.1:8081/readyz
+   ```
 
 On startup, Drydock also maintains a kind 0 profile for its signing identity — publishing name, about text, and an icon/banner pushed to a Blossom media server — and refreshes it whenever the configured metadata changes. Repositories can tune review behavior (severity floor, reviewed statuses, custom instructions, auto-fix, ensemble mode) by committing a [`.drydock.yaml`](docs/repo-config.md).
 
@@ -52,18 +51,23 @@ On startup, Drydock also maintains a kind 0 profile for its signing identity —
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| Go | 1.26+ | `CGO_ENABLED=0` — no C toolchain needed |
-| Git | any | Used at runtime for clone, fetch, grep |
-| Ollama (or compatible) | any | OpenAI-compatible `/chat/completions` endpoint |
+| Docker + Compose | Compose v2.24+ | Recommended way to run; the image bundles git, ripgrep and betterleaks |
+| Go (native builds) | 1.26+ | Build with `CGO_ENABLED=1` and a C compiler (tree-sitter symbol extraction; without CGO it falls back to regexes) |
+| Git, ripgrep | any | Used at runtime for clone, fetch, grep and call-site search |
+| An OpenAI-compatible LLM server | — | llama.cpp (recommended), Ollama or vLLM; see [Local Models](docs/local-models.md) |
+| A Nostr signer and relays | — | NIP-46 bunker recommended |
 
 ## Configuration
 
 All configuration is via `DRYDOCK_*` environment variables. See the full reference: **[docs/configuration.md](docs/configuration.md)**
 
-Key settings:
-- `DRYDOCK_SIGNER_BUNKER_URL` or `DRYDOCK_SIGNER_NSEC` — Nostr signing identity
+Templates: [`.env.example`](.env.example) (development with local models) and [`.env.production.example`](.env.production.example). Key settings:
+- `DRYDOCK_ENV` — `development` or `production` (production enforces TLS, API keys and explicit configuration)
 - `DRYDOCK_RELAYS` — comma-separated relay URLs
-- `DRYDOCK_PLANNER_BASE_URL`, `DRYDOCK_LLM70B_BASE_URL`, etc. — LLM endpoints
+- `DRYDOCK_MONITORED_REPOS_AUTHOR` — who publishes the list of repositories to review
+- `DRYDOCK_SIGNER_BUNKER_URL` or `DRYDOCK_SIGNER_NSEC_FILE` — Drydock's signing identity
+- `DRYDOCK_{PLANNER,CODER32B,LLM70B,CODER14B,META}_BASE_URL` / `_MODEL` — LLM endpoints
+- `DRYDOCK_AGENTIC_REVIEW_FALLBACK`, `DRYDOCK_LLM_TIMEOUT` — tune for your GPU
 
 ## Documentation
 
@@ -73,7 +77,8 @@ Key settings:
 |----------|-------------|
 | [Architecture](docs/architecture.md) | Component map, data flow, state machine, concurrency model |
 | [Configuration](docs/configuration.md) | Complete environment variable reference |
-| [Deployment](docs/deployment.md) | Native, Docker, signing, LLM setup, production hardening |
+| [Deployment](docs/deployment.md) | Step-by-step self-hosting: models, signer, monitored repos, Docker/native/systemd, verification, production TLS, operations, troubleshooting |
+| [Local Models](docs/local-models.md) | Which models to run per role, llama.cpp/Ollama/vLLM serving, hardware profiles, context, timeouts, agentic vs single-shot |
 | [Nostr Protocol](docs/nostr-protocol.md) | Subscribed kinds, NIP-42 AUTH, comment structure, publishing rules |
 | [Nostr Event Kinds](docs/event-kinds.md) | Current Nostr-native event kinds, tag conventions, deprecated kind replacements |
 | [ContextVM Integration](docs/contextvm-integration.md) | Kind 25910 JSON-RPC methods for review, fix, and marketplace commands |

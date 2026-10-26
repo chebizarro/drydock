@@ -13,7 +13,7 @@ logs:
 	$(COMPOSE) logs -f $(SERVICE)
 
 eval:
-	DRYDOCK_MODE=eval $(COMPOSE) run --rm $(SERVICE)
+	$(COMPOSE) run --rm -e DRYDOCK_MODE=eval $(SERVICE)
 
 build:
 	CGO_ENABLED=1 go build ./...

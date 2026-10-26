@@ -717,6 +717,10 @@ bd close <id>         # Complete work
 
 Drydock uses an operator-authored NIP-51 kind-30001 list for reactive repository monitoring, kind `30078` for IDE session state, kind `25910` for ContextVM requests and notifications (including `review/order` and `marketplace/feedback`), kind `31990` for reviewer profiles, and NIP-59 gift-wrap (`1059`) for private payloads. NIP-90 kinds `5900`, `6900`, and `7000` are retired.
 
+## Deploying
+
+To deploy or operate Drydock (rather than develop it), follow [docs/deployment.md](docs/deployment.md) step by step. It covers model serving ([docs/local-models.md](docs/local-models.md)), the signer, the monitored-repositories list, configuration ([docs/configuration.md](docs/configuration.md), templates `.env.example` and `.env.production.example`), running, verification and troubleshooting. Each step ends with a check; run it before moving on.
+
 ## Build & Test
 
 Use the Makefile targets — they carry flags the bare `go` commands do not.

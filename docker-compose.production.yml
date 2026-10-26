@@ -1,0 +1,34 @@
+# Production overlay: Qdrant with an API key and TLS, and a CA bundle drydock
+# trusts. Production mode requires https:// and an API key for Qdrant.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.production.yml up -d --build
+#
+# Before starting, create (see docs/deployment.md, "Production TLS"):
+#   ./tls/qdrant/tls.crt, ./tls/qdrant/tls.key  certificate for the name "qdrant"
+#   ./tls/ca-bundle.pem   public roots PLUS your private CA (SSL_CERT_FILE replaces
+#                         the system roots, so relays and git hosts need them too)
+# and set in .env:
+#   DRYDOCK_QDRANT_URL=https://qdrant:6333
+#   DRYDOCK_QDRANT_API_KEY=<secret>
+
+services:
+  qdrant:
+    environment:
+      QDRANT__SERVICE__API_KEY: ${DRYDOCK_QDRANT_API_KEY:?Set DRYDOCK_QDRANT_API_KEY in .env for production}
+      QDRANT__SERVICE__ENABLE_TLS: "true"
+      QDRANT__TLS__CERT: /qdrant/tls/tls.crt
+      QDRANT__TLS__KEY: /qdrant/tls/tls.key
+    volumes:
+      - ./tls/qdrant:/qdrant/tls:ro
+    # The base healthcheck probes plain HTTP, which TLS breaks.
+    healthcheck:
+      disable: true
+
+  drydock-core:
+    depends_on:
+      qdrant:
+        condition: service_started
+    environment:
+      SSL_CERT_FILE: /run/drydock-tls/ca-bundle.pem
+    volumes:
+      - ./tls/ca-bundle.pem:/run/drydock-tls/ca-bundle.pem:ro

@@ -41,3 +41,8 @@ extensions/vscode-drydock/out/
 
 # Preserved full-res logo original (kept on disk, out of history)
 docs/assets/logo-original.png
+
+# Local deployment material (docs/deployment.md): never commit keys or certificates
+secrets/
+tls/
+docker-compose.override.yml

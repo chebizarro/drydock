@@ -26,7 +26,7 @@ Git clone, fetch, and grep operations are I/O-bound. A per-repo mutex prevents c
 
 The `DRYDOCK_PIPELINE_WORKERS` environment variable controls the number of concurrent review workers (default: 2).
 
-**When to increase**: Only if your LLM infrastructure supports concurrent inference requests. With a single Ollama instance, requests are queued at the inference server — more workers just move the queue from Drydock to Ollama without improving throughput.
+**When to increase**: Only if your LLM infrastructure supports concurrent inference requests, such as llama-server started with `-np N` (and memory for N contexts), several servers, or vLLM batching. With a single-slot server, requests queue at the inference server, so more workers just move the queue from Drydock to the server without improving throughput. See [Local Models](local-models.md#splitting-roles-across-servers).
 
 **Recommended settings**:
 

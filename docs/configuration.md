@@ -1,17 +1,42 @@
 # Configuration Reference
 
-All configuration is via environment variables with the `DRYDOCK_` prefix. Agentic loop, snapshot/session, IDE workspace-binding, and MCP HTTP variables and defaults are listed in [Agentic Review Operations](agentic-review.md#operator-configuration). Copy `.env.example` as a starting point:
+All configuration is via environment variables, almost all with the `DRYDOCK_` prefix. This page lists every variable `cmd/drydock` reads, plus those of the optional sidecars. Start from a template:
 
 ```bash
-cp .env.example .env
+cp .env.example .env               # development, local models
+cp .env.production.example .env    # production
 ```
+
+For the step-by-step setup see [Deploying Drydock](deployment.md); for model choice and serving see [Local Models](local-models.md). Drydock validates the whole configuration at startup, logs every error and warning, and exits if there is any error.
 
 ## Runtime
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| `DRYDOCK_ENV` | string | *(empty)* | `production` (or `prod`) enables [production mode](#production-mode). Anything else, typically `development`, is development mode. |
+| `DRYDOCK_PRODUCTION` | boolean | `false` | `true` also enables production mode, whatever `DRYDOCK_ENV` says. |
+| `DEV_MODE` / `DRYDOCK_DEV_MODE` | boolean | `false` | Parsed but currently has no effect. Development behaviour comes from not being in production mode. |
 | `DRYDOCK_MODE` | `listener` \\| `eval` \\| `drift-guard` | `listener` | Deployment mode. `scripts/entrypoint.sh` routes `eval` to `cmd/drydock-eval`; `listener` and `drift-guard` both exec `cmd/drydock`, which also reads `DRYDOCK_MODE` itself (`main.go`) and switches into the drift-guard subcommands (`export`/`flag`/`list`) when it is `drift-guard`. |
 | `DRYDOCK_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` | Structured JSON log level. `debug` is verbose and includes raw LLM responses. |
+
+### Process environment (not `DRYDOCK_`-prefixed)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TIKTOKEN_CACHE_DIR` | `$TMPDIR/data-gym-cache` (Compose sets `/data/tiktoken-cache`) | Where the `cl100k_base` tokenizer file is cached after its first download. Startup fails without it in every mode, so put it on persistent storage and pre-seed it on air-gapped hosts ([Tokenizer cache](deployment.md#tokenizer-cache)). |
+| `SSL_CERT_FILE` | system roots | PEM bundle Drydock trusts for HTTPS. It **replaces** the system roots, so a bundle for a private CA must also contain the public roots that relays and git hosts need ([Production TLS](deployment.md#production-tls)). |
+
+### Production mode
+
+With `DRYDOCK_ENV=production` (or `DRYDOCK_PRODUCTION=true`), startup fails unless:
+
+- relays are set explicitly (`DRYDOCK_RELAYS`, or both `DRYDOCK_READ_RELAYS` and `DRYDOCK_WRITE_RELAYS`) and include none of the built-in public relays;
+- `DRYDOCK_MONITORED_REPOS_AUTHOR` is a valid public key, and a signer is configured;
+- the planner, coder32b, llm70b, coder14b and meta endpoints each have an explicit `*_BASE_URL`, `*_MODEL` and an API key (`DRYDOCK_LLM_API_KEY` or the per-role key). The built-in model defaults are empty in production;
+- every configured LLM (including the optional security and agentic-discovery endpoints), Qdrant, embedding and version-registry URL uses `https://` and is not localhost or loopback;
+- `DRYDOCK_QDRANT_URL`, `DRYDOCK_QDRANT_API_KEY`, `DRYDOCK_EMBED_BASE_URL`, `DRYDOCK_EMBED_MODEL` and `DRYDOCK_EMBED_API_KEY` are set.
+
+An empty `DRYDOCK_TRUSTED_ZAPPERS` only warns. Development mode relaxes all of these; missing optional services become warnings.
 
 ## Database & Storage
 
@@ -21,6 +46,8 @@ cp .env.example .env
 | `DRYDOCK_REPO_CACHE_DIR` | path | `repos` | Directory for cloned git repositories. |
 | `DRYDOCK_REPO_CACHE_MAX_COUNT` | integer | `50` | Maximum number of cached repositories before LRU eviction. Set to `0` to disable count-based eviction. |
 | `DRYDOCK_REPO_CACHE_MAX_SIZE_MB` | integer | `10240` | Maximum total cache size in MB (default 10 GB). Set to `0` to disable size-based eviction. |
+| `DRYDOCK_PR_DIFF_MAX_FILES` | integer | `1000` | Pull requests whose computed diff touches more files are rejected rather than truncated. |
+| `DRYDOCK_PR_DIFF_MAX_BYTES` | integer | `10485760` | Same, by diff size in bytes (10 MiB). |
 
 ## Repository Monitoring and Security Ceiling
 
@@ -71,6 +98,10 @@ All request counts must be at least 1 and all windows must be positive. Limits a
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_FREE_PUBKEYS` | comma-separated public keys | *(empty)* | Patch authors that bypass payment gating for every repository. Accepts npub or 64-character hex public keys and normalizes npub values to hex. |
+| `DRYDOCK_TRUSTED_ZAPPERS` | comma-separated public keys | *(empty)* | Zapper (LNURL provider) public keys whose zap receipts are accepted as payment. Empty rejects all zap receipts (warning in production). |
+| `DRYDOCK_NWC_CONNECTION_STRING` | string (secret) | *(empty)* | Nostr Wallet Connect URI used to authorize paid reviews. |
+| `DRYDOCK_CASHU_TRUSTED_MINTS` | comma-separated URLs | *(empty)* | Cashu mints whose tokens are accepted. Falls back to `DRYDOCK_CASHU_MINT_URL`. Setting NWC without a trusted mint, or the reverse, logs a warning. |
+| `DRYDOCK_CASHU_MINT_URL` | comma-separated URLs | *(empty)* | Legacy name for the trusted mint list, used when `DRYDOCK_CASHU_TRUSTED_MINTS` is empty. |
 
 Repository-specific payment policy, free pubkeys, maintainer access, pricing, quota, and subscriptions are configured under `payments` in `.drydock.yaml`; see [Payments](payments.md) and [Per-Repository Configuration](repo-config.md).
 
@@ -95,25 +126,27 @@ Drydock supports separate relay lists for reading (subscribing to events) and wr
 
 ## Signing
 
-Drydock needs a Nostr identity to sign review comments. Two signing methods are supported, checked in priority order:
+Drydock signs review comments with its own Nostr identity. It uses the first signer configured, in this order:
 
-1. **NIP-46 Bunker** (recommended for production) — key never touches disk
-2. **Local nsec** — for development and testing only
+1. **NIP-46 bunker** (recommended): the key stays in the signer.
+2. **Local nsec**, from `DRYDOCK_SIGNER_NSEC_FILE` (preferred) or `DRYDOCK_SIGNER_NSEC`.
 
-If none is configured, the listener and ingest pipeline still run, but the review pipeline is disabled (no reviews are published).
+With no signer, production mode fails validation. Development mode starts listen-only: events are ingested, but the review pipeline is disabled and nothing is published. See [step 2 of the deployment guide](deployment.md#step-2-create-drydocks-nostr-identity-and-signer) for creating keys and running a bunker.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DRYDOCK_SIGNER_BUNKER_URL` | string | *(empty)* | NIP-46 bunker URL (`bunker://...`) or NIP-05 bunker identifier. Checked first. |
-| `DRYDOCK_SIGNER_NSEC` | string | *(empty)* | Raw nsec bech32 key or 64-character hex private key. **Warning**: this is a plaintext secret. Use Docker secrets or a secrets manager in production. Checked last. |
+| `DRYDOCK_SIGNER_BUNKER_URL` | string | *(empty)* | NIP-46 bunker URL (`bunker://<signer-pubkey>?relay=wss://...&secret=...`) or a NIP-05 bunker identifier. Used first when set. |
+| `DRYDOCK_SIGNER_NSEC_FILE` | path | *(empty)* | File containing the nsec (bech32) or 64-character hex private key, for example a mounted Docker secret. Overrides `DRYDOCK_SIGNER_NSEC`. |
+| `DRYDOCK_SIGNER_NSEC` | string (secret) | *(empty)* | The key itself. It's a plaintext secret in the environment, so prefer the file or a bunker. |
 
 ## LLM Endpoints
 
-Drydock uses OpenAI-compatible `/chat/completions` endpoints. Five model slots are configured independently — they can all point to the same Ollama instance or be spread across multiple servers.
+Drydock uses OpenAI-compatible `/chat/completions` endpoints. Five core model slots are configured independently. They can all point at the same server, as [Local Models](local-models.md) recommends for one GPU, or be spread across servers. The defaults below apply in development mode only; in production they are empty and must be set. The defaults name older models that benchmark poorly, so set every slot explicitly; see [Which models](local-models.md#which-models).
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_LLM_API_KEY` | string | *(empty)* | Shared API key for all LLM endpoints. Sent as `Authorization: Bearer <key>`. |
+| `DRYDOCK_PLANNER_API_KEY`, `DRYDOCK_CODER32B_API_KEY`, `DRYDOCK_LLM70B_API_KEY`, `DRYDOCK_CODER14B_API_KEY` | string | *(falls back to `DRYDOCK_LLM_API_KEY`)* | Per-role keys, when roles use different servers. |
 | `DRYDOCK_PLANNER_BASE_URL` | URL | `http://127.0.0.1:11434/v1` | Base URL for the planner model (lightweight, selects review route). |
 | `DRYDOCK_PLANNER_MODEL` | string | `qwen2.5-coder-14b-instruct-q4_k_m` | Model name for planner requests. |
 | `DRYDOCK_CODER32B_BASE_URL` | URL | `http://127.0.0.1:11434/v1` | Base URL for the 32B coder model (complex code, multi-file). |
@@ -141,6 +174,17 @@ DRYDOCK_META_MAX_INPUT_BYTES=131072
 Use the exact model identifier served by your provider and size the input
 budget below that model's context limit, leaving room for the local-review
 JSON, system prompt, and completion.
+
+### Security and agentic-discovery endpoints (optional)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_SEC70B_BASE_URL`, `DRYDOCK_SEC70B_MODEL` | URL, string | *(empty; the sec70b route then uses the llm70b endpoint)* | Deep security reviewer route ([Security Review](security-review.md)). |
+| `DRYDOCK_SECCLASSIFY_BASE_URL`, `DRYDOCK_SECCLASSIFY_MODEL` | URL, string | *(empty)* | CWE classification and severity calibration route. |
+| `DRYDOCK_SECLOCALIZE_BASE_URL`, `DRYDOCK_SECLOCALIZE_MODEL` | URL, string | *(empty)* | Vulnerability localization route (audits). |
+| `DRYDOCK_AGENTIC_DISCOVERY_BASE_URL`, `DRYDOCK_AGENTIC_DISCOVERY_MODEL`, `DRYDOCK_AGENTIC_DISCOVERY_API_KEY` | URL, string, string | *(the coder32b endpoint, model and key)* | Model for the agentic context-discovery loop. |
+
+The security endpoints use `DRYDOCK_LLM_API_KEY`. In production every configured endpoint must be HTTPS and not loopback.
 
 ### Completion token cap
 
@@ -253,17 +297,71 @@ value produces warnings, not mislabeled reviews.
 
 ### Single-Endpoint Pattern
 
-For development or single-GPU deployments, point all endpoints to the same Ollama instance:
+For one GPU, point every slot at the same server and model, for example one llama-server serving `qwen3.8-27b` ([Local Models](local-models.md#serving-with-llamacpp-recommended)):
 
 ```bash
-DRYDOCK_PLANNER_BASE_URL=http://127.0.0.1:11434/v1
-DRYDOCK_CODER32B_BASE_URL=http://127.0.0.1:11434/v1
-DRYDOCK_LLM70B_BASE_URL=http://127.0.0.1:11434/v1
-DRYDOCK_CODER14B_BASE_URL=http://127.0.0.1:11434/v1
-DRYDOCK_META_BASE_URL=http://127.0.0.1:11434/v1
+DRYDOCK_PLANNER_BASE_URL=http://127.0.0.1:8080/v1
+DRYDOCK_CODER32B_BASE_URL=http://127.0.0.1:8080/v1
+DRYDOCK_LLM70B_BASE_URL=http://127.0.0.1:8080/v1
+DRYDOCK_CODER14B_BASE_URL=http://127.0.0.1:8080/v1
+DRYDOCK_META_BASE_URL=http://127.0.0.1:8080/v1
+# and DRYDOCK_{PLANNER,CODER32B,LLM70B,CODER14B,META}_MODEL=qwen3.8-27b
 ```
 
-This works but serializes all LLM calls through one instance — see [Scaling](scaling.md) for multi-endpoint setups.
+This serializes LLM calls through one server; see [Splitting roles across servers](local-models.md#splitting-roles-across-servers) and [Scaling](scaling.md).
+
+## Agentic Review
+
+The default review path is agentic ([Agentic Review Operations](agentic-review.md)). On modest local GPUs, start with `DRYDOCK_AGENTIC_REVIEW_FALLBACK=true`; see [Agentic or single-shot review](local-models.md#agentic-or-single-shot-review).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_AGENTIC_REVIEW_FALLBACK` | boolean | `false` | `true` uses the deterministic context builder plus a single-shot review (about 3 LLM calls per review) instead of the agentic loops. |
+| `DRYDOCK_AGENTIC_DISCOVERY_MAX_TURNS` | integer | `24` | Discovery turn limit. |
+| `DRYDOCK_AGENTIC_DISCOVERY_MAX_TOOL_CALLS` | integer | `96` | Discovery tool-call limit. |
+| `DRYDOCK_AGENTIC_DISCOVERY_MAX_CUMULATIVE_TOKENS` | integer | `256000` | Discovery cumulative-token limit. It re-counts the whole prompt each turn. |
+| `DRYDOCK_AGENTIC_REVIEWER_MAX_TURNS` | integer | `20` | Reviewer turn limit. |
+| `DRYDOCK_AGENTIC_REVIEWER_MAX_TOOL_CALLS` | integer | `96` | Reviewer tool-call limit. |
+| `DRYDOCK_AGENTIC_REVIEWER_MAX_CUMULATIVE_TOKENS` | integer | `384000` | Reviewer cumulative-token limit. |
+| `DRYDOCK_AGENTIC_MAX_TOOL_RESULT_BYTES` | integer | `16384` | Per-tool result size ceiling. |
+| `DRYDOCK_AGENTIC_MAX_MODEL_CONTEXT` | integer | `256000` | A turn whose serialized request exceeds this is rejected before sending. Set it to your server's real context size. |
+| `DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET` | integer | `64000` | Token budget of the finalized context package (also gates the fallback bundle). |
+| `DRYDOCK_AGENTIC_TOKEN_HEADROOM` | float | `0.10` | Fraction of the package budget reserved for tokenizer/model skew (0 ≤ x < 1). |
+| `DRYDOCK_AGENTIC_HISTORY_TOKEN_BUDGET` | integer | `64000` | Compacted conversation-history budget for continued sessions. |
+| `DRYDOCK_IDE_AGENTIC_TIMEOUT` | duration | `10m` | End-to-end deadline for an IDE review or continuation. |
+| `DRYDOCK_IDE_WORKSPACE_BINDINGS` | list | *(empty)* | Comma-separated `lowercase-hex-pubkey=/absolute/workspace` bindings for inline IDE reviews; repeat a pubkey for several roots. Empty disables inline filesystem review. |
+| `DRYDOCK_REVIEW_SNAPSHOT_STORAGE_PATH` | path | `<DRYDOCK_REPO_CACHE_DIR>/review-snapshots` | Frozen review snapshots. |
+| `DRYDOCK_REVIEW_SNAPSHOT_TTL` | duration | `24h` | Lifetime of an unleased snapshot. |
+| `DRYDOCK_REVIEW_SNAPSHOT_LEASE_TTL` | duration | `24h` | Default lease lifetime; must be at least the session lifetime. |
+| `DRYDOCK_REVIEW_SESSION_LIFETIME` | duration | `24h` | Review-session lifetime. |
+| `DRYDOCK_REVIEW_SNAPSHOT_GC_INTERVAL` | duration | `15m` | Session-expiry and snapshot garbage-collection cadence. |
+
+All integer limits must be positive.
+
+### MCP HTTP (optional)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_MCP_HTTP_ENABLED` | boolean | `false` | Serve the read-only MCP tool surface over authenticated Streamable HTTP. |
+| `DRYDOCK_MCP_HTTP_ADDR` | `host:port` | `127.0.0.1:8090` | Listen address. |
+| `DRYDOCK_MCP_HTTP_BEARER_TOKEN` | string (secret) | *(empty)* | Required when enabled. |
+| `DRYDOCK_MCP_HTTP_SESSION_ID` | string | *(empty)* | Required when enabled: the 32-character ID of a server-created review session. |
+| `DRYDOCK_MCP_MAX_REQUEST_BODY_BYTES` | integer | `4194304` | Request-body ceiling. |
+| `DRYDOCK_MCP_SHUTDOWN_TIMEOUT` | duration | `30s` | Graceful shutdown deadline. |
+
+Don't expose the MCP listener publicly without TLS termination.
+
+## Security Review
+
+See [Security Review](security-review.md) for what these enable.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_SECURITY_ENABLED` | boolean | `false` | Parsed but not currently consulted. The security stage is enabled per repository through the `security:` section of `.drydock.yaml` ([Security Review §10.1](security-review.md#101-drydockyaml--new-security-section)). |
+| `DRYDOCK_SECURITY_AUDIT_WORKERS` | integer | `2` | Concurrent full-repository audits. |
+| `DRYDOCK_SECURITY_NOSTR_ENABLED` | `auto` \| `true` \| `false` | `auto` | Operator switch for the Nostr security lens. `false` disables it everywhere. `auto` and `true` leave it to each repository's `.drydock.yaml` Nostr setting. Invalid values fail closed to `false`. |
+| `DRYDOCK_SECURITY_NOSTR_PROBE_TARGETS` | comma-separated | *(empty)* | Targets for the Nostr protocol probe. |
+| `DRYDOCK_SECURITY_NOSTR_PROBE_ACTIVE` | boolean | `false` | Allow active probing of those targets (sends traffic to them). |
 
 ## Qdrant Vector Store (Optional)
 
@@ -272,7 +370,9 @@ Qdrant provides vector similarity search for NIP spec retrieval, project documen
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_QDRANT_URL` | URL | *(empty)* | Qdrant REST API endpoint (e.g., `http://qdrant:6333`). Empty disables all RAG features. |
-| `DRYDOCK_QDRANT_API_KEY` | string | *(empty)* | API key for Qdrant authentication. Not needed for local/Docker deployments. |
+| `DRYDOCK_QDRANT_API_KEY` | string | *(empty)* | API key for Qdrant authentication. Optional in development, required in production. |
+| `DRYDOCK_QDRANT_COLLECTION_NIP_SPECS`, `_PROJECT_DOCS`, `_FEW_SHOT`, `_CODE_CHUNKS` | string | `nip_specs`, `project_docs`, `few_shot_reviews`, `code_chunks` | Collection names (letters, digits, `_`, `-`). Override them to share one Qdrant between deployments. |
+| `DRYDOCK_QDRANT_RESULTS_PER_COLLECTION` | integer | `3` | Retrieved results per collection. |
 
 Drydock auto-creates four collections on startup:
 - `nip_specs` — Nostr Improvement Proposal documentation chunks
@@ -291,6 +391,19 @@ Required when Qdrant is enabled. Any OpenAI-compatible `/embeddings` endpoint wo
 | `DRYDOCK_EMBED_API_KEY` | string | *(empty)* | API key for the embedding endpoint. |
 | `DRYDOCK_EMBED_DIMENSION` | integer | `768` | Embedding vector dimension; must match the configured model and existing Qdrant collections. |
 
+Qdrant and embeddings must be configured together; setting only one disables retrieval with a warning.
+
+### Chartroom retrieval (optional)
+
+An alternative retrieval backend appended to the context bundle ([Context Builder](context-builder.md)).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_CHARTROOM_URL` | URL | *(empty)* | Chartroom service endpoint. Empty disables it. |
+| `DRYDOCK_CHARTROOM_TOKEN` | string (secret) | *(falls back to `CHARTROOM_HTTP_BEARER_TOKEN`)* | Bearer token. A URL without a token warns. |
+| `DRYDOCK_CHARTROOM_CORPUS_IDS` | comma-separated | *(empty)* | Corpora to query. |
+| `DRYDOCK_CHARTROOM_SOURCE_IDS` | comma-separated | *(falls back to `DRYDOCK_CHARTROOM_SOURCES`)* | Sources to query. |
+
 ## LSP Bridge (Optional)
 
 The LSP bridge is a separate HTTP service that manages language servers for type-aware symbol analysis. Activate via the `lsp` Docker profile.
@@ -298,6 +411,48 @@ The LSP bridge is a separate HTTP service that manages language servers for type
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_LSP_BRIDGE_URL` | URL | *(empty)* | LSP bridge endpoint (e.g., `http://lsp-bridge:8082`). Empty disables LSP-enhanced analysis; drydock falls back to tree-sitter + ripgrep. |
+| `DRYDOCK_LSP_BRIDGE_TOKEN` | string (secret) | *(falls back to `LSP_BRIDGE_AUTH_TOKEN`)* | Bearer token Drydock sends to the bridge. |
+
+The bridge itself (`cmd/lsp-bridge`) reads:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LSP_BRIDGE_ADDR` | `127.0.0.1:8082` | Listen address (the Compose image listens on all interfaces inside the container network). |
+| `LSP_BRIDGE_AUTH_TOKEN` / `LSP_BRIDGE_AUTH_TOKENS` | *(required)* | Accepted token(s), comma-separated. Also read from `DRYDOCK_LSP_BRIDGE_TOKEN(S)`. The bridge refuses to start without one unless `LSP_BRIDGE_DEV=true`. |
+| `LSP_BRIDGE_DEV` | `false` | Allow unauthenticated development mode. |
+| `DRYDOCK_LSP_ALLOWED_ROOTS` | the working directory | Comma-separated directories the bridge may analyze (the repository cache). |
+
+## Dependency Upgrades (Optional)
+
+Operator-disabled by default; per-repository opt-in lives in `.drydock.yaml` under `upgrades`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_DEPUPGRADE_ENABLED` | boolean | `false` | Enable the dependency-upgrade service. It then requires `DRYDOCK_DEP_RUNNER_URL` and `DRYDOCK_MONITORED_REPOS_AUTHOR`. |
+| `DRYDOCK_DEPUPGRADE_INTERVAL` | duration | `24h` | Periodic sweep and reconciliation cadence. |
+| `DRYDOCK_DEPUPGRADE_WORKERS` | integer | `1` | Concurrent upgrade jobs. |
+| `DRYDOCK_DEP_RUNNER_URL` | URL | *(empty)* | The dep-runner sidecar (`http://dep-runner:8083` in Compose). |
+| `DRYDOCK_DEP_RUNNER_TOKEN` | string (secret) | *(falls back to `DEP_RUNNER_AUTH_TOKEN`)* | Bearer token Drydock sends to the runner. |
+| `DRYDOCK_GO_REGISTRY_URL` | URL | `https://proxy.golang.org` | Version source for Go modules. HTTP(S), without credentials, query or fragment; HTTPS in production. |
+| `DRYDOCK_NPM_REGISTRY_URL` | URL | `https://registry.npmjs.org` | Version source for npm. |
+| `DRYDOCK_CARGO_REGISTRY_URL` | URL | `https://crates.io` | Version source for Cargo. |
+| `DRYDOCK_PYPI_REGISTRY_URL` | URL | `https://pypi.org` | Version source for PyPI. |
+
+The runner (`cmd/dep-runner`) executes package managers against untrusted manifests inside a locked-down container, and reads:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DEP_RUNNER_ADDR` | `0.0.0.0:8083` | Listen address. |
+| `DEP_RUNNER_AUTH_TOKEN` / `DEP_RUNNER_AUTH_TOKENS` | *(required)* | Accepted token(s). The runner refuses to start without one unless `DEP_RUNNER_DEV=true`. |
+| `DEP_RUNNER_DEV` | `false` | Allow unauthenticated development mode. |
+| `DEP_RUNNER_ALLOW_SCRIPTS` | `false` | Allow package lifecycle scripts (npm postinstall, build.rs, setup.py). They run attacker-controlled code; enable only in a trusted, isolated deployment. |
+| `DEP_RUNNER_GOPROXY` (falls back to `GOPROXY`), `DEP_RUNNER_GOSUMDB`, `DEP_RUNNER_NPM_REGISTRY`, `DEP_RUNNER_CARGO_REGISTRY`, `DEP_RUNNER_PIP_INDEX_URL` | tool defaults (Compose pins the public registries) | Registries the package managers use. Restrict egress to exactly these hosts. |
+| `DEP_RUNNER_TIMEOUT` | Compose: `4m` | Per-job timeout. |
+| `DEP_RUNNER_MAX_MANIFEST_BYTES` | built-in limit | Maximum manifest size accepted. |
+| `DEP_RUNNER_WORK_ROOT` | system temp | Per-request work directory root (`/work` tmpfs in Compose). |
+| `DEP_RUNNER_TOOLCHAIN_PATH` | `PATH` | Where the go/npm/cargo/pip toolchains live. |
+
+Compose also reads `DEP_RUNNER_WORK_TMPFS`, `DEP_RUNNER_MEM_LIMIT` and `DEP_RUNNER_CPUS` (defaults `2g`, `2g`, `2.0`) to size the container.
 
 ## Pipeline
 
@@ -339,7 +494,8 @@ are omitted with a warning.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DRYDOCK_HEALTH_ADDR` | `host:port` | `127.0.0.1:8081` | Listen address for the health, metrics, dashboard, and management HTTP server. |
+| `DRYDOCK_HEALTH_ADDR` | `host:port` | `127.0.0.1:8081` | Listen address for the health, metrics, dashboard, and management HTTP server. The image and Compose set `:8081` inside the container; Compose publishes it on host loopback (`DRYDOCK_HEALTH_HOST_PORT`, default `8081`). |
+| `DRYDOCK_DASHBOARD_BEARER_TOKEN` | string (secret) | *(empty)* | Protects `/dashboard/` and `/api/*`. Empty leaves them unauthenticated, so keep the listener on loopback. `/healthz`, `/readyz` and `/metrics` are always open. |
 
 Endpoints:
 - `GET /healthz` — Always returns `200 OK`. Use as a liveness probe.
