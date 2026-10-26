@@ -75,6 +75,10 @@ Agentic findings use canonical priority with a total compatibility mapping:
 
 Each finding cites at least one successful current-run evidence tool-call ID. Patch and IDE findings must target the authoritative changed-file set. Security-audit findings may target any valid path and line in the frozen snapshot.
 
+Every tool result the model receives begins with its `tool_call_id` (`{"tool_call_id": "...", "content": ...}`). Many open-model chat templates never render tool-call metadata, so without this the model cannot see the ID it must cite and every evidence-backed submission is rejected. A finding may carry its own `needs_more_context`; it is merged into the review-level list before validation. A coverage rejection names every changed file missing from `coverage.examined_files`, so one corrected submission suffices.
+
+Discovery and reviewer loops append a one-time budget warning when the next turn is among the last the limits allow (two or fewer turns left, room for at most one more turn of the current size, or four or fewer tool calls left), telling the model to finalize or submit with what it has. The cumulative-token limit re-counts the whole prompt each turn, so long explorations otherwise run out before submitting.
+
 A continuation requires `chat_id`, owner, request ID, `expected_version`, and a non-empty message. The store applies request-ID idempotency and optimistic versioning. Duplicate identical requests replay the stored result; reused IDs with different payloads and stale/future versions fail without rerunning the model.
 
 ## Failure Modes

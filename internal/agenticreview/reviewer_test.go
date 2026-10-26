@@ -393,3 +393,115 @@ func TestDefaultReviewerLoopLimits(t *testing.T) {
 		t.Fatalf("reviewer defaults = %#v", limits)
 	}
 }
+
+func TestReviewerToolResultsLeadWithCitableCallID(t *testing.T) {
+	client := &scriptedClient{results: []reviewengine.CompletionResult{
+		reviewerCompletion(reviewerToolCall(t, "evidence-1", agenttools.ToolCodeRead, map[string]any{"path": "changed.go"})),
+		reviewerCompletion(reviewerToolCall(t, "submit-1", agenttools.ToolReviewSubmit,
+			findingSubmission("changed.go", 1, "evidence-1"))),
+	}}
+	if _, err := executeTestReviewer(newTestReviewer(t, client, FindingScopePatch, LoopLimits{})); err != nil {
+		t.Fatal(err)
+	}
+	// Chat templates often drop tool_call_id metadata, so the ID a finding must
+	// cite has to be visible in the tool result text itself.
+	var toolMessage *reviewengine.CompletionMessage
+	for i := range client.requests[1].Messages {
+		if m := &client.requests[1].Messages[i]; m.Role == reviewengine.MessageRoleTool && m.ToolCallID == "evidence-1" {
+			toolMessage = m
+		}
+	}
+	if toolMessage == nil || !strings.HasPrefix(toolMessage.Content, `{"tool_call_id":"evidence-1"`) {
+		t.Fatalf("tool message = %#v", toolMessage)
+	}
+	if !strings.Contains(client.requests[0].Messages[0].Content, "tool_call_id") {
+		t.Fatal("reviewer system prompt does not say where to find citable IDs")
+	}
+}
+
+func TestReviewerBudgetNudgeArrivesOnceBeforeTurnLimit(t *testing.T) {
+	client := &scriptedClient{results: []reviewengine.CompletionResult{
+		reviewerCompletion(reviewerToolCall(t, "evidence-1", agenttools.ToolCodeRead, map[string]any{"path": "changed.go"})),
+		reviewerCompletion(reviewerToolCall(t, "evidence-2", agenttools.ToolCodeRead, map[string]any{"path": "changed.go"})),
+		reviewerCompletion(reviewerToolCall(t, "submit-1", agenttools.ToolReviewSubmit,
+			findingSubmission("changed.go", 1, "evidence-1"))),
+	}}
+	result, err := executeTestReviewer(newTestReviewer(t, client, FindingScopePatch, LoopLimits{
+		MaxTurns: 3, MaxToolCalls: 20, MaxCumulativeTokens: 1_000_000, MaxModelContext: 1_000_000,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace.StopReason != string(StopReviewSubmitted) {
+		t.Fatalf("trace = %#v", result.Trace)
+	}
+	count := func(messages []reviewengine.CompletionMessage) int {
+		n := 0
+		for _, m := range messages {
+			if m.Role == reviewengine.MessageRoleUser && m.Content == reviewerBudgetNudge {
+				n++
+			}
+		}
+		return n
+	}
+	if count(client.requests[0].Messages) != 0 || count(client.requests[1].Messages) != 1 ||
+		count(client.requests[2].Messages) != 1 {
+		t.Fatalf("budget nudge counts = %d,%d,%d", count(client.requests[0].Messages),
+			count(client.requests[1].Messages), count(client.requests[2].Messages))
+	}
+}
+
+func TestReviewerAcceptsFindingLevelNeedsMoreContext(t *testing.T) {
+	submission := findingSubmission("changed.go", 1, "evidence-1")
+	finding := submission["findings"].([]any)[0].(map[string]any)
+	finding["confidence"] = 0.5
+	finding["needs_more_context"] = []string{"callers of changed.go"}
+	client := &scriptedClient{results: []reviewengine.CompletionResult{
+		reviewerCompletion(reviewerToolCall(t, "evidence-1", agenttools.ToolCodeRead, map[string]any{"path": "changed.go"})),
+		reviewerCompletion(reviewerToolCall(t, "submit-1", agenttools.ToolReviewSubmit, submission)),
+	}}
+	result, err := executeTestReviewer(newTestReviewer(t, client, FindingScopePatch, LoopLimits{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Review.Findings) != 1 || !slices.Equal(result.Review.NeedsMoreContext, []string{"callers of changed.go"}) {
+		t.Fatalf("review = %#v", result.Review)
+	}
+}
+
+func TestReviewerCoverageErrorNamesEveryMissingFile(t *testing.T) {
+	patch := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-old\n+new\n" +
+		"diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n-old\n+new\n" +
+		"diff --git a/c.go b/c.go\n--- a/c.go\n+++ b/c.go\n@@ -1 +1 @@\n-old\n+new\n"
+	snapshot := discoverySnapshot(t, patch, map[string]string{"a.go": "new\n", "b.go": "new\n", "c.go": "new\n"})
+	submit := func(files ...string) map[string]any {
+		return map[string]any{"summary": "no issues", "findings": []any{}, "coverage": map[string]any{
+			"examined_files": files, "outcome": "no_findings", "summary": "examined"}}
+	}
+	client := &scriptedClient{results: []reviewengine.CompletionResult{
+		reviewerCompletion(reviewerToolCall(t, "partial", agenttools.ToolReviewSubmit, submit("a.go"))),
+		reviewerCompletion(reviewerToolCall(t, "complete", agenttools.ToolReviewSubmit, submit("a.go", "b.go", "c.go"))),
+	}}
+	reviewer, err := NewReviewer(ReviewerConfig{
+		Client: client, Registry: agenttools.NewRegistry(), Counter: testCounter{},
+		Snapshot: snapshot, Scope: FindingScopePatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testReviewerExecutionRequest()
+	request.PatchDiff, request.ChangedFiles = patch, []string{"a.go", "b.go", "c.go"}
+	request.TargetEnvelope = targetidentity.New("repo", "root", "patch-event", "remote", "", "", "", patch, request.ContextBundle)
+	if _, err := reviewer.ExecuteReviewer(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	var rejection string
+	for _, m := range client.requests[1].Messages {
+		if m.ToolCallID == "partial" {
+			rejection = m.Content
+		}
+	}
+	if !strings.Contains(rejection, "b.go, c.go") {
+		t.Fatalf("coverage rejection = %q", rejection)
+	}
+}

@@ -94,6 +94,13 @@ type LoopRequest struct {
 	EmptyAssistantStop  StopReason
 	EmptyAssistantErr   error
 
+	// BudgetNudge, when non-empty, is appended once as a user message when the
+	// loop is about to run out of turns, tool calls, or cumulative tokens, so the
+	// model calls the terminal tool with what it has instead of being cut off
+	// mid-investigation. Long explorations otherwise exhaust the cumulative
+	// budget (which re-counts the whole prompt every turn) before submitting.
+	BudgetNudge string
+
 	// OnMessage, when set, receives each assistant and tool message as it is
 	// produced (the reviewer's transcript sink). A returned error stops the loop
 	// as a transport failure.
@@ -101,6 +108,15 @@ type LoopRequest struct {
 	// OnToolResult, when set, receives every successful non-terminal tool call and
 	// its result (the reviewer's evidence ledger).
 	OnToolResult func(reviewengine.ToolCall, agenttools.Result)
+}
+
+// nearBudget reports whether the coming turn is one of the last the limits
+// allow: two or fewer turns left, room for at most one more turn of this size
+// after it, or the tool-call budget nearly spent.
+func nearBudget(trace LoopTrace, limits LoopLimits, preflight int) bool {
+	return limits.MaxTurns-trace.Turns <= 2 ||
+		trace.CumulativeTokens+2*preflight > limits.MaxCumulativeTokens ||
+		limits.MaxToolCalls-trace.ToolCalls <= 4
 }
 
 type LoopResult struct {
@@ -160,6 +176,7 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 	trace := LoopTrace{}
 	servedModel := ""
 	emptyNudged := false
+	budgetNudged := false
 	defer observeLoopMetrics(&trace, limits)
 	stop := func(reason StopReason, err error) (LoopResult, error) {
 		trace.StopReason = reason
@@ -173,6 +190,15 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 		preflight, err := serializedRequestTokens(request.Completion, request.Counter)
 		if err != nil {
 			return stop(StopContextExceeded, err)
+		}
+		if request.BudgetNudge != "" && !budgetNudged && nearBudget(trace, limits, preflight) {
+			budgetNudged = true
+			request.Completion.Messages = append(request.Completion.Messages, reviewengine.CompletionMessage{
+				Role: reviewengine.MessageRoleUser, Content: request.BudgetNudge,
+			})
+			if preflight, err = serializedRequestTokens(request.Completion, request.Counter); err != nil {
+				return stop(StopContextExceeded, err)
+			}
 		}
 		if preflight > limits.MaxModelContext {
 			return stop(StopContextExceeded, fmt.Errorf("%w: tokens=%d limit=%d", ErrModelContext, preflight, limits.MaxModelContext))
@@ -246,7 +272,12 @@ func (r *LoopRunner) Run(ctx context.Context, request LoopRequest) (LoopResult, 
 			if request.OnToolResult != nil && dispatchErr == nil && !toolResult.IsError && call.Function.Name != terminalTool {
 				request.OnToolResult(call, toolResult)
 			}
-			encoded, err := json.Marshal(toolResult)
+			// Lead with the call ID: evidence citations must name it, and many
+			// chat templates never render tool_call_id metadata to the model.
+			encoded, err := json.Marshal(struct {
+				ToolCallID string `json:"tool_call_id"`
+				agenttools.Result
+			}{ToolCallID: call.ID, Result: toolResult})
 			if err != nil {
 				return stop(StopTransportError, err)
 			}

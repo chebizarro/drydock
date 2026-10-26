@@ -51,7 +51,9 @@ const (
 
 const ReviewerSystemPrompt = `You are Drydock's iterative code reviewer.
 Use the read-only frozen-snapshot tools to inspect and verify the change. Every
-finding must cite at least one successful evidence tool-call ID from this run.
+finding must cite at least one successful evidence tool-call ID from this run:
+copy the tool_call_id value that begins each tool result into
+evidence_tool_call_ids.
 The only successful completion is a schema-valid review.submit call. Do not
 return the review as assistant prose or raw JSON. Include explicit examined-file
 coverage, and when there are no findings submit outcome "no_findings".
@@ -59,6 +61,8 @@ The engine-owned policy below may describe a legacy JSON response; follow its
 review rubric, but submit exclusively through review.submit.`
 
 const reviewerCorrectiveNudge = `You did not call a tool. Continue the review with the provided tools. You can succeed only by calling review.submit with evidence-backed findings and explicit coverage.`
+
+const reviewerBudgetNudge = `Your review budget is almost exhausted. Do not start new investigations. Call review.submit now with the findings you can already support with cited tool_call_ids, and list every changed file in coverage.examined_files.`
 
 type ReviewerConfig struct {
 	Client   reviewengine.CompletionClient
@@ -248,6 +252,10 @@ type submittedFinding struct {
 	SuggestedCode       string   `json:"suggested_code,omitempty"`
 	Confidence          *float64 `json:"confidence"`
 	EvidenceToolCallIDs []string `json:"evidence_tool_call_ids"`
+	// NeedsMoreContext is accepted per finding because the engine-owned policy
+	// asks for it next to low-confidence findings; items merge into the review's
+	// needs_more_context instead of failing the whole submission.
+	NeedsMoreContext []string `json:"needs_more_context,omitempty"`
 }
 
 type submittedCoverage struct {
@@ -364,10 +372,16 @@ func (s *reviewSubmitter) validate(ctx context.Context, submission reviewSubmiss
 		return acceptedSubmission{}, fmt.Errorf("%w: at least one examined file is required", ErrCoverageIncomplete)
 	}
 	if s.scope == FindingScopePatch {
+		var missing []string
 		for _, required := range s.patchFiles {
 			if _, ok := examined[required]; !ok {
-				return acceptedSubmission{}, fmt.Errorf("%w: changed file %s was not examined", ErrCoverageIncomplete, required)
+				missing = append(missing, required)
 			}
+		}
+		if len(missing) > 0 {
+			// Name every missing file so one corrected submission suffices.
+			return acceptedSubmission{}, fmt.Errorf("%w: changed files not in coverage.examined_files: %s",
+				ErrCoverageIncomplete, strings.Join(missing, ", "))
 		}
 	}
 	sort.Strings(normalizedCoverage)
@@ -378,14 +392,28 @@ func (s *reviewSubmitter) validate(ctx context.Context, submission reviewSubmiss
 		NeedsMoreContext: cleanNonEmptyStrings(submission.NeedsMoreContext),
 	}
 	evidenceSet := make(map[string]struct{})
+	var findingContextNeeds []string
 	for i, finding := range submission.Findings {
 		converted, evidenceIDs, err := s.validateFinding(ctx, finding)
 		if err != nil {
 			return acceptedSubmission{}, fmt.Errorf("finding[%d]: %w", i, err)
 		}
 		output.Findings = append(output.Findings, converted)
+		findingContextNeeds = append(findingContextNeeds, finding.NeedsMoreContext...)
 		for _, id := range evidenceIDs {
 			evidenceSet[id] = struct{}{}
+		}
+	}
+	// Merge before Validate: low-confidence findings require a non-empty
+	// review-level needs_more_context.
+	seenNeeds := make(map[string]struct{}, len(output.NeedsMoreContext))
+	for _, need := range output.NeedsMoreContext {
+		seenNeeds[need] = struct{}{}
+	}
+	for _, need := range cleanNonEmptyStrings(findingContextNeeds) {
+		if _, dup := seenNeeds[need]; !dup {
+			seenNeeds[need] = struct{}{}
+			output.NeedsMoreContext = append(output.NeedsMoreContext, need)
 		}
 	}
 	if err := output.Validate(); err != nil {
@@ -673,6 +701,7 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 		EmptyAssistantNudge: reviewerCorrectiveNudge,
 		EmptyAssistantStop:  StopEmptyAssistant,
 		EmptyAssistantErr:   ErrReviewerEmptyResponse,
+		BudgetNudge:         reviewerBudgetNudge,
 		OnMessage:           onMessage,
 		OnToolResult: func(call reviewengine.ToolCall, result agenttools.Result) {
 			ledger.Record(call, result)

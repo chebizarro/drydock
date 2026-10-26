@@ -127,6 +127,7 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 		// when the model returns no tool call; a model that still fails to finalize
 		// then exhausts its turn budget and routes to the deterministic fallback.
 		EmptyAssistantNudge: discoveryCorrectiveNudge,
+		BudgetNudge:         discoveryBudgetNudge,
 	})
 	if loopErr == nil {
 		artifacts, err := selection.Artifacts()
