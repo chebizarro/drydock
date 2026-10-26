@@ -123,7 +123,7 @@ LIMIT 10;
 | `-agentic` | Run the default agentic path (discovery + tool-using reviewer over pinned Git snapshots); cases need `bench_meta.agentic {repo_dir, base}` |
 | `-workers N` / `-retries N` | Concurrent cases and provider-error retries for hosted APIs (timeouts are never retried) |
 | `-extra-body JSON` | Merge provider options, e.g. `{"reasoning":{"enabled":false}}` |
-| `-max-tokens N` | Cap completion tokens (production sends none) |
+| `-max-tokens N` | Cap completion tokens. The bench ignores `DRYDOCK_*_MAX_TOKENS`; production sends no cap unless those are set (see [configuration](configuration.md#completion-token-cap)) |
 | `-prompt-variant calibrated` | Reproduce the rejected severity/precision rubric experiment |
 
 Endpoints come from the usual `DRYDOCK_*_BASE_URL` / `_MODEL` variables. Dataset generation from a review corpus, sweeps over llama.cpp or OpenRouter, a frontier-judge quality pass and reporting live in the separate nostr-bench repository (`suites/drydock`).

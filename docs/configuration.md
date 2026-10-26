@@ -142,6 +142,52 @@ Use the exact model identifier served by your provider and size the input
 budget below that model's context limit, leaving room for the local-review
 JSON, system prompt, and completion.
 
+### Completion token cap
+
+A cap on completion tokens, sent as `max_tokens` on every `/chat/completions`
+request (single-shot and agentic turns). It bounds runaway generations such as
+a thinking model stuck in a degenerate reasoning loop. Without it, that loop
+runs until the request times out or the context fills.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_LLM_MAX_TOKENS` | integer | `0` (no cap) | Global completion-token cap. `0` sends no `max_tokens`. |
+| `DRYDOCK_PLANNER_MAX_TOKENS` | integer | *(inherits global)* | Planner and walkthrough calls. The conversation and code-chat handlers also use the planner endpoint. |
+| `DRYDOCK_CODER32B_MAX_TOKENS` | integer | *(inherits global)* | coder32b reviewer route. |
+| `DRYDOCK_LLM70B_MAX_TOKENS` | integer | *(inherits global)* | llm70b reviewer route. |
+| `DRYDOCK_CODER14B_MAX_TOKENS` | integer | *(inherits global)* | coder14b reviewer route. |
+| `DRYDOCK_SEC70B_MAX_TOKENS` | integer | *(inherits global)* | sec70b route and the security verifier. |
+| `DRYDOCK_SECCLASSIFY_MAX_TOKENS` | integer | *(inherits global)* | secclassify route and the security classifier. |
+| `DRYDOCK_SECLOCALIZE_MAX_TOKENS` | integer | *(inherits global)* | seclocalize route and the audit localizer. |
+| `DRYDOCK_META_MAX_TOKENS` | integer | *(inherits global)* | Meta-review and prompt refinement. |
+| `DRYDOCK_AGENTIC_DISCOVERY_MAX_TOKENS` | integer | *(inherits `DRYDOCK_CODER32B_MAX_TOKENS`)* | Each agentic discovery turn. Its fallback matches the discovery base URL and model. Agentic reviewer turns use the cap of the reviewer route they run on. |
+
+Each value must be a non-negative integer; anything else fails startup
+validation. A per-role `0` disables the cap for that role only.
+
+When a structured call (planner, reviewer, walkthrough, meta-review) stops
+with `finish_reason=length`, Drydock treats the output as invalid even if a
+fragment parses. It then goes through the normal JSON repair attempts. In an
+agentic loop a truncated turn is an ordinary turn: a cut-off tool call
+fails argument validation, and the error goes back to the model.
+
+**Why the default is off.** vLLM and TGI reject any request whose prompt
+tokens plus `max_tokens` exceed the served context window, with a
+non-retryable HTTP 400. A global default large enough for thinking models
+would therefore fail every review on a 32k-context deployment. A default small
+enough to avoid that would truncate legitimate thinking-mode reviews. Ollama
+and llama.cpp accept any cap. Choose the cap per deployment, using these
+measurements from the local-model benchmark:
+
+| Reviewer mode | Observed output per review | Suggested cap |
+|---------------|----------------------------|---------------|
+| Thinking off | ~1.2k–3.7k tokens | `8192` |
+| Thinking on | up to ~19k tokens | `24576` |
+
+Keep prompt tokens plus the cap within each endpoint's context window. Also
+remember that each LLM request has a 120-second HTTP timeout, so a cap your
+hardware cannot generate within that time still ends in a timeout.
+
 ### Model name verification
 
 Configured model names are deployment metadata and can go stale. At startup
