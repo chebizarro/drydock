@@ -17,6 +17,7 @@ Layers are assembled in stable priority/name order. When a layer exceeds the rem
 | Priority | Layer | Provider | Source | Caps |
 |----------|-------|----------|--------|------|
 | 1 | `patch` | `patchDiffProvider` | Authoritative filtered unified diff | 40 KB hard cap |
+| 2 | `added-lines` | `addedLinesProvider` | Added lines as `path:LINE: text` (new-file, 1-based) | 2,048 tokens; opt-in |
 | 2 | `modified-files` | `fileContextProvider` | Changed-file contents | 20 KB total, 4 KB per file |
 | 2 | `change-impact` | `changeImpactProvider` | Changed symbols and downstream callsites | bounded search results |
 | 2 | `taint` | `taintProvider` | Taint-oriented source/sink analysis, with optional LSP | bounded analysis output |
@@ -26,7 +27,21 @@ Layers are assembled in stable priority/name order. When a layer exceeds the rem
 | 6 | `commit-history` | `commitHistoryProvider` | `git log --oneline -n 10` for changed files | 10 commits |
 | 7 | `project-docs` | `projectDocsProvider` | Workspace-local and repository docs | 15 KB total, 4 KB per file |
 
-These are the **9 core providers** returned by `DefaultProviders`. Configured Qdrant or Chartroom retrieval is appended at priority 8; audit configuration may append security-surface providers.
+These are the **10 core providers** returned by `DefaultProviders`. Configured Qdrant or Chartroom retrieval is appended at priority 8; audit configuration may append security-surface providers.
+
+### Optional added-line index
+
+Set `context.include_added_lines: true` in `.drydock.yaml` to enable the
+`added-lines` layer (default: `false`). It uses the same gitdiff parser as the
+patch analysis, skips binary files and deletions, and uses the destination path
+for renames. Priority/name ordering puts it immediately after `patch`, before
+other priority-2 layers. It is capped at 2,048 tokens with the builder's token
+counter, and may be further truncated or dropped by the total bundle budget.
+
+The patch renderer and patch bytes are unchanged. Target identity still hashes
+the authoritative diff separately and hashes the complete final bundle, including
+this layer when enabled; an envelope from an unannotated bundle cannot verify an
+annotated bundle. This index supplements, rather than replaces, the diff.
 
 ## Token Budget
 

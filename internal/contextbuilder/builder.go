@@ -16,6 +16,7 @@ const DefaultTokenBudget = 64_000
 
 const (
 	LayerPatchDiff        = "patch"
+	LayerAddedLines       = "added-lines"
 	LayerFileContext      = "modified-files"
 	LayerSymbolsCallsites = "symbols"
 	LayerTests            = "tests"
@@ -49,6 +50,8 @@ type BuildInput struct {
 	ExcludePaths []string
 	// DisableDocs, if true, skips documentation providers and marks them as dropped.
 	DisableDocs bool
+	// IncludeAddedLines enables the optional, token-capped new-file line index.
+	IncludeAddedLines bool
 	// SecretScanContext is pre-rendered, redacted secret-scan output. Providers
 	// pass it through without executing another scan.
 	SecretScanContext string
@@ -294,6 +297,10 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 			statuses[p.LayerName()] = LayerStatus{Layer: p.LayerName(), Status: "degraded", Message: warning.Error()}
 		}
 		content = strings.TrimSpace(content)
+		if p.LayerName() == LayerAddedLines && b.Counter.Count(content) > AddedLinesTokenCap {
+			content = truncateToTokenBudget(content, AddedLinesTokenCap, b.Counter)
+			statuses[p.LayerName()] = LayerStatus{Layer: p.LayerName(), Status: "truncated", Message: "truncated to added-lines token cap"}
+		}
 		if content == "" {
 			continue
 		}
@@ -353,7 +360,7 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		}
 		usedTokens += lr.tokens
 		used = append(used, lr)
-		if status, ok := statuses[lr.name]; ok && status.Status == "degraded" {
+		if status, ok := statuses[lr.name]; ok && (status.Status == "degraded" || status.Status == "truncated") {
 			status.Tokens = lr.tokens
 			statuses[lr.name] = status
 		} else {

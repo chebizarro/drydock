@@ -30,6 +30,7 @@ func DefaultProviders(opts ...BuilderOptions) []Provider {
 
 	providers := []Provider{
 		patchDiffProvider{},
+		addedLinesProvider{},
 		fileContextProvider{},
 		changeImpactProvider{search: srch},
 		taintProvider{lspClient: opt.lspClient},

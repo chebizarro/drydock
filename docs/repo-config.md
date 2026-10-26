@@ -23,6 +23,7 @@ context:
   token_budget: 0               # override the context token budget (0 = default)
   exclude_paths: []             # glob paths excluded from context layers
   include_docs: true            # include the project-docs context layer
+  include_added_lines: false    # opt-in new-file line index, capped at 2,048 tokens
 
 status:
   enabled: false                # publish kind 1630 status events for blocking findings
