@@ -38,6 +38,8 @@ type DiscoveryConfig struct {
 	BaseURL     string
 	APIKey      string
 	Temperature float64
+	// MaxTokens caps completion tokens per discovery turn; 0 sends no cap.
+	MaxTokens int
 }
 
 type DiscoveryInput struct {
@@ -115,7 +117,7 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 	loopResult, loopErr := (&LoopRunner{Client: d.config.Client}).Run(ctx, LoopRequest{
 		Completion: reviewengine.CompletionRequest{
 			BaseURL: d.config.BaseURL, APIKey: d.config.APIKey, Model: d.config.Model,
-			Temperature: d.config.Temperature,
+			Temperature: d.config.Temperature, MaxTokens: d.config.MaxTokens,
 			Messages: []reviewengine.CompletionMessage{
 				{Role: reviewengine.MessageRoleSystem, Content: DiscoverySystemPrompt},
 				{Role: reviewengine.MessageRoleUser, Content: user},

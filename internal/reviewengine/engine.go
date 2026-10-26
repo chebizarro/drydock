@@ -14,6 +14,9 @@ type ModelEndpoint struct {
 	BaseURL string
 	APIKey  string
 	Model   string
+	// MaxTokens caps completion tokens per request (sent as max_tokens);
+	// 0 sends no cap.
+	MaxTokens int
 }
 
 type Config struct {
@@ -95,6 +98,7 @@ func (e *Engine) prepareReviewer(ctx context.Context, in RunInput) (reviewerPrep
 		BaseURL:     e.cfg.Planner.BaseURL,
 		APIKey:      e.cfg.Planner.APIKey,
 		Model:       e.cfg.Planner.Model,
+		MaxTokens:   e.cfg.Planner.MaxTokens,
 		Temperature: e.cfg.PlannerTemp,
 		System:      plannerSystemPrompt(),
 		User:        plannerUserPrompt(in.ContextBundle, in.ChangedFiles),
@@ -225,6 +229,7 @@ func (e *Engine) generateWalkthrough(ctx context.Context, in RunInput) (Walkthro
 		BaseURL:     e.cfg.Planner.BaseURL,
 		APIKey:      e.cfg.Planner.APIKey,
 		Model:       e.cfg.Planner.Model,
+		MaxTokens:   e.cfg.Planner.MaxTokens,
 		Temperature: e.cfg.PlannerTemp,
 		System:      walkthroughSystemPrompt(),
 		User:        walkthroughUserPrompt(in.ContextBundle, in.ChangedFiles),

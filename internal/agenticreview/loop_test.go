@@ -401,3 +401,52 @@ func writeDiscoveryFile(t *testing.T, root, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestLoopContinuesAfterLengthTruncatedTurn(t *testing.T) {
+	patch := testPatch()
+	snapshot := discoverySnapshot(t, patch, map[string]string{"changed.go": "package p\nconst Value = 2\n"})
+	selection, err := agenttools.NewSelection(agenttools.SelectionConfig{
+		Snapshot: snapshot, ChangedFiles: []string{"changed.go"},
+		Counter: testCounter{}, TokenBudget: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := agenttools.NewRegistry()
+	client := &scriptedClient{results: []reviewengine.CompletionResult{
+		{
+			// Cut off mid tool call: arguments are not valid JSON.
+			Message: reviewengine.CompletionMessage{Role: reviewengine.MessageRoleAssistant, ToolCalls: []reviewengine.ToolCall{
+				{ID: "cut", Type: "function", Function: reviewengine.ToolCallFunction{Name: agenttools.ToolSelectionFinalize, Arguments: `{"pa`}},
+			}},
+			FinishReason: reviewengine.FinishReasonLength,
+			Usage:        reviewengine.CompletionUsage{TotalTokens: 1},
+		},
+		{
+			Message: reviewengine.CompletionMessage{Role: reviewengine.MessageRoleAssistant, ToolCalls: []reviewengine.ToolCall{
+				{ID: "final", Type: "function", Function: reviewengine.ToolCallFunction{Name: agenttools.ToolSelectionFinalize, Arguments: `{}`}},
+			}},
+			Usage: reviewengine.CompletionUsage{TotalTokens: 1},
+		},
+	}}
+	scope := agenttools.NewScope("loop-length-test", snapshot, agenttools.RoleContextDiscovery)
+	result, err := (&LoopRunner{Client: client}).Run(context.Background(), LoopRequest{
+		Completion: reviewengine.CompletionRequest{
+			MaxTokens: 512,
+			Messages:  []reviewengine.CompletionMessage{{Role: reviewengine.MessageRoleUser, Content: "discover"}},
+		},
+		Registry: registry, Scope: scope, Selection: selection, Counter: testCounter{},
+		Limits: LoopLimits{MaxTurns: 3, MaxToolCalls: 3, MaxCumulativeTokens: 100_000, MaxModelContext: 100_000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace.StopReason != StopFinalized || result.Trace.Turns != 2 {
+		t.Fatalf("trace = %#v, want finalize on the turn after truncation", result.Trace)
+	}
+	for i, request := range client.requests {
+		if request.MaxTokens != 512 {
+			t.Fatalf("request[%d] MaxTokens = %d, want 512", i, request.MaxTokens)
+		}
+	}
+}

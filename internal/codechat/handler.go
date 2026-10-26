@@ -228,6 +228,7 @@ func (h *Handler) HandleDM(ctx context.Context, event nostr.Event, relayURL stri
 		BaseURL:     h.cfg.Endpoint.BaseURL,
 		APIKey:      h.cfg.Endpoint.APIKey,
 		Model:       h.cfg.Endpoint.Model,
+		MaxTokens:   h.cfg.Endpoint.MaxTokens,
 		Temperature: h.cfg.Temperature,
 		System:      system,
 		User:        user,

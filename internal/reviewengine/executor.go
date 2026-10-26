@@ -90,6 +90,7 @@ func (x *singleShotReviewerExecutor) ExecuteReviewer(ctx context.Context, reques
 		BaseURL:     request.Endpoint.BaseURL,
 		APIKey:      request.Endpoint.APIKey,
 		Model:       request.Endpoint.Model,
+		MaxTokens:   request.Endpoint.MaxTokens,
 		Temperature: request.Temperature,
 		System:      request.System,
 		User:        request.User,

@@ -238,6 +238,7 @@ func (s *Service) Run(ctx context.Context, in Input) (result Result, runErr erro
 		BaseURL:     s.cfg.Endpoint.BaseURL,
 		APIKey:      s.cfg.Endpoint.APIKey,
 		Model:       s.cfg.Endpoint.Model,
+		MaxTokens:   s.cfg.Endpoint.MaxTokens,
 		Temperature: 0.1,
 		System:      metaReviewSystemPrompt(),
 		User:        metaReviewUserPrompt(in, s.cfg.MaxInputBytes),

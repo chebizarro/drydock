@@ -47,6 +47,7 @@ func (l *AntaresLocalizer) Localize(ctx context.Context, cwe string, repoMap []c
 		BaseURL:     l.endpoint.BaseURL,
 		APIKey:      l.endpoint.APIKey,
 		Model:       l.endpoint.Model,
+		MaxTokens:   l.endpoint.MaxTokens,
 		JSONMode:    true,
 		Temperature: 0,
 		System:      "You localize vulnerability classes in source repositories. Return JSON only: {\"files\":[\"relative/path\"]}. Include only paths present in the repository map.",

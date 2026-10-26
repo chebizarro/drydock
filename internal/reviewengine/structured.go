@@ -50,7 +50,7 @@ func CompleteStructured[T any](ctx context.Context, client LLMClient, logger *sl
 		return zero, "", "", fmt.Errorf("%s completion: %w", label, err)
 	}
 
-	out, parseErr := parseExtracted(res.Content, parse)
+	out, parseErr := parseCompletion(res, parse)
 	if parseErr == nil {
 		return out, res.Model, res.Content, nil
 	}
@@ -80,7 +80,7 @@ func CompleteStructured[T any](ctx context.Context, client LLMClient, logger *sl
 			return zero, "", lastRaw, fmt.Errorf("%s repair completion attempt %d: %w (original parse/validation error: %v)", label, attempt, repairErr, originalErr)
 		}
 
-		out, parseErr = parseExtracted(repaired.Content, parse)
+		out, parseErr = parseCompletion(repaired, parse)
 		if parseErr == nil {
 			return out, repaired.Model, repaired.Content, nil
 		}
@@ -90,6 +90,17 @@ func CompleteStructured[T any](ctx context.Context, client LLMClient, logger *sl
 
 	var zero T
 	return zero, "", lastRaw, fmt.Errorf("%s output invalid after %d repair attempt(s): %w", label, maxStructuredRepairAttempts, lastErr)
+}
+
+// parseCompletion treats a completion cut off by its token limit as invalid
+// output even when a fragment of it happens to parse, so truncation goes
+// through repair instead of passing as a silently partial result.
+func parseCompletion[T any](res ChatResult, parse structuredParser[T]) (T, error) {
+	if res.FinishReason == FinishReasonLength {
+		var zero T
+		return zero, ErrOutputTruncated
+	}
+	return parseExtracted(res.Content, parse)
 }
 
 func parseExtracted[T any](raw string, parse structuredParser[T]) (T, error) {

@@ -86,6 +86,8 @@ type CompletionRequest struct {
 	Temperature float64
 	Messages    []CompletionMessage
 	Tools       []ToolSchema
+	// MaxTokens is sent as max_tokens when positive; 0 sends no cap.
+	MaxTokens int
 }
 
 // CompletionUsage reports provider token accounting when available.
@@ -106,6 +108,13 @@ type CompletionResult struct {
 
 var ErrCompletionUnsupported = errors.New("llm client does not support conversational completions")
 
+// FinishReasonLength is the OpenAI-compatible finish_reason for a completion
+// that stopped at max_tokens (or the context limit) rather than naturally.
+const FinishReasonLength = "length"
+
+// ErrOutputTruncated reports a completion cut off by its token limit.
+var ErrOutputTruncated = errors.New("llm output truncated by token limit (finish_reason=length)")
+
 // ChatResult is the outcome of a chat completion.
 type ChatResult struct {
 	// Content is the assistant message content.
@@ -113,6 +122,9 @@ type ChatResult struct {
 	// Model is the model identifier the endpoint reported serving for this
 	// request. Empty when the provider omits it.
 	Model string
+	// FinishReason is the provider's finish_reason for the first choice, e.g.
+	// "stop" or FinishReasonLength. Empty when the provider omits it.
+	FinishReason string
 }
 
 type ChatRequest struct {
@@ -125,6 +137,8 @@ type ChatRequest struct {
 	// JSONMode asks OpenAI-compatible providers to constrain output to a JSON
 	// object when they support response_format/json_object.
 	JSONMode bool
+	// MaxTokens is sent as max_tokens when positive; 0 sends no cap.
+	MaxTokens int
 }
 
 // LLMHTTPError represents an HTTP-level error from the LLM endpoint.
@@ -191,6 +205,9 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 	if req.JSONMode {
 		payload["response_format"] = map[string]string{"type": "json_object"}
 	}
+	if req.MaxTokens > 0 {
+		payload["max_tokens"] = req.MaxTokens
+	}
 	body, _ := json.Marshal(payload)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
@@ -223,6 +240,7 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&decoded); err != nil {
@@ -236,7 +254,11 @@ func (c *OpenAICompatClient) ChatCompletion(ctx context.Context, req ChatRequest
 	if c.Identity != nil {
 		c.Identity.Observe(req.BaseURL, req.APIKey, req.Model, decoded.Model)
 	}
-	return ChatResult{Content: decoded.Choices[0].Message.Content, Model: strings.TrimSpace(decoded.Model)}, nil
+	choice := decoded.Choices[0]
+	return ChatResult{
+		Content: choice.Message.Content, Model: strings.TrimSpace(decoded.Model),
+		FinishReason: choice.FinishReason,
+	}, nil
 }
 
 func (c *OpenAICompatClient) Complete(ctx context.Context, req CompletionRequest) (CompletionResult, error) {
@@ -276,6 +298,9 @@ func (c *OpenAICompatClient) Complete(ctx context.Context, req CompletionRequest
 	}
 	if len(tools) > 0 {
 		payload["tools"] = tools
+	}
+	if req.MaxTokens > 0 {
+		payload["max_tokens"] = req.MaxTokens
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

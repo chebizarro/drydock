@@ -37,6 +37,12 @@ const (
 	defaultEmbedModel        = "nomic-embed-text"
 )
 
+// defaultLLMMaxTokens is 0 (no cap): OpenAI-compatible servers that enforce
+// prompt+max_tokens <= context (vLLM, TGI) reject an oversized cap with a
+// non-retryable 400, so a global default would fail every review on
+// small-context deployments. See docs/configuration.md for recommended caps.
+const defaultLLMMaxTokens = 0
+
 var defaultPublicRelaySet = map[string]struct{}{
 	"wss://relay.damus.io":   {},
 	"wss://nos.lol":          {},
@@ -99,6 +105,16 @@ type Config struct {
 	LLM70BAPIKey                        string
 	Coder14BAPIKey                      string
 	MetaAPIKey                          string
+	LLMMaxTokens                        int // 0 sends no max_tokens; per-role caps below inherit it
+	PlannerMaxTokens                    int
+	Coder32BMaxTokens                   int
+	LLM70BMaxTokens                     int
+	Coder14BMaxTokens                   int
+	Sec70BMaxTokens                     int
+	SecClassifyMaxTokens                int
+	SecLocalizeMaxTokens                int
+	MetaMaxTokens                       int
+	AgenticDiscoveryMaxTokens           int // inherits Coder32BMaxTokens, like the rest of the discovery endpoint
 	SignerBunkerURL                     string
 	SignerNsec                          string
 	SignerNsecFile                      string
@@ -193,6 +209,9 @@ func FromEnv() Config {
 			signerNsec = strings.TrimSpace(string(nsecFromFile))
 		}
 	}
+
+	llmMaxTokens := parseMaxTokens("DRYDOCK_LLM_MAX_TOKENS", defaultLLMMaxTokens)
+	coder32BMaxTokens := parseMaxTokens("DRYDOCK_CODER32B_MAX_TOKENS", llmMaxTokens)
 
 	return Config{
 		Environment:          environment,
@@ -298,6 +317,16 @@ func FromEnv() Config {
 		AgenticDiscoveryBaseURL:             envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_BASE_URL", envOrDefault("DRYDOCK_CODER32B_BASE_URL", devDefault(production, defaultCoder32BBaseURL))),
 		AgenticDiscoveryModel:               envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MODEL", envOrDefault("DRYDOCK_CODER32B_MODEL", devDefault(production, defaultCoder32BModel))),
 		AgenticDiscoveryAPIKey:              envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_API_KEY", envOrDefault("DRYDOCK_CODER32B_API_KEY", "")),
+		LLMMaxTokens:                        llmMaxTokens,
+		PlannerMaxTokens:                    parseMaxTokens("DRYDOCK_PLANNER_MAX_TOKENS", llmMaxTokens),
+		Coder32BMaxTokens:                   coder32BMaxTokens,
+		LLM70BMaxTokens:                     parseMaxTokens("DRYDOCK_LLM70B_MAX_TOKENS", llmMaxTokens),
+		Coder14BMaxTokens:                   parseMaxTokens("DRYDOCK_CODER14B_MAX_TOKENS", llmMaxTokens),
+		Sec70BMaxTokens:                     parseMaxTokens("DRYDOCK_SEC70B_MAX_TOKENS", llmMaxTokens),
+		SecClassifyMaxTokens:                parseMaxTokens("DRYDOCK_SECCLASSIFY_MAX_TOKENS", llmMaxTokens),
+		SecLocalizeMaxTokens:                parseMaxTokens("DRYDOCK_SECLOCALIZE_MAX_TOKENS", llmMaxTokens),
+		MetaMaxTokens:                       parseMaxTokens("DRYDOCK_META_MAX_TOKENS", llmMaxTokens),
+		AgenticDiscoveryMaxTokens:           parseMaxTokens("DRYDOCK_AGENTIC_DISCOVERY_MAX_TOKENS", coder32BMaxTokens),
 		AgenticDiscoveryMaxTurns:            parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MAX_TURNS", "24"), 24),
 		AgenticDiscoveryMaxToolCalls:        parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MAX_TOOL_CALLS", "96"), 96),
 		AgenticDiscoveryMaxCumulativeTokens: parseIntOrDefault(envOrDefault("DRYDOCK_AGENTIC_DISCOVERY_MAX_CUMULATIVE_TOKENS", "256000"), 256000),
@@ -523,6 +552,26 @@ func parseIntOrDefault(v string, fallback int) int {
 	return result
 }
 
+// invalidMaxTokens marks a completion-token cap variable whose value is not a
+// non-negative integer, so Validate can reject it by name.
+const invalidMaxTokens = -1
+
+// parseMaxTokens resolves a completion-token cap from key. An unset variable
+// inherits; an invalid one becomes invalidMaxTokens. Inheriting from an
+// invalid parent yields 0 so one bad variable produces one validation error,
+// not one per role.
+func parseMaxTokens(key string, inherit int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return max(inherit, 0)
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return invalidMaxTokens
+	}
+	return n
+}
+
 func parseFloatOrDefault(v string, fallback float64) float64 {
 	parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 	if err != nil {
@@ -669,6 +718,15 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	// --- Database connectivity ---
 	if err := c.validateDatabase(ctx); err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("database validation failed: %v", err))
+	}
+
+	if c.LLMMaxTokens < 0 {
+		result.Errors = append(result.Errors, "DRYDOCK_LLM_MAX_TOKENS must be a non-negative integer (0 disables the cap)")
+	}
+	for _, endpoint := range c.modelEndpoints() {
+		if endpoint.maxTokens < 0 {
+			result.Errors = append(result.Errors, endpoint.maxTokensEnv+" must be a non-negative integer (0 disables the cap)")
+		}
 	}
 
 	if c.MetaMaxInputBytes <= 0 {
@@ -840,6 +898,10 @@ type modelEndpointSpec struct {
 	model      string
 	apiKey     string
 	required   bool
+	// maxTokensEnv names the role's completion-token cap variable; maxTokens
+	// is its resolved value.
+	maxTokensEnv string
+	maxTokens    int
 }
 
 // modelEndpoints enumerates every LLM endpoint the binary constructs in
@@ -847,15 +909,15 @@ type modelEndpointSpec struct {
 // (main.go passes EffectiveLLMAPIKey("")), so keyEnv points at the shared key.
 func (c *Config) modelEndpoints() []modelEndpointSpec {
 	return []modelEndpointSpec{
-		{name: "planner", baseURLEnv: "DRYDOCK_PLANNER_BASE_URL", modelEnv: "DRYDOCK_PLANNER_MODEL", keyEnv: "DRYDOCK_PLANNER_API_KEY", baseURL: c.PlannerBaseURL, model: c.PlannerModel, apiKey: c.EffectiveLLMAPIKey(c.PlannerAPIKey), required: true},
-		{name: "coder32b", baseURLEnv: "DRYDOCK_CODER32B_BASE_URL", modelEnv: "DRYDOCK_CODER32B_MODEL", keyEnv: "DRYDOCK_CODER32B_API_KEY", baseURL: c.Coder32BBaseURL, model: c.Coder32BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder32BAPIKey), required: true},
-		{name: "70b", baseURLEnv: "DRYDOCK_LLM70B_BASE_URL", modelEnv: "DRYDOCK_LLM70B_MODEL", keyEnv: "DRYDOCK_LLM70B_API_KEY", baseURL: c.LLM70BBaseURL, model: c.LLM70BModel, apiKey: c.EffectiveLLMAPIKey(c.LLM70BAPIKey), required: true},
-		{name: "coder14b", baseURLEnv: "DRYDOCK_CODER14B_BASE_URL", modelEnv: "DRYDOCK_CODER14B_MODEL", keyEnv: "DRYDOCK_CODER14B_API_KEY", baseURL: c.Coder14BBaseURL, model: c.Coder14BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder14BAPIKey), required: true},
-		{name: "meta", baseURLEnv: "DRYDOCK_META_BASE_URL", modelEnv: "DRYDOCK_META_MODEL", keyEnv: "DRYDOCK_META_API_KEY", baseURL: c.MetaBaseURL, model: c.MetaModel, apiKey: c.EffectiveLLMAPIKey(c.MetaAPIKey), required: true},
-		{name: "sec70b", baseURLEnv: "DRYDOCK_SEC70B_BASE_URL", modelEnv: "DRYDOCK_SEC70B_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.Sec70BBaseURL, model: c.Sec70BModel, apiKey: c.EffectiveLLMAPIKey("")},
-		{name: "secclassify", baseURLEnv: "DRYDOCK_SECCLASSIFY_BASE_URL", modelEnv: "DRYDOCK_SECCLASSIFY_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecClassifyBaseURL, model: c.SecClassifyModel, apiKey: c.EffectiveLLMAPIKey("")},
-		{name: "seclocalize", baseURLEnv: "DRYDOCK_SECLOCALIZE_BASE_URL", modelEnv: "DRYDOCK_SECLOCALIZE_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecLocalizeBaseURL, model: c.SecLocalizeModel, apiKey: c.EffectiveLLMAPIKey("")},
-		{name: "agentic-discovery", baseURLEnv: "DRYDOCK_AGENTIC_DISCOVERY_BASE_URL", modelEnv: "DRYDOCK_AGENTIC_DISCOVERY_MODEL", keyEnv: "DRYDOCK_AGENTIC_DISCOVERY_API_KEY", baseURL: c.AgenticDiscoveryBaseURL, model: c.AgenticDiscoveryModel, apiKey: c.EffectiveLLMAPIKey(c.AgenticDiscoveryAPIKey)},
+		{name: "planner", baseURLEnv: "DRYDOCK_PLANNER_BASE_URL", modelEnv: "DRYDOCK_PLANNER_MODEL", keyEnv: "DRYDOCK_PLANNER_API_KEY", baseURL: c.PlannerBaseURL, model: c.PlannerModel, apiKey: c.EffectiveLLMAPIKey(c.PlannerAPIKey), required: true, maxTokensEnv: "DRYDOCK_PLANNER_MAX_TOKENS", maxTokens: c.PlannerMaxTokens},
+		{name: "coder32b", baseURLEnv: "DRYDOCK_CODER32B_BASE_URL", modelEnv: "DRYDOCK_CODER32B_MODEL", keyEnv: "DRYDOCK_CODER32B_API_KEY", baseURL: c.Coder32BBaseURL, model: c.Coder32BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder32BAPIKey), required: true, maxTokensEnv: "DRYDOCK_CODER32B_MAX_TOKENS", maxTokens: c.Coder32BMaxTokens},
+		{name: "70b", baseURLEnv: "DRYDOCK_LLM70B_BASE_URL", modelEnv: "DRYDOCK_LLM70B_MODEL", keyEnv: "DRYDOCK_LLM70B_API_KEY", baseURL: c.LLM70BBaseURL, model: c.LLM70BModel, apiKey: c.EffectiveLLMAPIKey(c.LLM70BAPIKey), required: true, maxTokensEnv: "DRYDOCK_LLM70B_MAX_TOKENS", maxTokens: c.LLM70BMaxTokens},
+		{name: "coder14b", baseURLEnv: "DRYDOCK_CODER14B_BASE_URL", modelEnv: "DRYDOCK_CODER14B_MODEL", keyEnv: "DRYDOCK_CODER14B_API_KEY", baseURL: c.Coder14BBaseURL, model: c.Coder14BModel, apiKey: c.EffectiveLLMAPIKey(c.Coder14BAPIKey), required: true, maxTokensEnv: "DRYDOCK_CODER14B_MAX_TOKENS", maxTokens: c.Coder14BMaxTokens},
+		{name: "meta", baseURLEnv: "DRYDOCK_META_BASE_URL", modelEnv: "DRYDOCK_META_MODEL", keyEnv: "DRYDOCK_META_API_KEY", baseURL: c.MetaBaseURL, model: c.MetaModel, apiKey: c.EffectiveLLMAPIKey(c.MetaAPIKey), required: true, maxTokensEnv: "DRYDOCK_META_MAX_TOKENS", maxTokens: c.MetaMaxTokens},
+		{name: "sec70b", baseURLEnv: "DRYDOCK_SEC70B_BASE_URL", modelEnv: "DRYDOCK_SEC70B_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.Sec70BBaseURL, model: c.Sec70BModel, apiKey: c.EffectiveLLMAPIKey(""), maxTokensEnv: "DRYDOCK_SEC70B_MAX_TOKENS", maxTokens: c.Sec70BMaxTokens},
+		{name: "secclassify", baseURLEnv: "DRYDOCK_SECCLASSIFY_BASE_URL", modelEnv: "DRYDOCK_SECCLASSIFY_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecClassifyBaseURL, model: c.SecClassifyModel, apiKey: c.EffectiveLLMAPIKey(""), maxTokensEnv: "DRYDOCK_SECCLASSIFY_MAX_TOKENS", maxTokens: c.SecClassifyMaxTokens},
+		{name: "seclocalize", baseURLEnv: "DRYDOCK_SECLOCALIZE_BASE_URL", modelEnv: "DRYDOCK_SECLOCALIZE_MODEL", keyEnv: "DRYDOCK_LLM_API_KEY", baseURL: c.SecLocalizeBaseURL, model: c.SecLocalizeModel, apiKey: c.EffectiveLLMAPIKey(""), maxTokensEnv: "DRYDOCK_SECLOCALIZE_MAX_TOKENS", maxTokens: c.SecLocalizeMaxTokens},
+		{name: "agentic-discovery", baseURLEnv: "DRYDOCK_AGENTIC_DISCOVERY_BASE_URL", modelEnv: "DRYDOCK_AGENTIC_DISCOVERY_MODEL", keyEnv: "DRYDOCK_AGENTIC_DISCOVERY_API_KEY", baseURL: c.AgenticDiscoveryBaseURL, model: c.AgenticDiscoveryModel, apiKey: c.EffectiveLLMAPIKey(c.AgenticDiscoveryAPIKey), maxTokensEnv: "DRYDOCK_AGENTIC_DISCOVERY_MAX_TOKENS", maxTokens: c.AgenticDiscoveryMaxTokens},
 	}
 }
 

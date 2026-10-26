@@ -686,7 +686,8 @@ func (r *Reviewer) ExecuteReviewer(ctx context.Context, request reviewengine.Rev
 		Completion: reviewengine.CompletionRequest{
 			BaseURL: request.Endpoint.BaseURL, APIKey: request.Endpoint.APIKey,
 			Model: request.Endpoint.Model, Temperature: request.Temperature,
-			Messages: baseMessages,
+			MaxTokens: request.Endpoint.MaxTokens,
+			Messages:  baseMessages,
 		},
 		Registry: r.config.Registry, Scope: scope, Counter: r.config.Counter,
 		Limits:       r.config.Limits,
