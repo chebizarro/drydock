@@ -14,6 +14,16 @@ summary, findings, needs_more_context.
 Each finding must include:
 severity, category, file, line, evidence, explanation, suggestion, confidence.
 
+Field types and allowed values (output that violates these is rejected):
+- summary: non-empty string. needs_more_context: array of strings. findings: array of objects.
+- severity: exactly one of critical | high | medium | low | info.
+- category: exactly one of security | correctness | architecture | style | test-coverage.
+  Map other concerns onto these: performance, concurrency, robustness, logic, memory safety -> correctness;
+  compatibility, maintainability, API design -> architecture; naming, formatting, readability -> style;
+  missing or weak tests -> test-coverage.
+- file: path of a changed file. line: positive integer line number in the new version of that file.
+- confidence: number from 0 to 1. A finding with confidence below 0.6 requires a non-empty needs_more_context.
+
 Optional structured suggestion fields (include ONLY when the fix is concrete and localized):
 - suggested_diff: a minimal unified diff hunk showing the exact change. Start with @@ header.
 - suggested_code: the replacement code block that should replace the current code.
@@ -32,6 +42,13 @@ func plannerSystemPrompt() string {
 Return JSON ONLY with keys:
 change_type, risk_areas, needed_context, review_focus, model_route.
 Allowed model_route: coder32b | llm70b | coder14b.
+
+Field types:
+- change_type: non-empty string.
+- risk_areas: array of strings.
+- needed_context: array of strings (use [] when nothing is needed).
+- review_focus: a single string of one or two sentences, NOT an array.
+- model_route: exactly one of coder32b | llm70b | coder14b.
 If the context includes a change-impact section with high or critical blast radius, factor that into review_focus and prefer a route that can reason about downstream compatibility.`
 }
 
