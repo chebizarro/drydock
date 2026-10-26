@@ -22,6 +22,30 @@ cp .env.example .env
 | `DRYDOCK_REPO_CACHE_MAX_COUNT` | integer | `50` | Maximum number of cached repositories before LRU eviction. Set to `0` to disable count-based eviction. |
 | `DRYDOCK_REPO_CACHE_MAX_SIZE_MB` | integer | `10240` | Maximum total cache size in MB (default 10 GB). Set to `0` to disable size-based eviction. |
 
+### Review context token budget
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `DRYDOCK_CONTEXT_TOKEN_BUDGET` | integer | `64000` | Operator ceiling for deterministic review context, including discovery fallback. Must be between `1024` and `1048576`. Repository `.drydock.yaml` `context.token_budget` can only lower this ceiling. |
+| `DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET` | integer | Context budget | Inherits `DRYDOCK_CONTEXT_TOKEN_BUDGET` when unset. An explicit value must be at least the context budget so the single-shot package gate can accept built bundles. |
+
+The effective context prompt budget is the context budget minus
+`DRYDOCK_AGENTIC_TOKEN_HEADROOM` (default `0.10`), rounded down. Builders count
+rendered layer headings and separators too. This fixes the previous mismatch
+with the package gate: default bundles now cap at about **57,600 tokens**, not
+64,000. Headroom applies consistently to deterministic builders, including the
+benchmark and discovery fallback paths. The setting applies wherever Drydock
+builds context (listener, agentic discovery and its fallback, and the bench's
+agentic mode); `drydock-eval` and `drydock-bench` single-shot mode use the context
+supplied in their datasets.
+
+Size the budget approximately as **served context minus system prompts and
+completion headroom**; for a 32k server, start with
+`DRYDOCK_CONTEXT_TOKEN_BUDGET=24000` (21,600 effective context tokens with default
+headroom). With llama.cpp `-np N`, the per-slot context is `-c` divided by `N`,
+not the full `-c` allocation. Leave room for other request content as well as the
+model's answer.
+
 ## Repository Monitoring and Security Ceiling
 
 | Variable | Type | Default | Description |

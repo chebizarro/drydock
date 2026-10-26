@@ -6,6 +6,14 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/vectorstore"
 )
 
+// WithTokenBudget sets the operator's nominal budget and package-gate headroom.
+func WithTokenBudget(budget int, headroom float64) func(*BuilderOptions) {
+	return func(opts *BuilderOptions) {
+		opts.TokenBudget = budget
+		opts.TokenHeadroom = headroom
+	}
+}
+
 // WithChartRoom configures Chartroom-backed retrieval for the context builder.
 func WithChartRoom(cfg ChartRoomConfig) func(*BuilderOptions) {
 	return func(opts *BuilderOptions) {

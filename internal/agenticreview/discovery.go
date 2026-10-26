@@ -165,7 +165,9 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 	buildInput := input.BuildInput
 	buildInput.RepoPath = materialized
 	buildInput.PatchEventContent = analysis.FilteredDiff
-	buildInput.TokenBudgetOverride = d.config.TokenBudget
+	if buildInput.TokenBudgetOverride <= 0 || d.config.TokenBudget < buildInput.TokenBudgetOverride {
+		buildInput.TokenBudgetOverride = d.config.TokenBudget
+	}
 	fallback, err := d.config.Builder.Build(ctx, buildInput)
 	if err != nil {
 		return DiscoveryResult{Trace: trace}, fmt.Errorf("agentic review: deterministic exhaustion fallback: %w", err)

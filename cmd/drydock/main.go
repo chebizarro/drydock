@@ -413,7 +413,9 @@ func main() {
 	logger.Info("payment service configured", "nwc_configured", invoiceProvider != nil, "trusted_mints", len(cfg.PaymentTrustedMints))
 
 	// --- Optional service clients ---
-	var builderOpts []func(*contextbuilder.BuilderOptions)
+	builderOpts := []func(*contextbuilder.BuilderOptions){
+		contextbuilder.WithTokenBudget(cfg.ContextTokenBudget, cfg.AgenticTokenHeadroom),
+	}
 
 	// Qdrant + embedding
 	var qdrantClient *vectorstore.Client

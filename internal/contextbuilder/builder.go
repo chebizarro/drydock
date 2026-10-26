@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -13,6 +14,16 @@ import (
 )
 
 const DefaultTokenBudget = 64_000
+const DefaultTokenHeadroom = 0.10
+
+// EffectiveTokenLimit reserves tokenizer/model headroom, matching the package gate.
+// Zero headroom selects the default, as it does in agenttools.GateBundle.
+func EffectiveTokenLimit(budget int, headroom float64) int {
+	if headroom == 0 {
+		headroom = DefaultTokenHeadroom
+	}
+	return int(math.Floor(float64(budget) * (1 - headroom)))
+}
 
 const (
 	LayerPatchDiff        = "patch"
@@ -129,8 +140,10 @@ func (w *LayerWarning) Unwrap() error { return w.Err }
 // BuilderOptions configures optional service clients for enhanced analysis.
 // All fields are optional — nil means the feature is disabled.
 type BuilderOptions struct {
-	QdrantClient any // nil = no Qdrant retrieval
-	EmbedClient  any // nil = no embedding
+	TokenBudget   int     // zero selects DefaultTokenBudget
+	TokenHeadroom float64 // zero selects DefaultTokenHeadroom
+	QdrantClient  any     // nil = no Qdrant retrieval
+	EmbedClient   any     // nil = no embedding
 
 	// Typed accessors set internally. Use the With* helpers.
 	retrievalProvider Provider
@@ -139,9 +152,10 @@ type BuilderOptions struct {
 }
 
 type Builder struct {
-	TokenBudget int
-	Counter     TokenCounter
-	Providers   []Provider
+	TokenHeadroom float64
+	TokenBudget   int
+	Counter       TokenCounter
+	Providers     []Provider
 }
 
 // NewBuilder constructs a builder with an explicit, non-nil token counter.
@@ -188,7 +202,15 @@ func NewWithOptionsForMode(opts BuilderOptions, mode BuilderMode, encoding strin
 	default:
 		return nil, fmt.Errorf("contextbuilder: unknown builder mode %q", mode)
 	}
-	return NewBuilder(DefaultTokenBudget, counter, DefaultProviders(opts))
+	builder, err := NewBuilder(opts.TokenBudget, counter, DefaultProviders(opts))
+	if err != nil {
+		return nil, err
+	}
+	if opts.TokenHeadroom < 0 || opts.TokenHeadroom >= 1 || math.IsNaN(opts.TokenHeadroom) {
+		return nil, fmt.Errorf("contextbuilder: token headroom must be in [0,1)")
+	}
+	builder.TokenHeadroom = opts.TokenHeadroom
+	return builder, nil
 }
 
 // isDocLayer returns true if the layer name is a documentation provider.
@@ -233,6 +255,8 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 	if in.TokenBudgetOverride > 0 && in.TokenBudgetOverride < effectiveBudget {
 		effectiveBudget = in.TokenBudgetOverride
 	}
+
+	effectiveBudget = EffectiveTokenLimit(effectiveBudget, b.TokenHeadroom)
 
 	patchAnalysis, patchErr := AnalyzePatchStructure(PatchAnalysisRequest{
 		Diff: in.PatchEventContent, ExcludePaths: in.ExcludePaths,
@@ -329,18 +353,26 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 	})
 
 	usedTokens := 0
+	parts := make([]string, 0, len(layers))
 	used := make([]layer, 0, len(layers))
 	dropped := make([]string, 0, len(layers))
 
 	for _, lr := range layers {
+		prefix := strings.Join(parts, "\n\n")
+		if len(parts) > 0 {
+			prefix += "\n\n"
+		}
+		prefix += "## " + lr.name + "\n"
+		renderedTokens := b.Counter.Count(prefix + lr.content)
 		remaining := effectiveBudget - usedTokens
-		if lr.tokens > remaining {
+		if renderedTokens > effectiveBudget {
 			// Preserve the highest-priority patch/file context when a useful prefix fits.
 			if lr.priority <= 2 && remaining > 0 {
-				if truncated := truncateToTokenBudget(lr.content, remaining, b.Counter); truncated != "" {
+				if truncated := truncateLayerToTokenBudget(lr.content, prefix, effectiveBudget, b.Counter); truncated != "" {
 					lr.content = truncated
 					lr.tokens = b.Counter.Count(truncated)
-					usedTokens += lr.tokens
+					usedTokens = b.Counter.Count(prefix + truncated)
+					parts = append(parts, "## "+lr.name+"\n"+truncated)
 					used = append(used, lr)
 					message := "truncated to fit token budget"
 					if prior, ok := statuses[lr.name]; ok && prior.Message != "" {
@@ -358,7 +390,8 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 			statuses[lr.name] = LayerStatus{Layer: lr.name, Status: "dropped", Message: message, Tokens: lr.tokens}
 			continue
 		}
-		usedTokens += lr.tokens
+		usedTokens = renderedTokens
+		parts = append(parts, "## "+lr.name+"\n"+lr.content)
 		used = append(used, lr)
 		if status, ok := statuses[lr.name]; ok && (status.Status == "degraded" || status.Status == "truncated") {
 			status.Tokens = lr.tokens
@@ -368,10 +401,8 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		}
 	}
 
-	parts := make([]string, 0, len(used))
 	usedNames := make([]string, 0, len(used))
 	for _, lr := range used {
-		parts = append(parts, "## "+lr.name+"\n"+lr.content)
 		usedNames = append(usedNames, lr.name)
 	}
 
@@ -400,10 +431,10 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 			strings.Join(excludedFiles, ", ") + ".\n" +
 			"If these are dependency lock files, generated code, or schema definitions, " +
 			"note that changes may have security or compatibility implications."
-		noteTokens := b.Counter.Count(note)
-		if usedTokens+noteTokens <= effectiveBudget {
+		noteTokens := b.Counter.Count(strings.Join(append(append([]string(nil), parts...), note), "\n\n"))
+		if noteTokens <= effectiveBudget {
 			parts = append(parts, note)
-			usedTokens += noteTokens
+			usedTokens = noteTokens
 		}
 	}
 
@@ -428,6 +459,26 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (ContextBundle, erro
 		TestCoverageGaps: testCoverageGaps,
 		ChangedFiles:     changedFiles,
 	}, nil
+}
+
+// Fit a layer against the complete rendered prefix, including headings and
+// separators. Counting content alone can overflow the final package gate.
+func truncateLayerToTokenBudget(content, prefix string, budget int, counter TokenCounter) string {
+	runes := []rune(content)
+	low, high := 0, len(runes)
+	for low < high {
+		mid := low + (high-low+1)/2
+		if counter.Count(prefix+string(runes[:mid])) <= budget {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	truncated := strings.TrimSpace(string(runes[:low]))
+	if counter.Count(prefix+truncated) > budget {
+		return ""
+	}
+	return truncated
 }
 
 func truncateToTokenBudget(content string, budget int, counter TokenCounter) string {
