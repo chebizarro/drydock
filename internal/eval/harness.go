@@ -33,7 +33,7 @@ func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
 	fn := 0
 	severityMatches := 0
 	severityMismatches := 0
-	lineTolerance := max(h.LineTolerance, 0)
+	lineTolerance := h.LineTolerance
 
 	var calibrationAbsSum float64
 	calibrationN := 0
@@ -50,41 +50,18 @@ func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
 			return Metrics{}, fmt.Errorf("review case %s: %w", c.CaseID, err)
 		}
 
-		matchedExpected := make([]bool, len(c.ExpectedFindings))
-		totalExpected += len(c.ExpectedFindings)
-
-		for _, pred := range out.Findings {
-			totalPredicted++
-			label := 0.0
-			matchIndex := findExpectedMatch(c.ExpectedFindings, matchedExpected, pred, lineTolerance)
-			if matchIndex >= 0 {
-				tp++
-				label = 1
-				matchedExpected[matchIndex] = true
-				if normalizeLabel(c.ExpectedFindings[matchIndex].Severity) == normalizeLabel(pred.Severity) {
-					severityMatches++
-				} else {
-					severityMismatches++
-				}
-			} else {
-				fp++
-			}
-
-			calibrationAbsSum += math.Abs(pred.Confidence - label)
-			calibrationN++
-			if pred.Confidence >= 0.8 {
-				highConfN++
-				if label == 1 {
-					highConfTP++
-				}
-			}
-		}
-
-		for _, matched := range matchedExpected {
-			if !matched {
-				fn++
-			}
-		}
+		s := ScoreCase(c.ExpectedFindings, out.Findings, lineTolerance)
+		totalExpected += s.Expected
+		totalPredicted += s.Predicted
+		tp += s.TruePositives
+		fp += s.FalsePositives
+		fn += s.FalseNegatives
+		severityMatches += s.SeverityMatches
+		severityMismatches += s.SeverityMismatches
+		calibrationAbsSum += s.CalibrationAbsSum
+		calibrationN += s.Predicted
+		highConfN += s.HighConfidenceN
+		highConfTP += s.HighConfidenceTP
 	}
 
 	recall := ratio(tp, tp+fn)
@@ -141,6 +118,63 @@ func (h *Harness) RunMonthly(ctx context.Context, ds Dataset) (Metrics, error) {
 	}
 
 	return metrics, nil
+}
+
+// CaseScore is the matching outcome for one case. Fields are additive so
+// callers can aggregate cases however they need (RunMonthly sums them).
+type CaseScore struct {
+	Expected           int     `json:"expected"`
+	Predicted          int     `json:"predicted"`
+	TruePositives      int     `json:"true_positives"`
+	FalsePositives     int     `json:"false_positives"`
+	FalseNegatives     int     `json:"false_negatives"`
+	SeverityMatches    int     `json:"severity_matches"`
+	SeverityMismatches int     `json:"severity_mismatches"`
+	CalibrationAbsSum  float64 `json:"calibration_abs_sum"`
+	HighConfidenceN    int     `json:"high_conf_n"`
+	HighConfidenceTP   int     `json:"high_conf_tp"`
+	// MatchedBy[i] is the index of the prediction matched to expected[i], or -1.
+	MatchedBy []int `json:"matched_by"`
+}
+
+// ScoreCase matches predictions to expected findings one-to-one on category,
+// normalized file, and line within lineTolerance.
+func ScoreCase(expected []ExpectedFinding, findings []reviewengine.Finding, lineTolerance int) CaseScore {
+	lineTolerance = max(lineTolerance, 0)
+	s := CaseScore{Expected: len(expected), Predicted: len(findings), MatchedBy: make([]int, len(expected))}
+	matched := make([]bool, len(expected))
+	for i := range s.MatchedBy {
+		s.MatchedBy[i] = -1
+	}
+	for pi, pred := range findings {
+		label := 0.0
+		if mi := findExpectedMatch(expected, matched, pred, lineTolerance); mi >= 0 {
+			s.TruePositives++
+			label = 1
+			matched[mi] = true
+			s.MatchedBy[mi] = pi
+			if normalizeLabel(expected[mi].Severity) == normalizeLabel(pred.Severity) {
+				s.SeverityMatches++
+			} else {
+				s.SeverityMismatches++
+			}
+		} else {
+			s.FalsePositives++
+		}
+		s.CalibrationAbsSum += math.Abs(pred.Confidence - label)
+		if pred.Confidence >= 0.8 {
+			s.HighConfidenceN++
+			if label == 1 {
+				s.HighConfidenceTP++
+			}
+		}
+	}
+	for _, m := range matched {
+		if !m {
+			s.FalseNegatives++
+		}
+	}
+	return s
 }
 
 func findExpectedMatch(expected []ExpectedFinding, matched []bool, pred reviewengine.Finding, lineTolerance int) int {

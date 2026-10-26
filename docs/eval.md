@@ -114,6 +114,20 @@ ORDER BY created_at DESC
 LIMIT 10;
 ```
 
+## Model Benchmarking (`drydock-bench`)
+
+`cmd/drydock-bench` runs the same engine over a dataset in this format to compare model-to-role assignments. Unlike `drydock-eval`, it keeps going when a case fails, because a timeout or unrepairable JSON is an outcome to measure. It never writes to the drydock database, and it records per-call stage, latency, tokens, llama.cpp prefill/decode timings, JSON repair calls and provider cost as JSONL. Notable flags:
+
+| Flag | Purpose |
+|------|---------|
+| `-agentic` | Run the default agentic path (discovery + tool-using reviewer over pinned Git snapshots); cases need `bench_meta.agentic {repo_dir, base}` |
+| `-workers N` / `-retries N` | Concurrent cases and provider-error retries for hosted APIs (timeouts are never retried) |
+| `-extra-body JSON` | Merge provider options, e.g. `{"reasoning":{"enabled":false}}` |
+| `-max-tokens N` | Cap completion tokens (production sends none) |
+| `-prompt-variant calibrated` | Reproduce the rejected severity/precision rubric experiment |
+
+Endpoints come from the usual `DRYDOCK_*_BASE_URL` / `_MODEL` variables. Dataset generation from a review corpus, sweeps over llama.cpp or OpenRouter, a frontier-judge quality pass and reporting live in the separate nostr-bench repository (`suites/drydock`).
+
 ## Custom Review Runner
 
 The eval harness accepts any implementation of the `ReviewRunner` interface:
