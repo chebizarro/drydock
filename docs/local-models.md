@@ -132,11 +132,12 @@ vllm serve Qwen/Qwen3.8-27B --served-model-name qwen3.8-27b \
 
 ## Context size
 
-Drydock assembles a context bundle of up to **64,000 tokens** by default (the patch, changed-file contents and other context layers). It adds system prompts and needs room for the reply. When a prompt exceeds the server's context, that call fails and the review errors.
+Drydock assembles a context bundle (the patch, changed-file contents and other context layers) within `DRYDOCK_CONTEXT_TOKEN_BUDGET`, default `64000`. After the 10% tokenizer headroom, that's about **57,600 tokens** of context. Drydock adds system prompts and needs room for the reply. When a prompt exceeds the server's context, that call fails and the review errors. Either serve enough context or lower the budget:
 
-- Serve at least **64k** of context if memory allows, ideally ~80k. Check the KV-cache size llama-server logs at startup, and lower `-c` until weights plus KV fit in VRAM.
-- Most real patches need far less: about 5k prompt tokens per call in the benchmark. A 32k server works for typical patches but fails on very large ones.
-- Repository owners can lower the budget per repository with `context.token_budget` in `.drydock.yaml` ([Per-Repository Configuration](repo-config.md)).
+- **Match the budget to your server.** Set `DRYDOCK_CONTEXT_TOKEN_BUDGET` to roughly the served per-slot context minus about 8k for system prompts and the reply. For a 32k server, use `DRYDOCK_CONTEXT_TOKEN_BUDGET=24000` (about 21,600 effective). With llama.cpp `-np N`, the per-slot context is `-c` ÷ N.
+- **Or serve more context.** Use 64k or more if memory allows, ideally ~80k with the default budget. Check the KV-cache size llama-server logs at startup, and lower `-c` until weights plus KV fit in VRAM.
+- **Typical patches are small.** They need about 5k prompt tokens per call in the benchmark, so the budget mostly matters for large patches.
+- **Repositories can only go lower.** A repository can lower the budget further with `context.token_budget` in `.drydock.yaml` ([Per-Repository Configuration](repo-config.md)), but never raise it above the operator setting.
 - The agentic path also checks prompts against `DRYDOCK_AGENTIC_MAX_MODEL_CONTEXT` (default 256k). Set it to your server's real context so oversized turns are rejected before they are sent.
 
 ## Thinking (reasoning) mode

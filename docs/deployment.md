@@ -333,7 +333,7 @@ Runtime problems:
 | `/readyz` stays `503` | The monitored list hasn't loaded: it isn't published to Drydock's read relays, or it has the wrong `d` tag or author |
 | Reviews never start | The repository isn't in the monitored list, or there is no signer (the logs say `pipeline runner disabled`) |
 | `LLM endpoint ... not reachable` from the container | The model server listens only on `127.0.0.1`, or `host.docker.internal` isn't routable. Bind the server to the bridge-reachable address |
-| Reviews fail with context-length errors | The served context is smaller than Drydock's prompt. Raise the server's context; see [Local Models](local-models.md#context-size) |
+| Reviews fail with context-length errors | The served context is smaller than Drydock's prompt. Lower `DRYDOCK_CONTEXT_TOKEN_BUDGET` (e.g. `24000` for a 32k server) or raise the server's context; see [Local Models](local-models.md#context-size) |
 | Reviews time out | Raise `DRYDOCK_LLM_TIMEOUT`, turn thinking off, or use a faster model; see [Local Models](local-models.md#timeouts-and-token-caps) |
 | Many JSON repair calls in the logs (`structured llm output invalid`) | The model is weak at strict JSON. Use a recommended model from [Local Models](local-models.md) |
 | `failed to initialize authoritative agentic tokenizer` at startup | No outbound access to download the tokenizer and no cached copy; see [Tokenizer cache](#tokenizer-cache) |

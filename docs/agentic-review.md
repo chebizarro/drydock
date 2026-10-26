@@ -115,7 +115,7 @@ A continuation requires `chat_id`, owner, request ID, `expected_version`, and a 
 | `DRYDOCK_AGENTIC_REVIEWER_MAX_CUMULATIVE_TOKENS` | `384000` | Reviewer cumulative-token limit |
 | `DRYDOCK_AGENTIC_MAX_TOOL_RESULT_BYTES` | `16384` | Per-tool result byte ceiling |
 | `DRYDOCK_AGENTIC_MAX_MODEL_CONTEXT` | `256000` | Serialized request preflight ceiling |
-| `DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET` | `64000` | Final package budget |
+| `DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET` | `DRYDOCK_CONTEXT_TOKEN_BUDGET` (`64000`) | Final package budget; an explicit value must be at least the context budget |
 | `DRYDOCK_AGENTIC_TOKEN_HEADROOM` | `0.10` | Fraction reserved for tokenizer/model skew |
 | `DRYDOCK_AGENTIC_HISTORY_TOKEN_BUDGET` | `64000` | Compacted conversation-history budget |
 | `DRYDOCK_IDE_AGENTIC_TIMEOUT` | `10m` | End-to-end IDE review/continuation deadline |

@@ -349,7 +349,7 @@ The default review path is agentic ([Agentic Review Operations](agentic-review.m
 | `DRYDOCK_AGENTIC_REVIEWER_MAX_CUMULATIVE_TOKENS` | integer | `384000` | Reviewer cumulative-token limit. |
 | `DRYDOCK_AGENTIC_MAX_TOOL_RESULT_BYTES` | integer | `16384` | Per-tool result size ceiling. |
 | `DRYDOCK_AGENTIC_MAX_MODEL_CONTEXT` | integer | `256000` | A turn whose serialized request exceeds this is rejected before sending. Set it to your server's real context size. |
-| `DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET` | integer | `64000` | Token budget of the finalized context package (also gates the fallback bundle). |
+| `DRYDOCK_AGENTIC_PACKAGE_TOKEN_BUDGET` | integer | *(inherits `DRYDOCK_CONTEXT_TOKEN_BUDGET`)* | Token budget of the finalized context package (also gates the single-shot bundle). See [Review context token budget](#review-context-token-budget). |
 | `DRYDOCK_AGENTIC_TOKEN_HEADROOM` | float | `0.10` | Fraction of the package budget reserved for tokenizer/model skew (0 ≤ x < 1). |
 | `DRYDOCK_AGENTIC_HISTORY_TOKEN_BUDGET` | integer | `64000` | Compacted conversation-history budget for continued sessions. |
 | `DRYDOCK_IDE_AGENTIC_TIMEOUT` | duration | `10m` | End-to-end deadline for an IDE review or continuation. |
