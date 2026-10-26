@@ -506,6 +506,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		PatchEventContent: authoritativePatch, RepoPath: prep.RepoPath, RepoID: task.RepoID,
 		TokenBudgetOverride: repoCfg.Context.TokenBudget, ExcludePaths: repoCfg.Context.ExcludePaths,
 		DisableDocs: !repoCfg.DocsEnabled(), SecretScanContext: betterleaks.FormatContext(secretScanResult),
+		IncludeAddedLines: repoCfg.Context.IncludeAddedLines,
 	}
 
 	var bundle contextbuilder.ContextBundle

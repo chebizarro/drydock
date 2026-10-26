@@ -56,9 +56,10 @@ type ReviewConfig struct {
 
 // ContextConfig controls context builder behavior.
 type ContextConfig struct {
-	TokenBudget  int      `yaml:"token_budget"`
-	ExcludePaths []string `yaml:"exclude_paths"`
-	IncludeDocs  *bool    `yaml:"include_docs"` // pointer to distinguish missing from false
+	TokenBudget       int      `yaml:"token_budget"`
+	ExcludePaths      []string `yaml:"exclude_paths"`
+	IncludeDocs       *bool    `yaml:"include_docs"` // pointer to distinguish missing from false
+	IncludeAddedLines bool     `yaml:"include_added_lines"`
 }
 
 // PaymentsConfig controls Cashu ecash payment gating for review access.
