@@ -191,6 +191,36 @@ func TestOperatorControlPersistsBeforePublishing(t *testing.T) {
 	}
 }
 
+func TestOperatorControlRedeliveredCommandIsIdempotent(t *testing.T) {
+	f := newFixture(t, Policy{}, nil, scope.Matcher{})
+	admin, opA := nostr.Generate(), nostr.Generate()
+	ctrl := NewOperatorControl(f.registry, f.store, []string{nostr.GetPublicKey(admin).Hex()}, f.servicePK.Hex(), nil)
+	if _, rpcErr := f.operatorCall(ctrl, admin, OperatorParams{Action: "set", Operator: nostr.GetPublicKey(opA).Hex()}, true); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	// Build one rollback request and deliver it twice: the second delivery
+	// (replay, or retry after a commit that ingest never marked complete)
+	// must not swap the operators back.
+	raw, _ := json.Marshal(OperatorParams{Action: "rollback", AllowScopeExpansion: true})
+	event := nostr.Event{Kind: contextvm.KindContextVM, CreatedAt: nostr.Now(), Content: string(raw), Tags: nostr.Tags{
+		{"p", f.servicePK.Hex()}, {"method", MethodOperator}, {"expiration", strconv.FormatInt(time.Now().Add(5*time.Minute).Unix(), 10)}}}
+	if err := event.Sign(admin); err != nil {
+		t.Fatal(err)
+	}
+	req := contextvm.Request{Event: event, Sender: event.PubKey, Msg: contextvm.Message{JSONRPC: "2.0", ID: "rb", Method: MethodOperator, Params: raw}}
+	first, rpcErr := ctrl.Handle(f.ctx, req)
+	if rpcErr != nil || !first.(OperatorState).Changed || first.(OperatorState).Operator != "" {
+		t.Fatalf("first rollback = %+v err=%+v", first, rpcErr)
+	}
+	second, rpcErr := ctrl.Handle(f.ctx, req)
+	if rpcErr != nil || second.(OperatorState).Changed || second.(OperatorState).Operator != "" {
+		t.Fatalf("redelivered rollback changed state: %+v err=%+v", second, rpcErr)
+	}
+	if cur, _, _ := f.registry.OperatorState(); cur != nostr.ZeroPK {
+		t.Fatal("replayed rollback swapped operators back")
+	}
+}
+
 func TestOperatorControlSerializesConcurrentChanges(t *testing.T) {
 	f := newFixture(t, Policy{}, nil, scope.Matcher{})
 	admin := nostr.Generate()

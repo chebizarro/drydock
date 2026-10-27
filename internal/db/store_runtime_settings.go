@@ -16,6 +16,10 @@ const (
 	// RuntimeSettingMonitoringOperatorHasPrevious is "1" when a rollback
 	// target exists; an empty previous operator then means "no ceiling".
 	RuntimeSettingMonitoringOperatorHasPrevious = "monitoring.operator.has_previous"
+	// RuntimeSettingMonitoringOperatorLastCommand is the event id of the last
+	// applied monitoring/operator command, written atomically with the state
+	// it produced, so a redelivered command is a no-op.
+	RuntimeSettingMonitoringOperatorLastCommand = "monitoring.operator.last_command_event"
 )
 
 // GetRuntimeSetting returns a persisted operator setting. Missing keys report

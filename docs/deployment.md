@@ -295,6 +295,10 @@ Drydock counts prompt tokens with the `cl100k_base` encoding. It downloads the e
 - `DRYDOCK_REPO_CACHE_MAX_SIZE_MB` and `DRYDOCK_REPO_CACHE_MAX_COUNT` bound the repository cache; repositories range from 10 MB to several GB.
 - See [Scaling](scaling.md) for multi-server layouts.
 
+### Forge interoperability and the monitoring canary
+
+Repositories hosted on GRASP or any NIP-34 forge are reviewed from the relays their announcement declares; see [per-repository relay routing](configuration.md#per-repository-relay-routing). The repository-native check for this lives in `internal/listener/interop_test.go`. After deploying, prove the live path against your own stack with `scripts/monitoring-canary.sh` (run `--dry-run` first): it enrolls and unenrolls a repository, optionally replaces its relay set, and asserts that the container, process, signer pubkey, database file, Qdrant collections and queued work are unchanged while `/readyz` stays green. Budabit repositories flow through the same NIP-34 paths; Loom CI attestations and Armada Concord delivery are tracked as follow-ups in [the security review](reviews/monitoring-authority-security-review-2026-10-27.md).
+
 ### Management listener
 
 `DRYDOCK_HEALTH_ADDR` serves `/healthz` (liveness), `/readyz` (readiness), `/metrics` (Prometheus), `/dashboard/` and `/api/*`. The dashboard and API are unauthenticated unless `DRYDOCK_DASHBOARD_BEARER_TOKEN` is set, so keep the listener on loopback, or set the token:

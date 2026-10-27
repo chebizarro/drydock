@@ -68,8 +68,10 @@ type OperatorRegistry interface {
 	MonitoredCount() int
 }
 
-// SettingsStore persists control-plane state across restarts.
+// SettingsStore persists control-plane state across restarts and reads back
+// the last applied command so a redelivered request is idempotent.
 type SettingsStore interface {
+	GetRuntimeSetting(ctx context.Context, key string) (string, bool, error)
 	SetRuntimeSettings(ctx context.Context, values map[string]string, changedBy, changeEventID string) error
 }
 
@@ -161,6 +163,21 @@ func (c *OperatorControl) Handle(ctx context.Context, request contextvm.Request)
 	}
 	current, previous, hasPrevious := c.registry.OperatorState()
 
+	// Durable idempotency: the last applied command's event id is persisted in
+	// the same write as the state it produced. A redelivery (relay replay, or a
+	// crash after the commit but before ingest recorded handler completion)
+	// answers with the current state and changes nothing — a retried rollback
+	// must not swap the operators again.
+	if action != "get" {
+		last, _, err := c.settings.GetRuntimeSetting(ctx, db.RuntimeSettingMonitoringOperatorLastCommand)
+		if err != nil {
+			return nil, &contextvm.Error{Code: contextvm.ErrorInternal, Message: "operator control state unavailable"}
+		}
+		if last == request.Event.ID.Hex() {
+			return c.stateLocked(action, false), nil
+		}
+	}
+
 	var next struct {
 		current, previous nostr.PubKey
 		hasPrevious       bool
@@ -221,6 +238,7 @@ func (c *OperatorControl) persist(ctx context.Context, current, previous nostr.P
 		db.RuntimeSettingMonitoringOperator:            hexOf(current),
 		db.RuntimeSettingMonitoringOperatorPrevious:    hexOf(previous),
 		db.RuntimeSettingMonitoringOperatorHasPrevious: hasPrev,
+		db.RuntimeSettingMonitoringOperatorLastCommand: eventID,
 	}, sender, eventID)
 }
 
