@@ -93,6 +93,12 @@ type Config struct {
 	MonitoringEnrollPriceSats int64
 	MonitoringEnrollTTL       time.Duration
 	MonitoringEnrollMaxTTL    time.Duration
+	// MonitoringAdmins may rotate the operator ceiling through the
+	// monitoring/operator control plane (hex or npub).
+	MonitoringAdmins []string
+	// MonitoredReposAuthorForce makes the environment operator override a
+	// persisted control-plane value at startup (audited local recovery).
+	MonitoredReposAuthorForce bool
 
 	// Kind 0 profile metadata published for the signer identity at startup.
 	ProfileEnabled    bool
@@ -282,6 +288,8 @@ func FromEnv() Config {
 		MonitoringEnrollPriceSats: int64(parseIntOrDefault(envOrDefault("DRYDOCK_MONITORING_ENROLL_PRICE_SATS", "0"), 0)),
 		MonitoringEnrollTTL:       parseDurationOrDefault(envOrDefault("DRYDOCK_MONITORING_ENROLL_TTL", "0"), 0),
 		MonitoringEnrollMaxTTL:    parseDurationOrDefault(envOrDefault("DRYDOCK_MONITORING_ENROLL_MAX_TTL", "8760h"), 365*24*time.Hour),
+		MonitoringAdmins:          SplitCSV(envOrDefault("DRYDOCK_MONITORING_ADMINS", "")),
+		MonitoredReposAuthorForce: parseBoolOrDefault(envOrDefault("DRYDOCK_MONITORED_REPOS_AUTHOR_FORCE", "false"), false),
 		ProfileEnabled:            parseBoolOrDefault(envOrDefault("DRYDOCK_PROFILE_ENABLED", "true"), true),
 		ProfileName:               envOrDefault("DRYDOCK_PROFILE_NAME", "Drydock"),
 		ProfileAbout: envOrDefault("DRYDOCK_PROFILE_ABOUT",
@@ -774,23 +782,28 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 		if strings.TrimSpace(c.DepRunnerURL) == "" {
 			result.Errors = append(result.Errors, "dependency upgrades require DRYDOCK_DEP_RUNNER_URL (the sidecar that performs manifest edits)")
 		}
-		if strings.TrimSpace(c.MonitoredReposAuthor) == "" {
-			result.Errors = append(result.Errors, "dependency upgrades require DRYDOCK_MONITORED_REPOS_AUTHOR (the monitored-repository control plane)")
+		if c.SignerBunkerURL == "" && c.SignerNsec == "" {
+			result.Errors = append(result.Errors, "dependency upgrades require a signer (the monitored-repository registry is keyed on the service identity)")
 		}
 	}
 
-	// --- Operator-authored monitored repository list ---
+	// --- Operator ceiling (bootstrap only; the persisted control-plane value wins) ---
 	monitoredAuthor := strings.TrimSpace(c.MonitoredReposAuthor)
 	if monitoredAuthor == "" {
-		if c.IsProduction() {
-			result.Errors = append(result.Errors, "production mode requires DRYDOCK_MONITORED_REPOS_AUTHOR")
-		} else {
-			result.Warnings = append(result.Warnings, "DRYDOCK_MONITORED_REPOS_AUTHOR is empty: monitored repository control-plane ingestion is disabled")
-		}
+		result.Warnings = append(result.Warnings, "DRYDOCK_MONITORED_REPOS_AUTHOR is empty: no operator ceiling; reactive membership is bounded only by maintainer authority and the static allowlists")
 	} else if pubkey, err := scope.ParsePubkey(monitoredAuthor); err != nil {
 		result.Errors = append(result.Errors, "DRYDOCK_MONITORED_REPOS_AUTHOR must be a valid hex or npub public key")
 	} else {
 		c.MonitoredReposAuthor = pubkey.Hex()
+	}
+
+	for i, raw := range c.MonitoringAdmins {
+		pubkey, err := scope.ParsePubkey(raw)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("DRYDOCK_MONITORING_ADMINS entry %q must be a valid hex or npub public key", raw))
+			continue
+		}
+		c.MonitoringAdmins[i] = pubkey.Hex()
 	}
 
 	// --- Signer configuration ---

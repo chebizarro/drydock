@@ -143,24 +143,6 @@ func subscriptionFilters(since nostr.Timestamp, cfg Config) []nostr.Filter {
 			Tags:  nostr.TagMap{"d": {monitoring.ListIdentifier}, "p": {service.Hex()}},
 		})
 	}
-	operator, err := nostr.PubKeyFromHex(strings.TrimSpace(cfg.MonitoredReposAuthor))
-	if err == nil && operator != nostr.ZeroPK {
-		listAddress := monitoring.ListAddress(operator.Hex())
-		// These control-plane filters intentionally have no Since. They must
-		// recover the current replaceable list independently of the event HWM.
-		filters = append(filters,
-			nostr.Filter{
-				Kinds:   []nostr.Kind{eventkind.MonitoredRepositories},
-				Authors: []nostr.PubKey{operator},
-				Tags:    nostr.TagMap{"d": {monitoring.ListIdentifier}},
-			},
-			nostr.Filter{
-				Kinds:   []nostr.Kind{eventkind.Deletion},
-				Authors: []nostr.PubKey{operator},
-				Tags:    nostr.TagMap{"a": {listAddress}},
-			},
-		)
-	}
 	return filters
 }
 
@@ -173,7 +155,6 @@ type Config struct {
 	GiftWrapEnabled      bool
 	ContextVMPubkey      string
 	ContextVMMethods     []string
-	MonitoredReposAuthor string
 }
 
 // RoutePlanner supplies live routing inputs (customer relays, declared
@@ -473,6 +454,22 @@ func (s *Service) directedFilters(since nostr.Timestamp, routes relayroute.Route
 // deletions, and the announcements of every declared repository.
 func controlPlaneFilters(routes relayroute.Routes) []nostr.Filter {
 	var filters []nostr.Filter
+	// The operator ceiling list and its deletion. Coming from live routes
+	// rather than static config, an operator rotation resubscribes here.
+	if operator, err := nostr.PubKeyFromHex(strings.TrimSpace(routes.Operator)); err == nil && operator != nostr.ZeroPK {
+		filters = append(filters,
+			nostr.Filter{
+				Kinds:   []nostr.Kind{eventkind.MonitoredRepositories},
+				Authors: []nostr.PubKey{operator},
+				Tags:    nostr.TagMap{"d": {monitoring.ListIdentifier}},
+			},
+			nostr.Filter{
+				Kinds:   []nostr.Kind{eventkind.Deletion},
+				Authors: []nostr.PubKey{operator},
+				Tags:    nostr.TagMap{"a": {monitoring.ListAddress(operator.Hex())}},
+			},
+		)
+	}
 	var authors []nostr.PubKey
 	var addresses []string
 	for _, raw := range routes.ListAuthors {

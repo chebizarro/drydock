@@ -103,8 +103,20 @@ type AuthorSnapshot struct {
 // Snapshot is an immutable view of the effective membership.
 type Snapshot struct {
 	// Initialized is true once persisted state has been recovered and, when an
-	// operator ceiling is configured, the operator's list has been seen.
+	// operator ceiling is configured, the operator's list has been seen. It is
+	// the fail-closed gate for membership.
 	Initialized bool
+	// Loaded reports that persisted state has been recovered: the service is
+	// healthy regardless of whether any customer or operator list has arrived.
+	// Readiness keys on this, not on Initialized.
+	Loaded bool
+	// Operator is the current ceiling author (hex), empty when none.
+	Operator string
+	// PreviousOperator is the ceiling author a rollback would restore.
+	PreviousOperator string
+	// CeilingSeen reports that the current operator's list (or its deletion)
+	// is known. False with an operator configured means membership is empty.
+	CeilingSeen bool
 	// Repositories is the effective membership after authorization and ceilings.
 	Repositories map[string]struct{}
 	// Authors is every known list author's winning revision, keyed by pubkey hex.
@@ -123,6 +135,10 @@ type Config struct {
 	// set, effective membership is limited to the repositories that list names;
 	// a missing, deleted, or malformed operator list monitors nothing.
 	Operator string
+	// PreviousOperator and HasPreviousOperator hydrate rollback history that
+	// the control plane persisted before a restart.
+	PreviousOperator    string
+	HasPreviousOperator bool
 	// Scope is the operator repository/owner allowlist ceiling. Its zero value
 	// allows everything.
 	Scope scope.Matcher
@@ -144,10 +160,16 @@ type authority struct {
 }
 
 type Registry struct {
-	store    Store
-	drydock  nostr.PubKey
-	operator nostr.PubKey // nostr.ZeroPK when no operator ceiling is configured
-	scope    scope.Matcher
+	store   Store
+	drydock nostr.PubKey
+	scope   scope.Matcher
+	// operator is the ceiling author (ZeroPK = none). It is mutable through
+	// SetOperatorState so the ceiling can be rotated without a restart;
+	// previous/hasPrevious are rollback history owned by the control plane.
+	// All three are guarded by mu.
+	operator    nostr.PubKey
+	previous    nostr.PubKey
+	hasPrevious bool
 
 	now func() time.Time
 
@@ -183,6 +205,14 @@ func NewRegistry(store Store, cfg Config) (*Registry, error) {
 	if strings.TrimSpace(cfg.Operator) != "" {
 		if r.operator, err = scope.ParsePubkey(cfg.Operator); err != nil {
 			return nil, fmt.Errorf("invalid monitored repositories operator: %w", err)
+		}
+	}
+	if cfg.HasPreviousOperator {
+		r.hasPrevious = true
+		if strings.TrimSpace(cfg.PreviousOperator) != "" {
+			if r.previous, err = scope.ParsePubkey(cfg.PreviousOperator); err != nil {
+				return nil, fmt.Errorf("invalid previous monitored repositories operator: %w", err)
+			}
 		}
 	}
 	r.snapshot.Store(&Snapshot{Repositories: map[string]struct{}{}, Authors: map[string]AuthorSnapshot{}, Expiries: map[string]int64{}})
@@ -315,7 +345,7 @@ func (r *Registry) ApplyList(ctx context.Context, event nostr.Event) (bool, erro
 		return false, fmt.Errorf("%w: exactly one d tag must equal %q", ErrMalformedList, ListIdentifier)
 	}
 
-	names, repos, parseErr := r.parseListTags(event)
+	names, repos, parseErr := parseListTags(event, r.drydock)
 	raw, err := json.Marshal(event)
 	if err != nil {
 		return false, fmt.Errorf("marshal monitored repository list: %w", err)
@@ -468,6 +498,33 @@ func (r *Registry) ApplyAnnouncement(ctx context.Context, event nostr.Event) err
 	r.authorities[ref.Address] = current
 	r.rebuildLocked()
 	return nil
+}
+
+// OperatorState returns the ceiling author, the rollback target, and whether a
+// rollback target exists at all (ZeroPK previous with hasPrevious means "the
+// ceiling was absent before the last change").
+func (r *Registry) OperatorState() (current, previous nostr.PubKey, hasPrevious bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.operator, r.previous, r.hasPrevious
+}
+
+// SetOperatorState atomically installs ceiling state decided and persisted by
+// the control plane, and re-derives membership in the same critical section:
+// with a new operator whose list is not yet known, effective membership is
+// empty (fail closed) until the list arrives through the resubscription this
+// change signals. It carries no policy; scope-expansion acknowledgement and
+// authorization live in the control plane, which owns the durable record.
+func (r *Registry) SetOperatorState(current, previous nostr.PubKey, hasPrevious bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.operator, r.previous, r.hasPrevious = current, previous, hasPrevious
+	r.rebuildLocked()
+}
+
+// MonitoredCount is the expiry-aware number of monitored repositories.
+func (r *Registry) MonitoredCount() int {
+	return len(r.MonitoredRepositoryIDs())
 }
 
 // Membership is the live monitored-repository membership projection consumed by
@@ -665,8 +722,10 @@ func (r *Registry) rebuildLocked() {
 	}
 
 	initialized := r.loaded
+	ceilingSeen := true
 	if r.operator != nostr.ZeroPK {
 		ceiling, seen := r.operatorCeilingLocked()
+		ceilingSeen = seen
 		initialized = initialized && seen
 		for address := range members {
 			if _, ok := ceiling[address]; !ok {
@@ -690,7 +749,14 @@ func (r *Registry) rebuildLocked() {
 			delete(expiries, address) // cut by a ceiling
 		}
 	}
-	r.snapshot.Store(&Snapshot{Initialized: initialized, Repositories: members, Authors: authors, Expiries: expiries})
+	snapshot := &Snapshot{Initialized: initialized, Loaded: r.loaded, CeilingSeen: ceilingSeen, Repositories: members, Authors: authors, Expiries: expiries}
+	if r.operator != nostr.ZeroPK {
+		snapshot.Operator = r.operator.Hex()
+	}
+	if r.hasPrevious && r.previous != nostr.ZeroPK {
+		snapshot.PreviousOperator = r.previous.Hex()
+	}
+	r.snapshot.Store(snapshot)
 	select {
 	case r.changes <- struct{}{}:
 	default: // a signal is already pending; the receiver re-reads state anyway
@@ -818,6 +884,14 @@ func (r *Registry) lookupAuthority(ctx context.Context, ref scope.RepositoryRef)
 // listFromState rebuilds an author's in-memory list from its persisted winner,
 // re-parsing the stored event so recovery and live application share one parser.
 func (r *Registry) listFromState(state db.MonitoredRepositoryListState) (*authorList, error) {
+	return listFromPersisted(state, r.drydock)
+}
+
+// listFromPersisted is the single interpretation of a persisted list revision
+// (status, whether it names drydock, declared repositories). The inventory
+// uses it too, so a report can never disagree with the registry about what a
+// stored list means.
+func listFromPersisted(state db.MonitoredRepositoryListState, drydock nostr.PubKey) (*authorList, error) {
 	author, err := scope.ParsePubkey(state.OperatorPubkey)
 	if err != nil || state.ListAddress != ListAddress(author.Hex()) || state.DTag != ListIdentifier {
 		return nil, errors.New("persisted monitored repository list identity does not match configuration")
@@ -832,7 +906,7 @@ func (r *Registry) listFromState(state db.MonitoredRepositoryListState) (*author
 		event.Kind != MonitoredListKind || event.PubKey != author || event.ID.Hex() != state.EventID {
 		return nil, errors.New("persisted monitored repository list event does not match its record")
 	}
-	names, repos, parseErr := r.parseListTags(event)
+	names, repos, parseErr := parseListTags(event, drydock)
 	list.namesDrydock = names
 	switch {
 	case parseErr != nil:
@@ -850,7 +924,7 @@ func (r *Registry) listFromState(state db.MonitoredRepositoryListState) (*author
 // parseListTags extracts whether the list names Drydock and which repositories
 // it declares. Any unusable `a` or `p` tag, or an oversized list, makes the
 // whole revision malformed.
-func (r *Registry) parseListTags(event nostr.Event) (bool, map[string]scope.RepositoryRef, error) {
+func parseListTags(event nostr.Event, drydock nostr.PubKey) (bool, map[string]scope.RepositoryRef, error) {
 	names := false
 	repos := make(map[string]scope.RepositoryRef)
 	for _, tag := range event.Tags {
@@ -875,7 +949,7 @@ func (r *Registry) parseListTags(event nostr.Event) (bool, map[string]scope.Repo
 			if err != nil {
 				return false, nil, fmt.Errorf("%w: p tag is not a hex pubkey", ErrMalformedList)
 			}
-			if pubkey == r.drydock {
+			if pubkey == drydock {
 				names = true
 			}
 		}
@@ -915,10 +989,14 @@ func isListAddress(address string) bool {
 
 func cloneSnapshot(snapshot Snapshot) Snapshot {
 	clone := Snapshot{
-		Initialized:  snapshot.Initialized,
-		Repositories: make(map[string]struct{}, len(snapshot.Repositories)),
-		Authors:      make(map[string]AuthorSnapshot, len(snapshot.Authors)),
-		Expiries:     make(map[string]int64, len(snapshot.Expiries)),
+		Initialized:      snapshot.Initialized,
+		Loaded:           snapshot.Loaded,
+		Operator:         snapshot.Operator,
+		PreviousOperator: snapshot.PreviousOperator,
+		CeilingSeen:      snapshot.CeilingSeen,
+		Repositories:     make(map[string]struct{}, len(snapshot.Repositories)),
+		Authors:          make(map[string]AuthorSnapshot, len(snapshot.Authors)),
+		Expiries:         make(map[string]int64, len(snapshot.Expiries)),
 	}
 	for address, expiry := range snapshot.Expiries {
 		clone.Expiries[address] = expiry

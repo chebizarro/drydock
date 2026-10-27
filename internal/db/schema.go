@@ -353,6 +353,14 @@ CREATE TABLE IF NOT EXISTS monitoring_enrollments (
 CREATE INDEX IF NOT EXISTS idx_monitoring_enrollments_author
   ON monitoring_enrollments(author_pubkey);
 
+CREATE TABLE IF NOT EXISTS runtime_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  changed_by TEXT NOT NULL DEFAULT '',
+  change_event_id TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS eval_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   dataset_id TEXT NOT NULL,

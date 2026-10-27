@@ -356,6 +356,30 @@ func TestRevocationOrderingBeatsReplayedOlderEnrollment(t *testing.T) {
 	}
 }
 
+func TestEqualTimestampRevocationBeatsEnrollment(t *testing.T) {
+	f := newFixture(t, Policy{}, nil, scope.Matcher{})
+	f.announce(10)
+	ts := nostr.Now()
+	// Regardless of delivery order, an enrollment and a revocation signed in
+	// the same second resolve to revoked.
+	if _, rpcErr, _ := f.call(f.owner, MethodUnenroll, f.repo.Address, reqOpts{createdAt: ts}); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	late, rpcErr, _ := f.call(f.owner, MethodEnroll, f.repo.Address, reqOpts{createdAt: ts})
+	if rpcErr != nil || late.State != "revoked" || f.registry.Contains(f.repo.Address) {
+		t.Fatalf("enroll after same-second revoke = %+v err=%+v", late, rpcErr)
+	}
+	g := newFixture(t, Policy{}, nil, scope.Matcher{})
+	g.announce(10)
+	if _, rpcErr, _ := g.call(g.owner, MethodEnroll, g.repo.Address, reqOpts{createdAt: ts}); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	rev, rpcErr, _ := g.call(g.owner, MethodUnenroll, g.repo.Address, reqOpts{createdAt: ts})
+	if rpcErr != nil || rev.State != "revoked" || g.registry.Contains(g.repo.Address) {
+		t.Fatalf("revoke after same-second enroll = %+v err=%+v", rev, rpcErr)
+	}
+}
+
 func TestRevocationBeforeEnrollmentLeavesTombstone(t *testing.T) {
 	f := newFixture(t, Policy{}, nil, scope.Matcher{})
 	f.announce(10)

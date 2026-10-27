@@ -32,7 +32,7 @@ LLM servers are **not** part of the Compose stack. You run them separately and p
 | LLM endpoints | Built-in defaults if unset; `http://` and localhost allowed | planner, coder32b, llm70b, coder14b and meta must be set explicitly, with an API key |
 | Endpoint transport | Anything | Every configured LLM, Qdrant, embedding and registry URL must be `https://` and not loopback |
 | Relays | Defaults to public relays | Must be explicit; the built-in public relays are rejected |
-| `DRYDOCK_MONITORED_REPOS_AUTHOR` | Optional operator ceiling | Required (acts as a ceiling; repositories still enroll via their maintainers) |
+| `DRYDOCK_MONITORED_REPOS_AUTHOR` | Optional operator ceiling | Optional operator ceiling (warning when unset) |
 | Signer | Optional (listen-only without one) | Required (bunker or nsec) |
 | Qdrant and embeddings | Optional | URLs, models and API keys required |
 
@@ -103,29 +103,22 @@ If both are set, the bunker wins. Production mode refuses to start without a sig
 
 ## Step 3: Choose what Drydock reviews
 
-Drydock reviews NIP-34 patches (kind 1617) and pull requests (kinds 1618/1619) only for repositories named in a **monitored-repositories list**. This is a NIP-51 kind 30001 event authored by `DRYDOCK_MONITORED_REPOS_AUTHOR`. Until a valid list has loaded, reactive review stays off. That's fail-closed: an empty or deleted list also means "review nothing".
+Drydock reviews NIP-34 patches (kind 1617) and pull requests (kinds 1618/1619) for repositories whose **maintainers have opted in**. A repository is monitored when its kind-30617 owner, or a pubkey in its `maintainers` tag, publishes a NIP-51 kind 30001 list that names Drydock's pubkey in a `p` tag and the repository in an `a` tag — or sends an authenticated `monitoring/enroll` request. Authority follows the latest announcement, so dropping a maintainer withdraws their enrollments. Until the announcement is known and an opt-in exists, nothing is reviewed: that's fail-closed.
 
-Each repository is identified by its kind-30617 announcement address, `30617:<owner-hex-pubkey>:<identifier>`. To find addresses for a repository owner:
-
-```bash
-nak req -k 30617 -a <owner-hex-pubkey> wss://relay.example | jq -r '"30617:" + .pubkey + ":" + (.tags[] | select(.[0]=="d") | .[1])'
-```
-
-Publish the list, signed by the operator key, to the relays Drydock reads, with one `a` tag per repository:
+A maintainer opts a repository in with:
 
 ```bash
 nak event -k 30001 -d drydock:monitored-repositories:v1 \
+  -t p=<drydock-hex-pubkey> \
   -t a=30617:<owner-hex>:<repo-identifier> \
-  -t a=30617:<owner-hex>:<another-repo> \
-  --sec <operator-secret-or-bunker-url> \
-  wss://your-relay.example
+  --sec <maintainer-secret> wss://your-relay.example
 ```
 
-Rules: exactly one `d` tag equal to `drydock:monitored-repositories:v1`, and zero or more `a` tags. Publishing a newer list replaces the old one live; no restart is needed.
+Optionally, you as the operator can add a **ceiling**: set `DRYDOCK_MONITORED_REPOS_AUTHOR` to your key and publish the same kind of list (no `p` tag needed) naming the repositories you are willing to review. Only repositories in both the maintainer opt-ins and your list are monitored; a deleted or malformed ceiling list monitors nothing. The ceiling can be rotated live with `monitoring/operator` (see the [Configuration Reference](configuration.md#live-operator-ceiling)). `DRYDOCK_REPO_ALLOWLIST` and `DRYDOCK_REPO_OWNER_ALLOWLIST` remain static hard limits.
 
-Optional hard limits on top of the list: `DRYDOCK_REPO_ALLOWLIST` and `DRYDOCK_REPO_OWNER_ALLOWLIST`. See the [Configuration Reference](configuration.md#repository-monitoring-and-security-ceiling).
+To find a repository's address: `nak req -k 30617 -a <owner-hex-pubkey> wss://relay.example | jq -r '"30617:" + .pubkey + ":" + (.tags[] | select(.[0]=="d") | .[1])'`.
 
-**Check:** `nak req -k 30001 -a <operator-hex> -d drydock:monitored-repositories:v1 wss://your-relay.example` returns your event.
+**Check:** the startup log line `loaded monitored repository registry` shows `repository_count` > 0 once an opt-in (and, if configured, your ceiling list) has arrived.
 
 ## Step 4: Configure
 
@@ -289,6 +282,8 @@ Compose prefixes volume names with the project name (`drydock_` when the checkou
 ### Upgrades
 
 `git pull`, then `docker compose up -d --build`. The database schema migrates automatically at startup. Read the commit log for configuration changes; new settings come with defaults, and startup validation reports anything missing.
+
+Upgrading from a release where `DRYDOCK_MONITORED_REPOS_AUTHOR` granted membership: run the [monitoring inventory](configuration.md#migration-from-the-single-trusted-author) first. Repositories in your list without a maintainer opt-in stop being reviewed until a maintainer publishes one; nothing else changes and nothing is expanded.
 
 ### Tokenizer cache
 

@@ -774,6 +774,28 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 18,
+		name:    "runtime_settings",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			exists, err := hasColumn(ctx, tx, "runtime_settings", "key")
+			if err != nil {
+				return fmt.Errorf("check runtime_settings.key: %w", err)
+			}
+			if exists {
+				return nil
+			}
+			if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS runtime_settings (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL,
+				changed_by TEXT NOT NULL DEFAULT '',
+				change_event_id TEXT NOT NULL DEFAULT '',
+				updated_at INTEGER NOT NULL)`); err != nil {
+				return fmt.Errorf("apply runtime settings ddl: %w", err)
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

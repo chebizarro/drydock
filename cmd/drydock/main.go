@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -86,6 +87,10 @@ func main() {
 	if mode := os.Getenv("DRYDOCK_MODE"); mode == "drift-guard" {
 		runDriftGuard(cfg, logger)
 		return
+	}
+	// --- Monitoring inventory mode: report the operator-list migration and exit ---
+	if mode := os.Getenv("DRYDOCK_MODE"); mode == "monitoring-inventory" {
+		os.Exit(runMonitoringInventory(cfg, logger))
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -370,10 +375,24 @@ func main() {
 	repositoryScope := scope.NewMatcher(cfg.RepoAllowlist, cfg.RepoOwnerAllowlist)
 	var monitoredRepos *monitoring.Registry
 	if servicePubkey != "" {
+		// The environment only seeds the operator ceiling; a value set through
+		// the monitoring/operator control plane is persisted and wins.
+		boot, err := enrollment.BootstrapOperator(ctx, store, cfg.MonitoredReposAuthor, cfg.MonitoredReposAuthorForce)
+		if err != nil {
+			logger.Error("failed to resolve operator ceiling", "error", err)
+			os.Exit(1)
+		}
+		if boot.Source == "runtime_settings" && strings.TrimSpace(cfg.MonitoredReposAuthor) != boot.Operator {
+			logger.Warn("DRYDOCK_MONITORED_REPOS_AUTHOR differs from the persisted operator set through monitoring/operator; the persisted value is in effect (set DRYDOCK_MONITORED_REPOS_AUTHOR_FORCE=true to override)",
+				"environment", cfg.MonitoredReposAuthor, "persisted", boot.Operator)
+		}
+		logger.Info("operator ceiling resolved", "operator", boot.Operator, "previous", boot.PreviousOperator, "has_previous", boot.HasPrevious, "source", boot.Source)
 		monitoredRepos, err = monitoring.NewRegistry(store, monitoring.Config{
-			Drydock:  servicePubkey,
-			Operator: cfg.MonitoredReposAuthor,
-			Scope:    repositoryScope,
+			Drydock:             servicePubkey,
+			Operator:            boot.Operator,
+			PreviousOperator:    boot.PreviousOperator,
+			HasPreviousOperator: boot.HasPrevious,
+			Scope:               repositoryScope,
 		})
 		if err != nil {
 			logger.Error("failed to initialize monitored repository registry", "error", err)
@@ -388,8 +407,12 @@ func main() {
 			"initialized", snapshot.Initialized,
 			"author_count", len(snapshot.Authors),
 			"repository_count", len(snapshot.Repositories),
-			"operator_ceiling", cfg.MonitoredReposAuthor != "",
+			"operator", snapshot.Operator,
+			"ceiling_seen", snapshot.CeilingSeen,
 		)
+		if snapshot.Operator != "" && !snapshot.CeilingSeen {
+			logger.Warn("operator ceiling list not yet seen; reactive membership is empty until it arrives (readiness is unaffected)")
+		}
 		processorOpts = append(processorOpts, ingest.WithMonitoring(monitoredRepos))
 	}
 	// --- Repo service ---
@@ -845,6 +868,7 @@ func main() {
 				MaxTTL:    cfg.MonitoringEnrollMaxTTL,
 			}, logger)
 			contextVMProviders = append(contextVMProviders, enrollment.NewHandler(enrollSvc, servicePubkey, logger))
+			contextVMProviders = append(contextVMProviders, enrollment.NewOperatorControl(monitoredRepos, store, cfg.MonitoringAdmins, servicePubkey, logger))
 		}
 		// securityAuditHandler is only constructed when the audit engine is
 		// enabled. Append it by concrete type: handing a typed-nil pointer to a
@@ -904,7 +928,6 @@ func main() {
 		GiftWrapEnabled:      giftWrapOpener != nil,
 		ContextVMPubkey:      servicePubkey,
 		ContextVMMethods:     contextVMRouter.Methods(),
-		MonitoredReposAuthor: cfg.MonitoredReposAuthor,
 	}, processor, logger, listenerOpts...)
 
 	// --- Pipeline runner ---
@@ -967,9 +990,13 @@ func main() {
 	var listenerRunning atomic.Bool
 	var pipelineRunning atomic.Bool
 	if monitoredRepos != nil {
+		// Service health, not enrollment state: the registry has recovered its
+		// persisted state. Whether any maintainer has enrolled, or whether the
+		// operator ceiling list has arrived, is membership (fail-closed via
+		// Contains) and is reported in the snapshot, not in /readyz.
 		if err := healthSrv.AddReadinessFunc("monitored_repositories", func(context.Context) error {
-			if !monitoredRepos.Snapshot().Initialized {
-				return fmt.Errorf("no authoritative monitored repositories list has been loaded")
+			if !monitoredRepos.Snapshot().Loaded {
+				return fmt.Errorf("monitored repository registry has not loaded persisted state")
 			}
 			return nil
 		}); err != nil {
@@ -1445,4 +1472,70 @@ func runDriftGuard(cfg config.Config, logger *slog.Logger) {
 		logger.Error("unknown drift-guard subcommand", "cmd", args[0], "valid", "export, flag, list")
 		os.Exit(1)
 	}
+}
+
+// runMonitoringInventory reports what the maintainer-authority model does to
+// the operator's current list: which repositories stay monitored and which
+// drop, with the reason. It writes nothing; rollback is a redeploy of the
+// previous image, since the state tables are additive and the operator list is
+// untouched. Flags: --json, --strict (exit 2 when anything drops).
+func runMonitoringInventory(cfg config.Config, logger *slog.Logger) int {
+	ctx := context.Background()
+	store, err := openMigratedStore(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to initialize database", "error", err)
+		return 1
+	}
+	defer store.Close()
+
+	boot, err := enrollment.BootstrapOperator(ctx, store, cfg.MonitoredReposAuthor, false)
+	if err != nil {
+		logger.Error("failed to resolve operator", "error", err)
+		return 1
+	}
+	operator := boot.Operator
+	if operator == "" {
+		logger.Info("no operator ceiling configured; nothing to inventory", "source", boot.Source)
+		return 0
+	}
+	drydock := strings.TrimSpace(os.Getenv("DRYDOCK_INVENTORY_SERVICE_PUBKEY"))
+	if drydock == "" && cfg.SignerNsec != "" {
+		if s, err := signing.NewLocalSigner(cfg.SignerNsec); err == nil {
+			if pk, err := s.GetPublicKey(ctx); err == nil {
+				drydock = pk.Hex()
+			}
+		}
+	}
+	if drydock == "" {
+		logger.Error("service pubkey required: set DRYDOCK_INVENTORY_SERVICE_PUBKEY (hex or npub) or DRYDOCK_SIGNER_NSEC")
+		return 1
+	}
+	inventory, err := monitoring.BuildInventory(ctx, store, operator, drydock, time.Now())
+	if err != nil {
+		logger.Error("inventory failed", "error", err)
+		return 1
+	}
+	asJSON, strict := false, false
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "--json":
+			asJSON = true
+		case "--strict":
+			strict = true
+		}
+	}
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(inventory); err != nil {
+			logger.Error("encode inventory", "error", err)
+			return 1
+		}
+	} else {
+		fmt.Fprint(os.Stdout, inventory.Text())
+	}
+	if strict && inventory.Dropped > 0 {
+		return 2
+	}
+	return 0
 }

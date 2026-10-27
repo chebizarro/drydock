@@ -7,6 +7,8 @@ import (
 
 	"git.sharegap.net/cascadia/drydock/internal/monitoring"
 	"git.sharegap.net/cascadia/drydock/internal/scope"
+
+	"fiatjaf.com/nostr"
 )
 
 // Routes are the live control-plane inputs the listener turns into
@@ -21,6 +23,9 @@ type Routes struct {
 	// ListAuthors are known list authors (hex), subscribed directly so
 	// withdrawals and deletions arrive.
 	ListAuthors []string
+	// Operator is the current ceiling author (hex), whose list and deletion
+	// are subscribed without a Since bound. Empty when no ceiling is set.
+	Operator string
 }
 
 // Registry is the monitoring surface the source reads. *monitoring.Registry
@@ -29,6 +34,7 @@ type Registry interface {
 	Snapshot() monitoring.Snapshot
 	DeclaredRepositories() []scope.RepositoryRef
 	RoutedAuthors() []string
+	OperatorState() (current, previous nostr.PubKey, hasPrevious bool)
 	Changes() <-chan struct{}
 }
 
@@ -62,9 +68,13 @@ func NewMonitoringSource(registry Registry, store RelayStore, base []string, pol
 // a newly known author.
 func (m *MonitoringSource) Routes(ctx context.Context) (Routes, error) {
 	snapshot := m.registry.Snapshot()
+	operator, _, _ := m.registry.OperatorState()
 	control := Routes{
 		DeclaredRepositories: m.registry.DeclaredRepositories(),
 		ListAuthors:          m.registry.RoutedAuthors(),
+	}
+	if operator != nostr.ZeroPK {
+		control.Operator = operator.Hex()
 	}
 
 	refs := make([]scope.RepositoryRef, 0, len(snapshot.Repositories))

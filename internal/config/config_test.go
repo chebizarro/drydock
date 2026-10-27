@@ -137,11 +137,16 @@ func TestValidateMonitoredRepositoriesAuthor(t *testing.T) {
 		t.Fatalf("invalid author errors: %#v", result.Errors)
 	}
 
+	// The operator list is only a ceiling now; production no longer requires
+	// it, it warns that no ceiling bounds maintainer enrollments.
 	production := base()
 	production.Production = true
 	result = production.Validate(context.Background())
-	if !hasErrorContaining(result, "DRYDOCK_MONITORED_REPOS_AUTHOR") {
-		t.Fatalf("missing production author errors: %#v", result.Errors)
+	if hasErrorContaining(result, "DRYDOCK_MONITORED_REPOS_AUTHOR") {
+		t.Fatalf("missing production author must not be fatal: %#v", result.Errors)
+	}
+	if !hasWarningContaining(result, "DRYDOCK_MONITORED_REPOS_AUTHOR") {
+		t.Fatalf("missing production ceiling warning: %#v", result.Warnings)
 	}
 }
 
@@ -175,7 +180,7 @@ func TestValidate_DepUpgradeRequiresSidecar(t *testing.T) {
 		DepUpgradeEnabled:  true,
 		DepUpgradeInterval: 0,
 		DepUpgradeWorkers:  0,
-		// DepRunnerURL and MonitoredReposAuthor deliberately empty.
+		// DepRunnerURL and signer deliberately empty.
 	}
 
 	result := cfg.Validate(context.Background())
@@ -184,7 +189,7 @@ func TestValidate_DepUpgradeRequiresSidecar(t *testing.T) {
 		"DRYDOCK_DEPUPGRADE_INTERVAL must be greater than 0",
 		"DRYDOCK_DEPUPGRADE_WORKERS must be at least 1",
 		"DRYDOCK_DEP_RUNNER_URL",
-		"DRYDOCK_MONITORED_REPOS_AUTHOR",
+		"dependency upgrades require a signer",
 	}
 	for _, w := range want {
 		found := false
@@ -269,6 +274,34 @@ func TestValidate_RepoRelayBounds(t *testing.T) {
 		if found != tc.wantErr {
 			t.Errorf("perRepo=%d total=%d: relay bound error=%v want %v (%v)", tc.perRepo, tc.total, found, tc.wantErr, result.Errors)
 		}
+	}
+}
+
+func TestValidate_MonitoringAdminsAndOptionalOperator(t *testing.T) {
+	admin := nostr.GetPublicKey(nostr.Generate())
+	cfg := Config{
+		Relays: []string{"wss://relay.example.com"}, PipelineWorkers: 2, DatabaseURL: ":memory:",
+		ListenerHWMOverlap: time.Second, ListenerMaxFutureSkew: time.Second, ListenerMaxEventAge: time.Hour,
+		MonitoringEnrollMaxTTL: time.Hour, MonitoringAdmins: []string{admin.Hex(), "junk"},
+	}
+	result := cfg.Validate(context.Background())
+	foundAdminErr, foundOperatorErr := false, false
+	for _, err := range result.Errors {
+		if contains(err, "DRYDOCK_MONITORING_ADMINS") {
+			foundAdminErr = true
+		}
+		if contains(err, "DRYDOCK_MONITORED_REPOS_AUTHOR") {
+			foundOperatorErr = true
+		}
+	}
+	if !foundAdminErr {
+		t.Fatalf("invalid admin not reported: %v", result.Errors)
+	}
+	if foundOperatorErr {
+		t.Fatalf("empty operator must be a warning, not an error: %v", result.Errors)
+	}
+	if cfg.MonitoringAdmins[0] != admin.Hex() {
+		t.Fatalf("admin not normalized: %v", cfg.MonitoringAdmins)
 	}
 }
 

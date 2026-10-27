@@ -225,7 +225,7 @@ func (s *Service) Enroll(ctx context.Context, req Request) (Receipt, error) {
 	if err != nil {
 		return Receipt{}, err
 	}
-	if found && !existing.Supersedes(req.Event.ID.Hex(), requestCreated) {
+	if found && !existing.Supersedes(req.Event.ID.Hex(), requestCreated, false) {
 		row, found, err := s.project(ctx, req.Ref, req.Sender)
 		if err != nil {
 			return Receipt{}, err

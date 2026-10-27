@@ -77,7 +77,9 @@ model's answer.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DRYDOCK_MONITORED_REPOS_AUTHOR` | public key | *(empty)* | Optional operator **ceiling**. When set, only repositories named in this identity's NIP-51 kind-30001 `drydock:monitored-repositories:v1` list can be monitored, and readiness waits for that list. It does not grant membership: repositories are enrolled by their own owners/maintainers (see below). |
+| `DRYDOCK_MONITORED_REPOS_AUTHOR` | public key | *(empty)* | Optional operator **ceiling**, bootstrap only. When set, only repositories named in this identity's NIP-51 kind-30001 `drydock:monitored-repositories:v1` list can be monitored; until that list is seen, membership is empty (readiness is unaffected). It does not grant membership: repositories are enrolled by their own owners/maintainers (see below). A value set through `monitoring/operator` is persisted and overrides this on later starts. |
+| `DRYDOCK_MONITORING_ADMINS` | comma-separated public keys | *(empty)* | Identities allowed to rotate, roll back, or read the operator ceiling through the authenticated ContextVM `monitoring/operator` method, in addition to the current operator. Without admins, the operator cannot clear itself (that would leave no principal). |
+| `DRYDOCK_MONITORED_REPOS_AUTHOR_FORCE` | boolean | `false` | Audited local recovery: make `DRYDOCK_MONITORED_REPOS_AUTHOR` override the persisted control-plane operator at the next start. The prior value becomes the rollback target. |
 | `DRYDOCK_REPO_ALLOWLIST` | comma-separated repository IDs | *(empty)* | Optional hard security ceiling, as `npub:identifier` or `64-character-hex-pubkey:identifier`. |
 | `DRYDOCK_REPO_OWNER_ALLOWLIST` | comma-separated public keys | *(empty)* | Optional hard security ceiling by repository-announcement owner. Accepts npub or hex. |
 | `DRYDOCK_REPO_RELAYS_MAX_PER_REPO` | integer 0–16 | `3` | How many relays from a monitored repository's kind-30617 `relays` tag Drydock will subscribe to, in declaration order. `0` disables per-repository relays. |
@@ -97,6 +99,22 @@ Reactive processing is fail-closed: an unknown repository (no stored announcemen
 ### ContextVM enrollment
 
 Besides publishing a NIP-51 list, a maintainer can enroll a single repository with an authenticated ContextVM request (`monitoring/enroll`, kind 25910) and revoke it with `monitoring/unenroll`. The same authority rule applies — the sender must be the owner of, or a maintainer in, the latest stored kind-30617 announcement — and the signed request event is kept as provenance together with the verified announcement revision, the payment decision, and the expiry. Enrollments are re-evaluated with every announcement change and stop granting at their expiry without a restart. They are subject to the operator and static ceilings like list entries; an enrollment outside a ceiling is accepted and stored but reported as `monitored: false`.
+
+### Live operator ceiling
+
+The operator ceiling is runtime state, not a restart-only setting. `monitoring/operator` (kind 25910; `action` = `set`, `rollback`, or `get`) is accepted from `DRYDOCK_MONITORING_ADMINS` or the current operator, with the same envelope rules as enrollment (service `p` tag, method tag, in-window `expiration`). `set` swaps the ceiling author: the new state is persisted first, then published to the registry, which re-derives membership in the same step and keeps it empty until the new operator's list has been received through the resubscription the change triggers; the prior state is retained and `rollback` restores it (also across restarts). Removing the ceiling widens scope and is refused unless `allow_scope_expansion` is true — the flag acknowledges ceiling *removal* only; replacing one operator by another is not gated because a different list cannot authorize strangers, it only selects among existing maintainer opt-ins. Every change is logged with the sender, request event id, and the monitored count before and after. The value is persisted in `runtime_settings` and wins over the environment on restart; a differing environment value is logged at startup and only takes effect with `DRYDOCK_MONITORED_REPOS_AUTHOR_FORCE=true`.
+
+`/readyz` reports service health (`monitored_repositories` = persisted state recovered). Enrollment state — whether the ceiling list has arrived, how many repositories are monitored — is visible in the startup log and in the `monitoring/operator get` response, and is enforced fail-closed on membership rather than on readiness.
+
+### Migration from the single trusted author
+
+Earlier releases granted membership from the operator's list. Now the list is only a ceiling, so a repository in it is monitored only once its owner or a maintainer has opted in (list entry naming Drydock, or `monitoring/enroll`). Before upgrading a live deployment, run the inventory against a copy of the database:
+
+```bash
+DRYDOCK_MODE=monitoring-inventory DRYDOCK_INVENTORY_SERVICE_PUBKEY=<drydock-hex> drydock --json --strict
+```
+
+It reports, per repository in the operator list, whether it stays `monitored` or is `dropped` (`no_announcement`, `no_maintainer_optin`, or `maintainer_list_does_not_name_drydock`), and exits 2 with `--strict` when anything drops. It writes nothing. Rollback is a redeploy of the previous image: schema changes are additive and the operator list is untouched. No scope is ever expanded by the migration — a repository can only lose membership until a maintainer opts in.
 
 ### Per-repository relay routing
 

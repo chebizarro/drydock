@@ -37,15 +37,21 @@ func (e MonitoringEnrollment) Active(now int64) bool {
 	return e.RevokedAt == 0 && (e.ExpiresAt == 0 || now < e.ExpiresAt)
 }
 
-// Supersedes reports whether a command (eventID, createdAt) is newer than the
-// stored winning command: later created_at wins, ties go to the lower event
-// id, and the same command never supersedes itself.
-func (e MonitoringEnrollment) Supersedes(eventID string, createdAt int64) bool {
+// Supersedes reports whether a command (eventID, createdAt, revoke) is newer
+// than the stored winning command. Later created_at wins. On equal timestamps
+// a revocation beats an enrollment (fail closed, and deterministic regardless
+// of delivery order); between commands of the same kind the lower event id
+// wins. The same command never supersedes itself.
+func (e MonitoringEnrollment) Supersedes(eventID string, createdAt int64, revoke bool) bool {
 	if eventID == e.RequestEventID {
 		return false
 	}
 	if createdAt != e.RequestCreatedAt {
 		return createdAt > e.RequestCreatedAt
+	}
+	storedRevoke := e.RevokedAt != 0
+	if revoke != storedRevoke {
+		return revoke
 	}
 	return eventID < e.RequestEventID
 }
@@ -61,7 +67,7 @@ func (s *Store) ApplyMonitoringEnrollment(ctx context.Context, e MonitoringEnrol
 	if e.RepositoryAddress == "" || e.AuthorPubkey == "" || e.RequestEventID == "" || e.AnnouncementEventID == "" {
 		return false, errors.New("monitoring enrollment is incomplete")
 	}
-	return s.applyEnrollmentCommand(ctx, e.RepositoryAddress, e.AuthorPubkey, e.RequestEventID, e.RequestCreatedAt,
+	return s.applyEnrollmentCommand(ctx, e.RepositoryAddress, e.AuthorPubkey, e.RequestEventID, e.RequestCreatedAt, false,
 		func(tx *sql.Tx, now int64) error {
 			_, err := tx.ExecContext(ctx, `INSERT INTO monitoring_enrollments(
 					repository_addr, author_pubkey, request_event_id, request_created_at,
@@ -94,7 +100,7 @@ func (s *Store) RevokeMonitoringEnrollment(ctx context.Context, repositoryAddres
 	if repositoryAddress == "" || authorPubkey == "" || revokeEventID == "" {
 		return false, errors.New("monitoring revocation is incomplete")
 	}
-	return s.applyEnrollmentCommand(ctx, repositoryAddress, authorPubkey, revokeEventID, revokedAt,
+	return s.applyEnrollmentCommand(ctx, repositoryAddress, authorPubkey, revokeEventID, revokedAt, true,
 		func(tx *sql.Tx, now int64) error {
 			_, err := tx.ExecContext(ctx, `INSERT INTO monitoring_enrollments(
 					repository_addr, author_pubkey, request_event_id, request_created_at,
@@ -114,7 +120,7 @@ func (s *Store) RevokeMonitoringEnrollment(ctx context.Context, repositoryAddres
 
 // applyEnrollmentCommand runs the shared compare-then-write for both command
 // kinds inside one transaction.
-func (s *Store) applyEnrollmentCommand(ctx context.Context, repositoryAddress, authorPubkey, eventID string, createdAt int64, write func(tx *sql.Tx, now int64) error) (bool, error) {
+func (s *Store) applyEnrollmentCommand(ctx context.Context, repositoryAddress, authorPubkey, eventID string, createdAt int64, revoke bool, write func(tx *sql.Tx, now int64) error) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin monitoring enrollment transaction: %w", err)
@@ -122,12 +128,12 @@ func (s *Store) applyEnrollmentCommand(ctx context.Context, repositoryAddress, a
 	defer tx.Rollback()
 
 	var current MonitoringEnrollment
-	err = tx.QueryRowContext(ctx, `SELECT request_event_id, request_created_at
+	err = tx.QueryRowContext(ctx, `SELECT request_event_id, request_created_at, revoked_at
 		FROM monitoring_enrollments WHERE repository_addr=? AND author_pubkey=?`,
-		repositoryAddress, authorPubkey).Scan(&current.RequestEventID, &current.RequestCreatedAt)
+		repositoryAddress, authorPubkey).Scan(&current.RequestEventID, &current.RequestCreatedAt, &current.RevokedAt)
 	switch {
 	case err == nil:
-		if !current.Supersedes(eventID, createdAt) {
+		if !current.Supersedes(eventID, createdAt, revoke) {
 			return false, nil // replay, older, or a tie lost on event id
 		}
 	case errors.Is(err, sql.ErrNoRows):

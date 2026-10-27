@@ -138,3 +138,32 @@ func TestApplyRepositoryAnnouncementRejectsInvalid(t *testing.T) {
 		t.Fatalf("announcement with two d tags: applied=%v err=%v", applied, err)
 	}
 }
+
+func TestRuntimeSettingsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "settings.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.GetRuntimeSetting(ctx, RuntimeSettingMonitoringOperator); err != nil || found {
+		t.Fatalf("fresh setting found=%v err=%v", found, err)
+	}
+	if err := store.SetRuntimeSettings(ctx, map[string]string{RuntimeSettingMonitoringOperator: "abc", RuntimeSettingMonitoringOperatorPrevious: ""}, "admin", "evt"); err != nil {
+		t.Fatal(err)
+	}
+	v, found, err := store.GetRuntimeSetting(ctx, RuntimeSettingMonitoringOperator)
+	if err != nil || !found || v != "abc" {
+		t.Fatalf("get = %q %v %v", v, found, err)
+	}
+	v, found, err = store.GetRuntimeSetting(ctx, RuntimeSettingMonitoringOperatorPrevious)
+	if err != nil || !found || v != "" {
+		t.Fatalf("empty value must still be found: %q %v %v", v, found, err)
+	}
+	if err := store.SetRuntimeSettings(ctx, map[string]string{"": "x"}, "", ""); err == nil {
+		t.Fatal("empty key accepted")
+	}
+}

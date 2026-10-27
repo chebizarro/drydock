@@ -75,6 +75,7 @@ Request methods include:
 
 - `review/request` and `review/apply-fix` for IDE sessions
 - `review/order` for session-independent stored-patch orders
+- `monitoring/operator` (`set` / `rollback` / `get`): authenticated live control of the operator ceiling for `DRYDOCK_MONITORING_ADMINS` or the current operator. See [configuration.md](configuration.md#live-operator-ceiling).
 - `monitoring/enroll` and `monitoring/unenroll`: a repository owner or maintainer (per the latest stored kind-30617) opts a repository into or out of reactive review. Identity is the signed envelope's sender; a `p` tag addressing Drydock, a `method` tag, and an in-window `expiration` tag (≤ 15 minutes) are mandatory. The request event carries the payment tag when `DRYDOCK_MONITORING_ENROLL_PRICE_SATS` is set; maintainers are not free for enrollment. The receipt records the request event id, the verified announcement revision, the access kind, the expiry, and whether the repository is monitored after ceilings. Replays of the same request, or older requests than the stored one, answer with the stored receipt and change nothing.
 - `marketplace/assign`, `marketplace/accept`, `marketplace/reject`, and `marketplace/complete`
 - `security/audit` and `security/audit/sarif`
