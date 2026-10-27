@@ -29,16 +29,17 @@ const (
 
 // RepoConfig is the per-repository review configuration.
 type RepoConfig struct {
-	Version      int            `yaml:"version"`
-	Review       ReviewConfig   `yaml:"review"`
-	Context      ContextConfig  `yaml:"context"`
-	Status       StatusConfig   `yaml:"status"`
-	AutoFix      AutoFixConfig  `yaml:"autofix"`
-	Payments     PaymentsConfig `yaml:"payments"`
-	Security     SecurityConfig `yaml:"security"`
-	Ensemble     EnsembleConfig `yaml:"ensemble"`
-	Upgrades     UpgradesConfig `yaml:"upgrades"`
-	Instructions string         `yaml:"instructions"`
+	Version       int                 `yaml:"version"`
+	Review        ReviewConfig        `yaml:"review"`
+	Context       ContextConfig       `yaml:"context"`
+	Status        StatusConfig        `yaml:"status"`
+	AutoFix       AutoFixConfig       `yaml:"autofix"`
+	Payments      PaymentsConfig      `yaml:"payments"`
+	Security      SecurityConfig      `yaml:"security"`
+	Ensemble      EnsembleConfig      `yaml:"ensemble"`
+	Upgrades      UpgradesConfig      `yaml:"upgrades"`
+	Instructions  string              `yaml:"instructions"`
+	Notifications NotificationsConfig `yaml:"notifications"`
 }
 
 // ReviewConfig controls which findings are published.
@@ -686,6 +687,9 @@ func Parse(data []byte) (RepoConfig, error) {
 		return Default(), fmt.Errorf(".drydock.yaml: instructions exceeds %d bytes (%d)", maxInstructionBytes, len(raw.Instructions))
 	}
 
+	if err := raw.Notifications.Validate(); err != nil {
+		return Default(), fmt.Errorf("validate notifications: %w", err)
+	}
 	return raw, nil
 }
 
@@ -883,7 +887,7 @@ func RequiresFailClosed(data []byte) bool {
 		switch key {
 		case "review", "status", "payments", "security", "upgrades":
 			return true
-		case "version", "context", "autofix", "ensemble", "instructions":
+		case "version", "context", "autofix", "ensemble", "instructions", "notifications":
 			// Known tuning or schema metadata: a parse failure cannot relax a
 			// declared gate because this document declares none.
 		default:

@@ -122,6 +122,72 @@ Repositories hosted on GRASP, Buzz, or any other NIP-34 forge usually keep their
 
 Customer-declared state can never widen egress beyond the operator's policy: relays must be `wss://` and not loopback, private, or link-local hosts (both relaxed only when `DRYDOCK_ENV=development`), must pass `DRYDOCK_REPO_RELAYS_ALLOW`/`DENY`, and are capped per repository and globally. Shared relays are deduplicated. When membership, a list author, or an announcement changes, the listener resubscribes with the new plan from its live high-water mark — no restart, and no loss of persisted enrollment or review state. Rejected and truncated relays are logged with the reason.
 
+## Optional Forge Interoperability
+
+Both integrations require a configured Drydock signer and default to **off**.
+Neither changes monitoring membership, operator ceilings, enrollment, payment,
+or the deterministic review/status gates.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DRYDOCK_LOOM_ENABLED` | `false` | Consume public Budabit/Hive CI and Loom result claims as review context |
+| `DRYDOCK_LOOM_MAX_RUNS_PER_REPO` | `64` | Active lineage cap per repository; valid range 1–1024 |
+| `DRYDOCK_LOOM_MAX_RUNS` | `1024` | Global active lineage cap; at least the per-repo cap and at most 16384 |
+| `DRYDOCK_LOOM_RUN_TTL` | `24h` | Run tracking TTL from anchor timestamp; valid range 1m–168h |
+| `DRYDOCK_CONCORD_ENABLED` | `false` | Allow per-repo Concord review notices |
+| `DRYDOCK_CONCORD_STREAM_KEYS` | unset | **Secret operator-only** JSON object: `community_id/channel_id/epoch` → pre-derived channel stream secret key (64 hex) |
+
+Loom subscriptions start with monitored repository `#a` anchors. Secondary
+filters require exact run/job `#e` IDs **and** declared authors. Oldest runs
+are dropped at capacity (with a warning); first terminal result or TTL expiry
+removes tracking. This is a bounded view, not a complete CI inventory. Restart
+recovers active lineage from SQLite. The context layer looks up the exact
+resolved PR tip or full patch `commit`/`c` tag, includes at most 16 latest matching claims, and remains
+subject to the context token budget. Successful agentic discovery also includes
+the frozen claim snapshot, dropping it rather than blocking review if it exceeds
+the existing exact token gate. It does not fetch log URLs or wait for CI.
+
+Concord is per-repository opt-in, loaded from the **base-branch** `.drydock.yaml`:
+
+```yaml
+notifications:
+  concord:
+    community: "<64-lowercase-hex-community_id>"
+    channel: "<64-lowercase-hex-channel_id>"
+    epoch: 0
+    relays:
+      - wss://your-community-relay.example
+```
+
+Only public routing material belongs in this file. `epoch` is mandatory,
+including zero. Supply 1–5 unique `wss://` relay URLs without credentials,
+queries, or fragments. There is no secret-key field in the repository schema.
+The operator environment maps the exact community/channel/epoch locator to the
+**already derived stream secret key**, not `community_root`, a private channel
+root, the Drydock signing key, or a community pubkey. Several channel credentials
+can share the one JSON variable. Load it through your secret manager; do not
+commit it, print it, or put it in command-line arguments.
+
+Possession makes Drydock a key-holding participant of that channel, with the
+ability to decrypt all messages encrypted to the same stream key. It does not
+provide Control Plane authority or other channel keys. A missing key warns once
+per locator and skips delivery. Updating the epoch in repo config and replacing
+the corresponding operator credential (restart to reload) is the operator's
+responsibility. Relays must allow author-scoped Concord wraps rather than enforce
+recipient-only NIP-59 reads. Provision only channels whose posting policy permits
+Drydock and whose disappearing-message timer is disabled; automatic policy,
+invite, ban, rekey, and expiration synchronization is not implemented.
+
+After successful review publication, a small kind-9 notice links the public
+review via `nostr:nevent…` with review-relay hints. Signing and delivery run
+asynchronously, with four concurrent attempts maximum. Failures/capacity drops
+are logged and cannot fail the review. Notices have no durable outbox, retry-on-
+restart, exactly-once, or client-display guarantee. No review finding text or
+channel credential is copied into the notice/review metadata.
+
+See [the protocol and verification review](reviews/forge-interop-loom-concord-2026-10-27.md)
+for pinned source URLs and the deliberately limited supported subset.
+
 ## Betterleaks Secret Scanning
 
 Repository policy enables secret scanning with `security.secret_scan: true` in the root `.drydock.yaml`. The same setting applies to patch/PR reviews and full-repository audits. The shipped runtime image includes betterleaks; custom deployments must install `betterleaks` on `PATH`. Once enabled, scanning fails closed if the binary is missing, the command fails, or its JSON report is malformed.

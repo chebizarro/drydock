@@ -47,8 +47,8 @@ Drydock publishes **no** derived kind-30001 list; the signed artefacts *are* the
 | Forge | Status |
 |---|---|
 | GRASP | Covered by the repository-native test above: 30617 is the authority for maintainers and relays; patches delivered only on the declared relay are reviewed; relay replacement and withdrawal apply live. |
-| Budabit (Communikeys, Loom CI) | Repositories announced by Budabit are ordinary NIP-34 announcements, so maintainers and community relays flow through the same paths. Loom run-request/attestation kinds are not consumed; wiring them as review context needs the published event kinds. **Follow-up.** |
-| Armada Concord | Delivering review notifications into a Concord community (NIP-59 gift-wrap over generic relays) is a publisher feature that needs the Concord spec; not implemented. **Follow-up.** |
+| Budabit (Communikeys, Loom CI) | Ordinary NIP-34 authority remains unchanged. Default-off Loom/Hive CI context now follows repository-scoped 5401 anchors, authenticated 5100 job lineage, and 5402/5101 claims; bounded exact-ID/author filters reuse live routing. Offline tests only; no execution/provenance or complete CI-inventory claim. See [interop review](forge-interop-loom-concord-2026-10-27.md). |
+| Armada Concord | Default-off, per-repo review notices now use pinned CORD-01/03 channel-stream envelopes: 1059 / 20013 / unsigned 9. Operator-provisioned stream credentials make Drydock a key-holding channel participant, not an address-only non-member poster. Best-effort asynchronous delivery; offline shape/crypto tests, no live relay or Armada rendering acceptance. Rotation/policy sync remain manual. See [interop review](forge-interop-loom-concord-2026-10-27.md). |
 
 ## Not verified here
 

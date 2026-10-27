@@ -13,6 +13,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
+	"git.sharegap.net/cascadia/drydock/internal/repoconfig"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 	"git.sharegap.net/cascadia/drydock/internal/signing"
 	"git.sharegap.net/cascadia/drydock/internal/targetidentity"
@@ -33,9 +34,11 @@ type Config struct {
 	DefaultTTL          time.Duration
 	SupersededTTL       time.Duration
 	Audit               *AuditPublisher
+	Concord             *ConcordDelivery
 }
 
 type PublishInput struct {
+	Concord              *repoconfig.ConcordConfig
 	PatchEventID         string
 	RepoID               string
 	Summary              string
@@ -310,6 +313,7 @@ func (s *Service) PublishReview(ctx context.Context, in PublishInput) (string, e
 		return "", err
 	}
 	metrics.PublishSuccesses.Inc()
+	s.cfg.Concord.Notify(in.Concord, summaryEvent.ID.Hex(), relays...)
 	return summaryEvent.ID.Hex(), nil
 }
 

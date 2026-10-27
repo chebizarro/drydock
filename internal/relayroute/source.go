@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"git.sharegap.net/cascadia/drydock/internal/loom"
 	"git.sharegap.net/cascadia/drydock/internal/monitoring"
 	"git.sharegap.net/cascadia/drydock/internal/scope"
 
@@ -26,6 +27,8 @@ type Routes struct {
 	// Operator is the current ceiling author (hex), whose list and deletion
 	// are subscribed without a Since bound. Empty when no ceiling is set.
 	Operator string
+	// LoomFilters are keyed by monitored repository address, including exact result lineage.
+	LoomFilters map[string][]nostr.Filter
 }
 
 // Registry is the monitoring surface the source reads. *monitoring.Registry
@@ -54,6 +57,8 @@ type MonitoringSource struct {
 
 	mu       sync.Mutex
 	lastPlan Plan
+	loom     *loom.Service
+	changes  chan struct{}
 }
 
 func NewMonitoringSource(registry Registry, store RelayStore, base []string, policy Policy) *MonitoringSource {
@@ -104,10 +109,19 @@ func (m *MonitoringSource) Routes(ctx context.Context) (Routes, error) {
 	m.lastPlan = plan
 	m.mu.Unlock()
 	control.Plan = plan
+	if m.loom != nil {
+		control.LoomFilters, err = m.loom.Filters(ctx, refs)
+		if err != nil {
+			return control, fmt.Errorf("load loom routes: %w", err)
+		}
+	}
 	return control, nil
 }
 
 // Changes forwards the registry's coalesced change signal.
 func (m *MonitoringSource) Changes() <-chan struct{} {
+	if m.changes != nil {
+		return m.changes
+	}
 	return m.registry.Changes()
 }

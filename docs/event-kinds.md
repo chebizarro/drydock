@@ -8,9 +8,10 @@ This document is the Drydock reference for Nostr event kinds and tag conventions
 |------|----------|------|-------------|
 | 0 | NIP-01 | Profile metadata | Published/refreshed at startup for the Drydock identity |
 | 5 | NIP-09 | Deletion | Deletes the operator's monitored-repositories list when its `a` tag names that exact list |
+| 9 | Concord / NIP-C7 | Channel message | Optional unsigned review-notice rumor, never published directly |
 | 13 | NIP-59 | Seal | Sender-signed encrypted seal inside gift wraps; never published directly |
 | 14 | NIP-17 | Private direct message | Plaintext unsigned rumor inside a seal; never published directly |
-| 1059 | NIP-59 | Gift wrap | Ephemerally signed encrypted envelope for private Drydock traffic |
+| 1059 | NIP-59 / Concord | Gift wrap | Ephemeral-author private Drydock envelopes; optional fixed-stream-author Concord envelopes |
 | 1111 | NIP-22 | Comment | Published code review comments and thread replies |
 | 1617 | NIP-34 | Patch | Reactive review candidate when its repository is monitored |
 | 1618 | NIP-34 | Pull request | Reactive PR-tip review candidate; diff is computed from git |
@@ -21,6 +22,13 @@ This document is the Drydock reference for Nostr event kinds and tag conventions
 | 1632 | NIP-34 | Status: closed | Root status tracking; not reviewed unless an authorized on-demand order uses `force` |
 | 1633 | NIP-34 | Status: draft | Eligible only when repository policy opts in, or an authorized order uses `force` |
 | 1985 | NIP-32 | Label | Ingested for context and routing |
+| 5100 | Loom | Job request | Optional authenticated run-to-worker lineage, not dispatched by Drydock |
+| 5101 | Loom | Job result | Optional compute-job claim in review context |
+| 5102 | Loom | Job cancellation | Constant reserved for the verified external vocabulary; not consumed |
+| 5401 | Hive CI / Budabit | Workflow run | Optional repository-scoped CI anchor |
+| 5402 | Hive CI / Budabit | Workflow result | Optional publisher-signed workflow claim in review context |
+| 20013 | Concord CORD-01 | Encrypted seal | Author-signed encrypted rumor inside a channel stream wrap |
+| 30100 | Loom | Job status | Constant only; progress is not consumed or treated as completion |
 | 9735 | NIP-57 | Zap receipt | Payment authorization linked to a patch/PR by `e` tag |
 | 25910 | ContextVM | JSON-RPC transport | Review/order, IDE, marketplace, audit, feedback, and progress messages |
 | 30001 | NIP-51 | Named list | Operator-authored `drydock:monitored-repositories:v1` list |
@@ -112,6 +120,25 @@ Marketplace reviewers publish NIP-89 profiles to advertise languages, domains, a
 ### NIP-17/NIP-59 Privacy (13, 14, 1059)
 
 Private ContextVM requests and notifications may be gift-wrapped. The visible kind-1059 wrapper exposes only recipient routing; the authenticated unsigned inner rumor is kind `25910`. Plain signed kind-25910 messages remain supported for non-sensitive workflows.
+
+## Optional Forge Interoperability
+
+`DRYDOCK_LOOM_ENABLED` defaults to false. Budabit/Hive CI anchors (`5401`) are
+subscribed only by monitored repository `#a`. A bounded, persisted set of runs
+adds exact `#e` **and author** filters for jobs (`5100`, anchor author), workflow
+results (`5402`, anchor's `publisher`), and compute results (`5101`, authenticated
+job's `p` worker). Results do not contain a standardized patch pointer: the
+verified implementation correlates their anchor's exact `commit` to the review
+tip. Claims confer no monitoring, payment, or status-gate authority.
+
+`DRYDOCK_CONCORD_ENABLED` also defaults to false. Concord channel delivery is
+**not** ordinary recipient-encrypted NIP-59: kind `1059` is signed by the
+operator-provisioned channel stream key, with an ephemeral `p` tag; both layers
+are encrypted with the stream's self-ECDH NIP-44 key. The inner seal is `20013`,
+containing an unsigned kind-`9` rumor binding `channel`, `epoch`, and `ms`.
+Standard private ContextVM wraps above are unchanged. A service without a channel
+credential cannot post. See [the pinned protocol review](reviews/forge-interop-loom-concord-2026-10-27.md)
+and [configuration](configuration.md#optional-forge-interoperability) for limits.
 
 ## Tag Conventions
 

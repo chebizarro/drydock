@@ -11,6 +11,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/contextvm"
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
+	"git.sharegap.net/cascadia/drydock/internal/loom"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/monitoring"
 	"git.sharegap.net/cascadia/drydock/internal/revieworder"
@@ -72,6 +73,7 @@ type ContextVMResponder interface {
 
 type Processor struct {
 	store  *db.Store
+	loom   *loom.Service
 	logger *slog.Logger
 	// ReviewQueue is a deprecated receive-only view retained for callers while
 	// revieworder.Service owns the underlying channel.
@@ -196,6 +198,10 @@ func WithContextVM(router *contextvm.Router, responder ContextVMResponder) func(
 	}
 }
 
+func WithLoom(service *loom.Service) func(*Processor) {
+	return func(p *Processor) { p.loom = service }
+}
+
 func NewProcessor(store *db.Store, logger *slog.Logger, opts ...func(*Processor)) *Processor {
 	if logger == nil {
 		logger = slog.Default()
@@ -263,6 +269,11 @@ func (p *Processor) processEvent(ctx context.Context, event nostr.Event, relayUR
 
 func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL string) error {
 	switch event.Kind {
+	case eventkind.HiveWorkflowRun, eventkind.HiveWorkflowResult, eventkind.LoomJobRequest, eventkind.LoomJobResult:
+		if p.loom != nil {
+			return p.loom.HandleEvent(ctx, event)
+		}
+		return nil
 	case eventkind.MonitoredRepositories:
 		return p.handleMonitoringEvent(ctx, event, false)
 	case eventkind.Deletion:

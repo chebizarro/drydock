@@ -59,6 +59,7 @@ var defaultPublicRelaySet = map[string]struct{}{
 }
 
 type Config struct {
+	ForgeInteropConfig
 	Environment string
 	Production  bool
 	ExplicitEnv map[string]bool
@@ -254,6 +255,7 @@ func FromEnv() Config {
 	coder32BTimeout := parseLLMTimeout("DRYDOCK_CODER32B_TIMEOUT", llmTimeout)
 
 	return Config{
+		ForgeInteropConfig:   forgeInteropFromEnv(),
 		Environment:          environment,
 		Production:           production,
 		ExplicitEnv:          configuredEnv(),
@@ -733,6 +735,7 @@ func (v ValidationResult) Log(logger *slog.Logger) {
 // It performs connectivity checks where possible to fail fast.
 func (c *Config) Validate(ctx context.Context) ValidationResult {
 	result := ValidationResult{}
+	c.validateForgeInterop(&result)
 
 	if c.IsProduction() {
 		c.validateProductionConfig(&result)

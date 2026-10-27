@@ -796,6 +796,11 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 19,
+		name:    "loom_ci_claims",
+		apply:   migrateLoomCI,
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

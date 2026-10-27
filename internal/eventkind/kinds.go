@@ -26,6 +26,14 @@ const (
 	ReviewerProfile                   = nostr.KindHandlerInformation
 	ZapReceipt             nostr.Kind = 9735
 	CASAudit               nostr.Kind = 4903
+	LoomJobRequest         nostr.Kind = 5100
+	LoomJobResult          nostr.Kind = 5101
+	LoomJobCancellation    nostr.Kind = 5102
+	LoomJobStatus          nostr.Kind = 30100
+	HiveWorkflowRun        nostr.Kind = 5401
+	HiveWorkflowResult     nostr.Kind = 5402
+	ConcordMessage         nostr.Kind = 9
+	ConcordEncryptedSeal   nostr.Kind = 20013
 )
 
 // AutofixTagValue is the NIP-12 "t" topic-tag value Drydock stamps on the
