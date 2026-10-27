@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
@@ -8,11 +9,19 @@ RUN CGO_ENABLED=0 GOBIN=/out \
     go install github.com/betterleaks/betterleaks@${BETTERLEAKS_VERSION}
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=secret,id=git_credentials,required=true \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0=credential.helper \
+    GIT_CONFIG_VALUE_0="store --file=/run/secrets/git_credentials" \
+    go mod download
 
 COPY . .
 RUN CGO_ENABLED=1 GOOS=linux go build -o /out/drydock ./cmd/drydock && \
     CGO_ENABLED=1 GOOS=linux go build -o /out/drydock-eval ./cmd/drydock-eval
+
+FROM builder AS test
+RUN CGO_ENABLED=1 go vet ./... && \
+    CGO_ENABLED=1 go test -count=1 ./...
 
 FROM alpine:3.22
 
@@ -45,4 +54,3 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 EXPOSE 8081
 
 ENTRYPOINT ["/entrypoint.sh"]
-
