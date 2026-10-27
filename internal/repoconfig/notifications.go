@@ -17,7 +17,7 @@ type NotificationsConfig struct {
 type ConcordConfig struct {
 	Community string   `yaml:"community"`
 	Channel   string   `yaml:"channel"`
-	Epoch     *uint64  `yaml:"epoch"`
+	Epoch     *int64   `yaml:"epoch"` // int64 so a negative value is a validation error, not a decode error that fails the whole file
 	Relays    []string `yaml:"relays"`
 }
 
@@ -25,7 +25,7 @@ func (c ConcordConfig) CredentialID() string {
 	if c.Epoch == nil {
 		return ""
 	}
-	return c.Community + "/" + c.Channel + "/" + strconv.FormatUint(*c.Epoch, 10)
+	return c.Community + "/" + c.Channel + "/" + strconv.FormatInt(*c.Epoch, 10)
 }
 func concordID(s string) bool {
 	if len(s) != 64 || s != strings.ToLower(s) {
@@ -41,6 +41,9 @@ func (c NotificationsConfig) Validate() error {
 	n := c.Concord
 	if !concordID(n.Community) || !concordID(n.Channel) {
 		return errors.New("concord community and channel must be 64 lowercase hex characters")
+	}
+	if n.Epoch != nil && *n.Epoch < 0 {
+		return errors.New("notifications.concord.epoch must be >= 0")
 	}
 	if n.Epoch == nil {
 		return errors.New("concord epoch is required (including epoch 0)")

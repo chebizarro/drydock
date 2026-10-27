@@ -687,8 +687,12 @@ func Parse(data []byte) (RepoConfig, error) {
 		return Default(), fmt.Errorf(".drydock.yaml: instructions exceeds %d bytes (%d)", maxInstructionBytes, len(raw.Instructions))
 	}
 
+	// Notifications are an optional convenience. Callers fall back to Default()
+	// on ANY parse error, which would silently discard the repository's
+	// security and gating policy; so an invalid notifications block disables
+	// notifications for this repository and nothing else.
 	if err := raw.Notifications.Validate(); err != nil {
-		return Default(), fmt.Errorf("validate notifications: %w", err)
+		raw.Notifications = NotificationsConfig{}
 	}
 	return raw, nil
 }

@@ -706,6 +706,15 @@ func main() {
 
 	// --- Publisher ---
 	var pubSvc *publisher.Service
+	// One egress policy for every customer-declared destination: relay routing
+	// and Concord notification relays.
+	relayPolicy := relayroute.Policy{
+		MaxPerRepository: cfg.RepoRelaysMaxPerRepo,
+		MaxTotal:         cfg.RepoRelaysMaxTotal,
+		AllowInsecure:    !cfg.IsProduction(),
+		Allow:            cfg.RepoRelaysAllow,
+		Deny:             cfg.RepoRelaysDeny,
+	}
 	var concordDelivery *publisher.ConcordDelivery
 	if cfg.ConcordEnabled && signer != nil {
 		var err error
@@ -714,6 +723,7 @@ func main() {
 			logger.Error("invalid Concord operator credentials", "error", err)
 			os.Exit(1)
 		}
+		concordDelivery = concordDelivery.WithRelayPolicy(relayPolicy)
 	}
 	if signer != nil {
 		pubSvc = publisher.New(publisher.Config{
@@ -928,13 +938,7 @@ func main() {
 	// announcement says its events live, under the operator's egress policy, and
 	// resubscribe live when membership, authors, or announcements change.
 	if monitoredRepos != nil {
-		routes := relayroute.NewMonitoringSource(monitoredRepos, store, readRelays, relayroute.Policy{
-			MaxPerRepository: cfg.RepoRelaysMaxPerRepo,
-			MaxTotal:         cfg.RepoRelaysMaxTotal,
-			AllowInsecure:    !cfg.IsProduction(),
-			Allow:            cfg.RepoRelaysAllow,
-			Deny:             cfg.RepoRelaysDeny,
-		})
+		routes := relayroute.NewMonitoringSource(monitoredRepos, store, readRelays, relayPolicy)
 		if loomService != nil {
 			routes.WithLoom(ctx, loomService)
 		}

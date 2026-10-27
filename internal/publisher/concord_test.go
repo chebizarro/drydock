@@ -21,7 +21,7 @@ import (
 )
 
 func concordFixture() (*repoconfig.ConcordConfig, nostr.SecretKey, string) {
-	epoch := uint64(7)
+	epoch := int64(7)
 	cfg := &repoconfig.ConcordConfig{Community: strings.Repeat("a", 64), Channel: strings.Repeat("b", 64), Epoch: &epoch, Relays: []string{"wss://community.example"}}
 	key := nostr.MustSecretKeyFromHex(strings.Repeat("0", 63) + "2")
 	raw, _ := json.Marshal(map[string]string{cfg.CredentialID(): key.Hex()})
@@ -77,7 +77,7 @@ func TestConcordEnvelopeCORD01AndCORD03Fixture(t *testing.T) {
 	var nonces [2][32]byte
 	nonces[0][0] = 1
 	nonces[1][0] = 2
-	wrap, err := finishConcordFixture(t, rumor, stream, author, *cfg.Epoch, cfg.Channel, ephemeral, nonces)
+	wrap, err := finishConcordFixture(t, rumor, stream, author, uint64(*cfg.Epoch), cfg.Channel, ephemeral, nonces)
 	if err != nil {
 		t.Fatal(err)
 	}

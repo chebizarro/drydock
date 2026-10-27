@@ -186,6 +186,32 @@ func Build(repos []Repository, base []string, policy Policy) Plan {
 	return plan
 }
 
+// Admit applies the policy to a list of relay URLs from customer state and
+// returns the normalized admitted URLs (deduplicated, input order) and the
+// rejections. It is the single egress gate for every customer-declared
+// destination, routing and notifications alike.
+func (p Policy) Admit(urls []string) (admitted []string, rejected []Rejection) {
+	p = p.normalized()
+	seen := map[string]struct{}{}
+	for _, raw := range urls {
+		u, err := NormalizeRelayURL(raw)
+		if err != nil {
+			rejected = append(rejected, Rejection{Relay: raw, Reason: err.Error()})
+			continue
+		}
+		if _, dup := seen[u]; dup {
+			continue
+		}
+		seen[u] = struct{}{}
+		if reason := p.refuse(u); reason != "" {
+			rejected = append(rejected, Rejection{Relay: u, Reason: reason})
+			continue
+		}
+		admitted = append(admitted, u)
+	}
+	return admitted, rejected
+}
+
 // refuse returns a non-empty reason when the policy rejects the normalized URL.
 func (p Policy) refuse(u string) string {
 	parsed, err := url.Parse(u)

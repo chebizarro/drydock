@@ -16,6 +16,7 @@ import (
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip19"
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
+	"git.sharegap.net/cascadia/drydock/internal/relayroute"
 	"git.sharegap.net/cascadia/drydock/internal/repoconfig"
 	"git.sharegap.net/cascadia/drydock/internal/signing"
 )
@@ -27,6 +28,9 @@ type ConcordDelivery struct {
 	keys    map[string]nostr.SecretKey
 	signer  signing.Signer
 	publish RelayPublisher
+	// policy is the egress gate for repository-declared Concord relays; the
+	// zero value is the strict production policy (wss only, no private hosts).
+	policy  relayroute.Policy
 	logger  *slog.Logger
 	missing sync.Map
 	slots   chan struct{}
@@ -77,6 +81,14 @@ func NewConcordDelivery(ctx context.Context, raw string, signer signing.Signer, 
 	return &ConcordDelivery{ctx: ctx, keys: keys, signer: signer, publish: publish, logger: logger, slots: make(chan struct{}, 4)}, nil
 }
 
+// WithRelayPolicy installs the operator egress policy (the same one relay
+// routing uses) so a repository's notification relays cannot reach anything
+// routing would refuse.
+func (d *ConcordDelivery) WithRelayPolicy(policy relayroute.Policy) *ConcordDelivery {
+	d.policy = policy
+	return d
+}
+
 // Notify never waits for signing, relay IO or delivery. Missing credentials warn
 // once per public channel/epoch locator; they cannot fail the original review.
 func (d *ConcordDelivery) Notify(config *repoconfig.ConcordConfig, reviewID string, reviewRelays ...string) {
@@ -91,7 +103,7 @@ func (d *ConcordDelivery) Notify(config *repoconfig.ConcordConfig, reviewID stri
 	stream, ok := d.keys[id]
 	if !ok {
 		if _, loaded := d.missing.LoadOrStore(id, struct{}{}); !loaded {
-			d.logger.Warn("concord channel credential missing; skipping delivery", "channel", config.Channel, "epoch", *config.Epoch)
+			d.logger.Warn("concord channel credential missing; skipping delivery", "channel", config.Channel, "epoch", uint64(*config.Epoch))
 		}
 		return
 	}
@@ -102,8 +114,15 @@ func (d *ConcordDelivery) Notify(config *repoconfig.ConcordConfig, reviewID stri
 		return
 	}
 	// Snapshot the public configuration before crossing the goroutine boundary.
-	channel, epoch := config.Channel, *config.Epoch
-	relays := append([]string(nil), config.Relays...)
+	channel, epoch := config.Channel, uint64(*config.Epoch)
+	relays, rejected := d.policy.Admit(config.Relays)
+	if len(rejected) > 0 {
+		d.logger.Warn("concord relays rejected by egress policy", "rejected", len(rejected), "reason", rejected[0].Reason, "channel", config.Channel)
+	}
+	if len(relays) == 0 {
+		d.logger.Warn("concord notice skipped: no admitted relays", "channel", config.Channel)
+		return
+	}
 	reviewRelays = append([]string(nil), reviewRelays...)
 	go func() {
 		defer func() { <-d.slots }()
