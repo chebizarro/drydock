@@ -152,7 +152,9 @@ Drydock supports separate relay lists for reading (subscribing to events) and wr
 
 Drydock signs review comments with its own Nostr identity. It uses the first signer configured, in this order:
 
-1. **NIP-46 bunker** (recommended): the key stays in the signer.
+1. **NIP-46 bunker** (recommended): the key stays in the signer. Set
+   `DRYDOCK_SIGNER_CLIENT_KEY_FILE` to a writable path (inside the data volume
+   for deployments) so the bunker client identity is persisted across restarts.
 2. **Local nsec**, from `DRYDOCK_SIGNER_NSEC_FILE` (preferred) or `DRYDOCK_SIGNER_NSEC`.
 
 With no signer, production mode fails validation. Development mode starts listen-only: events are ingested, but the review pipeline is disabled and nothing is published. See [step 2 of the deployment guide](deployment.md#step-2-create-drydocks-nostr-identity-and-signer) for creating keys and running a bunker.
@@ -160,6 +162,7 @@ With no signer, production mode fails validation. Development mode starts listen
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `DRYDOCK_SIGNER_BUNKER_URL` | string | *(empty)* | NIP-46 bunker URL (`bunker://<signer-pubkey>?relay=wss://...&secret=...`) or a NIP-05 bunker identifier. Used first when set. |
+| `DRYDOCK_SIGNER_CLIENT_KEY_FILE` | string | *(empty)* | Persistent NIP-46 client key file path. When set, the generated client identity is persisted so a one-time bunker connect grant survives container and process restarts. Used only when `DRYDOCK_SIGNER_BUNKER_URL` is set. |
 | `DRYDOCK_SIGNER_NSEC_FILE` | path | *(empty)* | File containing the nsec (bech32) or 64-character hex private key, for example a mounted Docker secret. Overrides `DRYDOCK_SIGNER_NSEC`. |
 | `DRYDOCK_SIGNER_NSEC` | string (secret) | *(empty)* | The key itself. It's a plaintext secret in the environment, so prefer the file or a bunker. |
 

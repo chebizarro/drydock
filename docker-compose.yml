@@ -60,6 +60,7 @@ services:
       # or DRYDOCK_SIGNER_NSEC_FILE. Production mode refuses to start without a
       # signer; development mode runs listen-only without one.
       DRYDOCK_SIGNER_BUNKER_URL: ${DRYDOCK_SIGNER_BUNKER_URL:-}
+      DRYDOCK_SIGNER_CLIENT_KEY_FILE: ${DRYDOCK_SIGNER_CLIENT_KEY_FILE:-/data/signet-client.key}
       DRYDOCK_SIGNER_NSEC: ${DRYDOCK_SIGNER_NSEC:-}
       # LLM endpoints. Empty values fall back to drydock's own development
       # defaults (which point at the container's loopback, so set these in .env)
