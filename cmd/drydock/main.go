@@ -182,12 +182,20 @@ func main() {
 	// --- Signer (shared NIP-46 client, with local nsec for development only) ---
 	var signer signing.Signer
 	if cfg.SignerBunkerURL != "" {
-		clientKey, err := signing.LoadOrCreateClientKey(cfg.SignerClientKeyFile)
+		clientKey, resumed, err := signing.LoadOrCreateClientKey(cfg.SignerClientKeyFile)
 		if err != nil {
 			logger.Error("failed to load or create signer client key", "error", err)
 			os.Exit(1)
 		}
-		s, err := cascadiasignet.NewBunkerSignerWithClientKey(ctx, cfg.SignerBunkerURL, clientKey, cfg.Relays...)
+		bunkerURL := cfg.SignerBunkerURL
+		if resumed {
+			bunkerURL, err = signing.StripBunkerConnectSecret(bunkerURL)
+			if err != nil {
+				logger.Error("failed to prepare signer reconnect URL", "error", err)
+				os.Exit(1)
+			}
+		}
+		s, err := cascadiasignet.NewBunkerSignerWithClientKey(ctx, bunkerURL, clientKey, cfg.Relays...)
 		if err != nil {
 			logger.Error("failed to create bunker signer", "error", err)
 			os.Exit(1)

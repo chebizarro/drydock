@@ -8,13 +8,19 @@ import (
 
 func TestLoadOrCreateClientKeyPersistsIdentity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "signet", "client.key")
-	first, err := LoadOrCreateClientKey(path)
+	first, resumed, err := LoadOrCreateClientKey(path)
 	if err != nil {
 		t.Fatalf("create client key: %v", err)
 	}
-	second, err := LoadOrCreateClientKey(path)
+	if resumed {
+		t.Fatal("new client key reported as resumed")
+	}
+	second, resumed, err := LoadOrCreateClientKey(path)
 	if err != nil {
 		t.Fatalf("reload client key: %v", err)
+	}
+	if !resumed {
+		t.Fatal("persisted client key was not reported as resumed")
 	}
 	if first.Hex() != second.Hex() {
 		t.Fatal("client identity changed after reload")
@@ -30,15 +36,31 @@ func TestLoadOrCreateClientKeyPersistsIdentity(t *testing.T) {
 
 func TestLoadOrCreateClientKeyEmptyPath(t *testing.T) {
 	// An empty path must generate a fresh key every call.
-	first, err := LoadOrCreateClientKey("")
+	first, resumed, err := LoadOrCreateClientKey("")
 	if err != nil {
 		t.Fatalf("first call with empty path: %v", err)
 	}
-	second, err := LoadOrCreateClientKey("")
+	if resumed {
+		t.Fatal("empty path reported as resumed")
+	}
+	second, resumed, err := LoadOrCreateClientKey("")
 	if err != nil {
 		t.Fatalf("second call with empty path: %v", err)
 	}
+	if resumed {
+		t.Fatal("second empty path reported as resumed")
+	}
 	if first.Hex() == second.Hex() {
 		t.Fatal("two empty-path calls returned the same key")
+	}
+}
+
+func TestStripBunkerConnectSecret(t *testing.T) {
+	got, err := StripBunkerConnectSecret("bunker://abc?relay=wss%3A%2F%2Frelay.example&secret=one-time")
+	if err != nil {
+		t.Fatalf("strip connect secret: %v", err)
+	}
+	if got != "bunker://abc?relay=wss%3A%2F%2Frelay.example" {
+		t.Fatalf("stripped URL = %q", got)
 	}
 }

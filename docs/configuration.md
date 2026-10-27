@@ -155,6 +155,8 @@ Drydock signs review comments with its own Nostr identity. It uses the first sig
 1. **NIP-46 bunker** (recommended): the key stays in the signer. Set
    `DRYDOCK_SIGNER_CLIENT_KEY_FILE` to a writable path (inside the data volume
    for deployments) so the bunker client identity is persisted across restarts.
+   When that key is reused, Drydock removes the one-time connect secret before
+   reconnecting to the already-authorized session.
 2. **Local nsec**, from `DRYDOCK_SIGNER_NSEC_FILE` (preferred) or `DRYDOCK_SIGNER_NSEC`.
 
 With no signer, production mode fails validation. Development mode starts listen-only: events are ingested, but the review pipeline is disabled and nothing is published. See [step 2 of the deployment guide](deployment.md#step-2-create-drydocks-nostr-identity-and-signer) for creating keys and running a bunker.
