@@ -89,6 +89,11 @@ type Config struct {
 	RepoRelaysAllow      []string
 	RepoRelaysDeny       []string
 
+	// ContextVM monitoring/enroll policy (operator-level).
+	MonitoringEnrollPriceSats int64
+	MonitoringEnrollTTL       time.Duration
+	MonitoringEnrollMaxTTL    time.Duration
+
 	// Kind 0 profile metadata published for the signer identity at startup.
 	ProfileEnabled    bool
 	ProfileName       string
@@ -263,19 +268,22 @@ func FromEnv() Config {
 				devDefault(production, defaultRelays),
 			),
 		),
-		ReadRelays:            SplitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
-		WriteRelays:           SplitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
-		LogLevel:              parseLogLevel(envOrDefault("DRYDOCK_LOG_LEVEL", "info")),
-		ListenerLookbackMin:   parseIntOrDefault(envOrDefault("DRYDOCK_LISTENER_LOOKBACK_MIN", "5"), 5),
-		ListenerHWMOverlap:    parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_HWM_OVERLAP", "30s"), 30*time.Second),
-		ListenerMaxFutureSkew: parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_FUTURE_SKEW", "10m"), 10*time.Minute),
-		ListenerMaxEventAge:   parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_EVENT_AGE", "8760h"), 365*24*time.Hour),
-		RepoRelaysMaxPerRepo:  parseIntOrDefault(envOrDefault("DRYDOCK_REPO_RELAYS_MAX_PER_REPO", "3"), 3),
-		RepoRelaysMaxTotal:    parseIntOrDefault(envOrDefault("DRYDOCK_REPO_RELAYS_MAX_TOTAL", "32"), 32),
-		RepoRelaysAllow:       SplitCSV(envOrDefault("DRYDOCK_REPO_RELAYS_ALLOW", "")),
-		RepoRelaysDeny:        SplitCSV(envOrDefault("DRYDOCK_REPO_RELAYS_DENY", "")),
-		ProfileEnabled:        parseBoolOrDefault(envOrDefault("DRYDOCK_PROFILE_ENABLED", "true"), true),
-		ProfileName:           envOrDefault("DRYDOCK_PROFILE_NAME", "Drydock"),
+		ReadRelays:                SplitCSV(envOrDefault("DRYDOCK_READ_RELAYS", "")),
+		WriteRelays:               SplitCSV(envOrDefault("DRYDOCK_WRITE_RELAYS", "")),
+		LogLevel:                  parseLogLevel(envOrDefault("DRYDOCK_LOG_LEVEL", "info")),
+		ListenerLookbackMin:       parseIntOrDefault(envOrDefault("DRYDOCK_LISTENER_LOOKBACK_MIN", "5"), 5),
+		ListenerHWMOverlap:        parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_HWM_OVERLAP", "30s"), 30*time.Second),
+		ListenerMaxFutureSkew:     parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_FUTURE_SKEW", "10m"), 10*time.Minute),
+		ListenerMaxEventAge:       parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_EVENT_AGE", "8760h"), 365*24*time.Hour),
+		RepoRelaysMaxPerRepo:      parseIntOrDefault(envOrDefault("DRYDOCK_REPO_RELAYS_MAX_PER_REPO", "3"), 3),
+		RepoRelaysMaxTotal:        parseIntOrDefault(envOrDefault("DRYDOCK_REPO_RELAYS_MAX_TOTAL", "32"), 32),
+		RepoRelaysAllow:           SplitCSV(envOrDefault("DRYDOCK_REPO_RELAYS_ALLOW", "")),
+		RepoRelaysDeny:            SplitCSV(envOrDefault("DRYDOCK_REPO_RELAYS_DENY", "")),
+		MonitoringEnrollPriceSats: int64(parseIntOrDefault(envOrDefault("DRYDOCK_MONITORING_ENROLL_PRICE_SATS", "0"), 0)),
+		MonitoringEnrollTTL:       parseDurationOrDefault(envOrDefault("DRYDOCK_MONITORING_ENROLL_TTL", "0"), 0),
+		MonitoringEnrollMaxTTL:    parseDurationOrDefault(envOrDefault("DRYDOCK_MONITORING_ENROLL_MAX_TTL", "8760h"), 365*24*time.Hour),
+		ProfileEnabled:            parseBoolOrDefault(envOrDefault("DRYDOCK_PROFILE_ENABLED", "true"), true),
+		ProfileName:               envOrDefault("DRYDOCK_PROFILE_NAME", "Drydock"),
 		ProfileAbout: envOrDefault("DRYDOCK_PROFILE_ABOUT",
 			"Automated code review for git on Nostr. Drydock watches NIP-34 patch and pull-request events, checks out the proposed changes, and publishes structured reviews with findings, per-file walkthroughs, and status updates — powered by local LLMs."),
 		ProfileWebsite:     envOrDefault("DRYDOCK_PROFILE_WEBSITE", ""),
@@ -929,6 +937,17 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 	if c.RepoRelaysMaxPerRepo > 16 || c.RepoRelaysMaxTotal > 512 {
 		result.Errors = append(result.Errors, "DRYDOCK_REPO_RELAYS_MAX_PER_REPO must be <= 16 and DRYDOCK_REPO_RELAYS_MAX_TOTAL <= 512")
+	}
+	if c.MonitoringEnrollPriceSats < 0 || c.MonitoringEnrollTTL < 0 || c.MonitoringEnrollMaxTTL <= 0 {
+		result.Errors = append(result.Errors, "DRYDOCK_MONITORING_ENROLL_PRICE_SATS and _TTL must be >= 0 and _MAX_TTL > 0")
+	}
+	if c.MonitoringEnrollTTL > c.MonitoringEnrollMaxTTL {
+		result.Errors = append(result.Errors, "DRYDOCK_MONITORING_ENROLL_TTL must not exceed DRYDOCK_MONITORING_ENROLL_MAX_TTL")
+	}
+	if c.MonitoringEnrollPriceSats > 0 && c.MonitoringEnrollTTL <= 0 {
+		// A time-bound payment (notably a review subscription, which the shared
+		// authorizer accepts) must never buy permanent membership.
+		result.Errors = append(result.Errors, "DRYDOCK_MONITORING_ENROLL_PRICE_SATS > 0 requires DRYDOCK_MONITORING_ENROLL_TTL > 0 so paid enrollments expire")
 	}
 	if c.PaymentNWCURI != "" && len(c.PaymentTrustedMints) == 0 {
 		result.Warnings = append(result.Warnings, "DRYDOCK_NWC_CONNECTION_STRING set but no trusted Cashu mints configured (set DRYDOCK_CASHU_TRUSTED_MINTS or DRYDOCK_CASHU_MINT_URL)")

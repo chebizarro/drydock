@@ -84,12 +84,19 @@ model's answer.
 | `DRYDOCK_REPO_RELAYS_MAX_TOTAL` | integer 0–512 | `32` | Global cap on distinct customer relays across all monitored repositories. Relays shared by more repositories win; the rest are logged as truncated. |
 | `DRYDOCK_REPO_RELAYS_ALLOW` | comma-separated host suffixes | *(empty)* | When set, only declared relays whose host matches a suffix (e.g. `grasp.example.org`) are admitted. |
 | `DRYDOCK_REPO_RELAYS_DENY` | comma-separated host suffixes | *(empty)* | Declared relays whose host matches are refused. Deny wins over allow. |
+| `DRYDOCK_MONITORING_ENROLL_PRICE_SATS` | integer | `0` | Price of a ContextVM `monitoring/enroll`. `0` makes enrollment free. When set, the request event must carry a payment the payment service accepts (Cashu token, zap, or active subscription); maintainers are not free. |
+| `DRYDOCK_MONITORING_ENROLL_TTL` | duration | `0` | Lifetime applied to an enrollment that names no `expires_at`. `0` means no expiry; required to be `> 0` when a price is set, so paid enrollments (including those covered by an active review subscription) always expire. |
+| `DRYDOCK_MONITORING_ENROLL_MAX_TTL` | duration | `8760h` | Upper bound on a requested `expires_at`. |
 
 These settings have separate roles. **Automatic reactive** review of kinds 1617/1618/1619 is opted into by repository maintainers: a repository is monitored when its kind-30617 owner, or a pubkey in its `maintainers` tag, publishes a NIP-51 kind-30001 list (`d` = `drydock:monitored-repositories:v1`) that names the Drydock signer pubkey in a `p` tag and the repository in an `a` tag. Many authors may enroll; membership is the union. Authority is re-derived from the latest stored announcement, so dropping a maintainer from the announcement withdraws their enrollments. See [event-kinds.md](event-kinds.md) for the full contract. Because lists must name the signer, reactive review requires a configured signer.
 
 The operator list (`DRYDOCK_MONITORED_REPOS_AUTHOR`) and the static repository/owner allowlists are ceilings. A target is inside the static ceiling when either its repository ID or announcement owner matches; empty static allowlists impose no additional ceiling. Ceilings apply to reactive work; the static ceiling also bounds on-demand orders. Paid `review/order` requests may target repositories outside the monitored set, but never outside the static ceiling.
 
 Reactive processing is fail-closed: an unknown repository (no stored announcement), an author without authority, or a list that does not name this service grants nothing. Control-plane subscriptions are not bounded by the listener high-water mark, and winning revisions are restored from SQLite on restart.
+
+### ContextVM enrollment
+
+Besides publishing a NIP-51 list, a maintainer can enroll a single repository with an authenticated ContextVM request (`monitoring/enroll`, kind 25910) and revoke it with `monitoring/unenroll`. The same authority rule applies — the sender must be the owner of, or a maintainer in, the latest stored kind-30617 announcement — and the signed request event is kept as provenance together with the verified announcement revision, the payment decision, and the expiry. Enrollments are re-evaluated with every announcement change and stop granting at their expiry without a restart. They are subject to the operator and static ceilings like list entries; an enrollment outside a ceiling is accepted and stored but reported as `monitored: false`.
 
 ### Per-repository relay routing
 

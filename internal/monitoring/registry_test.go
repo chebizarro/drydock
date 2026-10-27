@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/scope"
@@ -551,6 +552,98 @@ func TestRoutedAuthorsPreferGrantingAuthorsWithinBudget(t *testing.T) {
 	if got := h.registry.RoutedAuthors(); len(got) != 2 {
 		t.Fatalf("withdrawn author still routed: %v", got)
 	}
+}
+
+func TestEnrollmentGrantsUntilExpiryAndWithinCeilings(t *testing.T) {
+	operator := nostr.Generate()
+	h := newHarness(t, Config{Operator: nostr.GetPublicKey(operator).Hex()})
+	base := time.Unix(1_800_000_000, 0)
+	h.registry.now = func() time.Time { return base }
+	owner := nostr.Generate()
+	repo := repositoryAddress(owner, "svc")
+	h.announce(owner, "svc", 10)
+	h.apply(h.list(operator, 100, false, repo))
+
+	enr := Enrollment{Author: nostr.GetPublicKey(owner), Ref: mustRef(t, repo), RequestEventID: "e1", CreatedAt: base.Unix(), ExpiresAt: base.Add(time.Hour).Unix()}
+	if err := h.registry.ApplyEnrollment(h.ctx, enr); err != nil {
+		t.Fatal(err)
+	}
+	if !h.registry.Contains(repo) || len(h.registry.MonitoredRepositoryIDs()) != 1 {
+		t.Fatalf("enrollment did not grant: %#v", h.registry.Snapshot())
+	}
+	if exp := h.registry.Snapshot().Expiries[repo]; exp != enr.ExpiresAt {
+		t.Fatalf("expiry = %d, want %d", exp, enr.ExpiresAt)
+	}
+	// Time passes: expired without any rebuild.
+	h.registry.now = func() time.Time { return base.Add(2 * time.Hour) }
+	if h.registry.Contains(repo) || len(h.registry.MonitoredRepositoryIDs()) != 0 {
+		t.Fatal("expired enrollment still grants")
+	}
+	// A list entry makes membership permanent; expiry no longer applies.
+	h.registry.now = func() time.Time { return base }
+	h.apply(h.list(owner, 100, true, repo))
+	if _, hasExpiry := h.registry.Snapshot().Expiries[repo]; hasExpiry {
+		t.Fatal("list-backed membership must not carry an enrollment expiry")
+	}
+	// Operator ceiling cuts enrollments too.
+	h.apply(h.list(operator, 200, false))
+	if h.registry.Contains(repo) {
+		t.Fatal("operator ceiling did not apply to enrollment")
+	}
+	// Revocation removes the enrollment-only grant.
+	h.apply(h.list(operator, 300, false, repo))
+	h.apply(h.list(owner, 200, false))
+	if !h.registry.Contains(repo) {
+		t.Fatal("precondition: enrollment-only grant")
+	}
+	h.registry.RevokeEnrollment(repo, nostr.GetPublicKey(owner))
+	if h.registry.Contains(repo) {
+		t.Fatal("revoked enrollment still grants")
+	}
+}
+
+func TestExpiredEnrollmentsAreNotDeclarationsOnLoad(t *testing.T) {
+	h := newHarness(t, Config{})
+	base := time.Unix(1_800_000_000, 0)
+	h.registry.now = func() time.Time { return base }
+	owner := nostr.Generate()
+	repo := repositoryAddress(owner, "svc")
+	h.announce(owner, "svc", 10)
+	row := db.MonitoringEnrollment{RepositoryAddress: repo, AuthorPubkey: nostr.GetPublicKey(owner).Hex(), RequestEventID: "e1",
+		RequestCreatedAt: base.Unix(), AnnouncementEventID: "a1", ExpiresAt: base.Add(time.Hour).Unix()}
+	if _, err := h.store.ApplyMonitoringEnrollment(h.ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.registry.Load(h.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !h.registry.Contains(repo) || len(h.registry.DeclaredRepositories()) != 1 {
+		t.Fatalf("active enrollment not loaded: %#v", h.registry.Snapshot())
+	}
+	// Past expiry: neither membership nor a declaration, so no recovery budget
+	// or cached authority is spent on it.
+	h.registry.now = func() time.Time { return base.Add(2 * time.Hour) }
+	if h.registry.Contains(repo) || len(h.registry.DeclaredRepositories()) != 0 {
+		t.Fatal("expired enrollment still declares or grants")
+	}
+	if err := h.registry.Load(h.ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.registry.mu.Lock()
+	cached := len(h.registry.authorities)
+	h.registry.mu.Unlock()
+	if cached != 0 || len(h.registry.DeclaredRepositories()) != 0 {
+		t.Fatalf("expired enrollment retained on reload: authorities=%d", cached)
+	}
+}
+
+func mustRef(t *testing.T, address string) scope.RepositoryRef {
+	t.Helper()
+	ref, err := scope.ParseRepositoryRef(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref
 }
 
 // failingStore lets one authority lookup fail to simulate a store error after

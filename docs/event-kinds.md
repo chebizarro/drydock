@@ -75,6 +75,7 @@ Request methods include:
 
 - `review/request` and `review/apply-fix` for IDE sessions
 - `review/order` for session-independent stored-patch orders
+- `monitoring/enroll` and `monitoring/unenroll`: a repository owner or maintainer (per the latest stored kind-30617) opts a repository into or out of reactive review. Identity is the signed envelope's sender; a `p` tag addressing Drydock, a `method` tag, and an in-window `expiration` tag (≤ 15 minutes) are mandatory. The request event carries the payment tag when `DRYDOCK_MONITORING_ENROLL_PRICE_SATS` is set; maintainers are not free for enrollment. The receipt records the request event id, the verified announcement revision, the access kind, the expiry, and whether the repository is monitored after ceilings. Replays of the same request, or older requests than the stored one, answer with the stored receipt and change nothing.
 - `marketplace/assign`, `marketplace/accept`, `marketplace/reject`, and `marketplace/complete`
 - `security/audit` and `security/audit/sarif`
 
@@ -93,7 +94,7 @@ Drydock publishes review summaries and detail comments as kind `1111`, threaded 
 
 ### NIP-34 Repository and Patch Events
 
-Drydock stores repository, patch, pull-request, revision, status, and snapshot events. Kinds `1617`, `1618`, and `1619` are reactive candidates only when their unique repository `a` tag is present in the active monitored list and passes the static security ceiling. On-demand `review/order` uses a stored patch and does not require list membership.
+Drydock stores repository, patch, pull-request, revision, status, and snapshot events. Kinds `1617`, `1618`, and `1619` are reactive candidates only when their unique repository `a` tag is monitored — through a maintainer-authored list entry or an unexpired `monitoring/enroll` enrollment, in both cases under current announcement authority — and passes the operator and static ceilings. On-demand `review/order` uses a stored patch and does not require list membership.
 
 ### NIP-57 Zap Receipt (9735)
 

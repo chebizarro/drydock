@@ -272,6 +272,30 @@ func TestValidate_RepoRelayBounds(t *testing.T) {
 	}
 }
 
+func TestValidate_PaidEnrollmentMustExpire(t *testing.T) {
+	cfg := Config{
+		Relays: []string{"wss://relay.example.com"}, PipelineWorkers: 2, DatabaseURL: ":memory:",
+		ListenerHWMOverlap: time.Second, ListenerMaxFutureSkew: time.Second, ListenerMaxEventAge: time.Hour,
+		MonitoringEnrollMaxTTL: time.Hour, MonitoringEnrollPriceSats: 100,
+	}
+	result := cfg.Validate(context.Background())
+	found := false
+	for _, err := range result.Errors {
+		if contains(err, "paid enrollments expire") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected paid-enrollment TTL error, got %v", result.Errors)
+	}
+	cfg.MonitoringEnrollTTL = 30 * time.Minute
+	for _, err := range cfg.Validate(context.Background()).Errors {
+		if contains(err, "ENROLL") {
+			t.Fatalf("unexpected enrollment error with TTL set: %s", err)
+		}
+	}
+}
+
 func TestValidate_InvalidRelayURL(t *testing.T) {
 	cfg := Config{
 		Relays:          []string{"http://invalid-scheme.com"},

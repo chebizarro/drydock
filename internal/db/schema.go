@@ -336,6 +336,23 @@ CREATE TABLE IF NOT EXISTS monitored_repository_members (
 CREATE INDEX IF NOT EXISTS idx_monitored_repository_members_repository
   ON monitored_repository_members(repository_addr);
 
+CREATE TABLE IF NOT EXISTS monitoring_enrollments (
+  repository_addr TEXT NOT NULL,
+  author_pubkey TEXT NOT NULL,
+  request_event_id TEXT NOT NULL UNIQUE,
+  request_created_at INTEGER NOT NULL,
+  announcement_event_id TEXT NOT NULL,
+  access_kind TEXT NOT NULL DEFAULT '',
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  revoked_at INTEGER NOT NULL DEFAULT 0,
+  revoke_event_id TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(repository_addr, author_pubkey)
+);
+CREATE INDEX IF NOT EXISTS idx_monitoring_enrollments_author
+  ON monitoring_enrollments(author_pubkey);
+
 CREATE TABLE IF NOT EXISTS eval_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   dataset_id TEXT NOT NULL,

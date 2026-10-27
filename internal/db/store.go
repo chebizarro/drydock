@@ -739,6 +739,41 @@ CREATE INDEX idx_review_payments_author_repo
 			return nil
 		},
 	},
+	{
+		version: 17,
+		name:    "monitoring_enrollments",
+		apply: func(ctx context.Context, tx *sql.Tx) error {
+			exists, err := hasColumn(ctx, tx, "monitoring_enrollments", "repository_addr")
+			if err != nil {
+				return fmt.Errorf("check monitoring_enrollments.repository_addr: %w", err)
+			}
+			if exists {
+				return nil
+			}
+			for _, ddl := range []string{
+				`CREATE TABLE IF NOT EXISTS monitoring_enrollments (
+					repository_addr TEXT NOT NULL,
+					author_pubkey TEXT NOT NULL,
+					request_event_id TEXT NOT NULL UNIQUE,
+					request_created_at INTEGER NOT NULL,
+					announcement_event_id TEXT NOT NULL,
+					access_kind TEXT NOT NULL DEFAULT '',
+					expires_at INTEGER NOT NULL DEFAULT 0,
+					revoked_at INTEGER NOT NULL DEFAULT 0,
+					revoke_event_id TEXT NOT NULL DEFAULT '',
+					created_at INTEGER NOT NULL,
+					updated_at INTEGER NOT NULL,
+					PRIMARY KEY(repository_addr, author_pubkey))`,
+				`CREATE INDEX IF NOT EXISTS idx_monitoring_enrollments_author
+					ON monitoring_enrollments(author_pubkey)`,
+			} {
+				if _, err := tx.ExecContext(ctx, ddl); err != nil {
+					return fmt.Errorf("apply monitoring enrollments ddl: %w", err)
+				}
+			}
+			return nil
+		},
+	},
 }
 
 func (s *Store) Migrate(ctx context.Context) error {

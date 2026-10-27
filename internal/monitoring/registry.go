@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"git.sharegap.net/cascadia/drydock/internal/db"
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
@@ -62,6 +63,18 @@ type Store interface {
 	ApplyMonitoredRepositoryList(context.Context, db.MonitoredRepositoryListState) (bool, error)
 	LoadMonitoredRepositoryLists(context.Context) ([]db.MonitoredRepositoryListState, error)
 	LoadRepositoryAnnouncement(ctx context.Context, repoID string) (nostr.Event, bool, error)
+	LoadMonitoringEnrollments(context.Context) ([]db.MonitoringEnrollment, error)
+}
+
+// Enrollment is a maintainer's ContextVM opt-in for one repository. It grants
+// membership under the same authority rule as a list entry, and additionally
+// stops granting at ExpiresAt (0 = never).
+type Enrollment struct {
+	Author         nostr.PubKey
+	Ref            scope.RepositoryRef
+	RequestEventID string
+	CreatedAt      int64
+	ExpiresAt      int64
 }
 
 // AuthorStatus is the effect an author's current list revision has on membership.
@@ -96,6 +109,10 @@ type Snapshot struct {
 	Repositories map[string]struct{}
 	// Authors is every known list author's winning revision, keyed by pubkey hex.
 	Authors map[string]AuthorSnapshot
+	// Expiries holds, for repositories whose membership rests only on
+	// enrollments, the latest expiry among the granting enrollments. Contains
+	// consults it so an expired enrollment stops granting without a rebuild.
+	Expiries map[string]int64
 }
 
 // Config configures a Registry.
@@ -132,9 +149,12 @@ type Registry struct {
 	operator nostr.PubKey // nostr.ZeroPK when no operator ceiling is configured
 	scope    scope.Matcher
 
+	now func() time.Time
+
 	mu          sync.Mutex
 	loaded      bool
 	lists       map[nostr.PubKey]*authorList
+	enrollments map[string]map[nostr.PubKey]Enrollment // address -> author -> enrollment
 	authorities map[string]authority
 	snapshot    atomic.Pointer[Snapshot]
 	// changes receives one coalesced signal per published rebuild so the
@@ -154,7 +174,9 @@ func NewRegistry(store Store, cfg Config) (*Registry, error) {
 		store:       store,
 		drydock:     drydock,
 		scope:       cfg.Scope,
+		now:         time.Now,
 		lists:       make(map[nostr.PubKey]*authorList),
+		enrollments: make(map[string]map[nostr.PubKey]Enrollment),
 		authorities: make(map[string]authority),
 		changes:     make(chan struct{}, 1),
 	}
@@ -163,7 +185,7 @@ func NewRegistry(store Store, cfg Config) (*Registry, error) {
 			return nil, fmt.Errorf("invalid monitored repositories operator: %w", err)
 		}
 	}
-	r.snapshot.Store(&Snapshot{Repositories: map[string]struct{}{}, Authors: map[string]AuthorSnapshot{}})
+	r.snapshot.Store(&Snapshot{Repositories: map[string]struct{}{}, Authors: map[string]AuthorSnapshot{}, Expiries: map[string]int64{}})
 	return r, nil
 }
 
@@ -190,15 +212,81 @@ func (r *Registry) Load(ctx context.Context) error {
 		}
 		lists[list.author] = list
 	}
-	authorities, err := r.loadAuthorities(ctx, lists, nil)
+	rows, err := r.store.LoadMonitoringEnrollments(ctx)
+	if err != nil {
+		return err
+	}
+	enrollments := make(map[string]map[nostr.PubKey]Enrollment)
+	loadNow := r.now().Unix()
+	for _, row := range rows {
+		if !row.Active(loadNow) {
+			continue
+		}
+		author, err := nostr.PubKeyFromHex(row.AuthorPubkey)
+		if err != nil {
+			return fmt.Errorf("persisted monitoring enrollment has an invalid author: %w", err)
+		}
+		ref, err := scope.ParseRepositoryRef(row.RepositoryAddress)
+		if err != nil {
+			return fmt.Errorf("persisted monitoring enrollment %q: %w", row.RepositoryAddress, err)
+		}
+		if enrollments[ref.Address] == nil {
+			enrollments[ref.Address] = map[nostr.PubKey]Enrollment{}
+		}
+		enrollments[ref.Address][author] = Enrollment{Author: author, Ref: ref, RequestEventID: row.RequestEventID, CreatedAt: row.RequestCreatedAt, ExpiresAt: row.ExpiresAt}
+	}
+	authorities, err := r.loadAuthorities(ctx, lists, enrollments, nil)
 	if err != nil {
 		return err
 	}
 	r.lists = lists
+	r.enrollments = enrollments
 	r.authorities = authorities
 	r.loaded = true
 	r.rebuildLocked()
 	return nil
+}
+
+// ApplyEnrollment admits a persisted enrollment into the live membership
+// derivation. Authority is resolved before the state changes so a lookup
+// failure leaves nothing half-applied.
+func (r *Registry) ApplyEnrollment(ctx context.Context, e Enrollment) error {
+	if e.Author == nostr.ZeroPK || e.Ref.Address == "" {
+		return errors.New("enrollment requires an author and a repository")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pending := map[string]map[nostr.PubKey]Enrollment{e.Ref.Address: {e.Author: e}}
+	authorities, err := r.loadAuthorities(ctx, nil, pending, r.authorities)
+	if err != nil {
+		return err
+	}
+	if r.enrollments[e.Ref.Address] == nil {
+		r.enrollments[e.Ref.Address] = map[nostr.PubKey]Enrollment{}
+	}
+	r.enrollments[e.Ref.Address][e.Author] = e
+	r.authorities = authorities
+	r.rebuildLocked()
+	return nil
+}
+
+// RevokeEnrollment removes a (repository, author) enrollment from the live
+// derivation. Unknown enrollments are a no-op.
+func (r *Registry) RevokeEnrollment(repositoryAddress string, author nostr.PubKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	byAuthor, ok := r.enrollments[repositoryAddress]
+	if !ok {
+		return
+	}
+	if _, ok := byAuthor[author]; !ok {
+		return
+	}
+	delete(byAuthor, author)
+	if len(byAuthor) == 0 {
+		delete(r.enrollments, repositoryAddress)
+	}
+	r.rebuildLocked()
 }
 
 // ApplyList applies an author's list revision. Any author may publish a list;
@@ -266,7 +354,7 @@ func (r *Registry) ApplyList(ctx context.Context, event nostr.Event) (bool, erro
 
 	// Resolve announcement authority before persisting so a lookup failure
 	// leaves no half-applied state and the event is safe to redeliver.
-	authorities, err := r.loadAuthorities(ctx, map[nostr.PubKey]*authorList{event.PubKey: list}, r.authorities)
+	authorities, err := r.loadAuthorities(ctx, map[nostr.PubKey]*authorList{event.PubKey: list}, nil, r.authorities)
 	if err != nil {
 		return false, err
 	}
@@ -399,8 +487,13 @@ func (r *Registry) Contains(repositoryAddress string) bool {
 	if current == nil || !current.Initialized {
 		return false
 	}
-	_, ok := current.Repositories[ref.Address]
-	return ok
+	if _, ok := current.Repositories[ref.Address]; !ok {
+		return false
+	}
+	if expiry, ok := current.Expiries[ref.Address]; ok && r.now().Unix() >= expiry {
+		return false
+	}
+	return true
 }
 
 // MonitoredRepositoryIDs returns the "<pubkey>:<identifier>" repository ids of
@@ -412,8 +505,12 @@ func (r *Registry) MonitoredRepositoryIDs() []string {
 	if current == nil || !current.Initialized {
 		return nil
 	}
+	now := r.now().Unix()
 	ids := make([]string, 0, len(current.Repositories))
 	for address := range current.Repositories {
+		if expiry, ok := current.Expiries[address]; ok && now >= expiry {
+			continue
+		}
 		ref, err := scope.ParseRepositoryRef(address)
 		if err != nil {
 			continue
@@ -429,7 +526,7 @@ func (r *Registry) MonitoredRepositoryIDs() []string {
 func (r *Registry) Snapshot() Snapshot {
 	current := r.snapshot.Load()
 	if current == nil {
-		return Snapshot{Repositories: map[string]struct{}{}, Authors: map[string]AuthorSnapshot{}}
+		return Snapshot{Repositories: map[string]struct{}{}, Authors: map[string]AuthorSnapshot{}, Expiries: map[string]int64{}}
 	}
 	return cloneSnapshot(*current)
 }
@@ -458,21 +555,16 @@ func (r *Registry) DeclaredRepositories() []scope.RepositoryRef {
 		}
 	}
 	declared := map[string]scope.RepositoryRef{}
-	for _, list := range r.lists {
-		if list.status != StatusActive {
-			continue
-		}
-		for address, ref := range list.repos {
-			if ceiling != nil {
-				if _, ok := ceiling[address]; !ok {
-					continue
-				}
-			}
-			if !r.scope.Allows(ref.RepositoryID, ref.OwnerPubkey) {
+	for address, ref := range r.declaredRefsLocked() {
+		if ceiling != nil {
+			if _, ok := ceiling[address]; !ok {
 				continue
 			}
-			declared[address] = ref
 		}
+		if !r.scope.Allows(ref.RepositoryID, ref.OwnerPubkey) {
+			continue
+		}
+		declared[address] = ref
 	}
 	refs := make([]scope.RepositoryRef, 0, len(declared))
 	for _, ref := range declared {
@@ -539,6 +631,38 @@ func (r *Registry) rebuildLocked() {
 			}
 		}
 	}
+	// Enrollments grant under the same authority rule; repositories granted
+	// only by enrollments carry the latest granting expiry.
+	now := r.now().Unix()
+	expiries := map[string]int64{}
+	for address, byAuthor := range r.enrollments {
+		if _, permanent := members[address]; permanent {
+			continue
+		}
+		var latest int64 = -1
+		for author, e := range byAuthor {
+			if !r.authorizedLocked(author, address) {
+				continue
+			}
+			if e.ExpiresAt != 0 && now >= e.ExpiresAt {
+				continue
+			}
+			if e.ExpiresAt == 0 {
+				latest = 0
+				break
+			}
+			if latest != 0 && e.ExpiresAt > latest {
+				latest = e.ExpiresAt
+			}
+		}
+		if latest < 0 {
+			continue
+		}
+		members[address] = struct{}{}
+		if latest > 0 {
+			expiries[address] = latest
+		}
+	}
 
 	initialized := r.loaded
 	if r.operator != nostr.ZeroPK {
@@ -561,7 +685,12 @@ func (r *Registry) rebuildLocked() {
 	for author, list := range r.lists {
 		authors[author.Hex()] = AuthorSnapshot{Status: list.status, RevisionID: list.revisionID, CreatedAt: list.createdAt}
 	}
-	r.snapshot.Store(&Snapshot{Initialized: initialized, Repositories: members, Authors: authors})
+	for address := range expiries {
+		if _, ok := members[address]; !ok {
+			delete(expiries, address) // cut by a ceiling
+		}
+	}
+	r.snapshot.Store(&Snapshot{Initialized: initialized, Repositories: members, Authors: authors, Expiries: expiries})
 	select {
 	case r.changes <- struct{}{}:
 	default: // a signal is already pending; the receiver re-reads state anyway
@@ -603,27 +732,66 @@ func (r *Registry) declaredLocked(address string) bool {
 			return true
 		}
 	}
+	for _, e := range r.enrollments[address] {
+		if e.ExpiresAt == 0 || r.now().Unix() < e.ExpiresAt {
+			return true
+		}
+	}
 	return false
+}
+
+// declaredRefsLocked is every repository named by an active list or an
+// enrollment, keyed by address. Callers hold r.mu.
+func (r *Registry) declaredRefsLocked() map[string]scope.RepositoryRef {
+	out := map[string]scope.RepositoryRef{}
+	for _, list := range r.lists {
+		if list.status != StatusActive {
+			continue
+		}
+		for address, ref := range list.repos {
+			out[address] = ref
+		}
+	}
+	now := r.now().Unix()
+	for address, byAuthor := range r.enrollments {
+		for _, e := range byAuthor {
+			if e.ExpiresAt == 0 || now < e.ExpiresAt {
+				out[address] = e.Ref
+				break
+			}
+		}
+	}
+	return out
 }
 
 // loadAuthorities returns the authority map covering every repository declared
 // by lists, reusing entries already present in cached.
-func (r *Registry) loadAuthorities(ctx context.Context, lists map[nostr.PubKey]*authorList, cached map[string]authority) (map[string]authority, error) {
+func (r *Registry) loadAuthorities(ctx context.Context, lists map[nostr.PubKey]*authorList, enrollments map[string]map[nostr.PubKey]Enrollment, cached map[string]authority) (map[string]authority, error) {
 	out := make(map[string]authority, len(cached))
 	for address, a := range cached {
 		out[address] = a
 	}
+	need := map[string]scope.RepositoryRef{}
 	for _, list := range lists {
 		for address, ref := range list.repos {
-			if _, ok := out[address]; ok {
-				continue
-			}
-			a, err := r.lookupAuthority(ctx, ref)
-			if err != nil {
-				return nil, err
-			}
-			out[address] = a
+			need[address] = ref
 		}
+	}
+	for address, byAuthor := range enrollments {
+		for _, e := range byAuthor {
+			need[address] = e.Ref
+			break
+		}
+	}
+	for address, ref := range need {
+		if _, ok := out[address]; ok {
+			continue
+		}
+		a, err := r.lookupAuthority(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		out[address] = a
 	}
 	return out, nil
 }
@@ -750,6 +918,10 @@ func cloneSnapshot(snapshot Snapshot) Snapshot {
 		Initialized:  snapshot.Initialized,
 		Repositories: make(map[string]struct{}, len(snapshot.Repositories)),
 		Authors:      make(map[string]AuthorSnapshot, len(snapshot.Authors)),
+		Expiries:     make(map[string]int64, len(snapshot.Expiries)),
+	}
+	for address, expiry := range snapshot.Expiries {
+		clone.Expiries[address] = expiry
 	}
 	for address := range snapshot.Repositories {
 		clone.Repositories[address] = struct{}{}

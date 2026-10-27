@@ -34,6 +34,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/depupgrade"
 	"git.sharegap.net/cascadia/drydock/internal/driftguard"
 	"git.sharegap.net/cascadia/drydock/internal/embedding"
+	"git.sharegap.net/cascadia/drydock/internal/enrollment"
 	"git.sharegap.net/cascadia/drydock/internal/health"
 	"git.sharegap.net/cascadia/drydock/internal/idegateway"
 	"git.sharegap.net/cascadia/drydock/internal/ingest"
@@ -834,6 +835,17 @@ func main() {
 		processorOpts = append(processorOpts, ingest.WithIDEGateway(ideHandler))
 		reviewOrderHandler := revieworder.NewHandler(reviewOrders, servicePubkey, logger)
 		contextVMProviders := []contextvm.MethodProvider{ideHandler, reviewOrderHandler}
+		// monitoring/enroll + unenroll: the paid handshake through which a
+		// repository maintainer opts into reactive review. Needs the registry
+		// (hence the signer) and reuses the payment service for the price.
+		if monitoredRepos != nil {
+			enrollSvc := enrollment.New(store, monitoredRepos, repositoryScope, paymentSvc, enrollment.Policy{
+				PriceSats: cfg.MonitoringEnrollPriceSats,
+				TTL:       cfg.MonitoringEnrollTTL,
+				MaxTTL:    cfg.MonitoringEnrollMaxTTL,
+			}, logger)
+			contextVMProviders = append(contextVMProviders, enrollment.NewHandler(enrollSvc, servicePubkey, logger))
+		}
 		// securityAuditHandler is only constructed when the audit engine is
 		// enabled. Append it by concrete type: handing a typed-nil pointer to a
 		// MethodProvider parameter yields a non-nil interface, which would
