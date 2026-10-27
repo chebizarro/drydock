@@ -62,6 +62,7 @@ services:
       DRYDOCK_SIGNER_BUNKER_URL: ${DRYDOCK_SIGNER_BUNKER_URL:-}
       DRYDOCK_SIGNER_CLIENT_KEY_FILE: ${DRYDOCK_SIGNER_CLIENT_KEY_FILE:-/data/signet-client.key}
       DRYDOCK_SIGNER_NSEC: ${DRYDOCK_SIGNER_NSEC:-}
+      DRYDOCK_PROFILE_ENABLED: ${DRYDOCK_PROFILE_ENABLED:-true}
       # LLM endpoints. Empty values fall back to drydock's own development
       # defaults (which point at the container's loopback, so set these in .env)
       # and are rejected in production; see docs/local-models.md.
