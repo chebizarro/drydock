@@ -98,6 +98,7 @@ type Runner struct {
 	activityHook            func()
 	applyFailurePublication string
 	agenticReviewFallback   bool
+	loomEnabled             bool
 
 	// Narrow function seams keep failure handling testable without replacing the
 	// concrete services used by the rest of the pipeline.
@@ -112,6 +113,7 @@ type Config struct {
 	// AgenticReviewFallback explicitly keeps the legacy deterministic
 	// Builder.Build + Engine.Run path available during rollout.
 	AgenticReviewFallback bool
+	LoomEnabled           bool
 }
 
 const (
@@ -218,6 +220,7 @@ func New(
 	}
 	r := &Runner{
 		store:                   store,
+		loomEnabled:             cfg.LoomEnabled,
 		repoSvc:                 repoSvc,
 		ctxBuilder:              ctxBuilder,
 		engine:                  engine,
@@ -504,9 +507,18 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 
 	buildInput := contextbuilder.BuildInput{
 		PatchEventContent: authoritativePatch, RepoPath: prep.RepoPath, RepoID: task.RepoID,
+		PatchEventID: task.PatchEventID, CommitRef: ciCommitReference(patchEvent, prep.TipCommit),
 		TokenBudgetOverride: repoCfg.Context.TokenBudget, ExcludePaths: repoCfg.Context.ExcludePaths,
 		DisableDocs: !repoCfg.DocsEnabled(), SecretScanContext: betterleaks.FormatContext(secretScanResult),
 		IncludeAddedLines: repoCfg.Context.IncludeAddedLines,
+	}
+
+	if r.loomEnabled {
+		buildInput.CIAttestations, err = (contextbuilder.CIAttestationsProvider{Store: r.store}).Build(ctx, buildInput)
+		buildInput.CIAttestationsLoaded = err == nil
+		if err != nil {
+			log.Warn("CI attestation context unavailable", "error", err)
+		}
 	}
 
 	var bundle contextbuilder.ContextBundle
@@ -559,7 +571,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 	if len(changedFiles) == 0 && len(bundle.ExcludedFiles) > 0 {
 		// All changed files were excluded by repo policy — skip the LLM call and
 		// publish an explicit policy-skip review instead of failing.
-		return r.publishExclusionOnlyReview(ctx, task, prep, bundle, targetEnvelope, ctxHash)
+		return r.publishExclusionOnlyReview(ctx, task, prep, bundle, targetEnvelope, ctxHash, repoCfg.Notifications.Concord)
 	}
 	if len(changedFiles) == 0 {
 		// Fail closed: with no deterministic changed-file set, the reviewer
@@ -703,6 +715,7 @@ func (r *Runner) process(ctx context.Context, task db.ReviewTask) error {
 		}
 		var pubErr error
 		reviewEventID, pubErr = r.pubSvc.PublishReview(ctx, publisher.PublishInput{
+			Concord:              repoCfg.Notifications.Concord,
 			PatchEventID:         task.PatchEventID,
 			RepoID:               task.RepoID,
 			Summary:              filteredReview.Summary,
@@ -909,11 +922,12 @@ func (r *Runner) buildReviewContext(
 // publishExclusionOnlyReview publishes an explicit policy-skip review for a
 // patch whose changed files were all excluded by repository review policy,
 // after re-checking the reactive-monitoring gate. No LLM call is made.
-func (r *Runner) publishExclusionOnlyReview(ctx context.Context, task db.ReviewTask, prep repo.PrepareResult, bundle contextbuilder.ContextBundle, targetEnvelope targetidentity.Envelope, ctxHash string) error {
+func (r *Runner) publishExclusionOnlyReview(ctx context.Context, task db.ReviewTask, prep repo.PrepareResult, bundle contextbuilder.ContextBundle, targetEnvelope targetidentity.Envelope, ctxHash string, concord *repoconfig.ConcordConfig) error {
 	if err := r.requireReactiveMonitoring(ctx, task, "pre_publication"); err != nil {
 		return err
 	}
 	reviewEventID, pubErr := r.pubSvc.PublishReview(ctx, publisher.PublishInput{
+		Concord:              concord,
 		PatchEventID:         task.PatchEventID,
 		RepoID:               task.RepoID,
 		Summary:              "This patch only modifies files excluded by repository review policy, so no automated review was run.",

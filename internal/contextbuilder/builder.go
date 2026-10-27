@@ -48,6 +48,12 @@ type BuildInput struct {
 	// RepoID is the unique repository identifier. Used by the Qdrant provider
 	// to filter project_docs results to the current repository.
 	RepoID string
+	// Exact reviewed target, used only for third-party CI context lookup.
+	PatchEventID string
+	CommitRef    string
+	// CIAttestations is the bounded, pre-rendered third-party claim snapshot.
+	CIAttestations       string
+	CIAttestationsLoaded bool
 	// WorkspaceRoots are relative paths of detected monorepo workspaces that
 	// contain changed files. Empty means "whole repo" (no workspace isolation).
 	// Set automatically by Builder.Build when a workspace config is detected.

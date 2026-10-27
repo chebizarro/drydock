@@ -40,6 +40,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/idegateway"
 	"git.sharegap.net/cascadia/drydock/internal/ingest"
 	"git.sharegap.net/cascadia/drydock/internal/listener"
+	"git.sharegap.net/cascadia/drydock/internal/loom"
 	"git.sharegap.net/cascadia/drydock/internal/lspbridge"
 	"git.sharegap.net/cascadia/drydock/internal/marketplace"
 	"git.sharegap.net/cascadia/drydock/internal/mcpserver"
@@ -525,6 +526,13 @@ func main() {
 	))
 	logger.Info("security scanners enabled", "rules", len(securityscan.BuiltinRules()), "betterleaks_validation", cfg.BetterleaksValidation)
 
+	var loomService *loom.Service
+	if cfg.LoomEnabled && monitoredRepos != nil {
+		loomService = loom.New(store, monitoredRepos, loom.Config{MaxPerRepository: cfg.LoomMaxRunsPerRepo, MaxTotal: cfg.LoomMaxRuns, TTL: cfg.LoomRunTTL}, logger)
+		processorOpts = append(processorOpts, ingest.WithLoom(loomService))
+		builderOpts = append(builderOpts, contextbuilder.WithExtraProviders(contextbuilder.CIAttestationsProvider{Store: store}))
+	}
+
 	// --- Context builder ---
 	ctxBuilder := contextbuilder.NewWithOptions(contextbuilder.NewBuilderOptions(builderOpts...))
 
@@ -698,6 +706,15 @@ func main() {
 
 	// --- Publisher ---
 	var pubSvc *publisher.Service
+	var concordDelivery *publisher.ConcordDelivery
+	if cfg.ConcordEnabled && signer != nil {
+		var err error
+		concordDelivery, err = publisher.NewConcordDelivery(ctx, os.Getenv("DRYDOCK_CONCORD_STREAM_KEYS"), signer, relayPub, logger)
+		if err != nil {
+			logger.Error("invalid Concord operator credentials", "error", err)
+			os.Exit(1)
+		}
+	}
 	if signer != nil {
 		pubSvc = publisher.New(publisher.Config{
 			DefaultRelays:       writeRelays,
@@ -705,6 +722,7 @@ func main() {
 			DefaultTTL:          90 * 24 * time.Hour,
 			SupersededTTL:       7 * 24 * time.Hour,
 			Audit:               auditPub,
+			Concord:             concordDelivery,
 		}, store, signer, relayPub, logger)
 	}
 
@@ -917,6 +935,9 @@ func main() {
 			Allow:            cfg.RepoRelaysAllow,
 			Deny:             cfg.RepoRelaysDeny,
 		})
+		if loomService != nil {
+			routes.WithLoom(ctx, loomService)
+		}
 		listenerOpts = append(listenerOpts, listener.WithRoutes(routes))
 	}
 	svc := listener.New(listener.Config{
@@ -959,6 +980,7 @@ func main() {
 				Workers:                 cfg.PipelineWorkers,
 				ApplyFailurePublication: cfg.ApplyFailurePublication,
 				AgenticReviewFallback:   cfg.AgenticReviewFallback,
+				LoomEnabled:             cfg.LoomEnabled,
 			},
 			store,
 			repoSvc,

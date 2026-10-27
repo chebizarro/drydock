@@ -440,6 +440,14 @@ func (s *Service) currentRoutes(ctx context.Context) (relayroute.Routes, bool) {
 // relay gets filters scoped to the repositories that declared it.
 func (s *Service) directedFilters(since nostr.Timestamp, routes relayroute.Routes) []nostr.DirectedFilter {
 	base := append(subscriptionFilters(since, s.cfg), controlPlaneFilters(routes)...)
+	addresses := make([]string, 0, len(routes.LoomFilters))
+	for address := range routes.LoomFilters {
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+	for _, address := range addresses {
+		base = append(base, routes.LoomFilters[address]...)
+	}
 	directed := make([]nostr.DirectedFilter, 0, len(base)*len(s.cfg.Relays)+2*len(routes.Plan.Relays))
 	for _, relay := range s.cfg.Relays {
 		for _, filter := range base {
@@ -513,6 +521,11 @@ func routeDirectedFilters(since nostr.Timestamp, routes relayroute.Routes) []nos
 			Tags:  nostr.TagMap{"a": addresses},
 			Since: since,
 		}})
+		for _, ref := range refs {
+			for _, filter := range routes.LoomFilters[ref.Address] {
+				directed = append(directed, nostr.DirectedFilter{Relay: relay, Filter: filter})
+			}
+		}
 		for _, filter := range announcementFilters(refs, true) {
 			directed = append(directed, nostr.DirectedFilter{Relay: relay, Filter: filter})
 		}

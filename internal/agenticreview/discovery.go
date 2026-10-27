@@ -139,7 +139,11 @@ func (d *Discovery) Run(ctx context.Context, input DiscoveryInput) (DiscoveryRes
 		if err != nil {
 			return DiscoveryResult{Trace: DiscoveryTrace{Loop: loopResult.Trace}}, err
 		}
-		return DiscoveryResult{Bundle: loopResult.Bundle, Trace: DiscoveryTrace{Loop: loopResult.Trace},
+		bundle, err := withCIClaims(loopResult.Bundle, input.BuildInput.CIAttestations, d.config.Counter, d.config.TokenBudget, d.config.Headroom)
+		if err != nil {
+			return DiscoveryResult{Trace: DiscoveryTrace{Loop: loopResult.Trace}}, err
+		}
+		return DiscoveryResult{Bundle: bundle, Trace: DiscoveryTrace{Loop: loopResult.Trace},
 			Artifacts: artifacts, SessionCapable: true}, nil
 	}
 	if !isExhaustion(loopErr) {
