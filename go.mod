@@ -6,7 +6,7 @@ toolchain go1.26.0
 
 require (
 	fiatjaf.com/nostr v0.0.0-20260902034142-316ef6591fa2
-	git.sharegap.net/cascadia/cascadia-go v1.0.2
+	git.sharegap.net/cascadia/cascadia-go v1.4.0
 	git.sharegap.net/cascadia/nostr-secprobe v0.2.0
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/aquasecurity/go-pep440-version v0.0.1
@@ -15,7 +15,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
-	golang.org/x/mod v0.27.0
+	golang.org/x/mod v0.35.0
 	golang.org/x/sync v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.39.1
@@ -50,11 +50,11 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	golang.org/x/crypto v0.42.0 // indirect
+	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
-	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/xerrors v0.0.0-20231012003039-104605ab7028 // indirect
 	modernc.org/libc v1.66.10 // indirect

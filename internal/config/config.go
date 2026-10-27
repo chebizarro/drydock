@@ -153,6 +153,7 @@ type Config struct {
 	MetaTimeout                         time.Duration
 	AgenticDiscoveryTimeout             time.Duration // inherits Coder32BTimeout, like the rest of the discovery endpoint
 	SignerBunkerURL                     string
+	SignerClientKeyFile                 string
 	SignerNsec                          string
 	SignerNsecFile                      string
 	DevMode                             bool
@@ -323,6 +324,7 @@ func FromEnv() Config {
 		Coder14BAPIKey:     envOrDefault("DRYDOCK_CODER14B_API_KEY", ""),
 		MetaAPIKey:         envOrDefault("DRYDOCK_META_API_KEY", ""),
 		SignerBunkerURL:    envOrDefault("DRYDOCK_SIGNER_BUNKER_URL", ""),
+		SignerClientKeyFile: envOrDefault("DRYDOCK_SIGNER_CLIENT_KEY_FILE", ""),
 		SignerNsec:         signerNsec,
 		SignerNsecFile:     signerNsecFile,
 		DevMode:            parseBoolOrDefault(envOrDefault("DEV_MODE", envOrDefault("DRYDOCK_DEV_MODE", "")), false),

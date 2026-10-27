@@ -155,9 +155,21 @@ Recommended for local GPUs, and already set in `.env.example`:
 ### Docker Compose (recommended)
 
 ```bash
-docker compose up -d --build                       # drydock-core + qdrant
-docker compose --profile lsp up -d --build         # optional: + LSP bridge
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
+docker compose build --secret id=git_credentials,src="$HOME/.git-credentials"
+docker compose up -d                               # drydock-core + qdrant
+docker compose --profile lsp up -d                 # optional: + LSP bridge
 docker compose logs -f drydock-core
+```
+
+The BuildKit secret supplies read-only Git credentials while resolving private
+Cascadia Go modules. It is mounted only for `go mod download` and is not copied
+into an image layer. To run the repository test gate in the same build path:
+
+```bash
+docker build --target test \
+  --secret id=git_credentials,src="$HOME/.git-credentials" .
 ```
 
 Compose passes every variable in `.env` to drydock-core. It publishes the management listener (health, readiness, metrics, dashboard) on host loopback port 8081, and Qdrant on loopback 6333.

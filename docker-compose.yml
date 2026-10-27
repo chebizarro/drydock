@@ -60,7 +60,9 @@ services:
       # or DRYDOCK_SIGNER_NSEC_FILE. Production mode refuses to start without a
       # signer; development mode runs listen-only without one.
       DRYDOCK_SIGNER_BUNKER_URL: ${DRYDOCK_SIGNER_BUNKER_URL:-}
+      DRYDOCK_SIGNER_CLIENT_KEY_FILE: ${DRYDOCK_SIGNER_CLIENT_KEY_FILE:-/data/signet-client.key}
       DRYDOCK_SIGNER_NSEC: ${DRYDOCK_SIGNER_NSEC:-}
+      DRYDOCK_PROFILE_ENABLED: ${DRYDOCK_PROFILE_ENABLED:-true}
       # LLM endpoints. Empty values fall back to drydock's own development
       # defaults (which point at the container's loopback, so set these in .env)
       # and are rejected in production; see docs/local-models.md.
@@ -117,7 +119,8 @@ services:
       - "127.0.0.1:${QDRANT_HOST_PORT:-6333}:6333"  # REST API
       - "127.0.0.1:${QDRANT_GRPC_PORT:-6334}:6334"  # gRPC (unused by drydock, exposed for debugging)
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:6333/healthz"]
+      # qdrant:1.12 image has no wget/curl; bash /dev/tcp probe instead
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333; printf \"GET /healthz HTTP/1.0\\r\\n\\r\\n\" >&3; read -r line <&3; case \"$$line\" in *200*) exit 0;; *) exit 1;; esac'"]
       interval: 10s
       timeout: 5s
       start_period: 10s
