@@ -16,7 +16,9 @@ type MonitoredRepositoryMember struct {
 	RepositoryID      string
 }
 
-// MonitoredRepositoryListState is the durable winning list revision.
+// MonitoredRepositoryListState is the durable winning list revision for one
+// list address. OperatorPubkey is the list author; the column keeps its
+// original name because lists are now authored by many maintainers.
 type MonitoredRepositoryListState struct {
 	ListAddress    string
 	OperatorPubkey string
@@ -154,22 +156,79 @@ func (s *Store) LoadMonitoredRepositoryList(ctx context.Context, listAddress str
 	}
 	state.Deleted = deleted != 0
 
-	rows, err := s.db.QueryContext(ctx, `SELECT repository_addr, repository_id
-		FROM monitored_repository_members WHERE list_address=?
-		ORDER BY repository_addr`, state.ListAddress)
+	members, err := s.loadMonitoredRepositoryMembers(ctx, map[string][]MonitoredRepositoryMember{}, state.ListAddress)
 	if err != nil {
-		return MonitoredRepositoryListState{}, false, fmt.Errorf("load monitored repository members: %w", err)
+		return MonitoredRepositoryListState{}, false, err
+	}
+	state.Repositories = members[state.ListAddress]
+	return state, true, nil
+}
+
+// LoadMonitoredRepositoryLists loads the winning revision of every persisted
+// list, one per author, ordered by list address. It is the restart-recovery
+// read for the multi-author registry.
+func (s *Store) LoadMonitoredRepositoryLists(ctx context.Context) ([]MonitoredRepositoryListState, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT
+		list_address, operator_pubkey, d_tag, source_kind, event_id,
+		created_at, deleted, raw_event, updated_at
+		FROM monitored_repository_list_state ORDER BY list_address`)
+	if err != nil {
+		return nil, fmt.Errorf("load monitored repository lists: %w", err)
+	}
+	defer rows.Close()
+
+	var states []MonitoredRepositoryListState
+	for rows.Next() {
+		var state MonitoredRepositoryListState
+		var deleted int
+		if err := rows.Scan(
+			&state.ListAddress, &state.OperatorPubkey, &state.DTag, &state.SourceKind,
+			&state.EventID, &state.CreatedAt, &deleted, &state.RawEvent, &state.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan monitored repository list: %w", err)
+		}
+		state.Deleted = deleted != 0
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate monitored repository lists: %w", err)
+	}
+
+	byList := make(map[string][]MonitoredRepositoryMember, len(states))
+	if _, err := s.loadMonitoredRepositoryMembers(ctx, byList, ""); err != nil {
+		return nil, err
+	}
+	for i := range states {
+		states[i].Repositories = byList[states[i].ListAddress]
+	}
+	return states, nil
+}
+
+// loadMonitoredRepositoryMembers fills byList with the member projection of
+// one list (listAddress != "") or of every list (listAddress == ""), and
+// returns it.
+func (s *Store) loadMonitoredRepositoryMembers(ctx context.Context, byList map[string][]MonitoredRepositoryMember, listAddress string) (map[string][]MonitoredRepositoryMember, error) {
+	query := `SELECT list_address, repository_addr, repository_id FROM monitored_repository_members`
+	var args []any
+	if listAddress != "" {
+		query += ` WHERE list_address=?`
+		args = append(args, listAddress)
+	}
+	rows, err := s.db.QueryContext(ctx, query+` ORDER BY list_address, repository_addr`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load monitored repository members: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
+		var list string
 		var member MonitoredRepositoryMember
-		if err := rows.Scan(&member.RepositoryAddress, &member.RepositoryID); err != nil {
-			return MonitoredRepositoryListState{}, false, fmt.Errorf("scan monitored repository member: %w", err)
+		if err := rows.Scan(&list, &member.RepositoryAddress, &member.RepositoryID); err != nil {
+			return nil, fmt.Errorf("scan monitored repository member: %w", err)
 		}
-		state.Repositories = append(state.Repositories, member)
+		byList[list] = append(byList[list], member)
 	}
 	if err := rows.Err(); err != nil {
-		return MonitoredRepositoryListState{}, false, fmt.Errorf("iterate monitored repository members: %w", err)
+		return nil, fmt.Errorf("iterate monitored repository members: %w", err)
 	}
-	return state, true, nil
+	return byList, nil
 }

@@ -107,26 +107,6 @@ func main() {
 	}
 	defer store.Close()
 
-	var monitoredRepos *monitoring.Registry
-	if cfg.MonitoredReposAuthor != "" {
-		monitoredRepos, err = monitoring.NewRegistry(store, cfg.MonitoredReposAuthor)
-		if err != nil {
-			logger.Error("failed to initialize monitored repository registry", "error", err)
-			os.Exit(1)
-		}
-		if err := monitoredRepos.Load(ctx); err != nil {
-			logger.Error("failed to load monitored repository registry", "error", err)
-			os.Exit(1)
-		}
-		snapshot := monitoredRepos.Snapshot()
-		logger.Info("loaded monitored repository registry",
-			"initialized", snapshot.Initialized,
-			"deleted", snapshot.Deleted,
-			"revision_event_id", snapshot.RevisionID,
-			"repository_count", len(snapshot.Repositories),
-		)
-	}
-
 	rateLimitStore := ratelimit.NewSQLStore(store.DB())
 	codeChatRateLimiter := ratelimit.New(ratelimit.Config{
 		Window:      cfg.CodeChatWindow,
@@ -356,9 +336,6 @@ func main() {
 
 	// --- Ingest / Listener ---
 	var processorOpts []func(*ingest.Processor)
-	if monitoredRepos != nil {
-		processorOpts = append(processorOpts, ingest.WithMonitoring(monitoredRepos))
-	}
 	if convHandler != nil {
 		processorOpts = append(processorOpts, ingest.WithConversation(convHandler))
 	}
@@ -383,6 +360,35 @@ func main() {
 			logger.Error("failed to resolve signer pubkey; ContextVM recipient identity is unavailable", "error", err)
 			os.Exit(1)
 		}
+	}
+	// --- Monitored repositories (maintainer-authorized, operator-ceilinged) ---
+	// Maintainer lists must name this service in a p tag, so the registry needs
+	// the signer identity; without a signer nothing can be named and reactive
+	// review stays off. The operator list and the static allowlists are ceilings.
+	repositoryScope := scope.NewMatcher(cfg.RepoAllowlist, cfg.RepoOwnerAllowlist)
+	var monitoredRepos *monitoring.Registry
+	if servicePubkey != "" {
+		monitoredRepos, err = monitoring.NewRegistry(store, monitoring.Config{
+			Drydock:  servicePubkey,
+			Operator: cfg.MonitoredReposAuthor,
+			Scope:    repositoryScope,
+		})
+		if err != nil {
+			logger.Error("failed to initialize monitored repository registry", "error", err)
+			os.Exit(1)
+		}
+		if err := monitoredRepos.Load(ctx); err != nil {
+			logger.Error("failed to load monitored repository registry", "error", err)
+			os.Exit(1)
+		}
+		snapshot := monitoredRepos.Snapshot()
+		logger.Info("loaded monitored repository registry",
+			"initialized", snapshot.Initialized,
+			"author_count", len(snapshot.Authors),
+			"repository_count", len(snapshot.Repositories),
+			"operator_ceiling", cfg.MonitoredReposAuthor != "",
+		)
+		processorOpts = append(processorOpts, ingest.WithMonitoring(monitoredRepos))
 	}
 	// --- Repo service ---
 	repoManager := repo.NewManager(cfg.RepoCacheDir, logger,
@@ -747,7 +753,6 @@ func main() {
 	}, store, metaClient, logger)
 
 	// --- Event handlers registered before subscribing ---
-	repositoryScope := scope.NewMatcher(cfg.RepoAllowlist, cfg.RepoOwnerAllowlist)
 	var reactiveRegistry monitoring.Membership
 	if monitoredRepos != nil {
 		reactiveRegistry = monitoredRepos
@@ -757,7 +762,7 @@ func main() {
 	).WithRateLimiter(reviewOrderRateLimiter)
 	processorOpts = append(processorOpts, ingest.WithReviewOrders(reviewOrders))
 	if monitoredRepos == nil {
-		logger.Warn("reactive review disabled: no monitored repositories author is configured")
+		logger.Warn("reactive review disabled: no signer identity for maintainer lists to name")
 	}
 
 	// --- Dependency-upgrade service (operator-disabled by default) ---
@@ -771,7 +776,7 @@ func main() {
 			os.Exit(1)
 		}
 		if monitoredRepos == nil {
-			logger.Error("dependency upgrades enabled but no monitored repositories author is configured")
+			logger.Error("dependency upgrades enabled but the monitored repository registry is unavailable (signer required)")
 			os.Exit(1)
 		}
 		resolver, err := depupgrade.NewResolver(cfg, nil)
@@ -864,6 +869,15 @@ func main() {
 	if giftWrapOpener != nil {
 		listenerOpts = append(listenerOpts, listener.WithGiftWrapOpener(giftWrapOpener))
 	}
+	// Authors already known from persisted lists are subscribed directly so a
+	// withdrawal (a list that no longer names this service) or a deletion still
+	// reaches us; new authors are discovered through the p-tag filter.
+	var monitoredListAuthors []string
+	if monitoredRepos != nil {
+		for author := range monitoredRepos.Snapshot().Authors {
+			monitoredListAuthors = append(monitoredListAuthors, author)
+		}
+	}
 	svc := listener.New(listener.Config{
 		Relays:               readRelays,
 		LookbackMinutes:      cfg.ListenerLookbackMin,
@@ -874,6 +888,7 @@ func main() {
 		ContextVMPubkey:      servicePubkey,
 		ContextVMMethods:     contextVMRouter.Methods(),
 		MonitoredReposAuthor: cfg.MonitoredReposAuthor,
+		MonitoredListAuthors: monitoredListAuthors,
 	}, processor, logger, listenerOpts...)
 
 	// --- Pipeline runner ---

@@ -715,7 +715,7 @@ bd close <id>         # Complete work
 
 ## Event Kinds in Use
 
-Drydock uses an operator-authored NIP-51 kind-30001 list for reactive repository monitoring, kind `30078` for IDE session state, kind `25910` for ContextVM requests and notifications (including `review/order` and `marketplace/feedback`), kind `31990` for reviewer profiles, and NIP-59 gift-wrap (`1059`) for private payloads. NIP-90 kinds `5900`, `6900`, and `7000` are retired.
+Drydock uses maintainer-authored NIP-51 kind-30001 lists (authority derived from the kind-30617 announcement; the operator list is only a ceiling) for reactive repository monitoring, kind `30078` for IDE session state, kind `25910` for ContextVM requests and notifications (including `review/order` and `marketplace/feedback`), kind `31990` for reviewer profiles, and NIP-59 gift-wrap (`1059`) for private payloads. NIP-90 kinds `5900`, `6900`, and `7000` are retired.
 
 ## Deploying
 

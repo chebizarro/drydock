@@ -18,10 +18,14 @@ import (
 func TestProcessorAppliesLiveMonitoredListToReactiveAdmission(t *testing.T) {
 	ctx := context.Background()
 	store := mustOpenStore(t, ctx)
-	operatorSK := nostr.Generate()
-	operator := nostr.GetPublicKey(operatorSK)
-	registry, err := monitoring.NewRegistry(store, operator.Hex())
+	service := nostr.GetPublicKey(nostr.Generate())
+	ownerSK := nostr.Generate()
+	owner := nostr.GetPublicKey(ownerSK)
+	registry, err := monitoring.NewRegistry(store, monitoring.Config{Drydock: service.Hex()})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -33,16 +37,26 @@ func TestProcessorAppliesLiveMonitoredListToReactiveAdmission(t *testing.T) {
 		ingest.WithReviewOrders(orders),
 	)
 
-	repo := "30617:" + nostr.GetPublicKey(nostr.Generate()).Hex() + ":repo"
+	repo := "30617:" + owner.Hex() + ":repo"
+	// The owner's announcement is what confers authority over the repository.
+	announcement := nostr.Event{
+		Kind: nostr.KindRepositoryAnnouncement, CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{{"d", "repo"}},
+	}
+	signEvent(t, ownerSK, &announcement)
+	if err := processor.ProcessEvent(ctx, announcement, "wss://relay.test"); err != nil {
+		t.Fatalf("process announcement: %v", err)
+	}
 	list := nostr.Event{
 		Kind:      monitoring.MonitoredListKind,
 		CreatedAt: nostr.Timestamp(time.Now().Add(-2 * 365 * 24 * time.Hour).Unix()),
 		Tags: nostr.Tags{
 			{"d", monitoring.ListIdentifier},
+			{"p", service.Hex()},
 			{"a", repo},
 		},
 	}
-	signEvent(t, operatorSK, &list)
+	signEvent(t, ownerSK, &list)
 	if err := processor.ProcessEvent(ctx, list, "wss://relay.test"); err != nil {
 		t.Fatalf("process list: %v", err)
 	}
@@ -73,14 +87,14 @@ func TestProcessorAppliesLiveMonitoredListToReactiveAdmission(t *testing.T) {
 	deletion := nostr.Event{
 		Kind:      monitoring.DeletionKind,
 		CreatedAt: nostr.Timestamp(time.Now().Add(-18 * 30 * 24 * time.Hour).Unix()),
-		Tags:      nostr.Tags{{"a", monitoring.ListAddress(operator.Hex())}},
+		Tags:      nostr.Tags{{"a", monitoring.ListAddress(owner.Hex())}},
 	}
-	signEvent(t, operatorSK, &deletion)
+	signEvent(t, ownerSK, &deletion)
 	if err := processor.ProcessEvent(ctx, deletion, "wss://relay.test"); err != nil {
 		t.Fatalf("process deletion: %v", err)
 	}
 	snapshot := registry.Snapshot()
-	if !snapshot.Initialized || !snapshot.Deleted || registry.Contains(repo) {
+	if !snapshot.Initialized || snapshot.Authors[owner.Hex()].Status != monitoring.StatusDeleted || registry.Contains(repo) {
 		t.Fatalf("deletion snapshot: %#v", snapshot)
 	}
 	removedPatch := nostr.Event{
@@ -108,7 +122,7 @@ func TestProcessorAppliesLiveMonitoredListToReactiveAdmission(t *testing.T) {
 	if err := processor.ProcessEvent(ctx, deletion, "wss://relay.test"); err != nil {
 		t.Fatalf("reprocess deletion: %v", err)
 	}
-	if registry.Snapshot().RevisionID != deletion.ID.Hex() {
+	if registry.Snapshot().Authors[owner.Hex()].RevisionID != deletion.ID.Hex() {
 		t.Fatalf("duplicate changed revision: %#v", registry.Snapshot())
 	}
 }

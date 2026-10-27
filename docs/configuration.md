@@ -77,15 +77,15 @@ model's answer.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `DRYDOCK_MONITORED_REPOS_AUTHOR` | public key | *(empty)* | Hex or npub identity that authors the NIP-51 kind-30001 `drydock:monitored-repositories:v1` list. Required in production; when absent in development, reactive review is disabled. |
+| `DRYDOCK_MONITORED_REPOS_AUTHOR` | public key | *(empty)* | Optional operator **ceiling**. When set, only repositories named in this identity's NIP-51 kind-30001 `drydock:monitored-repositories:v1` list can be monitored, and readiness waits for that list. It does not grant membership: repositories are enrolled by their own owners/maintainers (see below). |
 | `DRYDOCK_REPO_ALLOWLIST` | comma-separated repository IDs | *(empty)* | Optional hard security ceiling, as `npub:identifier` or `64-character-hex-pubkey:identifier`. |
 | `DRYDOCK_REPO_OWNER_ALLOWLIST` | comma-separated public keys | *(empty)* | Optional hard security ceiling by repository-announcement owner. Accepts npub or hex. |
 
-These settings have separate roles. The operator-authored NIP-51 list controls **automatic reactive** review of kinds 1617/1618/1619 and updates live. The static repository/owner allowlists are a security ceiling applied to both reactive work and on-demand orders. A target is inside the ceiling when either its repository ID or announcement owner matches; empty static allowlists impose no additional ceiling.
+These settings have separate roles. **Automatic reactive** review of kinds 1617/1618/1619 is opted into by repository maintainers: a repository is monitored when its kind-30617 owner, or a pubkey in its `maintainers` tag, publishes a NIP-51 kind-30001 list (`d` = `drydock:monitored-repositories:v1`) that names the Drydock signer pubkey in a `p` tag and the repository in an `a` tag. Many authors may enroll; membership is the union. Authority is re-derived from the latest stored announcement, so dropping a maintainer from the announcement withdraws their enrollments. See [event-kinds.md](event-kinds.md) for the full contract. Because lists must name the signer, reactive review requires a configured signer.
 
-Reactive processing is fail-closed until an authoritative list state is loaded. A valid empty list or deletion intentionally disables reactive review and satisfies readiness. The control-plane subscription is not bounded by the listener high-water mark, and the winning list revision is restored from SQLite on restart. Paid `review/order` requests may target repositories outside the monitored list, but never outside the static ceiling.
+The operator list (`DRYDOCK_MONITORED_REPOS_AUTHOR`) and the static repository/owner allowlists are ceilings. A target is inside the static ceiling when either its repository ID or announcement owner matches; empty static allowlists impose no additional ceiling. Ceilings apply to reactive work; the static ceiling also bounds on-demand orders. Paid `review/order` requests may target repositories outside the monitored set, but never outside the static ceiling.
 
-The list contract is kind `30001`, authored by `DRYDOCK_MONITORED_REPOS_AUTHOR`, with exactly one `d` tag equal to `drydock:monitored-repositories:v1` and zero or more canonical kind-30617 repository `a` tags. Publish this list before deploying the new binary.
+Reactive processing is fail-closed: an unknown repository (no stored announcement), an author without authority, or a list that does not name this service grants nothing. Control-plane subscriptions are not bounded by the listener high-water mark, and winning revisions are restored from SQLite on restart.
 
 ## Betterleaks Secret Scanning
 

@@ -32,7 +32,7 @@ LLM servers are **not** part of the Compose stack. You run them separately and p
 | LLM endpoints | Built-in defaults if unset; `http://` and localhost allowed | planner, coder32b, llm70b, coder14b and meta must be set explicitly, with an API key |
 | Endpoint transport | Anything | Every configured LLM, Qdrant, embedding and registry URL must be `https://` and not loopback |
 | Relays | Defaults to public relays | Must be explicit; the built-in public relays are rejected |
-| `DRYDOCK_MONITORED_REPOS_AUTHOR` | Optional (warning; reactive review disabled) | Required |
+| `DRYDOCK_MONITORED_REPOS_AUTHOR` | Optional operator ceiling | Required (acts as a ceiling; repositories still enroll via their maintainers) |
 | Signer | Optional (listen-only without one) | Required (bunker or nsec) |
 | Qdrant and embeddings | Optional | URLs, models and API keys required |
 

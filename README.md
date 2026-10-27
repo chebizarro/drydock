@@ -64,7 +64,7 @@ All configuration is via `DRYDOCK_*` environment variables. See the full referen
 Templates: [`.env.example`](.env.example) (development with local models) and [`.env.production.example`](.env.production.example). Key settings:
 - `DRYDOCK_ENV` — `development` or `production` (production enforces TLS, API keys and explicit configuration)
 - `DRYDOCK_RELAYS` — comma-separated relay URLs
-- `DRYDOCK_MONITORED_REPOS_AUTHOR` — who publishes the list of repositories to review
+- `DRYDOCK_MONITORED_REPOS_AUTHOR` — optional operator ceiling on which repositories may be reviewed reactively; repositories opt in through their own maintainers (see `docs/event-kinds.md`)
 - `DRYDOCK_SIGNER_BUNKER_URL` or `DRYDOCK_SIGNER_NSEC_FILE` — Drydock's signing identity
 - `DRYDOCK_{PLANNER,CODER32B,LLM70B,CODER14B,META}_BASE_URL` / `_MODEL` — LLM endpoints
 - `DRYDOCK_AGENTIC_REVIEW_FALLBACK`, `DRYDOCK_LLM_TIMEOUT` — tune for your GPU

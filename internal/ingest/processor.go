@@ -41,10 +41,12 @@ type MarketplaceHandler interface {
 	HandleEvent(ctx context.Context, event nostr.Event, relayURL string) error
 }
 
-// MonitoringHandler applies the operator-authored repository control plane.
+// MonitoringHandler applies the NIP-51 monitored-repository control plane and
+// re-derives maintainer authority when a repository announcement changes.
 type MonitoringHandler interface {
 	ApplyList(ctx context.Context, event nostr.Event) (bool, error)
 	ApplyDeletion(ctx context.Context, event nostr.Event) (bool, error)
+	ApplyAnnouncement(ctx context.Context, event nostr.Event) error
 }
 
 // DependencyUpgrader receives the default-branch head-change signal and decides
@@ -266,7 +268,15 @@ func (p *Processor) handleEvent(ctx context.Context, event nostr.Event, relayURL
 	case eventkind.Deletion:
 		return p.handleMonitoringEvent(ctx, event, true)
 	case eventkind.RepositoryAnnouncement:
-		return p.store.UpsertRepositoryAnnouncement(ctx, event)
+		if err := p.store.UpsertRepositoryAnnouncement(ctx, event); err != nil {
+			return err
+		}
+		if p.monitoring != nil {
+			// Ownership or maintainers may have changed; membership derived
+			// from this announcement must follow the stored winner.
+			return p.monitoring.ApplyAnnouncement(ctx, event)
+		}
+		return nil
 	case eventkind.RepositoryState:
 		change, err := p.store.UpsertRepositorySnapshot(ctx, event)
 		if err != nil {

@@ -906,12 +906,74 @@ func (s *Store) MarkIngestHandlerComplete(ctx context.Context, eventID string) e
 	return nil
 }
 
+// UpsertRepositoryAnnouncement stores a repository announcement under
+// replaceable-event ordering. A stale or invalid announcement is ignored without
+// error; use ApplyRepositoryAnnouncement to learn whether it won.
 func (s *Store) UpsertRepositoryAnnouncement(ctx context.Context, event nostr.Event) error {
+	_, err := s.ApplyRepositoryAnnouncement(ctx, event)
+	return err
+}
+
+// ValidRepositoryAnnouncement reports whether event is a kind-30617
+// announcement that can address a repository: exactly one non-empty d tag and
+// a real author. Anything else cannot replace an existing announcement.
+func ValidRepositoryAnnouncement(event nostr.Event) bool {
+	if event.Kind != nostr.KindRepositoryAnnouncement || event.PubKey == nostr.ZeroPK {
+		return false
+	}
+	dTags := 0
+	identifier := ""
+	for _, tag := range event.Tags {
+		if len(tag) >= 1 && tag[0] == "d" {
+			dTags++
+			if len(tag) >= 2 {
+				identifier = strings.TrimSpace(tag[1])
+			}
+		}
+	}
+	return dTags == 1 && identifier != ""
+}
+
+// ApplyRepositoryAnnouncement makes event the authoritative announcement for
+// its repository if it is valid and wins NIP-01 replacement ordering against
+// the stored one (newer created_at, then lower event ID). The announcement is
+// the authority for a repository's owner and maintainers, so a stale replay
+// must never overwrite a newer revision. It reports whether event became the
+// stored announcement.
+func (s *Store) ApplyRepositoryAnnouncement(ctx context.Context, event nostr.Event) (bool, error) {
+	if !ValidRepositoryAnnouncement(event) {
+		return false, nil
+	}
 	repo := nip34.ParseRepository(event)
 	repoID := RepoIDFromAnnouncement(event)
 	now := time.Now().Unix()
 
-	_, err := s.db.ExecContext(
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin repository announcement transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var currentRaw string
+	err = tx.QueryRowContext(ctx, `SELECT raw_event_json FROM repositories WHERE repo_id=?`, repoID).Scan(&currentRaw)
+	switch {
+	case err == nil:
+		var current nostr.Event
+		// An undecodable stored revision cannot be ordered against; the valid
+		// incoming announcement replaces it rather than wedging the repository.
+		if json.Unmarshal([]byte(currentRaw), &current) == nil {
+			if event.ID == current.ID ||
+				event.CreatedAt < current.CreatedAt ||
+				(event.CreatedAt == current.CreatedAt && event.ID.Hex() > current.ID.Hex()) {
+				return false, nil
+			}
+		}
+	case errors.Is(err, sql.ErrNoRows):
+	default:
+		return false, fmt.Errorf("load repository announcement winner: %w", err)
+	}
+
+	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO repositories
 			(repo_id, pubkey, identifier, announcement_event_id, name, description, clone_urls, relays, raw_event_json, created_at, updated_at)
@@ -926,11 +988,31 @@ func (s *Store) UpsertRepositoryAnnouncement(ctx context.Context, event nostr.Ev
 		    updated_at=excluded.updated_at`,
 		repoID, event.PubKey.Hex(), repo.ID, event.ID.Hex(), repo.Name, repo.Description,
 		strings.Join(repo.Clone, ","), strings.Join(repo.Relays, ","), event.String(), now, now,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert repository: %w", err)
+	); err != nil {
+		return false, fmt.Errorf("upsert repository: %w", err)
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit repository announcement: %w", err)
+	}
+	return true, nil
+}
+
+// LoadRepositoryAnnouncement returns the authoritative stored announcement for
+// repoID ("<owner-hex>:<identifier>"), and false when none has been stored.
+func (s *Store) LoadRepositoryAnnouncement(ctx context.Context, repoID string) (nostr.Event, bool, error) {
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT raw_event_json FROM repositories WHERE repo_id=?`, repoID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nostr.Event{}, false, nil
+	}
+	if err != nil {
+		return nostr.Event{}, false, fmt.Errorf("load repository announcement: %w", err)
+	}
+	var event nostr.Event
+	if err := json.Unmarshal([]byte(raw), &event); err != nil {
+		return nostr.Event{}, false, fmt.Errorf("decode repository announcement: %w", err)
+	}
+	return event, true, nil
 }
 
 func (s *Store) GetRepositoryAnnouncement(ctx context.Context, repoID string) (nostr.Event, error) {

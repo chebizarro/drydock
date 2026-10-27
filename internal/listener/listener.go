@@ -130,6 +130,45 @@ func subscriptionFilters(since nostr.Timestamp, cfg Config) []nostr.Filter {
 		)
 	}
 
+	// Maintainer-authored lists name this service in a p tag, which keeps the
+	// discovery filter scoped without knowing the authors in advance. No Since:
+	// control-plane filters must recover the current replaceable lists
+	// independently of the event HWM.
+	if service, err := nostr.PubKeyFromHex(strings.TrimSpace(cfg.ContextVMPubkey)); err == nil && service != nostr.ZeroPK {
+		filters = append(filters, nostr.Filter{
+			Kinds: []nostr.Kind{eventkind.MonitoredRepositories},
+			Tags:  nostr.TagMap{"d": {monitoring.ListIdentifier}, "p": {service.Hex()}},
+		})
+	}
+	// Authors already known are subscribed directly: a withdrawal is a list
+	// revision that no longer carries the p tag, and a deletion carries none,
+	// so neither would pass the discovery filter above. Authors that first
+	// appear while running are covered at the next (re)subscription.
+	var knownAuthors []nostr.PubKey
+	var knownAddresses []string
+	for _, raw := range cfg.MonitoredListAuthors {
+		author, err := nostr.PubKeyFromHex(strings.TrimSpace(raw))
+		if err != nil || author == nostr.ZeroPK {
+			continue
+		}
+		knownAuthors = append(knownAuthors, author)
+		knownAddresses = append(knownAddresses, monitoring.ListAddress(author.Hex()))
+	}
+	if len(knownAuthors) > 0 {
+		filters = append(filters,
+			nostr.Filter{
+				Kinds:   []nostr.Kind{eventkind.MonitoredRepositories},
+				Authors: knownAuthors,
+				Tags:    nostr.TagMap{"d": {monitoring.ListIdentifier}},
+			},
+			nostr.Filter{
+				Kinds:   []nostr.Kind{eventkind.Deletion},
+				Authors: knownAuthors,
+				Tags:    nostr.TagMap{"a": knownAddresses},
+			},
+		)
+	}
+
 	operator, err := nostr.PubKeyFromHex(strings.TrimSpace(cfg.MonitoredReposAuthor))
 	if err == nil && operator != nostr.ZeroPK {
 		listAddress := monitoring.ListAddress(operator.Hex())
@@ -161,6 +200,9 @@ type Config struct {
 	ContextVMPubkey      string
 	ContextVMMethods     []string
 	MonitoredReposAuthor string
+	// MonitoredListAuthors are list authors already persisted by the monitoring
+	// registry; they are subscribed by author so withdrawals and deletions arrive.
+	MonitoredListAuthors []string
 }
 
 type Service struct {

@@ -50,16 +50,22 @@ Kind `7000` is no longer subscribed to or routed. Legacy NIP-90 kinds `5900`, `6
 
 ## Reactive Monitoring: NIP-51 Kind 30001
 
-Automatic NIP-34 review is fail-closed and controlled by one parameterized replaceable list:
+Automatic NIP-34 review is fail-closed and opted into by repository maintainers. Any identity may publish a parameterized replaceable list:
 
 - kind: `30001`
-- author: `DRYDOCK_MONITORED_REPOS_AUTHOR`
 - exactly one `d` tag: `drydock:monitored-repositories:v1`
+- a `p` tag naming the Drydock service pubkey (the signer identity)
 - zero or more `a` tags, each a canonical `30617:<owner-pubkey>:<identifier>` address
 
-Drydock accepts only the configured author's newest valid replacement. Equal timestamps use the lower event ID as the winner. Foreign authors, wrong `d` tags, malformed repository addresses, and older revisions do not change the active snapshot. A valid empty list disables reactive review. A kind-5 event from the same author whose `a` tag names the exact list address deletes it; a newer valid list recreates it.
+A repository in the list is monitored only if the list author is the owner of, or appears in the `maintainers` tag of, the latest valid kind-30617 announcement for that repository. Authority is re-derived whenever the announcement is replaced, so removing a maintainer from the announcement withdraws every enrollment they made. Membership is the union over all authors. Lists from authors with no authority are retained but grant nothing.
 
-The control-plane subscription has no `since` bound, and the winning revision is persisted for restart recovery. Until an authoritative list, empty list, or deletion has loaded, reactive review remains disabled and readiness fails in configured deployments.
+Per author, the newest valid revision wins; equal timestamps use the lower event ID. A revision that no longer carries the `p` tag withdraws the author's opt-in. A malformed newer revision suspends the author rather than falling back to an older one. A kind-5 event whose `a` tag names the author's own list address deletes it; a deletion naming another author's list is rejected.
+
+Announcements follow the same ordering: a replayed older kind-30617 never overwrites a newer stored one.
+
+The operator may still configure `DRYDOCK_MONITORED_REPOS_AUTHOR`. That author's list is then a **ceiling**: only repositories it names can be monitored, and a deleted or malformed operator list monitors nothing. It never grants membership by itself. `DRYDOCK_REPO_ALLOWLIST` / `DRYDOCK_REPO_OWNER_ALLOWLIST` apply as a second ceiling.
+
+Control-plane subscriptions have no `since` bound. New authors are discovered through a `#p` filter on the service pubkey; authors already persisted are subscribed by author so withdrawals and deletions reach Drydock. Every winning revision is persisted for restart recovery. Readiness requires persisted state to have loaded and, when an operator ceiling is configured, the operator's list to have been seen.
 
 ## ContextVM Kind 25910
 

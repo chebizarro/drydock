@@ -18,9 +18,8 @@ import (
 func TestReactiveAdmissionFollowsLiveMonitoringAndFailsClosedWithoutList(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t, ctx, filepath.Join(t.TempDir(), "revieworder.db"))
-	operatorSK := nostr.Generate()
-	operator := nostr.GetPublicKey(operatorSK)
-	registry, err := monitoring.NewRegistry(store, operator.Hex())
+	drydock := nostr.GetPublicKey(nostr.Generate())
+	registry, err := monitoring.NewRegistry(store, monitoring.Config{Drydock: drydock.Hex()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,6 +30,16 @@ func TestReactiveAdmissionFollowsLiveMonitoringAndFailsClosedWithoutList(t *test
 	repoSK := nostr.Generate()
 	repository, err := scope.ParseRepositoryRef("30617:" + nostr.GetPublicKey(repoSK).Hex() + ":repo")
 	if err != nil {
+		t.Fatal(err)
+	}
+	announcement := nostr.Event{Kind: nostr.KindRepositoryAnnouncement, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"d", "repo"}}}
+	if err := announcement.Sign(repoSK); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyRepositoryAnnouncement(ctx, announcement); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.ApplyAnnouncement(ctx, announcement); err != nil {
 		t.Fatal(err)
 	}
 	service := New(Config{}, store, scope.Matcher{}, registry, nil, nil, testLogger())
@@ -47,9 +56,9 @@ func TestReactiveAdmissionFollowsLiveMonitoringAndFailsClosedWithoutList(t *test
 	list := nostr.Event{
 		Kind:      monitoring.MonitoredListKind,
 		CreatedAt: nostr.Now(),
-		Tags:      nostr.Tags{{"d", monitoring.ListIdentifier}, {"a", repository.Address}},
+		Tags:      nostr.Tags{{"d", monitoring.ListIdentifier}, {"p", drydock.Hex()}, {"a", repository.Address}},
 	}
-	if err := list.Sign(operatorSK); err != nil {
+	if err := list.Sign(repoSK); err != nil {
 		t.Fatal(err)
 	}
 	if applied, err := registry.ApplyList(ctx, list); err != nil || !applied {
@@ -73,9 +82,9 @@ func TestReactiveAdmissionFollowsLiveMonitoringAndFailsClosedWithoutList(t *test
 	emptyReplacement := nostr.Event{
 		Kind:      monitoring.MonitoredListKind,
 		CreatedAt: nostr.Timestamp(int64(list.CreatedAt) + 1),
-		Tags:      nostr.Tags{{"d", monitoring.ListIdentifier}},
+		Tags:      nostr.Tags{{"d", monitoring.ListIdentifier}, {"p", drydock.Hex()}},
 	}
-	if err := emptyReplacement.Sign(operatorSK); err != nil {
+	if err := emptyReplacement.Sign(repoSK); err != nil {
 		t.Fatal(err)
 	}
 	if applied, err := registry.ApplyList(ctx, emptyReplacement); err != nil || !applied {
