@@ -80,12 +80,22 @@ model's answer.
 | `DRYDOCK_MONITORED_REPOS_AUTHOR` | public key | *(empty)* | Optional operator **ceiling**. When set, only repositories named in this identity's NIP-51 kind-30001 `drydock:monitored-repositories:v1` list can be monitored, and readiness waits for that list. It does not grant membership: repositories are enrolled by their own owners/maintainers (see below). |
 | `DRYDOCK_REPO_ALLOWLIST` | comma-separated repository IDs | *(empty)* | Optional hard security ceiling, as `npub:identifier` or `64-character-hex-pubkey:identifier`. |
 | `DRYDOCK_REPO_OWNER_ALLOWLIST` | comma-separated public keys | *(empty)* | Optional hard security ceiling by repository-announcement owner. Accepts npub or hex. |
+| `DRYDOCK_REPO_RELAYS_MAX_PER_REPO` | integer 0–16 | `3` | How many relays from a monitored repository's kind-30617 `relays` tag Drydock will subscribe to, in declaration order. `0` disables per-repository relays. |
+| `DRYDOCK_REPO_RELAYS_MAX_TOTAL` | integer 0–512 | `32` | Global cap on distinct customer relays across all monitored repositories. Relays shared by more repositories win; the rest are logged as truncated. |
+| `DRYDOCK_REPO_RELAYS_ALLOW` | comma-separated host suffixes | *(empty)* | When set, only declared relays whose host matches a suffix (e.g. `grasp.example.org`) are admitted. |
+| `DRYDOCK_REPO_RELAYS_DENY` | comma-separated host suffixes | *(empty)* | Declared relays whose host matches are refused. Deny wins over allow. |
 
 These settings have separate roles. **Automatic reactive** review of kinds 1617/1618/1619 is opted into by repository maintainers: a repository is monitored when its kind-30617 owner, or a pubkey in its `maintainers` tag, publishes a NIP-51 kind-30001 list (`d` = `drydock:monitored-repositories:v1`) that names the Drydock signer pubkey in a `p` tag and the repository in an `a` tag. Many authors may enroll; membership is the union. Authority is re-derived from the latest stored announcement, so dropping a maintainer from the announcement withdraws their enrollments. See [event-kinds.md](event-kinds.md) for the full contract. Because lists must name the signer, reactive review requires a configured signer.
 
 The operator list (`DRYDOCK_MONITORED_REPOS_AUTHOR`) and the static repository/owner allowlists are ceilings. A target is inside the static ceiling when either its repository ID or announcement owner matches; empty static allowlists impose no additional ceiling. Ceilings apply to reactive work; the static ceiling also bounds on-demand orders. Paid `review/order` requests may target repositories outside the monitored set, but never outside the static ceiling.
 
 Reactive processing is fail-closed: an unknown repository (no stored announcement), an author without authority, or a list that does not name this service grants nothing. Control-plane subscriptions are not bounded by the listener high-water mark, and winning revisions are restored from SQLite on restart.
+
+### Per-repository relay routing
+
+Repositories hosted on GRASP, Buzz, or any other NIP-34 forge usually keep their patches on their own relay, declared in the kind-30617 `relays` tag. For every monitored repository Drydock subscribes to those relays in addition to `DRYDOCK_READ_RELAYS`, with filters scoped to that repository: NIP-34 work items (kinds 1617/1618/1619) by repository address, and the repository's own announcement and state (30617/30618) by owner and identifier. Base relays additionally carry a no-`Since` announcement filter for every declared repository, so authority can be recovered on a fresh database.
+
+Customer-declared state can never widen egress beyond the operator's policy: relays must be `wss://` and not loopback, private, or link-local hosts (both relaxed only when `DRYDOCK_ENV=development`), must pass `DRYDOCK_REPO_RELAYS_ALLOW`/`DENY`, and are capped per repository and globally. Shared relays are deduplicated. When membership, a list author, or an announcement changes, the listener resubscribes with the new plan from its live high-water mark — no restart, and no loss of persisted enrollment or review state. Rejected and truncated relays are logged with the reason.
 
 ## Betterleaks Secret Scanning
 

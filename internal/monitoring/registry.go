@@ -41,6 +41,15 @@ const (
 	maxListRepositories = 2048
 )
 
+// Routing budgets. Strangers may publish service-addressed lists naming any
+// repository, so the recovery subscriptions derived from declarations must be
+// bounded independently of the per-list limit. Variables so tests can shrink
+// them.
+var (
+	maxDeclaredRepositories = 2048
+	maxRoutedAuthors        = 256
+)
+
 var (
 	ErrUnauthorizedAuthor = errors.New("event author may not modify this monitored repository list")
 	ErrMalformedList      = errors.New("malformed monitored repository list")
@@ -128,6 +137,9 @@ type Registry struct {
 	lists       map[nostr.PubKey]*authorList
 	authorities map[string]authority
 	snapshot    atomic.Pointer[Snapshot]
+	// changes receives one coalesced signal per published rebuild so the
+	// listener can resubscribe when membership, authors, or announcements move.
+	changes chan struct{}
 }
 
 func NewRegistry(store Store, cfg Config) (*Registry, error) {
@@ -144,6 +156,7 @@ func NewRegistry(store Store, cfg Config) (*Registry, error) {
 		scope:       cfg.Scope,
 		lists:       make(map[nostr.PubKey]*authorList),
 		authorities: make(map[string]authority),
+		changes:     make(chan struct{}, 1),
 	}
 	if strings.TrimSpace(cfg.Operator) != "" {
 		if r.operator, err = scope.ParsePubkey(cfg.Operator); err != nil {
@@ -421,6 +434,90 @@ func (r *Registry) Snapshot() Snapshot {
 	return cloneSnapshot(*current)
 }
 
+// Changes delivers a coalesced signal after every published rebuild: a list,
+// deletion, or announcement was applied, so routing inputs may have changed.
+// Receivers must re-read Snapshot/DeclaredRepositories rather than count
+// signals.
+func (r *Registry) Changes() <-chan struct{} {
+	return r.changes
+}
+
+// DeclaredRepositories returns the repositories named by active lists,
+// authorized or not, that fall inside the operator and static ceilings, sorted
+// by address and bounded by a global budget. Routing uses it to recover the
+// announcements that decide authority; ceilings apply first so a stranger
+// cannot spend the budget on repositories this deployment could never monitor.
+func (r *Registry) DeclaredRepositories() []scope.RepositoryRef {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var ceiling map[string]struct{}
+	if r.operator != nostr.ZeroPK {
+		var seen bool
+		if ceiling, seen = r.operatorCeilingLocked(); !seen {
+			return nil
+		}
+	}
+	declared := map[string]scope.RepositoryRef{}
+	for _, list := range r.lists {
+		if list.status != StatusActive {
+			continue
+		}
+		for address, ref := range list.repos {
+			if ceiling != nil {
+				if _, ok := ceiling[address]; !ok {
+					continue
+				}
+			}
+			if !r.scope.Allows(ref.RepositoryID, ref.OwnerPubkey) {
+				continue
+			}
+			declared[address] = ref
+		}
+	}
+	refs := make([]scope.RepositoryRef, 0, len(declared))
+	for _, ref := range declared {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].Address < refs[j].Address })
+	if len(refs) > maxDeclaredRepositories {
+		refs = refs[:maxDeclaredRepositories]
+	}
+	return refs
+}
+
+// RoutedAuthors returns the list authors worth subscribing by author so their
+// withdrawals and deletions arrive: authors that currently grant membership
+// first, then other active authors, each group sorted, bounded by a budget.
+func (r *Registry) RoutedAuthors() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var granting, other []string
+	for author, list := range r.lists {
+		if list.status != StatusActive {
+			continue
+		}
+		grants := false
+		for address := range list.repos {
+			if r.authorizedLocked(author, address) {
+				grants = true
+				break
+			}
+		}
+		if grants {
+			granting = append(granting, author.Hex())
+		} else {
+			other = append(other, author.Hex())
+		}
+	}
+	sort.Strings(granting)
+	sort.Strings(other)
+	authors := append(granting, other...)
+	if len(authors) > maxRoutedAuthors {
+		authors = authors[:maxRoutedAuthors]
+	}
+	return authors
+}
+
 // rebuildLocked recomputes effective membership from the list and authority
 // state and publishes it atomically. Callers hold r.mu.
 func (r *Registry) rebuildLocked() {
@@ -465,6 +562,10 @@ func (r *Registry) rebuildLocked() {
 		authors[author.Hex()] = AuthorSnapshot{Status: list.status, RevisionID: list.revisionID, CreatedAt: list.createdAt}
 	}
 	r.snapshot.Store(&Snapshot{Initialized: initialized, Repositories: members, Authors: authors})
+	select {
+	case r.changes <- struct{}{}:
+	default: // a signal is already pending; the receiver re-reads state anyway
+	}
 }
 
 // operatorCeilingLocked returns the repositories the operator list names and

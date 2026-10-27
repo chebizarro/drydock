@@ -65,7 +65,7 @@ Announcements follow the same ordering: a replayed older kind-30617 never overwr
 
 The operator may still configure `DRYDOCK_MONITORED_REPOS_AUTHOR`. That author's list is then a **ceiling**: only repositories it names can be monitored, and a deleted or malformed operator list monitors nothing. It never grants membership by itself. `DRYDOCK_REPO_ALLOWLIST` / `DRYDOCK_REPO_OWNER_ALLOWLIST` apply as a second ceiling.
 
-Control-plane subscriptions have no `since` bound. New authors are discovered through a `#p` filter on the service pubkey; authors already persisted are subscribed by author so withdrawals and deletions reach Drydock. Every winning revision is persisted for restart recovery. Readiness requires persisted state to have loaded and, when an operator ceiling is configured, the operator's list to have been seen.
+Control-plane subscriptions have no `since` bound. New authors are discovered through a `#p` filter on the service pubkey; authors already persisted are subscribed by author so withdrawals and deletions reach Drydock. The kind-30617 announcements of every declared repository are also fetched without a `since` bound (and exempt from the ingest age cutoff) because they decide authority. Monitored repositories' declared relays are subscribed per repository under the operator's egress policy; see [configuration.md](configuration.md#per-repository-relay-routing). Every winning revision is persisted for restart recovery. Readiness requires persisted state to have loaded and, when an operator ceiling is configured, the operator's list to have been seen.
 
 ## ContextVM Kind 25910
 

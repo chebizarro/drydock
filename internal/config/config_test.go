@@ -242,6 +242,36 @@ func TestValidate_NoRelays(t *testing.T) {
 	}
 }
 
+func TestValidate_RepoRelayBounds(t *testing.T) {
+	for _, tc := range []struct {
+		perRepo, total int
+		wantErr        bool
+	}{
+		{3, 32, false}, {0, 0, false}, {-1, 32, true}, {17, 32, true}, {3, 513, true},
+	} {
+		cfg := Config{
+			Relays:                []string{"wss://relay.example.com"},
+			PipelineWorkers:       2,
+			DatabaseURL:           ":memory:",
+			ListenerHWMOverlap:    time.Second,
+			ListenerMaxFutureSkew: time.Second,
+			ListenerMaxEventAge:   time.Hour,
+			RepoRelaysMaxPerRepo:  tc.perRepo,
+			RepoRelaysMaxTotal:    tc.total,
+		}
+		result := cfg.Validate(context.Background())
+		found := false
+		for _, err := range result.Errors {
+			if contains(err, "DRYDOCK_REPO_RELAYS_MAX") {
+				found = true
+			}
+		}
+		if found != tc.wantErr {
+			t.Errorf("perRepo=%d total=%d: relay bound error=%v want %v (%v)", tc.perRepo, tc.total, found, tc.wantErr, result.Errors)
+		}
+	}
+}
+
 func TestValidate_InvalidRelayURL(t *testing.T) {
 	cfg := Config{
 		Relays:          []string{"http://invalid-scheme.com"},

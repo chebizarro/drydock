@@ -450,6 +450,109 @@ func TestRestartRecoveryAcrossAuthorsAndServiceIdentity(t *testing.T) {
 	}
 }
 
+func TestChangesSignalAndDeclaredRepositories(t *testing.T) {
+	h := newHarness(t, Config{})
+	drain := func() {
+		for {
+			select {
+			case <-h.registry.Changes():
+			default:
+				return
+			}
+		}
+	}
+	drain()
+	owner, stranger := nostr.Generate(), nostr.Generate()
+	repoA, repoB := repositoryAddress(owner, "a"), repositoryAddress(stranger, "b")
+	h.announce(owner, "a", 10)
+
+	// A stranger's list declares b: not monitored, but declared, so routing can
+	// recover its announcement.
+	h.apply(h.list(stranger, 100, true, repoB))
+	select {
+	case <-h.registry.Changes():
+	default:
+		t.Fatal("ApplyList did not signal a change")
+	}
+	declared := h.registry.DeclaredRepositories()
+	if len(declared) != 1 || declared[0].Address != repoB || h.registry.Contains(repoB) {
+		t.Fatalf("declared = %+v contains=%v", declared, h.registry.Contains(repoB))
+	}
+
+	h.apply(h.list(owner, 100, true, repoA))
+	drain()
+	if got := h.registry.DeclaredRepositories(); len(got) != 2 {
+		t.Fatalf("declared after second list = %d", len(got))
+	}
+	// Announcement replacement for a declared repo also signals (relays may change).
+	h.announce(owner, "a", 20)
+	select {
+	case <-h.registry.Changes():
+	default:
+		t.Fatal("ApplyAnnouncement did not signal a change")
+	}
+	// Withdrawn lists no longer declare.
+	h.apply(h.list(stranger, 200, false, repoB))
+	if got := h.registry.DeclaredRepositories(); len(got) != 1 || got[0].Address != repoA {
+		t.Fatalf("declared after withdrawal = %+v", got)
+	}
+}
+
+func TestDeclaredRepositoriesApplyCeilingsAndBudget(t *testing.T) {
+	operator := nostr.Generate()
+	h := newHarness(t, Config{Operator: nostr.GetPublicKey(operator).Hex()})
+	stranger, owner := nostr.Generate(), nostr.Generate()
+	inCeiling := repositoryAddress(owner, "in")
+	outside := []string{repositoryAddress(owner, "x"), repositoryAddress(owner, "y"), repositoryAddress(owner, "z")}
+	h.apply(h.list(stranger, 100, true, append([]string{inCeiling}, outside...)...))
+	if got := h.registry.DeclaredRepositories(); len(got) != 0 {
+		t.Fatalf("declared before the operator ceiling was seen = %d, want 0", len(got))
+	}
+	h.apply(h.list(operator, 100, false, inCeiling))
+	if got := h.registry.DeclaredRepositories(); len(got) != 1 || got[0].Address != inCeiling {
+		t.Fatalf("declared must be cut by the operator ceiling: %+v", got)
+	}
+
+	// Budget: shrink it and check deterministic truncation.
+	old := maxDeclaredRepositories
+	maxDeclaredRepositories = 2
+	t.Cleanup(func() { maxDeclaredRepositories = old })
+	h.apply(h.list(operator, 200, false, append([]string{inCeiling}, outside...)...))
+	got := h.registry.DeclaredRepositories()
+	if len(got) != 2 {
+		t.Fatalf("declared = %d, want budget of 2", len(got))
+	}
+	if got[0].Address > got[1].Address {
+		t.Fatalf("declared not sorted: %+v", got)
+	}
+}
+
+func TestRoutedAuthorsPreferGrantingAuthorsWithinBudget(t *testing.T) {
+	h := newHarness(t, Config{})
+	owner, strangerA, strangerB := nostr.Generate(), nostr.Generate(), nostr.Generate()
+	repo := repositoryAddress(owner, "svc")
+	h.announce(owner, "svc", 10)
+	h.apply(h.list(strangerA, 100, true, repo))
+	h.apply(h.list(strangerB, 100, true, repo))
+	h.apply(h.list(owner, 100, true, repo))
+	authors := h.registry.RoutedAuthors()
+	if len(authors) != 3 || authors[0] != nostr.GetPublicKey(owner).Hex() {
+		t.Fatalf("granting author must rank first: %v", authors)
+	}
+	old := maxRoutedAuthors
+	maxRoutedAuthors = 1
+	t.Cleanup(func() { maxRoutedAuthors = old })
+	if got := h.registry.RoutedAuthors(); len(got) != 1 || got[0] != nostr.GetPublicKey(owner).Hex() {
+		t.Fatalf("budget must keep the granting author: %v", got)
+	}
+	// Withdrawn authors drop out entirely.
+	h.apply(h.list(owner, 200, false))
+	maxRoutedAuthors = old
+	if got := h.registry.RoutedAuthors(); len(got) != 2 {
+		t.Fatalf("withdrawn author still routed: %v", got)
+	}
+}
+
 // failingStore lets one authority lookup fail to simulate a store error after
 // the announcement itself was already committed by ingest.
 type failingStore struct {

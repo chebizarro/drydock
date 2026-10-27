@@ -83,6 +83,12 @@ type Config struct {
 	ListenerMaxFutureSkew time.Duration
 	ListenerMaxEventAge   time.Duration
 
+	// Per-repository relay routing bounds (relays declared in kind-30617).
+	RepoRelaysMaxPerRepo int
+	RepoRelaysMaxTotal   int
+	RepoRelaysAllow      []string
+	RepoRelaysDeny       []string
+
 	// Kind 0 profile metadata published for the signer identity at startup.
 	ProfileEnabled    bool
 	ProfileName       string
@@ -264,6 +270,10 @@ func FromEnv() Config {
 		ListenerHWMOverlap:    parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_HWM_OVERLAP", "30s"), 30*time.Second),
 		ListenerMaxFutureSkew: parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_FUTURE_SKEW", "10m"), 10*time.Minute),
 		ListenerMaxEventAge:   parseDurationOrDefault(envOrDefault("DRYDOCK_LISTENER_MAX_EVENT_AGE", "8760h"), 365*24*time.Hour),
+		RepoRelaysMaxPerRepo:  parseIntOrDefault(envOrDefault("DRYDOCK_REPO_RELAYS_MAX_PER_REPO", "3"), 3),
+		RepoRelaysMaxTotal:    parseIntOrDefault(envOrDefault("DRYDOCK_REPO_RELAYS_MAX_TOTAL", "32"), 32),
+		RepoRelaysAllow:       SplitCSV(envOrDefault("DRYDOCK_REPO_RELAYS_ALLOW", "")),
+		RepoRelaysDeny:        SplitCSV(envOrDefault("DRYDOCK_REPO_RELAYS_DENY", "")),
 		ProfileEnabled:        parseBoolOrDefault(envOrDefault("DRYDOCK_PROFILE_ENABLED", "true"), true),
 		ProfileName:           envOrDefault("DRYDOCK_PROFILE_NAME", "Drydock"),
 		ProfileAbout: envOrDefault("DRYDOCK_PROFILE_ABOUT",
@@ -913,6 +923,12 @@ func (c *Config) Validate(ctx context.Context) ValidationResult {
 	}
 	if c.ListenerHWMOverlap <= 0 || c.ListenerMaxFutureSkew <= 0 || c.ListenerMaxEventAge <= 0 {
 		result.Errors = append(result.Errors, "listener overlap, future skew, and max event age must be greater than 0")
+	}
+	if c.RepoRelaysMaxPerRepo < 0 || c.RepoRelaysMaxTotal < 0 {
+		result.Errors = append(result.Errors, "DRYDOCK_REPO_RELAYS_MAX_PER_REPO and DRYDOCK_REPO_RELAYS_MAX_TOTAL must be >= 0 (0 disables customer relays)")
+	}
+	if c.RepoRelaysMaxPerRepo > 16 || c.RepoRelaysMaxTotal > 512 {
+		result.Errors = append(result.Errors, "DRYDOCK_REPO_RELAYS_MAX_PER_REPO must be <= 16 and DRYDOCK_REPO_RELAYS_MAX_TOTAL <= 512")
 	}
 	if c.PaymentNWCURI != "" && len(c.PaymentTrustedMints) == 0 {
 		result.Warnings = append(result.Warnings, "DRYDOCK_NWC_CONNECTION_STRING set but no trusted Cashu mints configured (set DRYDOCK_CASHU_TRUSTED_MINTS or DRYDOCK_CASHU_MINT_URL)")

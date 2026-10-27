@@ -135,6 +135,35 @@ func (s *Store) ApplyMonitoredRepositoryList(ctx context.Context, state Monitore
 	return true, nil
 }
 
+// ListRepositoryRelays returns, for each requested "<owner>:<identifier>"
+// repository id, the relays declared by its stored announcement in declaration
+// order. Repositories without a stored announcement are absent from the result.
+func (s *Store) ListRepositoryRelays(ctx context.Context, repoIDs []string) (map[string][]string, error) {
+	out := make(map[string][]string, len(repoIDs))
+	for _, repoID := range repoIDs {
+		repoID = strings.TrimSpace(repoID)
+		if repoID == "" {
+			continue
+		}
+		var csv string
+		err := s.db.QueryRowContext(ctx, `SELECT relays FROM repositories WHERE repo_id=?`, repoID).Scan(&csv)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("load repository relays: %w", err)
+		}
+		var relays []string
+		for _, relay := range strings.Split(csv, ",") {
+			if relay = strings.TrimSpace(relay); relay != "" {
+				relays = append(relays, relay)
+			}
+		}
+		out[repoID] = relays
+	}
+	return out, nil
+}
+
 // LoadMonitoredRepositoryList loads the persisted winning revision and members.
 func (s *Store) LoadMonitoredRepositoryList(ctx context.Context, listAddress string) (MonitoredRepositoryListState, bool, error) {
 	var state MonitoredRepositoryListState

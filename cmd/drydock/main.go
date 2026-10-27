@@ -50,6 +50,7 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/promptrefine"
 	"git.sharegap.net/cascadia/drydock/internal/publisher"
 	"git.sharegap.net/cascadia/drydock/internal/ratelimit"
+	"git.sharegap.net/cascadia/drydock/internal/relayroute"
 	"git.sharegap.net/cascadia/drydock/internal/repo"
 	"git.sharegap.net/cascadia/drydock/internal/reviewengine"
 	"git.sharegap.net/cascadia/drydock/internal/revieworder"
@@ -869,14 +870,18 @@ func main() {
 	if giftWrapOpener != nil {
 		listenerOpts = append(listenerOpts, listener.WithGiftWrapOpener(giftWrapOpener))
 	}
-	// Authors already known from persisted lists are subscribed directly so a
-	// withdrawal (a list that no longer names this service) or a deletion still
-	// reaches us; new authors are discovered through the p-tag filter.
-	var monitoredListAuthors []string
+	// Per-repository relay routing: subscribe where each monitored repository's
+	// announcement says its events live, under the operator's egress policy, and
+	// resubscribe live when membership, authors, or announcements change.
 	if monitoredRepos != nil {
-		for author := range monitoredRepos.Snapshot().Authors {
-			monitoredListAuthors = append(monitoredListAuthors, author)
-		}
+		routes := relayroute.NewMonitoringSource(monitoredRepos, store, readRelays, relayroute.Policy{
+			MaxPerRepository: cfg.RepoRelaysMaxPerRepo,
+			MaxTotal:         cfg.RepoRelaysMaxTotal,
+			AllowInsecure:    !cfg.IsProduction(),
+			Allow:            cfg.RepoRelaysAllow,
+			Deny:             cfg.RepoRelaysDeny,
+		})
+		listenerOpts = append(listenerOpts, listener.WithRoutes(routes))
 	}
 	svc := listener.New(listener.Config{
 		Relays:               readRelays,
@@ -888,7 +893,6 @@ func main() {
 		ContextVMPubkey:      servicePubkey,
 		ContextVMMethods:     contextVMRouter.Methods(),
 		MonitoredReposAuthor: cfg.MonitoredReposAuthor,
-		MonitoredListAuthors: monitoredListAuthors,
 	}, processor, logger, listenerOpts...)
 
 	// --- Pipeline runner ---

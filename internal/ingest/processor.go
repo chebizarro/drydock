@@ -540,9 +540,10 @@ func eventTimestampPlausibleForKind(kind nostr.Kind, ts nostr.Timestamp, maxFutu
 		return false
 	}
 	// Dedicated no-Since subscriptions must be able to recover an old current
-	// replaceable list or tombstone. Replacement ordering, not a global age
-	// cutoff, decides whether these control-plane events still matter.
-	if kind == eventkind.MonitoredRepositories || kind == eventkind.Deletion {
+	// replaceable list, tombstone, or repository announcement. Replacement
+	// ordering, not a global age cutoff, decides whether these control-plane
+	// events still matter; the announcement is the authority behind monitoring.
+	if kind == eventkind.MonitoredRepositories || kind == eventkind.Deletion || kind == eventkind.RepositoryAnnouncement {
 		return true
 	}
 	return !createdAt.Before(now.Add(-maxPastAge))

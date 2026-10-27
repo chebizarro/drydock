@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"git.sharegap.net/cascadia/drydock/internal/eventkind"
 	"git.sharegap.net/cascadia/drydock/internal/metrics"
 	"git.sharegap.net/cascadia/drydock/internal/monitoring"
+	"git.sharegap.net/cascadia/drydock/internal/relayroute"
+	"git.sharegap.net/cascadia/drydock/internal/scope"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip59"
@@ -140,35 +143,6 @@ func subscriptionFilters(since nostr.Timestamp, cfg Config) []nostr.Filter {
 			Tags:  nostr.TagMap{"d": {monitoring.ListIdentifier}, "p": {service.Hex()}},
 		})
 	}
-	// Authors already known are subscribed directly: a withdrawal is a list
-	// revision that no longer carries the p tag, and a deletion carries none,
-	// so neither would pass the discovery filter above. Authors that first
-	// appear while running are covered at the next (re)subscription.
-	var knownAuthors []nostr.PubKey
-	var knownAddresses []string
-	for _, raw := range cfg.MonitoredListAuthors {
-		author, err := nostr.PubKeyFromHex(strings.TrimSpace(raw))
-		if err != nil || author == nostr.ZeroPK {
-			continue
-		}
-		knownAuthors = append(knownAuthors, author)
-		knownAddresses = append(knownAddresses, monitoring.ListAddress(author.Hex()))
-	}
-	if len(knownAuthors) > 0 {
-		filters = append(filters,
-			nostr.Filter{
-				Kinds:   []nostr.Kind{eventkind.MonitoredRepositories},
-				Authors: knownAuthors,
-				Tags:    nostr.TagMap{"d": {monitoring.ListIdentifier}},
-			},
-			nostr.Filter{
-				Kinds:   []nostr.Kind{eventkind.Deletion},
-				Authors: knownAuthors,
-				Tags:    nostr.TagMap{"a": knownAddresses},
-			},
-		)
-	}
-
 	operator, err := nostr.PubKeyFromHex(strings.TrimSpace(cfg.MonitoredReposAuthor))
 	if err == nil && operator != nostr.ZeroPK {
 		listAddress := monitoring.ListAddress(operator.Hex())
@@ -200,10 +174,21 @@ type Config struct {
 	ContextVMPubkey      string
 	ContextVMMethods     []string
 	MonitoredReposAuthor string
-	// MonitoredListAuthors are list authors already persisted by the monitoring
-	// registry; they are subscribed by author so withdrawals and deletions arrive.
-	MonitoredListAuthors []string
 }
+
+// RoutePlanner supplies live routing inputs (customer relays, declared
+// repositories, known list authors) and signals when they may have changed.
+type RoutePlanner interface {
+	Routes(ctx context.Context) (relayroute.Routes, error)
+	Changes() <-chan struct{}
+}
+
+// routeChangeDebounce coalesces bursts of control-plane changes into one
+// resubscription; routeRetryInterval re-attempts a failed route load.
+const (
+	routeChangeDebounce = 2 * time.Second
+	routeRetryInterval  = 30 * time.Second
+)
 
 type Service struct {
 	cfg       Config
@@ -212,9 +197,12 @@ type Service struct {
 	pool      *nostr.Pool
 	store     highWaterStore
 	opener    GiftWrapOpener
+	routes    RoutePlanner
+	// subscribe opens one batched subscription; tests replace it.
+	subscribe func(ctx context.Context, directed []nostr.DirectedFilter) (chan nostr.RelayEvent, chan nostr.RelayClosed)
+	debounce  time.Duration
 }
 
-// Option is a functional option for the listener Service.
 type Option func(*Service)
 
 // WithPool injects a shared nostr.Pool instead of creating a new one.
@@ -232,6 +220,11 @@ func WithStore(store *db.Store) Option {
 }
 
 // WithGiftWrapOpener injects NIP-59 opening/verification for kind-1059 events.
+// WithRoutes enables per-repository relay routing and live resubscription.
+func WithRoutes(routes RoutePlanner) Option {
+	return func(s *Service) { s.routes = routes }
+}
+
 func WithGiftWrapOpener(opener GiftWrapOpener) Option {
 	return func(s *Service) {
 		s.opener = opener
@@ -252,6 +245,14 @@ func New(cfg Config, processor EventProcessor, logger *slog.Logger, opts ...Opti
 	}
 	if s.pool == nil {
 		s.pool = nostr.NewPool()
+	}
+	if s.subscribe == nil {
+		s.subscribe = func(ctx context.Context, directed []nostr.DirectedFilter) (chan nostr.RelayEvent, chan nostr.RelayClosed) {
+			return s.pool.BatchedSubscribeManyNotifyClosed(ctx, directed, nostr.SubscriptionOptions{Label: "drydock-listener"})
+		}
+	}
+	if s.debounce <= 0 {
+		s.debounce = routeChangeDebounce
 	}
 	return s
 }
@@ -317,38 +318,67 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
-	filters := subscriptionFilters(nostr.Timestamp(since), s.cfg)
-
-	s.logger.Info("starting nostr listener", "relay_count", len(s.cfg.Relays))
+	s.logger.Info("starting nostr listener", "relay_count", len(s.cfg.Relays), "routing", s.routes != nil)
 
 	var lastSeen atomic.Int64
 	backoff := time.Second
+	var changes <-chan struct{}
+	if s.routes != nil {
+		changes = s.routes.Changes()
+	}
 
+	// Resubscriptions reuse the initial catch-up bound rather than a live
+	// high-water mark: the mark is a global maximum, so one fast relay would
+	// make us skip another relay's unfinished backlog, and a newly admitted
+	// customer relay has never been read at all. Ingest handler completion
+	// makes the resulting replays idempotent.
+	var pending []nostr.DirectedFilter
 	for {
-		var stream chan nostr.RelayEvent
-		var closedCh chan nostr.RelayClosed
-		if len(filters) == 1 {
-			stream, closedCh = s.pool.SubscribeManyNotifyClosed(ctx, s.cfg.Relays, filters[0], nostr.SubscriptionOptions{
-				Label: "drydock-listener",
-			})
-		} else {
-			directed := make([]nostr.DirectedFilter, 0, len(filters)*len(s.cfg.Relays))
-			for _, relay := range s.cfg.Relays {
-				for _, filter := range filters {
-					directed = append(directed, nostr.DirectedFilter{Relay: relay, Filter: filter})
-				}
+		directed := pending
+		var retry <-chan time.Time
+		if directed == nil {
+			routes, ok := s.currentRoutes(ctx)
+			directed = s.directedFilters(nostr.Timestamp(since), routes)
+			if !ok {
+				retry = time.After(routeRetryInterval)
 			}
-			stream, closedCh = s.pool.BatchedSubscribeManyNotifyClosed(ctx, directed, nostr.SubscriptionOptions{
-				Label: "drydock-listener",
-			})
 		}
+		pending = nil
+		currentKey := directedKey(directed)
+		subCtx, cancel := s.withCancel(ctx)
+		stream, closedCh := s.subscribe(subCtx, directed)
 
+		var debounce <-chan time.Time
+		resubscribe := false
 		streamEnded := false
 		for !streamEnded {
 			select {
 			case <-ctx.Done():
+				cancel()
 				s.pool.Close("shutdown")
 				return nil
+			case <-changes:
+				if debounce == nil {
+					debounce = time.After(s.debounce)
+				}
+			case <-retry:
+				retry = nil
+				if debounce == nil {
+					debounce = time.After(s.debounce)
+				}
+			case <-debounce:
+				debounce = nil
+				routes, ok := s.currentRoutes(ctx)
+				if !ok && retry == nil {
+					retry = time.After(routeRetryInterval)
+				}
+				next := s.directedFilters(nostr.Timestamp(since), routes)
+				if directedKey(next) == currentKey {
+					continue // nothing we subscribe to actually changed
+				}
+				pending = next
+				resubscribe = true
+				streamEnded = true
 			case closed, ok := <-closedCh:
 				if !ok {
 					closedCh = nil
@@ -363,6 +393,12 @@ func (s *Service) Run(ctx context.Context) error {
 				backoff = time.Second
 				s.processRelayEvent(ctx, ie, &lastSeen)
 			}
+		}
+		cancel()
+
+		if resubscribe {
+			s.logger.Info("control plane changed; resubscribing", "filters", len(pending))
+			continue
 		}
 
 		select {
@@ -379,6 +415,143 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// directedKey canonicalizes a subscription set so unchanged routing does not
+// cause a resubscription.
+func directedKey(directed []nostr.DirectedFilter) string {
+	parts := make([]string, 0, len(directed))
+	for _, d := range directed {
+		parts = append(parts, d.String())
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\n")
+}
+
+func (s *Service) withCancel(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithCancel(ctx)
+}
+
+// currentRoutes loads routing inputs. On error the planner still returns
+// control-plane coverage with its last good relay plan; ok=false asks the
+// caller to retry later.
+func (s *Service) currentRoutes(ctx context.Context) (relayroute.Routes, bool) {
+	if s.routes == nil {
+		return relayroute.Routes{}, true
+	}
+	routes, err := s.routes.Routes(ctx)
+	if err != nil {
+		s.logger.Error("failed to load relay routes; keeping previous relay plan", "error", err)
+		return routes, false
+	}
+	if len(routes.Plan.Rejected) > 0 || routes.Plan.Truncated {
+		s.logger.Warn("relay routing policy rejected declared relays",
+			"rejected", len(routes.Plan.Rejected),
+			"truncated", routes.Plan.Truncated,
+			"admitted", len(routes.Plan.Relays),
+		)
+	}
+	return routes, true
+}
+
+// directedFilters builds the full subscription set: every base relay gets the
+// general filters plus the control-plane filters, and each admitted customer
+// relay gets filters scoped to the repositories that declared it.
+func (s *Service) directedFilters(since nostr.Timestamp, routes relayroute.Routes) []nostr.DirectedFilter {
+	base := append(subscriptionFilters(since, s.cfg), controlPlaneFilters(routes)...)
+	directed := make([]nostr.DirectedFilter, 0, len(base)*len(s.cfg.Relays)+2*len(routes.Plan.Relays))
+	for _, relay := range s.cfg.Relays {
+		for _, filter := range base {
+			directed = append(directed, nostr.DirectedFilter{Relay: relay, Filter: filter})
+		}
+	}
+	return append(directed, routeDirectedFilters(since, routes)...)
+}
+
+// controlPlaneFilters are the no-Since filters added on base relays for state
+// the registry already knows about: known authors' list revisions and
+// deletions, and the announcements of every declared repository.
+func controlPlaneFilters(routes relayroute.Routes) []nostr.Filter {
+	var filters []nostr.Filter
+	var authors []nostr.PubKey
+	var addresses []string
+	for _, raw := range routes.ListAuthors {
+		author, err := nostr.PubKeyFromHex(strings.TrimSpace(raw))
+		if err != nil || author == nostr.ZeroPK {
+			continue
+		}
+		authors = append(authors, author)
+		addresses = append(addresses, monitoring.ListAddress(author.Hex()))
+	}
+	if len(authors) > 0 {
+		filters = append(filters,
+			nostr.Filter{
+				Kinds:   []nostr.Kind{eventkind.MonitoredRepositories},
+				Authors: authors,
+				Tags:    nostr.TagMap{"d": {monitoring.ListIdentifier}},
+			},
+			nostr.Filter{
+				Kinds:   []nostr.Kind{eventkind.Deletion},
+				Authors: authors,
+				Tags:    nostr.TagMap{"a": addresses},
+			},
+		)
+	}
+	return append(filters, announcementFilters(routes.DeclaredRepositories, false)...)
+}
+
+// routeDirectedFilters scopes each admitted customer relay to the repositories
+// that declared it: NIP-34 work items by repository address, and the
+// repository's own announcement and state by owner and identifier.
+func routeDirectedFilters(since nostr.Timestamp, routes relayroute.Routes) []nostr.DirectedFilter {
+	var directed []nostr.DirectedFilter
+	for _, relay := range routes.Plan.RelayURLs() {
+		refs := routes.Plan.Relays[relay]
+		addresses := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			addresses = append(addresses, ref.Address)
+		}
+		directed = append(directed, nostr.DirectedFilter{Relay: relay, Filter: nostr.Filter{
+			Kinds: []nostr.Kind{eventkind.Patch, eventkind.GitPullRequest, eventkind.GitPullRequestUpdate},
+			Tags:  nostr.TagMap{"a": addresses},
+			Since: since,
+		}})
+		for _, filter := range announcementFilters(refs, true) {
+			directed = append(directed, nostr.DirectedFilter{Relay: relay, Filter: filter})
+		}
+	}
+	return directed
+}
+
+// announcementFilters returns one no-Since filter per owner for the kind-30617
+// announcements (and, when withState, kind-30618 state) of refs. One filter per
+// owner keeps the scope exact: a combined owners × identifiers filter would
+// also request repositories nobody declared.
+func announcementFilters(refs []scope.RepositoryRef, withState bool) []nostr.Filter {
+	byOwner := map[string][]string{}
+	for _, ref := range refs {
+		byOwner[ref.OwnerPubkey] = append(byOwner[ref.OwnerPubkey], ref.Identifier)
+	}
+	owners := make([]string, 0, len(byOwner))
+	for owner := range byOwner {
+		owners = append(owners, owner)
+	}
+	sort.Strings(owners)
+	filters := make([]nostr.Filter, 0, len(owners))
+	for _, owner := range owners {
+		pk, err := nostr.PubKeyFromHex(owner)
+		if err != nil {
+			continue
+		}
+		identifiers := byOwner[owner]
+		sort.Strings(identifiers)
+		kinds := []nostr.Kind{eventkind.RepositoryAnnouncement}
+		if withState {
+			kinds = append(kinds, eventkind.RepositoryState)
+		}
+		filters = append(filters, nostr.Filter{Kinds: kinds, Authors: []nostr.PubKey{pk}, Tags: nostr.TagMap{"d": identifiers}})
+	}
+	return filters
 }
 
 func (s *Service) logClosed(closed nostr.RelayClosed) {

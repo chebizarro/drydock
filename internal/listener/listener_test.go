@@ -127,35 +127,18 @@ func TestSubscriptionFiltersAddNoSinceMonitoredListControlPlane(t *testing.T) {
 	}
 }
 
-func TestSubscriptionFiltersDiscoverMaintainerListsByServiceTagAndKnownAuthors(t *testing.T) {
+func TestSubscriptionFiltersDiscoverMaintainerListsByServiceTag(t *testing.T) {
 	service := nostr.GetPublicKey(nostr.Generate())
-	known := nostr.GetPublicKey(nostr.Generate())
-	filters := subscriptionFilters(nostr.Timestamp(1), Config{
-		ContextVMPubkey:      service.Hex(),
-		MonitoredListAuthors: []string{known.Hex(), "not-a-pubkey"},
-	})
-
-	var discovery, byAuthor, deletion *nostr.Filter
+	filters := subscriptionFilters(nostr.Timestamp(1), Config{ContextVMPubkey: service.Hex()})
+	var discovery *nostr.Filter
 	for i := range filters {
-		f := &filters[i]
-		switch {
-		case len(f.Kinds) == 1 && f.Kinds[0] == 30001 && len(f.Authors) == 0:
-			discovery = f
-		case len(f.Kinds) == 1 && f.Kinds[0] == 30001 && len(f.Authors) == 1:
-			byAuthor = f
-		case len(f.Kinds) == 1 && f.Kinds[0] == 5:
-			deletion = f
+		if len(filters[i].Kinds) == 1 && filters[i].Kinds[0] == 30001 {
+			discovery = &filters[i]
 		}
 	}
-	if discovery == nil || discovery.Since != 0 || discovery.Tags["p"][0] != service.Hex() || discovery.Tags["d"][0] != "drydock:monitored-repositories:v1" {
+	if discovery == nil || discovery.Since != 0 || len(discovery.Authors) != 0 ||
+		discovery.Tags["p"][0] != service.Hex() || discovery.Tags["d"][0] != "drydock:monitored-repositories:v1" {
 		t.Fatalf("discovery filter = %#v", discovery)
-	}
-	if byAuthor == nil || byAuthor.Since != 0 || byAuthor.Authors[0] != known || len(byAuthor.Tags["p"]) != 0 {
-		t.Fatalf("known-author list filter = %#v (must not require the p tag so withdrawals arrive)", byAuthor)
-	}
-	wantAddress := "30001:" + known.Hex() + ":drydock:monitored-repositories:v1"
-	if deletion == nil || deletion.Since != 0 || len(deletion.Authors) != 1 || deletion.Authors[0] != known || deletion.Tags["a"][0] != wantAddress {
-		t.Fatalf("known-author deletion filter = %#v", deletion)
 	}
 }
 

@@ -74,6 +74,42 @@ func TestApplyRepositoryAnnouncementNewestWinsAndStaleReplayIsIgnored(t *testing
 	}
 }
 
+func TestListRepositoryRelaysFollowsLatestAnnouncement(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "relays.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	owner := nostr.Generate()
+	repoID := nostr.GetPublicKey(owner).Hex() + ":svc"
+	first := nostr.Event{Kind: nostr.KindRepositoryAnnouncement, CreatedAt: 100, Tags: nostr.Tags{{"d", "svc"}, {"relays", "wss://one.example.com", "wss://two.example.com"}}}
+	if err := first.Sign(owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyRepositoryAnnouncement(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ListRepositoryRelays(ctx, []string{repoID, "missing:repo"})
+	if err != nil || len(got) != 1 || len(got[repoID]) != 2 || got[repoID][0] != "wss://one.example.com" {
+		t.Fatalf("relays = %v err=%v", got, err)
+	}
+	replaced := nostr.Event{Kind: nostr.KindRepositoryAnnouncement, CreatedAt: 200, Tags: nostr.Tags{{"d", "svc"}, {"relays", "wss://three.example.com"}}}
+	if err := replaced.Sign(owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyRepositoryAnnouncement(ctx, replaced); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.ListRepositoryRelays(ctx, []string{repoID})
+	if err != nil || len(got[repoID]) != 1 || got[repoID][0] != "wss://three.example.com" {
+		t.Fatalf("relays after replacement = %v err=%v", got, err)
+	}
+}
+
 func TestApplyRepositoryAnnouncementRejectsInvalid(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "ann.db"))
